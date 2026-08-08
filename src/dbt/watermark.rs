@@ -210,6 +210,62 @@ pub async fn target_state(target: &DeltaTable, app_id: &str, max_scan: u64) -> R
     Ok(TargetState::OursOrUntouched)
 }
 
+/// What our own last commit to the target recorded about itself.
+#[derive(Debug, Clone, Default)]
+pub struct OurLastCommit {
+    /// The source table id we were reading. `None` for commits written before this was
+    /// recorded, or when we have never written to this target.
+    pub source_table_id: Option<String>,
+}
+
+/// Walk the target log backwards for the most recent commit that carries our txn action,
+/// and report what it said about the source it came from.
+///
+/// Same walk as [`target_state`], and normally just as short.
+pub async fn our_last_commit(
+    target: &DeltaTable,
+    app_id: &str,
+    max_scan: u64,
+) -> Result<OurLastCommit> {
+    let Some(head) = target.version() else {
+        return Ok(OurLastCommit::default());
+    };
+    let log = target.log_store();
+
+    let mut v = head;
+    let mut scanned = 0u64;
+    loop {
+        if scanned >= max_scan {
+            return Ok(OurLastCommit::default());
+        }
+        let Some(raw) = log.read_commit_entry(v).await? else {
+            return Ok(OurLastCommit::default());
+        };
+        let actions = get_actions(v, &raw)?;
+
+        if actions
+            .iter()
+            .any(|a| matches!(a, Action::Txn(t) if t.app_id == app_id))
+        {
+            let source_table_id = actions.iter().find_map(|a| match a {
+                Action::CommitInfo(ci) => ci
+                    .info
+                    .get("ddi.sourceTableId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                _ => None,
+            });
+            return Ok(OurLastCommit { source_table_id });
+        }
+
+        if v == 0 {
+            return Ok(OurLastCommit::default());
+        }
+        v -= 1;
+        scanned += 1;
+    }
+}
+
 /// How far back to walk the target log before giving up. Generous: a busy pipeline
 /// commits often, so our own txn is normally within a handful of commits.
 pub const DEFAULT_MAX_SCAN: u64 = 10_000;

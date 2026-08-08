@@ -468,10 +468,11 @@ async fn silver_dropped_and_recreated_is_refilled_from_scratch() {
 }
 
 #[tokio::test]
-async fn bronze_dropped_and_recreated_is_a_loud_error_not_a_silent_stall() {
-    // The nastiest of the five. A recreated source restarts its log at zero, so a cursor
-    // that has already passed that point would sit "caught up" forever against commits
-    // that will never arrive: a pipeline that looks healthy and streams nothing.
+async fn bronze_dropped_and_recreated_simply_starts_over() {
+    // Dropping and recreating a table keeps its path but restarts its log at zero, so the
+    // old offset means nothing. Starting over is the obvious answer and is safe here:
+    // the dedup filter drops whatever silver already holds, so only genuinely new rows
+    // are emitted.
     let lake = Lake::new().await;
     lake.arrive(&orders(1..=5)).await;
     lake.arrive(&orders(6..=9)).await;
@@ -480,15 +481,71 @@ async fn bronze_dropped_and_recreated_is_a_loud_error_not_a_silent_stall() {
 
     std::fs::remove_dir_all(&lake.raw).unwrap();
     create(&lake.raw, raw_schema()).await;
-    lake.arrive(&orders(100..=101)).await;
 
-    let Err(e) = Pipeline::open(lake.cfg()).await else {
-        panic!("a source whose log went backwards must not open quietly");
+    // Re-seeded with the same history plus more.
+    lake.arrive(&orders(1..=9)).await;
+    lake.arrive(&orders(10..=12)).await;
+
+    lake.stream().await;
+    lake.assert_exactly(&orders(1..=12)).await;
+}
+
+#[tokio::test]
+async fn a_recreated_bronze_that_is_already_ahead_does_not_skip_its_early_commits() {
+    // The dangerous shape, and the reason identity is checked rather than just the
+    // version. If the new table has *more* commits than the old offset, nothing looks
+    // wrong: the cursor is comfortably inside the log. Resuming from it would silently
+    // skip everything the new table wrote before that point.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=2)).await;
+    lake.stream().await;
+    lake.assert_exactly(&orders(1..=2)).await;
+
+    std::fs::remove_dir_all(&lake.raw).unwrap();
+    create(&lake.raw, raw_schema()).await;
+    // Eight commits, well past the old offset, and carrying orders silver has never
+    // seen — so anything skipped shows up as a missing key rather than being masked by
+    // rows that happened to be there already.
+    for i in 10..=17 {
+        lake.arrive(&orders(i..=i)).await;
+    }
+
+    lake.stream().await;
+    let mut expected = orders(1..=2);
+    expected.extend(orders(10..=17));
+    lake.assert_exactly(&expected).await;
+}
+
+#[tokio::test]
+async fn without_a_dedup_timestamp_a_replaced_source_stops_rather_than_duplicating() {
+    // Starting over is only safe because the filter suppresses what is already there.
+    // With no timestamp to filter on, it would append the whole table a second time.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=5)).await;
+
+    let mut cfg = lake.cfg();
+    cfg.dedup_timestamp = None;
+    cfg.dedup_key = None;
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+
+    std::fs::remove_dir_all(&lake.raw).unwrap();
+    create(&lake.raw, raw_schema()).await;
+    lake.arrive(&orders(1..=5)).await;
+
+    let Err(e) = Pipeline::open(cfg).await else {
+        panic!("without a filter, starting over would duplicate the table");
     };
     let msg = e.to_string();
-    assert!(msg.contains("gone backwards"), "got: {msg}");
-    assert!(msg.contains("dropped and recreated"), "got: {msg}");
-    assert!(msg.contains("app_id"), "it must name the way out: {msg}");
+    assert!(msg.contains("dropped and"), "got: {msg}");
+    assert!(
+        msg.contains("dedup_timestamp"),
+        "it must name the fix: {msg}"
+    );
 }
 
 #[tokio::test]

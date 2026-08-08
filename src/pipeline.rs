@@ -72,30 +72,7 @@ impl Pipeline {
         let offsets = OffsetStore::new(&cfg.app_id, cfg.starting_version);
         let cursor = resume_cursor(&cfg, &offsets, &source, &target).await?;
 
-        // A source whose head is behind where we already read is not the table we were
-        // reading. Dropping and recreating it restarts its log at zero, and the cursor
-        // would then sit forever past a head that never catches up — a pipeline that
-        // looks healthy and silently streams nothing. Say so instead.
-        let head = source
-            .log_store()
-            .get_latest_version(0)
-            .await
-            .map_err(Error::Delta)?;
-        // `head + 1` is the ordinary caught-up position: the cursor names the next
-        // commit to read, which does not exist yet. Beyond that, commits we have already
-        // consumed are missing from the log.
-        if cursor.version > head.saturating_add(1) && cursor.version > cfg.starting_version {
-            return Err(Error::Config(format!(
-                "pipeline {:?}: source {:?} is at version {head}, but this pipeline has \
-                 already consumed through version {}. The source's log has gone backwards, \
-                 which happens when a table is dropped and recreated. Streaming on would \
-                 wait forever for commits that will never come. Choose a new app_id to \
-                 start over against the new table, or restore the old one.",
-                cfg.name,
-                cfg.source_uri,
-                cursor.version.saturating_sub(1)
-            )));
-        }
+        let cursor = adjust_for_replaced_source(&cfg, &source, &target, cursor).await?;
 
         let target_schema: SchemaRef = target
             .snapshot()
@@ -114,7 +91,8 @@ impl Pipeline {
             None => Box::new(Identity),
         };
 
-        let sink = Sink::new(&cfg.app_id, cfg.target_file_size);
+        let sink =
+            Sink::new(&cfg.app_id, cfg.target_file_size).with_source_table_id(table_id(&source));
 
         info!(
             pipeline = %cfg.name,
@@ -329,6 +307,87 @@ impl Pipeline {
             }
         }
     }
+}
+
+/// A Delta table's own identity, which survives nothing but the table itself.
+///
+/// Read out of the serialized metadata because the kernel keeps the accessor private; the
+/// field name is part of the Delta protocol, so this is stable.
+fn table_id(t: &DeltaTable) -> Option<String> {
+    let snapshot = t.snapshot().ok()?;
+    serde_json::to_value(snapshot.metadata())
+        .ok()?
+        .get("id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Start over when the source is no longer the table we were reading.
+///
+/// Dropping and recreating a table keeps its path and its name but gives it a new
+/// identity and a log that restarts at zero. An offset carried over from the old table
+/// then means nothing, and there are two ways it goes wrong: if the new table has fewer
+/// commits than we had consumed, we wait forever for commits that will never come; if it
+/// already has more, we resume past its early commits and never read them at all. The
+/// second is the dangerous one, because nothing looks wrong.
+///
+/// Starting over is the obvious answer, and it is safe exactly when `dedup_timestamp` is
+/// set: the filter drops whatever the target already covers, so re-reading the table from
+/// the beginning re-emits only what is genuinely missing. Without it, starting over would
+/// append the whole table a second time, so it stops and says so instead.
+async fn adjust_for_replaced_source(
+    cfg: &ResolvedPipeline,
+    source: &DeltaTable,
+    target: &DeltaTable,
+    cursor: StreamCursor,
+) -> Result<StreamCursor> {
+    let head = source
+        .log_store()
+        .get_latest_version(0)
+        .await
+        .map_err(Error::Delta)?;
+
+    // Identity is the reliable signal. The log going backwards is the fallback for
+    // targets written before we recorded it.
+    let recorded = watermark::our_last_commit(target, &cfg.app_id, watermark::DEFAULT_MAX_SCAN)
+        .await?
+        .source_table_id;
+    let current = table_id(source);
+    let different_table = matches!((&recorded, &current), (Some(a), Some(b)) if a != b);
+    let log_went_backwards = cursor.version > head.saturating_add(1);
+
+    if !different_table && !log_went_backwards {
+        return Ok(cursor);
+    }
+
+    let why = if different_table {
+        "the source table has a different id than the one this pipeline last read from"
+    } else {
+        "the source's log has gone backwards"
+    };
+
+    let Some(ts) = cfg.dedup_timestamp.as_deref() else {
+        return Err(Error::Config(format!(
+            "pipeline {:?}: {why} — source {:?} appears to have been dropped and \
+             recreated. Resuming would either wait for commits that never come or skip \
+             the new table's early ones. Starting over is safe once dedup_timestamp is \
+             set, because rows the target already holds are then filtered out; without it \
+             it would append the whole table a second time. Set it (or `meta: \
+             {{ddi_timestamp: ...}}` on the dbt model), or choose a new app_id.",
+            cfg.name, cfg.source_uri
+        )));
+    };
+
+    let from = StreamCursor::at_version(cfg.starting_version);
+    warn!(
+        pipeline = %cfg.name,
+        reason = why,
+        previous_offset = %cursor,
+        restart_from = %from,
+        dedup_timestamp = ts,
+        "source was replaced; starting over and skipping rows the target already holds"
+    );
+    Ok(from)
 }
 
 /// Where to resume, accounting for a target that another writer may have rebuilt.

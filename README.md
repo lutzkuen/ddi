@@ -373,12 +373,22 @@ these and asserts the same invariant every time — no key missing, no key twice
 | `DELETE`/`UPDATE` upstream | Skipped per `change_policy`, never propagated |
 | `DELETE` behind the target's watermark | Left deleted |
 | Target dropped and recreated | Refilled from scratch |
-| **Source dropped and recreated** | **Hard error** |
+| Source dropped and recreated | Starts over, emitting only what is missing |
 
-The last one is the trap. A recreated source restarts its log at zero, so an offset that
-has already passed that point would sit "caught up" against commits that will never
-arrive — a pipeline that looks healthy and silently streams nothing. It fails loudly and
-names the fix instead.
+The last one is the trap, and not in the obvious direction. Dropping and recreating a
+table keeps its path and its name but gives it a new identity and a log that restarts at
+zero, so the carried-over offset means nothing. If the new table has *fewer* commits than
+were consumed, the pipeline waits for commits that will never arrive. If it already has
+*more* — the likelier case, and the dangerous one — the offset still lands comfortably
+inside the log, so nothing looks wrong while the new table's early commits are skipped and
+never read.
+
+Neither is detectable from the version alone, so `ddi` records the source's table id in
+each of its commits and compares it on restart. When the source turns out to be a
+different table, it starts over from the beginning; `dedup_timestamp` then drops whatever
+the target already holds, so only genuinely missing rows are emitted. Without a
+`dedup_timestamp` there is nothing to filter on and starting over would append the whole
+table a second time, so it stops and says so.
 
 ### JSON payloads
 

@@ -19,6 +19,10 @@ use crate::error::{Error, Result};
 pub struct Sink {
     app_id: String,
     target_file_size: Option<NonZeroU64>,
+    /// Which source table this pipeline is reading, so a later run can tell whether it is
+    /// still the same one. A dropped-and-recreated source keeps its path but gets a new
+    /// id, and nothing else in the log records that.
+    source_table_id: Option<String>,
 }
 
 impl Sink {
@@ -26,7 +30,13 @@ impl Sink {
         Self {
             app_id: app_id.into(),
             target_file_size: NonZeroU64::new(target_file_size),
+            source_table_id: None,
         }
+    }
+
+    pub fn with_source_table_id(mut self, id: Option<String>) -> Self {
+        self.source_table_id = id;
+        self
     }
 
     /// Append `batches` and record `source_version` in a `txn` action, atomically.
@@ -46,16 +56,25 @@ impl Sink {
             .with_application_transaction(txn)
             // Recorded for operators and for v2's mid-commit cursor work. Purely
             // informational today: the txn action above is the authority.
-            .with_metadata([
-                (
-                    "ddi.sourceVersion".to_string(),
-                    serde_json::Value::from(source_version),
-                ),
-                (
-                    "ddi.appId".to_string(),
-                    serde_json::Value::from(self.app_id.clone()),
-                ),
-            ]);
+            .with_metadata(
+                [
+                    (
+                        "ddi.sourceVersion".to_string(),
+                        serde_json::Value::from(source_version),
+                    ),
+                    (
+                        "ddi.appId".to_string(),
+                        serde_json::Value::from(self.app_id.clone()),
+                    ),
+                ]
+                .into_iter()
+                .chain(self.source_table_id.iter().map(|id| {
+                    (
+                        "ddi.sourceTableId".to_string(),
+                        serde_json::Value::from(id.clone()),
+                    )
+                })),
+            );
 
         let mut write = table
             .write(batches)
