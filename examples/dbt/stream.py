@@ -1,8 +1,13 @@
-"""Append raw orders to the bronze Delta table — stands in for the upstream stream.
+"""Append orders to the bronze Delta table, with increasing timestamps.
 
-    python stream.py <from> <to>      # rows [from:to) of raw_orders.csv
+    python stream.py <from> <to>
+
+orders_raw is deliberately raw: an id, an opaque JSON payload, and the instant the
+record arrived. Parsing it is the model's job.
 """
 import csv
+import datetime as dt
+import json
 import os
 import sys
 
@@ -11,19 +16,34 @@ from deltalake import write_deltalake
 
 LAKE = os.environ["DDI_LAKE"]
 HERE = os.path.dirname(os.path.abspath(__file__))
+EPOCH = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc).replace(tzinfo=None)
 
-rows = list(csv.DictReader(open(os.path.join(HERE, "raw_orders.csv"))))
+rows = list(csv.DictReader(open(os.path.join(HERE, "orders.csv"))))
 lo, hi = int(sys.argv[1]), int(sys.argv[2])
 chunk = rows[lo:hi]
 
 table = pa.table(
     {
-        "id": pa.array([int(r["id"]) for r in chunk], pa.int64()),
-        "user_id": pa.array([int(r["user_id"]) for r in chunk], pa.int64()),
-        "order_date": pa.array([r["order_date"] for r in chunk], pa.string()),
-        "status": pa.array([r["status"] for r in chunk], pa.string()),
+        "order_id": pa.array([int(r["id"]) for r in chunk], pa.int64()),
+        "data": pa.array(
+            [
+                json.dumps(
+                    {
+                        "customer_id": int(r["user_id"]),
+                        "amount": int(r["id"]) * 100,
+                        "status": r["status"],
+                    }
+                )
+                for r in chunk
+            ],
+            pa.string(),
+        ),
+        # Increases with arrival order — that is the whole contract.
+        "_timestamp": pa.array(
+            [EPOCH + dt.timedelta(minutes=int(r["id"])) for r in chunk],
+            pa.timestamp("us"),
+        ),
     }
 )
-# Append, so each call is one new Delta commit for ddi to pick up.
-write_deltalake(f"{LAKE}/raw_orders", table, mode="append")
-print(f"  bronze += raw_orders[{lo}:{hi}]  ({len(chunk)} rows)")
+write_deltalake(f"{LAKE}/orders_raw", table, mode="append")
+print(f"  orders_raw += rows[{lo}:{hi}]  ({len(chunk)} orders)")

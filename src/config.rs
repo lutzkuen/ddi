@@ -95,16 +95,21 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub watermark_uri: Option<String>,
 
-    /// A column that increases with arrival order, used to skip rows a rebuild already
-    /// covered.
+    /// Timestamp column used to skip rows a rebuild already covered.
     ///
-    /// The zero-cooperation alternative to `watermark_uri`: instead of dbt telling us
-    /// where it got to, we read `max(dedup_key)` out of the target and emit only rows
-    /// beyond it. dbt needs to know nothing about this tool.
+    /// The zero-cooperation alternative to `watermark_uri`: instead of the batch telling
+    /// us where it got to, we read `max(dedup_timestamp)` out of the target and emit only
+    /// rows beyond it. The batch needs to know nothing about this tool.
     ///
-    /// The column MUST be non-decreasing in the order rows arrive in the source. A late
-    /// row carrying an older key is indistinguishable from one the rebuild already wrote,
-    /// and will be dropped.
+    /// Must be non-decreasing in the order rows arrive in the source. See
+    /// [`crate::dedup`].
+    #[serde(default)]
+    pub dedup_timestamp: Option<String>,
+
+    /// Row identity, used to resolve rows sharing exactly the watermark instant.
+    ///
+    /// Optional but strongly recommended: without it, a row that arrived in the same
+    /// instant as the rebuild's newest is assumed covered and dropped.
     #[serde(default)]
     pub dedup_key: Option<String>,
 }
@@ -123,6 +128,13 @@ pub struct DbtConfig {
     /// Default watermark table for every pipeline derived from the manifest.
     #[serde(default)]
     pub watermark_uri: Option<String>,
+    /// Timestamp column to assume for converted models. Per-model `meta.ddi_timestamp`
+    /// wins. Defaults to [`crate::dedup::DEFAULT_TIMESTAMP_COLUMN`].
+    #[serde(default)]
+    pub timestamp_column: Option<String>,
+    /// Key column to assume for converted models. Per-model `meta.ddi_key` wins.
+    #[serde(default)]
+    pub key_column: Option<String>,
 }
 
 /// A pipeline with defaults folded in and every value parsed.
@@ -142,7 +154,9 @@ pub struct ResolvedPipeline {
     pub target_file_size: u64,
     /// Where dbt records its rebuild watermark for this target, if dbt shares it.
     pub watermark_uri: Option<String>,
-    /// Column used to skip rows a dbt rebuild already covered. See [`PipelineConfig`].
+    /// Timestamp column used to skip rows a rebuild already covered.
+    pub dedup_timestamp: Option<String>,
+    /// Row identity, for resolving ties at the watermark instant.
     pub dedup_key: Option<String>,
 }
 
@@ -265,6 +279,7 @@ impl Config {
                         .watermark_uri
                         .clone()
                         .or_else(|| self.dbt.watermark_uri.clone()),
+                    dedup_timestamp: p.dedup_timestamp.clone(),
                     dedup_key: p.dedup_key.clone(),
                 })
             })

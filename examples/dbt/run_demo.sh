@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# dbt and ddi writing the same Delta table, and neither corrupting the other.
+# orders_raw -> orders_stg, with a batch job and a stream writing the same table.
 #
 #   ./examples/dbt/run_demo.sh
 #
-# dbt is vanilla jaffle shop: no hooks, no macros, nothing that mentions ddi. It
-# rebuilds silver.stg_orders from scratch every run, exactly as a nightly batch does.
-# ddi streams the same transformation continuously into the same table in between.
+# dbt is vanilla: no hooks, no macros, nothing that mentions ddi. It rebuilds
+# orders_stg from scratch on every run, exactly as a nightly batch does. ddi streams
+# the same model continuously into the same table in between.
 #
-# The invariant asserted after every step: every bronze key appears in silver exactly
-# once, with the right values.
+# After every step: no order missing, no order twice, JSON parsed and cast.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,17 +29,23 @@ export RUST_LOG="${RUST_LOG:-error}"
 
 dbt_run() { (cd "$HERE" && "$DBT" run --profiles-dir . -q 2>&1 | grep -E 'delta_write|Error|Failure' || true); }
 ddi_once() { "$DDI" once --config "$DDI_LAKE/pipelines.toml"; }
+stream()   { "$PY" "$HERE/stream.py" "$@"; }
 show()     { "$PY" "$HERE/check.py" show "$DDI_LAKE/$1"; }
 verify()   { "$PY" "$HERE/check.py" verify; }
+optimize() { "$PY" -c "
+from deltalake import DeltaTable
+import sys
+dt = DeltaTable('$DDI_LAKE/$1'); dt.optimize.compact()
+print(f'  compacted $1 -> v{DeltaTable(\"$DDI_LAKE/$1\").version()}')"; }
 
 echo
-echo "1. bronze gets its first orders, then dbt builds silver"
-"$PY" "$HERE/stream.py" 0 5
+echo "1. first orders arrive; dbt builds orders_stg from the JSON payload"
+stream 0 5
 dbt_run
-show raw_orders; show stg_orders; verify
+show orders_raw; show orders_stg; verify
 
 echo
-echo "2. ddi works out which models it can stream, from dbt's own manifest"
+echo "2. ddi reads dbt's manifest to see what it can stream"
 cat > "$DDI_LAKE/ddi.toml" <<TOML
 [dbt]
 manifest     = "$HERE/target/manifest.json"
@@ -48,39 +53,56 @@ uri_template = "$DDI_LAKE/{name}"
 TOML
 "$DDI" dbt check --config "$DDI_LAKE/ddi.toml"
 "$DDI" dbt convert --config "$DDI_LAKE/ddi.toml" --out "$DDI_LAKE/pipelines.toml" >/dev/null
-# The one thing the manifest cannot tell us: which column advances with arrival order.
-printf 'dedup_key = "order_id"\n' >> "$DDI_LAKE/pipelines.toml"
-echo "  wrote $DDI_LAKE/pipelines.toml"
+echo "  dedup settings taken from the model's meta: in dbt, next to the model"
+grep -E 'dedup_' "$DDI_LAKE/pipelines.toml" | sed 's/^/    /'
 
 echo
-echo "3. new orders arrive; ddi streams them into dbt's table"
-"$PY" "$HERE/stream.py" 5 7
+echo "3. more orders; ddi streams them"
+stream 5 9
 ddi_once
-show raw_orders; show stg_orders; verify
+show orders_raw; show orders_stg; verify
 
 echo
-echo "4. the nightly dbt run — it overwrites the table ddi has been appending to"
+echo "4. orders arrive WHILE the batch is running — the window that makes this hard"
+echo "   the batch reads orders_raw now, at $(show orders_raw | grep -o 'max_ts=[^ ]*')"
+BATCH_SNAPSHOT_ROWS=9
+stream 9 13                 # these land after the batch read, before it commits
+ddi_once                    # and ddi streams them
+show orders_stg
+echo "   ...now the batch commits what it read, wiping rows 10-13 from the table"
+"$PY" - <<PY
+import os, pyarrow as pa
+from deltalake import DeltaTable, write_deltalake
+lake = os.environ["DDI_LAKE"]
+stg = DeltaTable(f"{lake}/orders_stg").to_pandas()
+snapshot = stg[stg.order_id <= $BATCH_SNAPSHOT_ROWS]
+write_deltalake(f"{lake}/orders_stg", pa.Table.from_pandas(snapshot, preserve_index=False),
+                mode="overwrite", schema_mode="overwrite")
+print(f"  batch rebuilt orders_stg with the {len(snapshot)} orders it saw")
+PY
+show orders_stg
+echo "   ddi must put back exactly the ones the batch never saw:"
+ddi_once
+show orders_stg; verify
+
+echo
+echo "5. a real dbt rebuild over the top"
 dbt_run
-show stg_orders; verify
+ddi_once
+show orders_stg; verify
 
 echo
-echo "5. ddi wakes up to a rebuilt target. Every key is already there, so it emits nothing."
-RUST_LOG=warn,delta_delta_ingest=info ddi_once 2>&1 | grep -E 'rebuilt|committed' || true
-show stg_orders; verify
+echo "6. both tables get compacted"
+optimize orders_raw
+optimize orders_stg
+ddi_once
+show orders_raw; show orders_stg; verify
 
 echo
-echo "6. the stream continues past the rebuild"
-"$PY" "$HERE/stream.py" 7 20
+echo "7. the stream continues past all of it"
+stream 13 40
 ddi_once
-show raw_orders; show stg_orders; verify
-
-echo
-echo "7. and once more around the loop"
-dbt_run
-ddi_once
-"$PY" "$HERE/stream.py" 20 40
-ddi_once
-show raw_orders; show stg_orders; verify
+show orders_raw; show orders_stg; verify
 
 echo
 echo "done — dbt never knew ddi existed."

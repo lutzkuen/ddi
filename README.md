@@ -298,29 +298,90 @@ row streamed while dbt was reading.
 
 ### When the rebuild cannot be changed at all
 
-A watermark means touching the dbt project. If the batch side must stay untouched — no
-hooks, no macros, nothing that knows `ddi` exists — name a column instead:
+A watermark table means touching the dbt project. If the batch side must stay untouched —
+no hooks, no macros, nothing that knows `ddi` exists — the tables can answer the question
+themselves, provided each carries a timestamp that increases with arrival:
 
 ```toml
-dedup_key = "order_id"
+dedup_timestamp = "_timestamp"   # the default
+dedup_key       = "order_id"
 ```
 
-After a rebuild, `ddi` reads `max(order_id)` out of the target and emits only rows beyond
-it. Nothing has to be recorded by anyone; the answer is already in the data. That is the
-mode [`examples/dbt/`](examples/dbt/) runs in.
+After a rebuild, `ddi` reads `max(_timestamp)` out of the target and emits only rows beyond
+it. Nothing has to be recorded by anyone; the answer is already in the data.
 
-The column **must be non-decreasing in the order rows reach the source**. A late row
-carrying an older key is indistinguishable from one the rebuild already wrote, and will be
-dropped — so this suits an append-only stream with a sequence or an arrival timestamp, not
-a table that gets backfilled.
+**This is what closes the in-flight window.** A batch job reads the source at one instant
+and commits its output later, and rows landing in between are in neither — not its
+snapshot, and not the target once it overwrites, even though `ddi` had already streamed
+them. Their timestamps are later than anything the batch saw, so they come back; the rows
+the batch did write carry earlier ones, so they are not duplicated. The schedule stops
+mattering, because coverage became a property of the row.
+
+`dedup_key` resolves rows sharing *exactly* the watermark instant, which a bare `>` would
+drop and a `>=` would duplicate. That set is small by construction — only the rows tied at
+the maximum — so it is compared row by row against the keys already there. Without a key,
+ties fall back to `>`: fine for a strictly increasing sequence, wrong for a
+second-granularity clock under load.
+
+Declare both in dbt, next to the model, and `ddi dbt convert` picks them up:
+
+```yaml
+models:
+  - name: orders_stg
+    meta:
+      ddi_timestamp: _timestamp
+      ddi_key: order_id
+```
+
+The timestamp **must be non-decreasing in the order rows reach the source** — a late row
+bearing an older timestamp is indistinguishable from one the rebuild already wrote, and
+will be dropped. That suits an append-only stream, not a table that gets backfilled.
 
 The cost is a rescan: `ddi` cannot know how far back the rebuild's contents reach, so it
-re-reads the source from `starting_version` and lets the key filter suppress what is
-already present. That is one pass per rebuild, not per batch, and it is why the key filter
-has to be exact — over-scanning is then merely wasteful rather than wrong.
+re-reads the source from `starting_version` and lets the filter suppress what is already
+present. One pass per rebuild, not per batch — and it is why the filter has to be exact,
+so that over-scanning is merely wasteful rather than wrong.
 
-`watermark_uri` remains the better choice where you can set it: it is exact, needs no
-rescan, and imposes no ordering requirement on any column.
+`watermark_uri` remains the better choice where you can set it: exact, no rescan, and no
+ordering requirement on any column.
+
+### What else happens to a shared table
+
+[`tests/hardening.rs`](tests/hardening.rs) runs `orders_raw -> orders_stg` through each of
+these and asserts the same invariant every time — no key missing, no key twice:
+
+| Event | Behaviour |
+|---|---|
+| Full refresh of the target | Rescan; rows the rebuild covers are skipped |
+| Rows arrive while the batch runs | Re-emitted, by timestamp |
+| `OPTIMIZE` on either table | Ignored — `dataChange: false` |
+| `DELETE`/`UPDATE` upstream | Skipped per `change_policy`, never propagated |
+| `DELETE` behind the target's watermark | Left deleted |
+| Target dropped and recreated | Refilled from scratch |
+| **Source dropped and recreated** | **Hard error** |
+
+The last one is the trap. A recreated source restarts its log at zero, so an offset that
+has already passed that point would sit "caught up" against commits that will never
+arrive — a pipeline that looks healthy and silently streams nothing. It fails loudly and
+names the fix instead.
+
+### JSON payloads
+
+Bronze often carries a payload as text. `json_extract_scalar` (Trino, Starburst),
+`json_extract_string` (DuckDB) and `get_json_object` (Spark) are all registered, with
+identical behaviour, so one dbt model runs both in the warehouse and here:
+
+```sql
+SELECT order_id,
+       CAST(json_extract_scalar(data, '$.customer_id') AS BIGINT) AS customer_id,
+       json_extract_scalar(data, '$.status')                      AS status,
+       _timestamp
+FROM source
+```
+
+Dotted paths only; array indexing and wildcards are rejected rather than silently empty.
+A missing field is NULL, but malformed JSON stops the pipeline — input is a typed column,
+not arbitrary text, so that is a data-quality failure rather than a row to skip.
 
 ### Ordering, when using a watermark table
 

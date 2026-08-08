@@ -9,6 +9,7 @@ use deltalake::arrow::array::RecordBatch;
 
 use crate::error::Result;
 
+pub mod json;
 pub mod sql;
 pub mod udf;
 pub mod validate;

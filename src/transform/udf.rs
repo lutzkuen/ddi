@@ -26,6 +26,7 @@ pub fn register_udfs(ctx: &SessionContext) {
     for op in [Reduce::Sum, Reduce::Min, Reduce::Max, Reduce::Avg] {
         ctx.register_udf(ScalarUDF::from(ArrayReduce::new(op)));
     }
+    crate::transform::json::register(ctx);
 }
 
 /// `array_length(array) -> int64`

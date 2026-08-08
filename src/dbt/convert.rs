@@ -69,6 +69,16 @@ pub fn to_toml(manifest: &Manifest, cfg: &Config) -> Result<String> {
         out.push_str(&format!("app_id     = {:?}\n", app_id_for(&s.name)));
         out.push_str(&format!("source_uri = {:?}\n", template.render(src)));
         out.push_str(&format!("target_uri = {:?}\n", template.render(tgt)));
+        // The rebuild handover. `meta:` on the model wins over the project default, so a
+        // model with an unusual timestamp column says so once, in dbt, where it belongs.
+        let ts = tgt
+            .meta_str("ddi_timestamp")
+            .or(cfg.dbt.timestamp_column.as_deref())
+            .unwrap_or(crate::dedup::DEFAULT_TIMESTAMP_COLUMN);
+        out.push_str(&format!("dedup_timestamp = {ts:?}\n"));
+        if let Some(key) = tgt.meta_str("ddi_key").or(cfg.dbt.key_column.as_deref()) {
+            out.push_str(&format!("dedup_key       = {key:?}\n"));
+        }
         if let Some(sql) = &s.transform_sql {
             out.push_str(&format!("transform_sql = \"\"\"\n{sql}\n\"\"\"\n"));
         }
@@ -195,6 +205,47 @@ mod tests {
         let toml = to_toml(&fixture(), &config()).unwrap();
         assert!(toml.contains("#   daily_totals:"), "{toml}");
         assert!(toml.contains("GROUP BY"), "the reason must survive: {toml}");
+    }
+
+    #[test]
+    fn the_timestamp_column_defaults_and_meta_overrides_it() {
+        let mut m = fixture();
+        let mut cfg = config();
+        cfg.dbt.key_column = Some("order_id".into());
+
+        // Default: the convention.
+        let toml = to_toml(&m, &cfg).unwrap();
+        assert!(toml.contains("dedup_timestamp = \"_timestamp\""), "{toml}");
+        assert!(toml.contains("dedup_key       = \"order_id\""), "{toml}");
+
+        // A model that says otherwise, in dbt, wins.
+        m.nodes
+            .get_mut("model.p.orders_header")
+            .unwrap()
+            .meta
+            .insert(
+                "ddi_timestamp".into(),
+                serde_json::Value::String("event_ts".into()),
+            );
+        let toml = to_toml(&m, &cfg).unwrap();
+        assert!(toml.contains("dedup_timestamp = \"event_ts\""), "{toml}");
+
+        // ... and it survives the round trip.
+        let r = Config::from_toml_str(&toml).unwrap().resolve().unwrap();
+        assert_eq!(r[0].dedup_timestamp.as_deref(), Some("event_ts"));
+        assert_eq!(r[0].dedup_key.as_deref(), Some("order_id"));
+    }
+
+    #[test]
+    fn meta_declared_under_config_is_also_seen() {
+        // dbt puts `meta:` under config when it came from dbt_project.yml.
+        let mut m = fixture();
+        let n = m.nodes.get_mut("model.p.orders_header").unwrap();
+        n.config
+            .meta
+            .insert("ddi_key".into(), serde_json::Value::String("oid".into()));
+        let toml = to_toml(&m, &config()).unwrap();
+        assert!(toml.contains("dedup_key       = \"oid\""), "{toml}");
     }
 
     #[test]

@@ -302,10 +302,14 @@ async fn the_watermark_store_reads_the_highest_version_for_its_own_app_id() {
 // ------------------------------------------------------- zero-cooperation dedup
 
 /// The mode where the rebuilding writer knows nothing about `ddi`: no watermark table,
-/// no hooks. `ddi` reads the highest key the rebuild left in the target and emits only
-/// what lies beyond it.
+/// no hooks. `ddi` reads how far the target already reaches and emits only what lies
+/// beyond it.
+///
+/// These fixtures have no timestamp column, so `id` plays that role — the mechanism only
+/// needs a column that increases with arrival order, whatever its type.
 fn cfg_with_dedup_key(f: &Fixture, name: &str) -> ResolvedPipeline {
     let mut c = f.cfg(name);
+    c.dedup_timestamp = Some("id".into());
     c.dedup_key = Some("id".into());
     c
 }

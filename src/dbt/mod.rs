@@ -55,6 +55,10 @@ pub struct Node {
     pub depends_on: DependsOn,
     #[serde(default)]
     pub config: NodeConfig,
+    /// dbt surfaces model `meta:` both at the top level and under `config`, depending on
+    /// where it was declared. Both are consulted.
+    #[serde(default)]
+    pub meta: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -70,6 +74,8 @@ pub struct NodeConfig {
     /// dbt-spark / dbt-trino external-table root, when the project sets one.
     #[serde(default)]
     pub location_root: Option<String>,
+    #[serde(default)]
+    pub meta: HashMap<String, serde_json::Value>,
 }
 
 impl Node {
@@ -88,6 +94,25 @@ impl Node {
 
     pub fn materialized(&self) -> &str {
         self.config.materialized.as_deref().unwrap_or("view")
+    }
+
+    /// A `meta:` value, from wherever dbt put it.
+    ///
+    /// This is how a project says which column carries its timestamp without ddi having
+    /// to be configured separately for every model:
+    ///
+    /// ```yaml
+    /// models:
+    ///   - name: orders_stg
+    ///     meta:
+    ///       ddi_timestamp: event_ts
+    ///       ddi_key: order_id
+    /// ```
+    pub fn meta_str(&self, key: &str) -> Option<&str> {
+        self.meta
+            .get(key)
+            .or_else(|| self.config.meta.get(key))
+            .and_then(|v| v.as_str())
     }
 }
 

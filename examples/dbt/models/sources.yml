@@ -1,9 +1,18 @@
 version: 2
+
 sources:
   - name: bronze
     meta:
       plugin: delta_read
     tables:
-      - name: raw_orders
+      - name: orders_raw
         meta:
-          delta_table_path: "{{ env_var('DDI_LAKE') }}/raw_orders"
+          delta_table_path: "{{ env_var('DDI_LAKE') }}/orders_raw"
+
+models:
+  - name: orders_stg
+    # How ddi resumes after a rebuild, declared once, in dbt, next to the model.
+    # These are the defaults; they are spelled out here to show where they live.
+    meta:
+      ddi_timestamp: _timestamp
+      ddi_key: order_id

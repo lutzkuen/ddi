@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod dbt;
+pub mod dedup;
 pub mod error;
 pub mod metrics;
 pub mod offset;
