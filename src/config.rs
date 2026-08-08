@@ -114,27 +114,30 @@ pub struct PipelineConfig {
     pub dedup_key: Option<String>,
 }
 
-/// Project-level dbt settings.
+/// Where the lake is and how to reach it. Deployment, not semantics.
+///
+/// Nothing here changes what a pipeline computes — that is the dbt project's job. These
+/// are the things a dbt project cannot know: credentials, and where the tables live when
+/// dbt has not said so itself.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct DbtConfig {
-    /// Path to `target/manifest.json`.
-    #[serde(default)]
-    pub manifest: Option<String>,
-    /// How a `schema.table` becomes a storage URI, e.g.
+pub struct StorageConfig {
+    /// Fallback for turning `schema.table` into a URI, e.g.
     /// `"abfss://lake@acct.dfs.core.windows.net/{schema}/{name}"`.
+    ///
+    /// Only consulted when the dbt project does not declare a location itself
+    /// (`location_root`, `delta_path`, a source's `delta_table_path`, `meta.ddi_location`).
     #[serde(default)]
     pub uri_template: Option<String>,
-    /// Default watermark table for every pipeline derived from the manifest.
+
+    /// Optional table where a cooperating batch job records the source version it
+    /// consumed. See [`crate::dbt::watermark`]; `meta.ddi_timestamp` needs no such thing.
     #[serde(default)]
     pub watermark_uri: Option<String>,
-    /// Timestamp column to assume for converted models. Per-model `meta.ddi_timestamp`
-    /// wins. Defaults to [`crate::dedup::DEFAULT_TIMESTAMP_COLUMN`].
+
+    /// Object-store credentials, passed through to delta-rs verbatim.
     #[serde(default)]
-    pub timestamp_column: Option<String>,
-    /// Key column to assume for converted models. Per-model `meta.ddi_key` wins.
-    #[serde(default)]
-    pub key_column: Option<String>,
+    pub options: HashMap<String, String>,
 }
 
 /// A pipeline with defaults folded in and every value parsed.
@@ -160,13 +163,29 @@ pub struct ResolvedPipeline {
     pub dedup_key: Option<String>,
 }
 
+/// `ddi`'s own configuration, which is deliberately not where the work is described.
+///
+/// What each pipeline *does* — which tables, which SQL, which timestamp — comes from the
+/// dbt project, because that is where it is already written down and where it is kept
+/// correct. Two copies of that would only ever disagree. What is left here is the part
+/// dbt has no opinion about: where the manifest is, how hard to run, and how to
+/// authenticate.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Path to the dbt project's `target/manifest.json`. This is the source of truth.
     #[serde(default)]
-    pub defaults: Defaults,
+    pub manifest: Option<String>,
+
+    /// How eagerly to run, and how large a batch may get.
+    #[serde(default, alias = "defaults")]
+    pub runtime: Defaults,
+
     #[serde(default)]
-    pub dbt: DbtConfig,
+    pub storage: StorageConfig,
+
+    /// Hand-written pipelines, for running without a dbt project at all. When `manifest`
+    /// is set these are ignored — the manifest wins, so there is one place to look.
     #[serde(default, rename = "pipeline")]
     pub pipelines: Vec<PipelineConfig>,
 }
@@ -193,14 +212,33 @@ impl Config {
     ///
     /// A pipeline that cannot be correct must fail here, at load, not on its first batch.
     pub fn resolve(&self) -> Result<Vec<ResolvedPipeline>> {
-        if self.pipelines.is_empty() {
-            return Err(Error::Config("no [[pipeline]] entries defined".into()));
+        // The dbt project is the source of truth whenever there is one.
+        let derived;
+        let pipelines: &[PipelineConfig] = match &self.manifest {
+            Some(path) => {
+                let manifest = crate::dbt::Manifest::from_path(std::path::Path::new(path))?;
+                derived = crate::dbt::convert::pipelines(&manifest, &self.storage)?;
+                if derived.is_empty() {
+                    return Err(Error::Config(format!(
+                        "no streamable models in {path:?}. Run `ddi dbt check` to see why                          each model was rejected."
+                    )));
+                }
+                &derived
+            }
+            None => &self.pipelines,
+        };
+
+        if pipelines.is_empty() {
+            return Err(Error::Config(
+                "nothing to run: set `manifest` to a dbt target/manifest.json, or declare                  [[pipeline]] entries."
+                    .into(),
+            ));
         }
 
         // app_id uniqueness: duplicates silently corrupt offsets, because two pipelines
         // would read and overwrite the same txn key on (possibly) different targets.
         let mut seen: HashMap<&str, &str> = HashMap::new();
-        for p in &self.pipelines {
+        for p in pipelines {
             if p.app_id.trim().is_empty() {
                 return Err(Error::Config(format!(
                     "pipeline {:?}: app_id must not be empty — it is the offset key",
@@ -217,7 +255,7 @@ impl Config {
         }
 
         let mut names = HashMap::new();
-        for p in &self.pipelines {
+        for p in pipelines {
             if names.insert(&p.name, ()).is_some() {
                 return Err(Error::Config(format!(
                     "duplicate pipeline name {:?}",
@@ -226,8 +264,8 @@ impl Config {
             }
         }
 
-        let d = &self.defaults;
-        self.pipelines
+        let d = &self.runtime;
+        pipelines
             .iter()
             .map(|p| {
                 if let Some(sql) = &p.transform_sql {
@@ -278,7 +316,7 @@ impl Config {
                     watermark_uri: p
                         .watermark_uri
                         .clone()
-                        .or_else(|| self.dbt.watermark_uri.clone()),
+                        .or_else(|| self.storage.watermark_uri.clone()),
                     dedup_timestamp: p.dedup_timestamp.clone(),
                     dedup_key: p.dedup_key.clone(),
                 })

@@ -188,10 +188,10 @@ fn select(
 fn manifest_path(explicit: &Option<PathBuf>, cfg: &Config) -> delta_delta_ingest::Result<PathBuf> {
     explicit
         .clone()
-        .or_else(|| cfg.dbt.manifest.as_ref().map(PathBuf::from))
+        .or_else(|| cfg.manifest.as_ref().map(PathBuf::from))
         .ok_or_else(|| {
             delta_delta_ingest::Error::Config(
-                "no dbt manifest: pass --manifest, or set [dbt].manifest in the config".into(),
+                "no dbt manifest: pass --manifest, or set `manifest` in the config".into(),
             )
         })
 }

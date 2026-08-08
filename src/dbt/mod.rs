@@ -74,6 +74,9 @@ pub struct NodeConfig {
     /// dbt-spark / dbt-trino external-table root, when the project sets one.
     #[serde(default)]
     pub location_root: Option<String>,
+    /// Explicit path, as adapters that write straight to storage record it.
+    #[serde(default)]
+    pub delta_path: Option<String>,
     #[serde(default)]
     pub meta: HashMap<String, serde_json::Value>,
 }

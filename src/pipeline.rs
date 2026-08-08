@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use crate::config::ResolvedPipeline;
 use crate::dbt::watermark;
-use crate::dedup::Dedup;
+use crate::dedup::{self, Dedup};
 use crate::error::{Error, Result};
 use crate::offset::OffsetStore;
 use crate::schema::SchemaCoercer;
@@ -70,7 +70,7 @@ impl Pipeline {
         })?;
 
         let offsets = OffsetStore::new(&cfg.app_id, cfg.starting_version);
-        let cursor = resume_cursor(&cfg, &offsets, &target).await?;
+        let cursor = resume_cursor(&cfg, &offsets, &source, &target).await?;
 
         // A source whose head is behind where we already read is not the table we were
         // reading. Dropping and recreating it restarts its log at zero, and the cursor
@@ -343,6 +343,7 @@ impl Pipeline {
 async fn resume_cursor(
     cfg: &ResolvedPipeline,
     offsets: &OffsetStore,
+    source: &DeltaTable,
     target: &DeltaTable,
 ) -> Result<StreamCursor> {
     let own = offsets.resume_cursor(target).await?;
@@ -362,13 +363,29 @@ async fn resume_cursor(
     // may already be past what the rebuild covered, which is the whole hazard --- so the
     // scan restarts and the key filter suppresses everything already present.
     if let Some(ts) = cfg.dedup_timestamp.as_deref() {
-        let from = StreamCursor::at_version(cfg.starting_version);
+        // How far back the rescan has to reach is a question the source's own file
+        // statistics can answer, so ask rather than re-reading history every night.
+        let dedup = Dedup::read(target, ts, cfg.dedup_key.as_deref()).await?;
+        let from = match dedup.watermark() {
+            Some(w) => StreamCursor::at_version(
+                dedup::bounded_rescan_start(
+                    source,
+                    ts,
+                    w,
+                    cfg.starting_version,
+                    watermark::DEFAULT_MAX_SCAN,
+                )
+                .await?,
+            ),
+            None => StreamCursor::at_version(cfg.starting_version),
+        };
         warn!(
             pipeline = %cfg.name,
             overwritten_at_target_version = at,
             own_offset = %own,
             dedup_timestamp = ts,
             rescan_from = %from,
+            bounded = (from.version > cfg.starting_version),
             "target was rebuilt by another writer; rescanning and skipping rows the target \
              already covers"
         );

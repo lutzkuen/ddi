@@ -43,6 +43,7 @@ use deltalake::DeltaTable;
 use futures::TryStreamExt;
 
 use crate::error::{Error, Result};
+use crate::source::Version;
 
 /// The default timestamp column, matching the convention this tool assumes tables follow.
 pub const DEFAULT_TIMESTAMP_COLUMN: &str = "_timestamp";
@@ -157,6 +158,11 @@ impl Dedup {
 
     pub fn watermark_is_known(&self) -> bool {
         self.watermark.is_some()
+    }
+
+    /// The cut-off itself, for bounding how far back a rescan must reach.
+    pub fn watermark(&self) -> Option<&ArrayRef> {
+        self.watermark.as_ref()
     }
 
     pub fn boundary_key_count(&self) -> usize {
@@ -380,5 +386,183 @@ mod tests {
         let e = d.apply(batch(&[(1, 10)])).unwrap_err().to_string();
         assert!(e.contains("nope"), "got: {e}");
         assert!(e.contains("order_id"), "should list the real columns: {e}");
+    }
+}
+
+// ---------------------------------------------------------------- bounded rescan
+
+/// A value from either side, reduced to something comparable.
+///
+/// Delta writes per-file statistics as JSON, so the target's watermark (an Arrow scalar)
+/// and the source's `maxValues` (a JSON value) have to meet somewhere.
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+enum Bound {
+    Int(i64),
+    Float(f64),
+    Text(String),
+}
+
+/// Reduce the watermark to a comparable bound. `None` when its type is not one we can
+/// line up against Delta statistics — the caller then falls back to a full rescan.
+fn watermark_bound(watermark: &ArrayRef) -> Option<Bound> {
+    use deltalake::arrow::array::{AsArray, Int64Array};
+    use deltalake::arrow::datatypes::{Int64Type, TimeUnit};
+
+    match watermark.data_type() {
+        DataType::Timestamp(_, _) => {
+            let us = cast(watermark, &DataType::Timestamp(TimeUnit::Microsecond, None)).ok()?;
+            let us =
+                us.as_primitive_opt::<deltalake::arrow::datatypes::TimestampMicrosecondType>()?;
+            (!us.is_null(0)).then(|| Bound::Int(us.value(0)))
+        }
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            let v = cast(watermark, &DataType::Int64).ok()?;
+            let v = v.as_any().downcast_ref::<Int64Array>()?;
+            (!v.is_null(0)).then(|| Bound::Int(v.value(0)))
+        }
+        DataType::Date32 | DataType::Date64 => {
+            let v = cast(watermark, &DataType::Int64).ok()?;
+            let v = v.as_primitive_opt::<Int64Type>()?;
+            (!v.is_null(0)).then(|| Bound::Int(v.value(0)))
+        }
+        // A numeric sequence works as well as a clock, and Delta writes those stats as
+        // JSON numbers.
+        DataType::Float32 | DataType::Float64 | DataType::Decimal128(_, _) => {
+            let v = cast(watermark, &DataType::Float64).ok()?;
+            let v = v.as_primitive_opt::<deltalake::arrow::datatypes::Float64Type>()?;
+            (!v.is_null(0)).then(|| Bound::Float(v.value(0)))
+        }
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            let v = cast(watermark, &DataType::Utf8).ok()?;
+            let v = v.as_string_opt::<i32>()?;
+            (!v.is_null(0)).then(|| Bound::Text(v.value(0).to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Interpret a Delta statistic in the same shape as the watermark.
+fn stat_bound(stat: &serde_json::Value, like: &Bound) -> Option<Bound> {
+    match like {
+        Bound::Int(_) => match stat {
+            serde_json::Value::Number(n) => n.as_i64().map(Bound::Int),
+            // Timestamps are written as text, in more than one shape depending on writer.
+            serde_json::Value::String(s) => parse_timestamp_micros(s).map(Bound::Int),
+            _ => None,
+        },
+        Bound::Float(_) => stat.as_f64().map(Bound::Float),
+        Bound::Text(_) => stat.as_str().map(|s| Bound::Text(s.to_string())),
+    }
+}
+
+/// Microseconds since epoch, from the spellings Delta writers actually emit.
+fn parse_timestamp_micros(s: &str) -> Option<i64> {
+    use chrono::NaiveDateTime;
+
+    const FORMATS: &[&str] = &[
+        "%Y-%m-%dT%H:%M:%S%.fZ",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ];
+    for f in FORMATS {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(s, f) {
+            return dt.and_utc().timestamp_micros().into();
+        }
+    }
+    None
+}
+
+/// The earliest source version that can still hold rows beyond `watermark`.
+///
+/// After a rebuild, `ddi` has to re-read the source far enough back to recover whatever
+/// the rebuild wiped — but it does not know how far back that is. Reading from
+/// `starting_version` is always correct and always wasteful: on a large bronze table it
+/// re-reads history every night.
+///
+/// Delta records per-file `maxValues`, so the log can answer it directly. Walking
+/// backwards from the head, the first commit whose newest row is already covered by the
+/// watermark is the boundary: everything before it is covered too, because the timestamp
+/// increases with arrival — which is the same assumption the filter already rests on.
+///
+/// Anything unexpected — statistics missing, a type that will not line up, a log that
+/// runs out — returns `fallback`. Being slow is a cost; being wrong is not an option.
+pub async fn bounded_rescan_start(
+    source: &DeltaTable,
+    timestamp_column: &str,
+    watermark: &ArrayRef,
+    fallback: Version,
+    max_scan: u64,
+) -> Result<Version> {
+    use deltalake::kernel::Action;
+    use deltalake::logstore::get_actions;
+
+    let Some(mark) = watermark_bound(watermark) else {
+        return Ok(fallback);
+    };
+    let Some(head) = source.version() else {
+        return Ok(fallback);
+    };
+    let log = source.log_store();
+
+    let mut v = head;
+    let mut scanned = 0u64;
+    loop {
+        if scanned >= max_scan || v < fallback {
+            return Ok(fallback);
+        }
+        let Some(raw) = log.read_commit_entry(v).await? else {
+            return Ok(fallback); // log truncated under us
+        };
+        let actions = get_actions(v, &raw)?;
+
+        // Highest value this commit added. A commit that added nothing (compaction, a
+        // txn marker) says nothing about coverage, so keep walking.
+        let mut commit_max: Option<Bound> = None;
+        let mut saw_add = false;
+        for a in &actions {
+            let Action::Add(add) = a else { continue };
+            if !add.data_change {
+                continue;
+            }
+            saw_add = true;
+            let Some(stats) = add.stats.as_deref() else {
+                return Ok(fallback); // no statistics: cannot reason, so re-read it all
+            };
+            let parsed: serde_json::Value = match serde_json::from_str(stats) {
+                Ok(p) => p,
+                Err(_) => return Ok(fallback),
+            };
+            let Some(stat) = parsed
+                .get("maxValues")
+                .and_then(|m| m.get(timestamp_column))
+            else {
+                return Ok(fallback);
+            };
+            let Some(b) = stat_bound(stat, &mark) else {
+                return Ok(fallback);
+            };
+            commit_max = Some(match commit_max {
+                Some(cur) if cur > b => cur,
+                _ => b,
+            });
+        }
+
+        if saw_add {
+            if let Some(cmax) = commit_max {
+                // Everything this commit added is already in the target, so everything
+                // before it is too.
+                if cmax <= mark {
+                    return Ok(v.saturating_add(1));
+                }
+            }
+        }
+
+        if v == 0 {
+            return Ok(fallback);
+        }
+        v -= 1;
+        scanned += 1;
     }
 }

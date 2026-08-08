@@ -521,3 +521,86 @@ async fn ties_at_the_watermark_are_resolved_by_key() {
         "order 2 shares the watermark instant but was never written"
     );
 }
+
+#[tokio::test]
+async fn the_rescan_after_a_rebuild_is_bounded_by_file_statistics() {
+    // Correctness is covered above; this is about cost. A rebuild must not send ddi back
+    // through the whole of bronze, because on a real table that is the entire history,
+    // every night. Delta records maxValues per file, so the log itself says how far back
+    // the rescan has to reach.
+    use delta_delta_ingest::dedup::{bounded_rescan_start, Dedup};
+
+    let lake = Lake::new().await;
+    for i in 1..=20 {
+        lake.arrive(&orders(i..=i)).await; // 20 separate commits
+    }
+    lake.stream().await;
+    lake.assert_exactly(&orders(1..=20)).await;
+
+    // The batch rebuilds from everything it saw except the last two commits.
+    lake.rebuild(&orders(1..=18)).await;
+
+    let target = open_table(ensure_table_uri(&lake.stg).unwrap())
+        .await
+        .unwrap();
+    let source = open_table(ensure_table_uri(&lake.raw).unwrap())
+        .await
+        .unwrap();
+    let dedup = Dedup::read(&target, DEFAULT_TIMESTAMP_COLUMN, Some("order_id"))
+        .await
+        .unwrap();
+
+    let start = bounded_rescan_start(
+        &source,
+        DEFAULT_TIMESTAMP_COLUMN,
+        dedup.watermark().expect("the rebuild left a watermark"),
+        0,
+        10_000,
+    )
+    .await
+    .unwrap();
+
+    // Orders 1..=18 landed in commits 1..=18, so everything needed is at 19 and beyond.
+    assert_eq!(
+        start, 19,
+        "the rescan should start just past the last commit the rebuild covered, not at 0"
+    );
+
+    // And the pipeline built on it still gets the right answer.
+    lake.stream().await;
+    lake.assert_exactly(&orders(1..=20)).await;
+}
+
+#[tokio::test]
+async fn an_unbounded_rescan_is_still_correct_when_statistics_are_missing() {
+    // The fallback path: anything it cannot reason about must send it back to the start
+    // rather than guess. Asking for a column the source does not carry stands in for any
+    // of the ways statistics can be unusable.
+    use delta_delta_ingest::dedup::{bounded_rescan_start, Dedup};
+
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=5)).await;
+    lake.stream().await;
+    lake.rebuild(&orders(1..=3)).await;
+
+    let target = open_table(ensure_table_uri(&lake.stg).unwrap())
+        .await
+        .unwrap();
+    let source = open_table(ensure_table_uri(&lake.raw).unwrap())
+        .await
+        .unwrap();
+    let dedup = Dedup::read(&target, DEFAULT_TIMESTAMP_COLUMN, Some("order_id"))
+        .await
+        .unwrap();
+
+    let start = bounded_rescan_start(
+        &source,
+        "a_column_the_source_does_not_have",
+        dedup.watermark().unwrap(),
+        0,
+        10_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(start, 0, "no usable statistics must mean a full rescan");
+}

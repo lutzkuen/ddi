@@ -387,7 +387,11 @@ async fn a_rebuild_that_overtook_the_stream_does_not_duplicate_its_rows() {
     let got = read_ids(&f.target).await;
     assert_eq!(got, vec![1, 2, 3, 4, 5], "no key reprocessed: {got:?}");
     assert!(!has_duplicates(&got));
-    assert!(n > 0, "it did read the source; it just emitted nothing new");
+    assert_eq!(
+        n, 0,
+        "the rescan is bounded by the source's file statistics, so there was nothing left \
+         to read at all — not merely nothing left to emit"
+    );
 }
 
 #[tokio::test]

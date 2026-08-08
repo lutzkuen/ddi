@@ -1,31 +1,35 @@
-//! JSON field extraction, for bronze tables that carry a payload as text.
+//! Trino/Starburst JSON functions, for bronze tables that carry a payload as text.
 //!
 //! Row-local and stateless, exactly like the `array_*` UDFs: a value is derived from one
 //! row's own column and nothing else, so batch boundaries cannot change the answer.
 //!
-//! # Why these names
+//! # Why these, and why these names
 //!
 //! A dbt model has to run in two places — in the warehouse when the batch rebuilds it,
 //! and here when `ddi` streams it — so the SQL must mean the same thing in both. These
-//! are the spellings the warehouses already use:
+//! follow [Trino's JSON
+//! functions](https://trino.io/docs/current/functions/json.html), which is what Starburst
+//! runs, including the parts people get wrong:
 //!
-//! | Engine | Function |
-//! |---|---|
-//! | Trino / Starburst | `json_extract_scalar(json, '$.field')` |
-//! | DuckDB | `json_extract_string(json, '$.field')` |
-//! | Spark | `get_json_object(json, '$.field')` |
+//! - `json_extract_scalar` returns **NULL for an object or array**. Only `json_extract`
+//!   returns those, as JSON text. Rendering a container from the scalar form would put
+//!   `{"a":1}` in a column somebody casts to a number.
+//! - A missing path is NULL, but malformed JSON is an error. Input is a typed column, not
+//!   arbitrary text, so bad JSON is a data-quality failure rather than a row to skip.
+//! - `json_size` counts members of an object or elements of an array, and is 0 for a
+//!   scalar.
 //!
-//! All three are registered, with identical behaviour, so a model written for any of them
-//! streams unchanged.
+//! Since `ddi` has no distinct JSON type, `json` and `varchar` are both text here.
+//! `json_parse` therefore validates rather than converting, and `json_format` is identity
+//! — which is exactly how they compose in a model that has to survive both engines.
 //!
-//! The result is always text. Casting it is the model's job — `CAST(... AS BIGINT)` — and
-//! that cast goes through the same hard-failing coercion as everything else, so a payload
-//! whose field is not a number is an error rather than a silent NULL.
+//! DuckDB's `json_extract_string` and Spark's `get_json_object` are registered as aliases
+//! of `json_extract_scalar`, so a model written against either streams unchanged.
 
 use std::any::Any;
 use std::sync::Arc;
 
-use deltalake::arrow::array::{Array, ArrayRef, StringArray};
+use deltalake::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray};
 use deltalake::arrow::datatypes::DataType;
 use deltalake::datafusion::common::Result as DFResult;
 use deltalake::datafusion::error::DataFusionError;
@@ -33,76 +37,225 @@ use deltalake::datafusion::logical_expr::{
     ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use deltalake::datafusion::prelude::SessionContext;
+use serde_json::Value;
 
-/// Every spelling of "pull this field out of that JSON".
-pub const NAMES: &[&str] = &[
-    "json_extract_scalar",
-    "json_extract_string",
-    "get_json_object",
+/// One step of a JSON path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Step {
+    Field(String),
+    Index(usize),
+}
+
+/// Parse the JSONPath subset Trino accepts: `$`, `.name`, `["name"]`, `[0]`.
+///
+/// Wildcards and filters are rejected rather than silently ignored — they select sets,
+/// and a function declared to return one value cannot honestly do that.
+fn parse_path(path: &str) -> Result<Vec<Step>, String> {
+    let bytes: Vec<char> = path.chars().collect();
+    let mut i = 0;
+    let mut steps = Vec::new();
+
+    if bytes.first() == Some(&'$') {
+        i = 1;
+    }
+    while i < bytes.len() {
+        match bytes[i] {
+            '.' => {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i] != '.' && bytes[i] != '[' {
+                    i += 1;
+                }
+                if start == i {
+                    return Err(format!("JSON path {path:?}: empty field name after '.'"));
+                }
+                let name: String = bytes[start..i].iter().collect();
+                if name.contains('*') {
+                    return Err(wildcard(path));
+                }
+                steps.push(Step::Field(name));
+            }
+            '[' => {
+                i += 1;
+                if i < bytes.len() && (bytes[i] == '"' || bytes[i] == '\'') {
+                    let quote = bytes[i];
+                    i += 1;
+                    let start = i;
+                    while i < bytes.len() && bytes[i] != quote {
+                        i += 1;
+                    }
+                    let name: String = bytes[start..i].iter().collect();
+                    i += 1; // closing quote
+                    if i >= bytes.len() || bytes[i] != ']' {
+                        return Err(format!("JSON path {path:?}: unterminated ["));
+                    }
+                    i += 1;
+                    steps.push(Step::Field(name));
+                } else {
+                    let start = i;
+                    while i < bytes.len() && bytes[i] != ']' {
+                        i += 1;
+                    }
+                    let raw: String = bytes[start..i].iter().collect();
+                    if i >= bytes.len() {
+                        return Err(format!("JSON path {path:?}: unterminated ["));
+                    }
+                    i += 1; // ']'
+                    if raw.contains('*') {
+                        return Err(wildcard(path));
+                    }
+                    let n: usize = raw.trim().parse().map_err(|_| {
+                        format!("JSON path {path:?}: {raw:?} is not an array index")
+                    })?;
+                    steps.push(Step::Index(n));
+                }
+            }
+            // A bare leading field, as in 'a.b' — tolerated so a path that forgot its $
+            // behaves the way the author obviously meant.
+            c if steps.is_empty() && (c.is_alphanumeric() || c == '_') => {
+                let start = i;
+                while i < bytes.len() && bytes[i] != '.' && bytes[i] != '[' {
+                    i += 1;
+                }
+                steps.push(Step::Field(bytes[start..i].iter().collect()));
+            }
+            c => return Err(format!("JSON path {path:?}: unexpected {c:?}")),
+        }
+    }
+    Ok(steps)
+}
+
+fn wildcard(path: &str) -> String {
+    format!(
+        "JSON path {path:?} is not supported: wildcards select a set of values, and these \
+         functions return a single one. Unnest the array instead."
+    )
+}
+
+fn resolve<'a>(doc: &'a Value, steps: &[Step]) -> Option<&'a Value> {
+    let mut cur = doc;
+    for s in steps {
+        cur = match s {
+            Step::Field(f) => cur.get(f)?,
+            Step::Index(n) => cur.get(*n)?,
+        };
+    }
+    Some(cur)
+}
+
+/// Trino's scalar rendering: a string loses its quotes, other scalars print themselves,
+/// and containers are **not** scalars.
+fn as_scalar_text(v: &Value) -> Option<String> {
+    match v {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+/// Every function this module provides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Kind {
+    /// `json_extract(json, path) -> json`
+    Extract,
+    /// `json_extract_scalar(json, path) -> varchar`
+    ExtractScalar,
+    /// `json_size(json, path) -> bigint`
+    Size,
+    /// `json_array_length(json) -> bigint`
+    ArrayLength,
+    /// `json_array_contains(json, value) -> boolean`
+    ArrayContains,
+    /// `json_array_get(json, index) -> json`
+    ArrayGet,
+    /// `json_format(json) -> varchar`
+    Format,
+    /// `json_parse(varchar) -> json`
+    Parse,
+    /// `is_json_scalar(json) -> boolean`
+    IsScalar,
+    /// `json_exists(json, path) -> boolean`
+    Exists,
+}
+
+impl Kind {
+    fn arity(&self) -> usize {
+        match self {
+            Kind::ArrayLength | Kind::Format | Kind::Parse | Kind::IsScalar => 1,
+            _ => 2,
+        }
+    }
+
+    fn return_type(&self) -> DataType {
+        match self {
+            Kind::Size | Kind::ArrayLength => DataType::Int64,
+            Kind::ArrayContains | Kind::IsScalar | Kind::Exists => DataType::Boolean,
+            _ => DataType::Utf8,
+        }
+    }
+}
+
+/// Name → behaviour. Several names share one implementation, which is the point: the same
+/// model streams whichever engine wrote it.
+const FUNCTIONS: &[(&str, Kind)] = &[
+    // Trino / Starburst
+    ("json_extract", Kind::Extract),
+    ("json_extract_scalar", Kind::ExtractScalar),
+    ("json_size", Kind::Size),
+    ("json_array_length", Kind::ArrayLength),
+    ("json_array_contains", Kind::ArrayContains),
+    ("json_array_get", Kind::ArrayGet),
+    ("json_format", Kind::Format),
+    ("json_parse", Kind::Parse),
+    ("is_json_scalar", Kind::IsScalar),
+    // SQL/JSON standard spellings, which Trino also accepts
+    ("json_value", Kind::ExtractScalar),
+    ("json_query", Kind::Extract),
+    ("json_exists", Kind::Exists),
+    // Other engines, same behaviour
+    ("json_extract_string", Kind::ExtractScalar), // DuckDB
+    ("get_json_object", Kind::ExtractScalar),     // Spark
 ];
 
 pub fn register(ctx: &SessionContext) {
-    for name in NAMES {
-        ctx.register_udf(ScalarUDF::from(JsonExtract::new(name)));
+    for (name, kind) in FUNCTIONS {
+        ctx.register_udf(ScalarUDF::from(JsonFn::new(name, *kind)));
     }
+}
+
+/// The names registered, for diagnostics and tests.
+pub fn names() -> Vec<&'static str> {
+    FUNCTIONS.iter().map(|(n, _)| *n).collect()
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
-struct JsonExtract {
+struct JsonFn {
     name: &'static str,
+    kind: Kind,
     signature: Signature,
 }
 
-impl JsonExtract {
-    fn new(name: &'static str) -> Self {
+impl JsonFn {
+    fn new(name: &'static str, kind: Kind) -> Self {
         Self {
             name,
-            signature: Signature::any(2, Volatility::Immutable),
+            kind,
+            signature: Signature::any(kind.arity(), Volatility::Immutable),
         }
     }
-}
 
-/// Resolve a `$.a.b` path against one document.
-///
-/// Only the dotted subset is supported: it is what these functions are used for in
-/// practice, and an unsupported path is an error rather than a silently empty result.
-fn lookup<'a>(
-    doc: &'a serde_json::Value,
-    path: &str,
-) -> Result<Option<&'a serde_json::Value>, String> {
-    let rest = path
-        .strip_prefix("$.")
-        .or_else(|| path.strip_prefix('$'))
-        .unwrap_or(path);
-    if rest.contains('[') || rest.contains('*') {
-        return Err(format!(
-            "JSON path {path:?} is not supported: only dotted field access like \
-             '$.customer.id' is. Array indexing and wildcards reach across structure in \
-             ways this tool does not model."
-        ));
-    }
-
-    let mut cur = doc;
-    for part in rest.split('.').filter(|p| !p.is_empty()) {
-        match cur.get(part) {
-            Some(v) => cur = v,
-            None => return Ok(None),
-        }
-    }
-    Ok(Some(cur))
-}
-
-/// Render a JSON value as the text these functions return: scalars bare, containers as
-/// their JSON encoding, null as SQL NULL.
-fn render(v: &serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(s) => Some(s.clone()),
-        other => Some(other.to_string()),
+    fn bad_json(&self, row: usize, e: impl std::fmt::Display) -> DataFusionError {
+        DataFusionError::Execution(format!(
+            "{}: row {row} is not valid JSON: {e}. Input is a typed column, not arbitrary \
+             text, so this is a data-quality failure rather than a row to skip.",
+            self.name
+        ))
     }
 }
 
-impl ScalarUDFImpl for JsonExtract {
+impl ScalarUDFImpl for JsonFn {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -113,7 +266,7 @@ impl ScalarUDFImpl for JsonExtract {
         &self.signature
     }
     fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
+        Ok(self.kind.return_type())
     }
 
     fn invoke_with_args(
@@ -122,30 +275,85 @@ impl ScalarUDFImpl for JsonExtract {
     ) -> DFResult<ColumnarValue> {
         let rows = args.number_rows;
         let docs = to_text(&args.args[0], rows, self.name)?;
-        let paths = to_text(&args.args[1], rows, self.name)?;
+        let second = if self.kind.arity() == 2 {
+            Some(to_text(&args.args[1], rows, self.name)?)
+        } else {
+            None
+        };
 
-        let mut out: Vec<Option<String>> = Vec::with_capacity(rows);
+        let mut text: Vec<Option<String>> = Vec::new();
+        let mut nums: Vec<Option<i64>> = Vec::new();
+        let mut bools: Vec<Option<bool>> = Vec::new();
+
         for i in 0..rows {
-            if docs.is_null(i) || paths.is_null(i) {
-                out.push(None);
+            let arg2 = second.as_ref().map(|a| (a.is_null(i), a.value(i)));
+            if docs.is_null(i) || matches!(arg2, Some((true, _))) {
+                match self.kind.return_type() {
+                    DataType::Int64 => nums.push(None),
+                    DataType::Boolean => bools.push(None),
+                    _ => text.push(None),
+                }
                 continue;
             }
-            let doc: serde_json::Value = serde_json::from_str(docs.value(i)).map_err(|e| {
-                // Loud, like every other malformed-input path here: there is no
-                // dead-letter queue, so bad JSON stops the pipeline.
-                DataFusionError::Execution(format!(
-                    "{}: row {i} is not valid JSON: {e}. Input is a typed column, not \
-                     arbitrary text, so this is a data-quality failure rather than a row \
-                     to skip.",
-                    self.name
-                ))
-            })?;
-            let found = lookup(&doc, paths.value(i)).map_err(DataFusionError::Execution)?;
-            out.push(found.and_then(render));
+            let raw = docs.value(i);
+
+            // json_parse validates; json_format passes through. Both need the parse.
+            let doc: Value = serde_json::from_str(raw).map_err(|e| self.bad_json(i, e))?;
+
+            match self.kind {
+                Kind::Parse | Kind::Format => text.push(Some(raw.to_string())),
+                Kind::IsScalar => bools.push(Some(!doc.is_object() && !doc.is_array())),
+                Kind::ArrayLength => nums.push(doc.as_array().map(|a| a.len() as i64)),
+                Kind::ArrayContains => {
+                    let needle = arg2.expect("arity 2").1;
+                    // Trino compares against a typed value; from SQL text, the honest
+                    // reading is "as JSON if it parses, else as a string".
+                    let want: Value = serde_json::from_str(needle)
+                        .unwrap_or_else(|_| Value::String(needle.to_string()));
+                    bools.push(doc.as_array().map(|a| a.contains(&want)));
+                }
+                Kind::ArrayGet => {
+                    let idx = arg2.expect("arity 2").1;
+                    let n: Result<i64, _> = idx.trim().parse();
+                    let got = match (doc.as_array(), n) {
+                        (Some(a), Ok(n)) => {
+                            // Trino allows negative indexing from the end.
+                            let pos = if n < 0 { a.len() as i64 + n } else { n };
+                            usize::try_from(pos).ok().and_then(|p| a.get(p))
+                        }
+                        _ => None,
+                    };
+                    text.push(got.filter(|v| !v.is_null()).map(|v| v.to_string()));
+                }
+                Kind::Extract | Kind::ExtractScalar | Kind::Size | Kind::Exists => {
+                    let path = arg2.expect("arity 2").1;
+                    let steps = parse_path(path).map_err(DataFusionError::Execution)?;
+                    let found = resolve(&doc, &steps);
+                    match self.kind {
+                        // JSON in, JSON out: a string keeps its quotes, so the result
+                        // composes with the other json_* functions. Unwrapping it here is
+                        // what `json_extract_scalar` is for.
+                        Kind::Extract => {
+                            text.push(found.filter(|v| !v.is_null()).map(|v| v.to_string()))
+                        }
+                        Kind::ExtractScalar => text.push(found.and_then(as_scalar_text)),
+                        Kind::Size => nums.push(found.map(|v| match v {
+                            Value::Array(a) => a.len() as i64,
+                            Value::Object(o) => o.len() as i64,
+                            _ => 0,
+                        })),
+                        Kind::Exists => bools.push(Some(found.is_some())),
+                        _ => unreachable!(),
+                    }
+                }
+            }
         }
-        Ok(ColumnarValue::Array(
-            Arc::new(StringArray::from(out)) as ArrayRef
-        ))
+
+        Ok(ColumnarValue::Array(match self.kind.return_type() {
+            DataType::Int64 => Arc::new(Int64Array::from(nums)) as ArrayRef,
+            DataType::Boolean => Arc::new(BooleanArray::from(bools)) as ArrayRef,
+            _ => Arc::new(StringArray::from(text)) as ArrayRef,
+        }))
     }
 }
 
@@ -173,6 +381,10 @@ mod tests {
     use deltalake::arrow::array::RecordBatch;
     use deltalake::arrow::datatypes::{Field, Schema};
 
+    const ORDER: &str = r#"{"id":7,"customer":{"id":42,"country":"DE"},
+        "lines":[{"sku":"A","qty":2},{"sku":"B","qty":1}],
+        "status":"paid","paid":true,"note":null}"#;
+
     fn batch(payloads: &[&str]) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, true)])),
@@ -181,82 +393,159 @@ mod tests {
         .unwrap()
     }
 
-    async fn run(sql: &str, payloads: &[&str]) -> Vec<Option<String>> {
-        let out = SqlTransform::new(sql)
-            .apply(vec![batch(payloads)])
+    async fn one(expr: &str) -> Option<String> {
+        let out = SqlTransform::new(format!("SELECT {expr} AS v FROM source"))
+            .apply(vec![batch(&[ORDER])])
             .await
-            .expect("transform should succeed");
-        let mut v = Vec::new();
-        for b in out {
-            let a = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("utf8 out");
-            for i in 0..a.len() {
-                v.push((!a.is_null(i)).then(|| a.value(i).to_string()));
-            }
+            .unwrap_or_else(|e| panic!("{expr} failed: {e}"));
+        let b = &out[0];
+        let c = deltalake::arrow::compute::cast(b.column(0), &DataType::Utf8).unwrap();
+        let c = c.as_any().downcast_ref::<StringArray>().unwrap();
+        (!c.is_null(0)).then(|| c.value(0).to_string())
+    }
+
+    #[tokio::test]
+    async fn extract_scalar_pulls_out_values() {
+        assert_eq!(
+            one("json_extract_scalar(data, '$.status')").await,
+            Some("paid".into())
+        );
+        assert_eq!(
+            one("json_extract_scalar(data, '$.id')").await,
+            Some("7".into())
+        );
+        assert_eq!(
+            one("json_extract_scalar(data, '$.paid')").await,
+            Some("true".into())
+        );
+        assert_eq!(
+            one("json_extract_scalar(data, '$.customer.country')").await,
+            Some("DE".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_scalar_is_null_for_a_container() {
+        // Trino's rule, and the one that matters: otherwise `{"id":42,...}` lands in a
+        // column somebody casts to a number.
+        assert_eq!(one("json_extract_scalar(data, '$.customer')").await, None);
+        assert_eq!(one("json_extract_scalar(data, '$.lines')").await, None);
+    }
+
+    #[tokio::test]
+    async fn extract_returns_containers_as_json() {
+        assert_eq!(
+            one("json_extract(data, '$.customer')").await,
+            Some(r#"{"country":"DE","id":42}"#.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn array_indexing_works() {
+        assert_eq!(
+            one("json_extract_scalar(data, '$.lines[0].sku')").await,
+            Some("A".into())
+        );
+        assert_eq!(
+            one("json_extract_scalar(data, '$.lines[1].qty')").await,
+            Some("1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn bracketed_field_names_work() {
+        assert_eq!(
+            one(r#"json_extract_scalar(data, '$["customer"]["country"]')"#).await,
+            Some("DE".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn sizes_and_lengths() {
+        assert_eq!(one("json_size(data, '$.lines')").await, Some("2".into()));
+        assert_eq!(one("json_size(data, '$.customer')").await, Some("2".into()));
+        assert_eq!(one("json_size(data, '$.status')").await, Some("0".into()));
+        assert_eq!(
+            one("json_array_length(json_extract(data, '$.lines'))").await,
+            Some("2".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn array_contains_and_get() {
+        assert_eq!(
+            one("json_array_contains(json_extract(data, '$.lines'), '{\"sku\":\"A\",\"qty\":2}')")
+                .await,
+            Some("true".into())
+        );
+        assert_eq!(
+            one("json_extract_scalar(json_array_get(json_extract(data, '$.lines'), '0'), '$.sku')")
+                .await,
+            Some("A".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn exists_and_is_scalar() {
+        assert_eq!(
+            one("json_exists(data, '$.status')").await,
+            Some("true".into())
+        );
+        assert_eq!(
+            one("json_exists(data, '$.nope')").await,
+            Some("false".into())
+        );
+        assert_eq!(one("is_json_scalar(data)").await, Some("false".into()));
+        assert_eq!(
+            one("is_json_scalar(json_extract(data, '$.status'))").await,
+            Some("true".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_and_format_round_trip() {
+        assert_eq!(
+            one("json_extract_scalar(json_format(json_parse(data)), '$.status')").await,
+            Some("paid".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_json_null_and_a_missing_path_are_both_sql_null() {
+        assert_eq!(one("json_extract_scalar(data, '$.note')").await, None);
+        assert_eq!(one("json_extract_scalar(data, '$.nope')").await, None);
+    }
+
+    #[tokio::test]
+    async fn json_value_and_json_query_are_the_standard_spellings() {
+        assert_eq!(
+            one("json_value(data, '$.status')").await,
+            Some("paid".into())
+        );
+        assert_eq!(
+            one("json_query(data, '$.customer')").await,
+            Some(r#"{"country":"DE","id":42}"#.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn every_engines_alias_agrees() {
+        for f in [
+            "json_extract_scalar",
+            "json_extract_string",
+            "get_json_object",
+        ] {
+            assert_eq!(
+                one(&format!("{f}(data, '$.status')")).await,
+                Some("paid".into()),
+                "{f} disagreed"
+            );
         }
-        v
-    }
-
-    #[tokio::test]
-    async fn extracts_a_top_level_field() {
-        let got = run(
-            "SELECT json_extract_scalar(data, '$.status') AS s FROM source",
-            &[r#"{"status":"paid"}"#, r#"{"status":"shipped"}"#],
-        )
-        .await;
-        assert_eq!(got, vec![Some("paid".into()), Some("shipped".into())]);
-    }
-
-    #[tokio::test]
-    async fn extracts_a_nested_field() {
-        let got = run(
-            "SELECT json_extract_scalar(data, '$.customer.id') AS s FROM source",
-            &[r#"{"customer":{"id":42}}"#],
-        )
-        .await;
-        assert_eq!(got, vec![Some("42".into())], "numbers come back as text");
-    }
-
-    #[tokio::test]
-    async fn every_engines_spelling_behaves_the_same() {
-        // The property that lets one dbt model run in the warehouse and here.
-        for f in NAMES {
-            let got = run(
-                &format!("SELECT {f}(data, '$.a') AS s FROM source"),
-                &[r#"{"a":"x"}"#],
-            )
-            .await;
-            assert_eq!(got, vec![Some("x".into())], "{f} disagreed");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_missing_field_is_null_not_an_error() {
-        let got = run(
-            "SELECT json_extract_scalar(data, '$.nope') AS s FROM source",
-            &[r#"{"a":1}"#],
-        )
-        .await;
-        assert_eq!(got, vec![None]);
-    }
-
-    #[tokio::test]
-    async fn a_json_null_is_sql_null() {
-        let got = run(
-            "SELECT json_extract_scalar(data, '$.a') AS s FROM source",
-            &[r#"{"a":null}"#],
-        )
-        .await;
-        assert_eq!(got, vec![None]);
     }
 
     #[tokio::test]
     async fn malformed_json_stops_the_pipeline() {
-        // No dead-letter queue by design: bad input is a failure, not a skipped row.
-        let e = SqlTransform::new("SELECT json_extract_scalar(data, '$.a') AS s FROM source")
+        let e = SqlTransform::new("SELECT json_extract_scalar(data, '$.a') AS v FROM source")
             .apply(vec![batch(&["{not json"])])
             .await
             .unwrap_err();
@@ -264,27 +553,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn array_paths_are_rejected_rather_than_silently_empty() {
-        let e = SqlTransform::new("SELECT json_extract_scalar(data, '$.a[0]') AS s FROM source")
-            .apply(vec![batch(&[r#"{"a":[1]}"#])])
-            .await
-            .unwrap_err();
-        assert!(e.to_string().contains("not supported"), "got: {e}");
+    async fn wildcards_are_rejected_rather_than_silently_wrong() {
+        let e = SqlTransform::new(
+            "SELECT json_extract_scalar(data, '$.lines[*].sku') AS v FROM source",
+        )
+        .apply(vec![batch(&[ORDER])])
+        .await
+        .unwrap_err();
+        assert!(e.to_string().contains("wildcards"), "got: {e}");
     }
 
-    #[tokio::test]
-    async fn a_casted_field_becomes_a_real_number() {
-        let out = SqlTransform::new(
-            "SELECT CAST(json_extract_scalar(data, '$.amount') AS BIGINT) AS amount FROM source",
-        )
-        .apply(vec![batch(&[r#"{"amount":"1250"}"#])])
-        .await
-        .unwrap();
-        let a = out[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<deltalake::arrow::array::Int64Array>()
-            .expect("int64 after cast");
-        assert_eq!(a.value(0), 1250);
+    #[test]
+    fn paths_parse() {
+        assert_eq!(parse_path("$.a").unwrap(), vec![Step::Field("a".into())]);
+        assert_eq!(
+            parse_path("$.a.b[2]").unwrap(),
+            vec![
+                Step::Field("a".into()),
+                Step::Field("b".into()),
+                Step::Index(2)
+            ]
+        );
+        assert_eq!(
+            parse_path(r#"$["a b"]"#).unwrap(),
+            vec![Step::Field("a b".into())]
+        );
+        assert_eq!(parse_path("$").unwrap(), vec![], "the document itself");
+        assert!(parse_path("$.a[").is_err());
     }
 }

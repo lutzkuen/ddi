@@ -235,26 +235,37 @@ daemon applies to any `transform_sql`. If `ddi` would refuse to run it, `check` 
 why. A model qualifies when it reads exactly one upstream relation, materializes as a real
 table, and transforms row by row.
 
-`convert` turns the streamable ones into a config, listing the rest as comments so the
-generated file doubles as the report:
+### ddi is not where the work is described
+
+Everything a pipeline *does* — which tables, which SQL, which timestamp, which key — comes
+from the dbt project, because that is where it is already written down and kept correct.
+Two copies of that would only ever disagree. `ddi run` re-derives it from the manifest on
+every start, so there is no generated file to regenerate and nothing to drift.
+
+What is left is the part dbt has no opinion about:
 
 ```toml
-[dbt]
-manifest      = "target/manifest.json"
-uri_template  = "abfss://lake@acct.dfs.core.windows.net/{schema}/{name}"
-watermark_uri = "abfss://lake@acct.dfs.core.windows.net/meta/ddi_watermark"
+manifest = "target/manifest.json"      # the source of truth
+
+[runtime]                              # how eagerly to run
+allowed_latency_secs = 30
+
+[storage]                              # how to reach the lake
+options = { azure_storage_account_name = "acct", azure_storage_account_key = "..." }
+# uri_template = "abfss://lake@acct.dfs.core.windows.net/{schema}/{name}"
 ```
 
 ```bash
-ddi dbt convert --out pipelines.toml
-ddi run -s orders_header        # one model
-ddi run                         # all of them
+ddi run -s orders_stg     # one model
+ddi run                   # every streamable model in the project
+ddi dbt convert           # print what it derived, without running
 ```
 
-The manifest names relations, not locations, so `uri_template` bridges the two —
-`{database}`, `{schema}` and `{name}` expand per model, and a model's own `location_root`
-wins where dbt sets one. That template is the only adapter-specific part; everything else
-reads `manifest.json`, which is the same shape for dbt-trino, dbt-databricks and dbt-spark.
+Locations come from dbt wherever dbt knows them — `location_root`, a source's
+`delta_table_path`, `meta.ddi_location`. `uri_template` is only a fallback for warehouses
+that name relations without locating them; `{database}`, `{schema}` and `{name}` expand per
+model. Everything else reads `manifest.json`, which is the same shape for dbt-trino,
+dbt-databricks and dbt-spark.
 
 There is a runnable version of all of this in [`examples/dbt/`](examples/dbt/): vanilla
 jaffle shop, a real dbt project with no hooks and no mention of `ddi`, rebuilding the same
@@ -323,13 +334,14 @@ the maximum — so it is compared row by row against the keys already there. Wit
 ties fall back to `>`: fine for a strictly increasing sequence, wrong for a
 second-granularity clock under load.
 
-Declare both in dbt, next to the model, and `ddi dbt convert` picks them up:
+Declare both in dbt, next to the model — `_timestamp` is the default, so most models say
+nothing at all:
 
 ```yaml
 models:
   - name: orders_stg
     meta:
-      ddi_timestamp: _timestamp
+      ddi_timestamp: _timestamp   # the default
       ddi_key: order_id
 ```
 
@@ -337,10 +349,13 @@ The timestamp **must be non-decreasing in the order rows reach the source** — 
 bearing an older timestamp is indistinguishable from one the rebuild already wrote, and
 will be dropped. That suits an append-only stream, not a table that gets backfilled.
 
-The cost is a rescan: `ddi` cannot know how far back the rebuild's contents reach, so it
-re-reads the source from `starting_version` and lets the filter suppress what is already
-present. One pass per rebuild, not per batch — and it is why the filter has to be exact,
-so that over-scanning is merely wasteful rather than wrong.
+The rescan is bounded by the source's own file statistics. Delta records `maxValues` per
+file, so the log itself says how far back the rebuild's contents reach: walking backwards
+from the head, the first commit whose newest row is already covered is the boundary, and
+everything before it is covered too. A rebuild of a table with months of history re-reads
+the last commit or two, not the history. Where statistics are missing or of a type that
+will not line up, it falls back to a full rescan — being slow is a cost, being wrong is
+not an option.
 
 `watermark_uri` remains the better choice where you can set it: exact, no rescan, and no
 ordering requirement on any column.
@@ -367,21 +382,38 @@ names the fix instead.
 
 ### JSON payloads
 
-Bronze often carries a payload as text. `json_extract_scalar` (Trino, Starburst),
-`json_extract_string` (DuckDB) and `get_json_object` (Spark) are all registered, with
-identical behaviour, so one dbt model runs both in the warehouse and here:
+Bronze often carries a payload as text, so Trino's JSON functions are implemented here
+too — a model has to mean the same thing in the warehouse and in `ddi`:
+
+| Function | |
+|---|---|
+| `json_extract(json, path)` | the value at `path`, as JSON |
+| `json_extract_scalar(json, path)` | the value at `path`, as text; **NULL for an object or array** |
+| `json_size(json, path)` | members of an object, elements of an array, 0 for a scalar |
+| `json_array_length(json)` | elements, or NULL if not an array |
+| `json_array_contains(json, value)` | |
+| `json_array_get(json, index)` | negative indexes count from the end |
+| `json_exists(json, path)` | |
+| `json_parse` / `json_format` / `is_json_scalar` | |
+| `json_value` / `json_query` | the SQL/JSON spellings of scalar / extract |
+
+`json_extract_string` (DuckDB) and `get_json_object` (Spark) are aliases of
+`json_extract_scalar`, so a model written against either streams unchanged.
 
 ```sql
 SELECT order_id,
-       CAST(json_extract_scalar(data, '$.customer_id') AS BIGINT) AS customer_id,
+       CAST(json_extract_scalar(data, '$.customer.id') AS BIGINT) AS customer_id,
+       json_extract_scalar(data, '$.lines[0].sku')                AS first_sku,
        json_extract_scalar(data, '$.status')                      AS status,
        _timestamp
 FROM source
 ```
 
-Dotted paths only; array indexing and wildcards are rejected rather than silently empty.
-A missing field is NULL, but malformed JSON stops the pipeline — input is a typed column,
-not arbitrary text, so that is a data-quality failure rather than a row to skip.
+Paths support `$`, `.field`, `["field"]` and `[0]`. Wildcards are rejected rather than
+quietly returning one of several matches. A missing path is NULL, and so is a container
+under `json_extract_scalar` — that is Trino's rule, and it is what stops `{"id":42}`
+landing in a column somebody casts to a number. Malformed JSON stops the pipeline: input
+is a typed column, not arbitrary text.
 
 ### Ordering, when using a watermark table
 
