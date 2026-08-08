@@ -11,6 +11,7 @@ use futures::TryStreamExt;
 use tracing::{info, warn};
 
 use crate::config::ResolvedPipeline;
+use crate::dbt::watermark;
 use crate::error::{Error, Result};
 use crate::offset::OffsetStore;
 use crate::schema::SchemaCoercer;
@@ -65,7 +66,7 @@ impl Pipeline {
         })?;
 
         let offsets = OffsetStore::new(&cfg.app_id, cfg.starting_version);
-        let cursor = offsets.resume_cursor(&target).await?;
+        let cursor = resume_cursor(&cfg, &offsets, &target).await?;
 
         let target_schema: SchemaRef = target
             .snapshot()
@@ -278,6 +279,60 @@ impl Pipeline {
             }
         }
     }
+}
+
+/// Where to resume, accounting for a target that another writer may have rebuilt.
+///
+/// Normally the answer is our own `txn` offset. But when dbt shares the target, that
+/// offset can describe rows that no longer exist: `txn` actions survive an overwrite, so
+/// after a nightly rebuild we would resume past everything we streamed while dbt was
+/// reading, and those rows would never come back. When the target has been rewritten
+/// since our last append, dbt's watermark is the authority instead.
+///
+/// See [`crate::dbt::watermark`] for the full argument.
+async fn resume_cursor(
+    cfg: &ResolvedPipeline,
+    offsets: &OffsetStore,
+    target: &DeltaTable,
+) -> Result<StreamCursor> {
+    let own = offsets.resume_cursor(target).await?;
+
+    let Some(uri) = cfg.watermark_uri.as_deref() else {
+        return Ok(own);
+    };
+
+    let state = watermark::target_state(target, &cfg.app_id, watermark::DEFAULT_MAX_SCAN).await?;
+    let watermark::TargetState::OverwrittenAt(at) = state else {
+        return Ok(own);
+    };
+
+    let store = watermark::WatermarkStore::new(uri);
+    let Some(w) = store.last(&cfg.app_id).await? else {
+        // Refusing is the whole point. Continuing from our own offset would drop every
+        // row we streamed after dbt started reading, silently and for good.
+        return Err(Error::Config(format!(
+            "pipeline {:?}: target {:?} was rewritten at version {at} by another writer \
+             (a dbt rebuild), but the watermark table {uri:?} holds no source_version for \
+             app_id {:?}. Resuming from this pipeline's own offset would silently drop \
+             every row streamed while dbt was reading. Have the dbt model record the \
+             source version it consumed, then restart.",
+            cfg.name, cfg.target_uri, cfg.app_id
+        )));
+    };
+
+    let reset = StreamCursor::at_version(w + 1);
+    if reset != own {
+        warn!(
+            pipeline = %cfg.name,
+            overwritten_at_target_version = at,
+            own_offset = %own,
+            watermark = w,
+            resume_from = %reset,
+            "target was rebuilt by dbt; resuming from dbt's watermark rather than our own \
+             offset"
+        );
+    }
+    Ok(reset)
 }
 
 /// Re-attach Delta partition values, which live in the log rather than in the parquet.

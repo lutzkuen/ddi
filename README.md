@@ -208,6 +208,100 @@ commit alongside the source offset, so a replay resolves the same rows it did th
 time. The `txn` action already carries the source offset; a pinned lookup needs the same
 treatment for every table it reads.
 
+## Running alongside dbt
+
+The two-speed lakehouse: dbt rebuilds a model nightly and owns correctness; `ddi` streams
+the same transformation continuously in between and owns latency. Not every model can be
+streamed, so the first question is which ones can.
+
+```bash
+ddi dbt check --manifest target/manifest.json
+```
+
+```
+streamable  orders_header    bronze.orders -> silver.orders_header
+streamable  order_lines      bronze.orders -> silver.order_lines
+no          customer_totals  GROUP BY is not supported: this tool preserves grain ...
+no          orders_enriched  depends on 2 upstream relations; ddi streams from exactly one ...
+no          orders_view      materialized as "view"; ddi appends to a real table ...
+no          ranked           window functions (OVER) is not supported ...
+
+2 streamable, 4 not, of 6 model(s).
+```
+
+The verdict comes from the compiled SQL, not from tags or naming conventions: the model's
+`compiled_code` is rewritten to read `source` and then put through the same validator the
+daemon applies to any `transform_sql`. If `ddi` would refuse to run it, `check` says so and
+why. A model qualifies when it reads exactly one upstream relation, materializes as a real
+table, and transforms row by row.
+
+`convert` turns the streamable ones into a config, listing the rest as comments so the
+generated file doubles as the report:
+
+```toml
+[dbt]
+manifest      = "target/manifest.json"
+uri_template  = "abfss://lake@acct.dfs.core.windows.net/{schema}/{name}"
+watermark_uri = "abfss://lake@acct.dfs.core.windows.net/meta/ddi_watermark"
+```
+
+```bash
+ddi dbt convert --out pipelines.toml
+ddi run -s orders_header        # one model
+ddi run                         # all of them
+```
+
+The manifest names relations, not locations, so `uri_template` bridges the two —
+`{database}`, `{schema}` and `{name}` expand per model, and a model's own `location_root`
+wins where dbt sets one. That template is the only adapter-specific part; everything else
+reads `manifest.json`, which is the same shape for dbt-trino, dbt-databricks and dbt-spark.
+
+### The handover, and why it needs a watermark
+
+`ddi` keeps its offset in a `txn` action in the target's log, and **`txn` actions survive an
+overwrite** — they live in the log, not in the data. So a nightly dbt rebuild of a shared
+target silently strands rows:
+
+```
+00:00  dbt reads bronze@100
+00:03  ddi streams 101, 102  -> appended to silver
+00:05  dbt OVERWRITE silver = f(bronze@100)   <- 101 and 102 are gone
+00:06  ddi resumes at 103                     <- and never come back
+```
+
+Nothing errors, and it compounds every night. So when dbt shares a target, the dbt run must
+record the source version it consumed, and `ddi` resumes from that instead of from its own
+offset:
+
+```sql
+-- one row per rebuild; app_id VARCHAR, source_version BIGINT
+INSERT INTO lake.meta.ddi_watermark VALUES ('ddi.orders_header', 100)
+```
+
+Plain SQL on purpose — an `INSERT` any adapter can run, rather than a `txn` action only the
+Spark writer can produce.
+
+`ddi` walks the target's log backwards on startup. If the most recent commit that touched
+data is not its own, the target was rebuilt, and dbt's watermark takes over. A target
+rebuilt with *no* watermark recorded is a hard error, not a guess:
+
+```
+pipeline "orders_header": target "..." was rewritten at version 41 by another writer
+(a dbt rebuild), but the watermark table "..." holds no source_version for app_id
+"ddi.orders_header". Resuming from this pipeline's own offset would silently drop every
+row streamed while dbt was reading.
+```
+
+Prefer a **pre-hook** that records the version and a model that pins its read to it
+(`FOR VERSION AS OF`). Then the watermark is on disk before the overwrite lands and there is
+no window at all. With a post-hook the watermark appears one commit later; if `ddi` looks in
+between it re-streams from the previous watermark, which duplicates rows rather than dropping
+them. That asymmetry is deliberate — duplicates are visible and the next rebuild erases them,
+whereas a gap is silent and permanent.
+
+`OPTIMIZE` on the target is not mistaken for a rebuild: its `Remove` actions carry
+`dataChange: false`.
+
 ## Commit classification
 
 | Commit contains | Classification | Action |

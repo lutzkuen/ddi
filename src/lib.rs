@@ -4,6 +4,7 @@
 //! version number read from the target's own transaction log.
 
 pub mod config;
+pub mod dbt;
 pub mod error;
 pub mod metrics;
 pub mod offset;

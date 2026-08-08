@@ -86,6 +86,30 @@ pub struct PipelineConfig {
     pub max_output_rows_per_batch: Option<usize>,
     #[serde(default)]
     pub target_file_size: Option<String>,
+
+    /// Delta table where dbt records the source version it last rebuilt this target from.
+    ///
+    /// Set this whenever dbt also writes `target_uri`. Without it, a dbt overwrite
+    /// silently strands every row this pipeline streamed after dbt began its read — see
+    /// [`crate::dbt::watermark`]. Defaults to `[dbt].watermark_uri`.
+    #[serde(default)]
+    pub watermark_uri: Option<String>,
+}
+
+/// Project-level dbt settings.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DbtConfig {
+    /// Path to `target/manifest.json`.
+    #[serde(default)]
+    pub manifest: Option<String>,
+    /// How a `schema.table` becomes a storage URI, e.g.
+    /// `"abfss://lake@acct.dfs.core.windows.net/{schema}/{name}"`.
+    #[serde(default)]
+    pub uri_template: Option<String>,
+    /// Default watermark table for every pipeline derived from the manifest.
+    #[serde(default)]
+    pub watermark_uri: Option<String>,
 }
 
 /// A pipeline with defaults folded in and every value parsed.
@@ -103,6 +127,8 @@ pub struct ResolvedPipeline {
     pub max_files_per_batch: usize,
     pub max_output_rows_per_batch: usize,
     pub target_file_size: u64,
+    /// Where dbt records its rebuild watermark for this target, if dbt shares it.
+    pub watermark_uri: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -110,6 +136,8 @@ pub struct ResolvedPipeline {
 pub struct Config {
     #[serde(default)]
     pub defaults: Defaults,
+    #[serde(default)]
+    pub dbt: DbtConfig,
     #[serde(default, rename = "pipeline")]
     pub pipelines: Vec<PipelineConfig>,
 }
@@ -218,6 +246,10 @@ impl Config {
                         .max_output_rows_per_batch
                         .unwrap_or(d.max_output_rows_per_batch),
                     target_file_size,
+                    watermark_uri: p
+                        .watermark_uri
+                        .clone()
+                        .or_else(|| self.dbt.watermark_uri.clone()),
                 })
             })
             .collect()

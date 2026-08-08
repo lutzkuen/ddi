@@ -114,6 +114,7 @@ pub fn pipeline_cfg(name: &str, source: &str, target: &str) -> ResolvedPipeline 
         max_files_per_batch: 1_000,
         max_output_rows_per_batch: 5_000_000,
         target_file_size: 128 * 1024 * 1024,
+        watermark_uri: None,
     }
 }
 
