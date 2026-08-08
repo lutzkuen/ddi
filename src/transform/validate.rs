@@ -12,11 +12,13 @@
 
 use deltalake::datafusion::sql::parser::{DFParser, Statement};
 use deltalake::datafusion::sql::sqlparser::ast::{
-    Expr, Query, Select, SetExpr, Statement as SqlStatement, TableFactor, VisitMut, VisitorMut,
+    Expr, ObjectName, Query, Select, SetExpr, Statement as SqlStatement, TableFactor, VisitMut,
+    VisitorMut,
 };
 use std::ops::ControlFlow;
 
 use crate::error::{Error, Result};
+use crate::transform::sql::SOURCE_TABLE;
 
 /// A rejected construct, with the alternative spelled out.
 fn reject(what: &str, why: &str, instead: &str) -> Error {
@@ -140,6 +142,20 @@ fn check_select(select: &Select) -> Result<()> {
     }
 
     // Joins: v1 has no pinned-snapshot machinery, so any join is unpinned by definition.
+    //
+    // Two FROM items separated by a comma is a join written the old way. It has to be
+    // caught here rather than by the per-item `joins` check below, which only sees the
+    // `a JOIN b` spelling — and by the relation check in the visitor, which cannot tell
+    // `FROM source a, source b` from a plain `FROM source`.
+    if select.from.len() > 1 {
+        return Err(reject(
+            "a comma-separated FROM list (an implicit cross join)",
+            "a join against a table that can change between batches makes output \
+             non-reproducible, and joining the source to itself is cross-row state.",
+            "denormalise upstream; pinned-snapshot lookup joins are planned for v2.",
+        ));
+    }
+
     for twj in &select.from {
         if !twj.joins.is_empty() {
             return Err(reject(
@@ -228,6 +244,42 @@ const AGGREGATES: &[&str] = &[
 
 impl VisitorMut for StatefulConstructVisitor {
     type Break = ();
+
+    /// Every table name mentioned anywhere in the statement, including inside subqueries
+    /// the `check_select` walk never reaches (an `IN (SELECT ... FROM products)` lives in
+    /// the WHERE expression, not in the FROM list).
+    ///
+    /// Only `source` is registered on the session, so any other name could only ever fail
+    /// at plan time — on the first batch, in production, from a daemon that started
+    /// clean and passed `ddi validate`. Naming it here keeps the promise that a pipeline
+    /// which cannot be correct never starts.
+    fn pre_visit_relation(&mut self, relation: &mut ObjectName) -> ControlFlow<Self::Break> {
+        if self.found.is_some() {
+            return ControlFlow::Break(());
+        }
+        let full = relation.to_string();
+        let bare = full
+            .rsplit('.')
+            .next()
+            .unwrap_or(&full)
+            .trim_matches('"')
+            .to_ascii_lowercase();
+        if bare != SOURCE_TABLE {
+            self.found = Some(reject(
+                &format!("the table {full:?}"),
+                &format!(
+                    "a transform may only read the batch it was given, which is registered \
+                     as {SOURCE_TABLE:?}. Reading a second table means joining against \
+                     something that can change between batches, which makes the output \
+                     non-reproducible."
+                ),
+                "denormalise upstream, or enrich downstream; pinned-snapshot lookup joins \
+                 are planned for v2.",
+            ));
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         if self.found.is_some() {
@@ -336,6 +388,47 @@ mod tests {
         let e = err_of("SELECT a FROM source GROUP BY a HAVING count(*) > 1");
         // GROUP BY fires first; either rejection is correct so long as it is rejected.
         assert!(e.contains("not supported"), "got: {e}");
+    }
+
+    #[test]
+    fn a_comma_separated_from_list_is_rejected_like_any_other_join() {
+        // The old spelling of a join. It carries no `joins` on either FROM item, so the
+        // per-item check never sees it.
+        let e =
+            validate_sql("SELECT s.order_id, p.name FROM source s, products p WHERE s.sku = p.sku")
+                .unwrap_err();
+        assert!(e.to_string().contains("cross join"), "got: {e}");
+    }
+
+    #[test]
+    fn joining_the_source_to_itself_is_rejected() {
+        // Both relations are `source`, so the table-name check cannot catch this one.
+        let e = validate_sql("SELECT a.order_id FROM source a, source b").unwrap_err();
+        assert!(e.to_string().contains("cross join"), "got: {e}");
+    }
+
+    #[test]
+    fn a_second_table_in_a_subquery_is_rejected_at_load_not_at_plan_time() {
+        // Lives in the WHERE expression, so the FROM walk never reaches it. Without the
+        // relation check this passed `ddi validate` and only died on the first batch.
+        let e = validate_sql(
+            "SELECT order_id FROM source WHERE order_id IN (SELECT order_id FROM products)",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("products"), "got: {e}");
+        assert!(e.to_string().contains("denormalise"), "got: {e}");
+    }
+
+    #[test]
+    fn a_second_table_in_a_derived_table_is_rejected() {
+        let e = validate_sql("SELECT order_id FROM (SELECT order_id FROM products)").unwrap_err();
+        assert!(e.to_string().contains("products"), "got: {e}");
+    }
+
+    #[test]
+    fn a_qualified_name_for_the_source_is_still_accepted() {
+        // Whatever the planner resolves it to, the trailing identifier is what matters.
+        validate_sql("SELECT order_id FROM public.source").unwrap();
     }
 
     #[test]

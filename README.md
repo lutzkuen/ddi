@@ -173,6 +173,41 @@ FROM source
 Also `array_min` and `array_avg`. For real Rust, implement the `Transform` trait — an escape
 hatch that does not require forking.
 
+### Lookups against a second table
+
+Not in v1. A transform may read exactly one table — the batch it was handed, registered as
+`source` — and anything else is rejected at config load:
+
+```
+the table "products" is not supported: a transform may only read the batch it was given,
+which is registered as "source". Reading a second table means joining against something
+that can change between batches, which makes the output non-reproducible. Instead:
+denormalise upstream, or enrich downstream; pinned-snapshot lookup joins are planned for v2.
+```
+
+This covers `JOIN`, a comma-separated `FROM` list, a second table inside a derived table,
+and a second table inside a `WHERE ... IN (SELECT ...)` subquery.
+
+The problem is not the join, it is the *pinning*. This tool's entire restart story is that a
+source version number reproduces a batch exactly. Join to `products` unpinned and the same
+source version yields different output depending on when it is replayed, so a restart stops
+being a no-op and exactly-once quietly becomes exactly-once-modulo-the-dimension.
+
+Until v2, three options that keep the property:
+
+- **Denormalise upstream** — resolve the product attributes in whatever writes bronze. Best
+  when the attributes are part of the event's meaning at the time it happened (the price
+  actually charged).
+- **Enrich downstream** — let `ddi` land silver at source grain, and join to the dimension in
+  a downstream view or job. Best when you want current attributes, not historical ones.
+- **Inline it** — for a genuinely static handful of values, a `CASE` expression in the
+  transform is stateless and reproducible.
+
+v2's shape is to pin the dimension at a specific version and record that version in the
+commit alongside the source offset, so a replay resolves the same rows it did the first
+time. The `txn` action already carries the source offset; a pinned lookup needs the same
+treatment for every table it reads.
+
 ## Commit classification
 
 | Commit contains | Classification | Action |
