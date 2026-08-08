@@ -66,6 +66,22 @@ ddi run                 # run continuously
 
 `ddi` never creates the target table — create it with whatever tooling owns your lakehouse.
 
+### Building on a small machine
+
+Linking `deltalake` + `datafusion` + `arrow` into every test binary is what makes this crate
+expensive to build, and dependency *debug info* is the bulk of it. The `dev` profile
+therefore keeps line tables for this crate and drops debug info for dependencies entirely,
+which takes `target/debug` from ~26 GB to ~4 GB and each binary from ~1.3 GB to ~350 MB. A
+clean `cargo build --all-targets -j 2` peaks under 2 GB RSS.
+
+If the release link is still too much — `lto = "thin"` with `codegen-units = 1` is one large
+single-threaded step — build the lean profile instead, trading some runtime performance for
+a build that fits:
+
+```bash
+cargo build --profile release-lean     # binary at target/release-lean/ddi
+```
+
 ## Scope, and why it is narrow
 
 The property that makes this worth existing is *restart from a version number with no state

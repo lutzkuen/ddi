@@ -48,6 +48,30 @@ bytesize = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
 
+# Debug builds link deltalake + datafusion + arrow into every test binary, and their
+# debug info — not their code — is what makes those binaries enormous. Keeping full
+# DWARF for dependencies costs gigabytes of link memory to describe internals nobody
+# steps through. Trimming it is what lets the suite build on a small machine.
+[profile.dev]
+# Enough for a backtrace to name a file and line in *our* code.
+debug = "line-tables-only"
+# Leave debug info in the .o files instead of copying it into the binary.
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+
+# `cargo test` inherits from dev, so the same trim applies to every test binary.
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# A release build for a machine that cannot afford the LTO step. Thin LTO with
+# codegen-units = 1 is a single, very large, single-threaded link; this trades some
+# runtime performance for a build that fits in a few GB.
+#   cargo build --profile release-lean
+[profile.release-lean]
+inherits = "release"
+lto = false
+codegen-units = 16
