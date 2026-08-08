@@ -66,12 +66,20 @@ enum Command {
     Status,
 }
 
+/// Default log filter: our own events at info, and the storage stack quiet.
+///
+/// `buoyant_kernel` is delta-rs's Delta-kernel implementation, and it logs a full snapshot
+/// dump per commit at info. Leaving it out of this filter buries every line the daemon
+/// actually emits.
+const DEFAULT_LOG: &str =
+    "info,deltalake=warn,deltalake_core=warn,buoyant_kernel=warn,datafusion=warn";
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,deltalake=warn,datafusion=warn".into()),
+                .unwrap_or_else(|_| DEFAULT_LOG.into()),
         )
         .init();
 

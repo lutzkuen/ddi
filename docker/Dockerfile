@@ -17,6 +17,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd --system --uid 10001 ddi
 COPY --from=build /src/target/release/ddi /usr/local/bin/ddi
 USER ddi
-ENV RUST_LOG=info,deltalake=warn,datafusion=warn
+ENV RUST_LOG=info,deltalake=warn,deltalake_core=warn,buoyant_kernel=warn,datafusion=warn
 ENTRYPOINT ["/usr/local/bin/ddi"]
 CMD ["run"]

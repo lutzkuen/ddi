@@ -66,6 +66,51 @@ ddi run                 # run continuously
 
 `ddi` never creates the target table — create it with whatever tooling owns your lakehouse.
 
+### See it work, locally
+
+No cloud storage, no cluster. The example builds a small lakehouse on local disk whose
+bronze table is shaped the way bronze really arrives — timestamps as strings, money as
+doubles, one array of structs per row:
+
+```bash
+cargo run --example local_demo -- seed /tmp/ddi-demo
+cargo run --bin ddi -- once --config /tmp/ddi-demo/pipelines.toml
+cargo run --example local_demo -- show /tmp/ddi-demo
+```
+
+One bronze row fans out into a typed header row and N line-item rows:
+
+```
+BRONZE  bronze/orders
+  order_id  created_at           order_status  customer              line_items
+  1001      2026-01-15T10:30:00  PAID          {id: 7, country: DE}  [{sku: WIDGET-A, qty: 2, price: 10.0}, {sku: WIDGET-B, qty: 1, price: 5.5}]
+  1003      2026-01-15T11:30:00  DRAFT         {id: 9, country: NL}  [{sku: WIDGET-D, qty: 1, price: 3.25}]
+
+SILVER  silver/orders        (header grain)
+  order_id  created_at           customer_id  customer_country  line_count  order_total
+  1001      2026-01-15T10:30:00  7            DE                2           25.5000
+
+SILVER  silver/order_lines   (line-item grain)
+  order_id  sku       qty  price
+  1001      WIDGET-A  2    10.0000
+  1001      WIDGET-B  1    5.5000
+```
+
+`created_at` became a real `TIMESTAMP`, `customer_id` came out of a struct, `order_total` is
+`array_sum(line_items, 'price * qty')` landed in a `DECIMAL(18,4)`, and the DRAFT order is
+absent from the header target but present in the line target — the two pipelines carry
+separate offsets and separate filters.
+
+Then stream a further bronze commit through the same pipelines and watch it stay
+incremental — the second run reads one new row, not all four:
+
+```bash
+cargo run --example local_demo -- append /tmp/ddi-demo
+cargo run --bin ddi -- once --config /tmp/ddi-demo/pipelines.toml
+```
+
+The same end-to-end path is asserted in [`tests/end_to_end_nested.rs`](tests/end_to_end_nested.rs).
+
 ### Building on a small machine
 
 Linking `deltalake` + `datafusion` + `arrow` into every test binary is what makes this crate
