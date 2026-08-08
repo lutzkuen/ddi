@@ -1,0 +1,4 @@
+name: jaffle_delta
+version: "1.0"
+profile: jaffle_delta
+model-paths: ["models"]

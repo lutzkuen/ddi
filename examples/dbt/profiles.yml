@@ -1,0 +1,14 @@
+jaffle_delta:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('DDI_LAKE') }}/jaffle.duckdb"
+      threads: 1
+      plugins:
+        # Reads the bronze Delta table. Ships with dbt-duckdb.
+        - module: delta
+          alias: delta_read
+        # Writes the model out as Delta. Local to this example; see plugins/.
+        - module: delta_write
+          alias: delta_write

@@ -1,2 +1,5 @@
 /target
 **/*.rs.bk
+/.venv-dbt
+/examples/dbt/target
+/examples/dbt/logs

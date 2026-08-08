@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use deltalake::arrow::array::RecordBatch;
+use deltalake::arrow::array::{Array, ArrayRef, RecordBatch};
 use deltalake::arrow::datatypes::SchemaRef;
 use deltalake::delta_datafusion::DataFusionMixins;
 use deltalake::{ensure_table_uri, open_table, DeltaTable};
@@ -44,6 +44,9 @@ pub struct Pipeline {
     sink: Sink,
     offsets: OffsetStore,
     coercer: SchemaCoercer,
+    /// Highest `dedup_key` already in the target when this pipeline opened. Rows at or
+    /// below it are suppressed, because a rebuild already wrote them.
+    key_watermark: Option<ArrayRef>,
 }
 
 impl Pipeline {
@@ -95,6 +98,20 @@ impl Pipeline {
             "pipeline ready"
         );
 
+        let key_watermark = match &cfg.dedup_key {
+            Some(k) => {
+                let w = read_key_watermark(&target, k).await?;
+                info!(
+                    pipeline = %cfg.name,
+                    dedup_key = %k,
+                    known = w.is_some(),
+                    "rows at or below the target's highest dedup_key will be skipped"
+                );
+                w
+            }
+            None => None,
+        };
+
         Ok(Self {
             cfg,
             source,
@@ -104,6 +121,7 @@ impl Pipeline {
             sink,
             offsets,
             coercer: SchemaCoercer::new(target_schema),
+            key_watermark,
         })
     }
 
@@ -144,7 +162,11 @@ impl Pipeline {
             if b.num_rows() == 0 {
                 continue;
             }
-            coerced.push(self.coercer.coerce(b)?);
+            let c = self.coercer.coerce(b)?;
+            let c = self.drop_rows_already_covered(c)?;
+            if c.num_rows() > 0 {
+                coerced.push(c);
+            }
         }
         let out_rows: usize = coerced.iter().map(|b| b.num_rows()).sum();
 
@@ -198,6 +220,45 @@ impl Pipeline {
             rows: out_rows,
             target_version,
         })
+    }
+
+    /// Suppress rows a rebuild already wrote, by comparing `dedup_key` to the highest
+    /// value the target held when this pipeline opened.
+    ///
+    /// No-op when `dedup_key` is unset, and when the target was empty there is nothing to
+    /// be beyond, so everything passes.
+    fn drop_rows_already_covered(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        use deltalake::arrow::array::Scalar;
+        use deltalake::arrow::compute::filter_record_batch;
+        use deltalake::arrow::compute::kernels::cmp::gt;
+
+        let (Some(key), Some(mark)) = (self.cfg.dedup_key.as_deref(), &self.key_watermark) else {
+            return Ok(batch);
+        };
+        let idx = batch.schema().index_of(key).map_err(|_| {
+            Error::Schema(format!(
+                "dedup_key {key:?} is not a column of the transformed batch"
+            ))
+        })?;
+        let col = batch.column(idx);
+        if col.null_count() > 0 {
+            return Err(Error::Schema(format!(
+                "dedup_key {key:?} contains {} null(s). A null key cannot be compared \
+                 against the target's high-water mark, so it can be neither kept nor \
+                 skipped safely.",
+                col.null_count()
+            )));
+        }
+
+        let mark = Scalar::new(mark.clone());
+        let keep = gt(col, &mark).map_err(|e| {
+            Error::Schema(format!(
+                "dedup_key {key:?}: cannot compare against the target's highest value. \
+                 Source and target must agree on its type. ({e})"
+            ))
+        })?;
+        filter_record_batch(&batch, &keep)
+            .map_err(|e| Error::Other(format!("dedup_key {key:?}: filter failed: {e}")))
     }
 
     async fn commit(&mut self, batches: Vec<RecordBatch>, txn_version: i64) -> Result<()> {
@@ -281,6 +342,58 @@ impl Pipeline {
     }
 }
 
+/// `max(dedup_key)` currently in the target, as a one-element array to compare against.
+///
+/// Kept as an array rather than a typed scalar so the mechanism works for whatever the
+/// key happens to be — a bigint id, a timestamp, a string — without this module knowing.
+async fn read_key_watermark(target: &DeltaTable, key: &str) -> Result<Option<ArrayRef>> {
+    use deltalake::datafusion::datasource::MemTable;
+    use deltalake::datafusion::prelude::SessionContext;
+
+    // Scan the target and let DataFusion take the max, rather than matching on every
+    // Arrow type by hand. The cost is one pass over the target per pipeline start.
+    let (_t, stream) = target.clone().scan_table().await.map_err(Error::Delta)?;
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .map_err(|e| Error::Other(format!("dedup_key {key:?}: cannot scan the target: {e}")))?;
+    let Some(schema) = batches.first().map(|b| b.schema()) else {
+        return Ok(None); // empty target: nothing has been covered yet
+    };
+
+    let ctx = SessionContext::new();
+    let provider = MemTable::try_new(schema, vec![batches])
+        .map_err(|e| Error::Other(format!("dedup_key {key:?}: {e}")))?;
+    ctx.register_table("target", Arc::new(provider))
+        .map_err(|e| Error::Other(format!("cannot register target for dedup_key: {e}")))?;
+
+    let df = ctx
+        .sql(&format!("SELECT max(\"{key}\") AS m FROM target"))
+        .await
+        .map_err(|e| {
+            Error::Config(format!(
+                "dedup_key {key:?}: cannot read it from the target. It must be a column of \
+                 the target table. ({e})"
+            ))
+        })?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| Error::Other(format!("dedup_key {key:?}: max() failed: {e}")))?;
+
+    for b in batches {
+        if b.num_rows() == 1 {
+            let col = b.column(0);
+            // An empty target gives max() = NULL, which means "nothing covered yet".
+            if col.is_null(0) {
+                return Ok(None);
+            }
+            return Ok(Some(col.slice(0, 1)));
+        }
+    }
+    Ok(None)
+}
+
 /// Where to resume, accounting for a target that another writer may have rebuilt.
 ///
 /// Normally the answer is our own `txn` offset. But when dbt shares the target, that
@@ -297,15 +410,38 @@ async fn resume_cursor(
 ) -> Result<StreamCursor> {
     let own = offsets.resume_cursor(target).await?;
 
-    let Some(uri) = cfg.watermark_uri.as_deref() else {
+    if cfg.watermark_uri.is_none() && cfg.dedup_key.is_none() {
         return Ok(own);
-    };
+    }
 
     let state = watermark::target_state(target, &cfg.app_id, watermark::DEFAULT_MAX_SCAN).await?;
     let watermark::TargetState::OverwrittenAt(at) = state else {
         return Ok(own);
     };
 
+    // dedup_key needs no cooperation from the rebuilding writer, so it is tried first: the
+    // rows to emit are those beyond the highest key the rebuild left behind, and the scan
+    // has to start early enough to reach them. Our own offset is not early enough --- it
+    // may already be past what the rebuild covered, which is the whole hazard --- so the
+    // scan restarts and the key filter suppresses everything already present.
+    if let Some(key) = cfg.dedup_key.as_deref() {
+        let from = StreamCursor::at_version(cfg.starting_version);
+        warn!(
+            pipeline = %cfg.name,
+            overwritten_at_target_version = at,
+            own_offset = %own,
+            dedup_key = key,
+            rescan_from = %from,
+            "target was rebuilt by another writer; rescanning and skipping rows at or below \
+             the target's highest dedup_key"
+        );
+        return Ok(from);
+    }
+
+    let uri = cfg
+        .watermark_uri
+        .as_deref()
+        .expect("checked above: one of watermark_uri or dedup_key is set");
     let store = watermark::WatermarkStore::new(uri);
     let Some(w) = store.last(&cfg.app_id).await? else {
         // Refusing is the whole point. Continuing from our own offset would drop every
@@ -314,8 +450,9 @@ async fn resume_cursor(
             "pipeline {:?}: target {:?} was rewritten at version {at} by another writer \
              (a dbt rebuild), but the watermark table {uri:?} holds no source_version for \
              app_id {:?}. Resuming from this pipeline's own offset would silently drop \
-             every row streamed while dbt was reading. Have the dbt model record the \
-             source version it consumed, then restart.",
+             every row streamed while dbt was reading. Either have the rebuild record the \
+             source version it consumed, or set dedup_key to a column that increases with \
+             arrival order so the overlap can be skipped without its cooperation.",
             cfg.name, cfg.target_uri, cfg.app_id
         )));
     };

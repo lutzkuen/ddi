@@ -298,3 +298,117 @@ async fn the_watermark_store_reads_the_highest_version_for_its_own_app_id() {
         "an unknown app_id has no watermark, rather than borrowing someone else's"
     );
 }
+
+// ------------------------------------------------------- zero-cooperation dedup
+
+/// The mode where the rebuilding writer knows nothing about `ddi`: no watermark table,
+/// no hooks. `ddi` reads the highest key the rebuild left in the target and emits only
+/// what lies beyond it.
+fn cfg_with_dedup_key(f: &Fixture, name: &str) -> ResolvedPipeline {
+    let mut c = f.cfg(name);
+    c.dedup_key = Some("id".into());
+    c
+}
+
+#[tokio::test]
+async fn a_dedup_key_needs_no_cooperation_from_the_rebuilding_writer() {
+    let f = Fixture::new().await;
+    for i in 1..=3 {
+        append(&f.source, &[i]).await;
+    }
+
+    let cfg = cfg_with_dedup_key(&f, "copy");
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(read_ids(&f.target).await, vec![1, 2, 3]);
+
+    // A vanilla rebuild: it overwrites the target and records nothing anywhere. It read
+    // the source as of version 2, so row 3 -- which ddi had already streamed -- is gone.
+    dbt_rebuild(&f.target, &[1, 2]).await;
+
+    append(&f.source, &[4]).await;
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+
+    let got = read_ids(&f.target).await;
+    assert_eq!(
+        got,
+        vec![1, 2, 3, 4],
+        "row 3 recovered from the rescan, row 4 streamed normally"
+    );
+    assert!(
+        !has_duplicates(&got),
+        "and 1 and 2 not written twice: {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rebuild_that_overtook_the_stream_does_not_duplicate_its_rows() {
+    // The other direction: dbt is *ahead* of ddi. Everything ddi has yet to read is
+    // already in the target, so a rescan must emit nothing at all.
+    let f = Fixture::new().await;
+    for i in 1..=2 {
+        append(&f.source, &[i]).await;
+    }
+
+    let cfg = cfg_with_dedup_key(&f, "copy");
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+
+    // More source arrives, and dbt rebuilds covering all of it before ddi gets there.
+    for i in 3..=5 {
+        append(&f.source, &[i]).await;
+    }
+    dbt_rebuild(&f.target, &[1, 2, 3, 4, 5]).await;
+
+    let n = Pipeline::open(cfg)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+
+    let got = read_ids(&f.target).await;
+    assert_eq!(got, vec![1, 2, 3, 4, 5], "no key reprocessed: {got:?}");
+    assert!(!has_duplicates(&got));
+    assert!(n > 0, "it did read the source; it just emitted nothing new");
+}
+
+#[tokio::test]
+async fn an_empty_target_after_a_rebuild_streams_everything() {
+    // max(key) over an empty table is NULL, which must mean "nothing covered", not
+    // "everything covered".
+    let f = Fixture::new().await;
+    for i in 1..=3 {
+        append(&f.source, &[i]).await;
+    }
+    let cfg = cfg_with_dedup_key(&f, "copy");
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+
+    dbt_rebuild(&f.target, &[]).await; // a rebuild that produced no rows
+
+    Pipeline::open(cfg)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(read_ids(&f.target).await, vec![1, 2, 3]);
+}

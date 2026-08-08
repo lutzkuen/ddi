@@ -256,6 +256,10 @@ The manifest names relations, not locations, so `uri_template` bridges the two �
 wins where dbt sets one. That template is the only adapter-specific part; everything else
 reads `manifest.json`, which is the same shape for dbt-trino, dbt-databricks and dbt-spark.
 
+There is a runnable version of all of this in [`examples/dbt/`](examples/dbt/): vanilla
+jaffle shop, a real dbt project with no hooks and no mention of `ddi`, rebuilding the same
+Delta table that `ddi` streams into.
+
 ### The handover, and why it needs a watermark
 
 `ddi` keeps its offset in a `txn` action in the target's log, and **`txn` actions survive an
@@ -291,6 +295,34 @@ pipeline "orders_header": target "..." was rewritten at version 41 by another wr
 "ddi.orders_header". Resuming from this pipeline's own offset would silently drop every
 row streamed while dbt was reading.
 ```
+
+### When the rebuild cannot be changed at all
+
+A watermark means touching the dbt project. If the batch side must stay untouched — no
+hooks, no macros, nothing that knows `ddi` exists — name a column instead:
+
+```toml
+dedup_key = "order_id"
+```
+
+After a rebuild, `ddi` reads `max(order_id)` out of the target and emits only rows beyond
+it. Nothing has to be recorded by anyone; the answer is already in the data. That is the
+mode [`examples/dbt/`](examples/dbt/) runs in.
+
+The column **must be non-decreasing in the order rows reach the source**. A late row
+carrying an older key is indistinguishable from one the rebuild already wrote, and will be
+dropped — so this suits an append-only stream with a sequence or an arrival timestamp, not
+a table that gets backfilled.
+
+The cost is a rescan: `ddi` cannot know how far back the rebuild's contents reach, so it
+re-reads the source from `starting_version` and lets the key filter suppress what is
+already present. That is one pass per rebuild, not per batch, and it is why the key filter
+has to be exact — over-scanning is then merely wasteful rather than wrong.
+
+`watermark_uri` remains the better choice where you can set it: it is exact, needs no
+rescan, and imposes no ordering requirement on any column.
+
+### Ordering, when using a watermark table
 
 Prefer a **pre-hook** that records the version and a model that pins its read to it
 (`FOR VERSION AS OF`). Then the watermark is on disk before the overwrite lands and there is

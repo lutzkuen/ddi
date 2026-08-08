@@ -15,6 +15,7 @@ use deltalake::datafusion::sql::sqlparser::ast::{
     Expr, ObjectName, Query, Select, SetExpr, Statement as SqlStatement, TableFactor, VisitMut,
     VisitorMut,
 };
+use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 use crate::error::{Error, Result};
@@ -186,10 +187,37 @@ fn check_table_factor(tf: &TableFactor) -> Result<()> {
     }
 }
 
+/// The CTE names a query introduces, lower-cased.
+pub(crate) fn cte_names(query: &Query) -> Vec<String> {
+    query
+        .with
+        .iter()
+        .flat_map(|w| {
+            w.cte_tables
+                .iter()
+                .map(|c| c.alias.name.value.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+/// True when `relation` refers to a CTE rather than a stored table.
+///
+/// Only an unqualified single-part name can be a CTE; `schema.name` is always a table.
+pub(crate) fn is_cte(relation: &ObjectName, ctes: &BTreeSet<String>) -> bool {
+    relation.0.len() == 1
+        && relation
+            .0
+            .first()
+            .and_then(|p| p.as_ident())
+            .map(|i| ctes.contains(&i.value.to_ascii_lowercase()))
+            .unwrap_or(false)
+}
+
 /// Catches window functions and aggregate calls wherever they hide.
 #[derive(Default)]
 struct StatefulConstructVisitor {
     found: Option<Error>,
+    ctes: BTreeSet<String>,
 }
 
 /// Aggregate function names that imply cross-row state.
@@ -253,9 +281,18 @@ impl VisitorMut for StatefulConstructVisitor {
     /// at plan time — on the first batch, in production, from a daemon that started
     /// clean and passed `ddi validate`. Naming it here keeps the promise that a pipeline
     /// which cannot be correct never starts.
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        self.ctes.extend(cte_names(query));
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_relation(&mut self, relation: &mut ObjectName) -> ControlFlow<Self::Break> {
         if self.found.is_some() {
             return ControlFlow::Break(());
+        }
+        // A CTE is a name the query defines for itself, not a second table to read.
+        if is_cte(relation, &self.ctes) {
+            return ControlFlow::Continue(());
         }
         let full = relation.to_string();
         let bare = full
@@ -422,6 +459,30 @@ mod tests {
     #[test]
     fn a_second_table_in_a_derived_table_is_rejected() {
         let e = validate_sql("SELECT order_id FROM (SELECT order_id FROM products)").unwrap_err();
+        assert!(e.to_string().contains("products"), "got: {e}");
+    }
+
+    #[test]
+    fn a_cte_is_not_mistaken_for_a_second_table() {
+        // How dbt writes its staging models: `with source as (...), renamed as (...)`.
+        // Counting those names as tables would reject every one of them.
+        validate_sql(
+            "WITH src AS (SELECT * FROM source), renamed AS (SELECT id AS order_id FROM src) \
+             SELECT * FROM renamed",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_cte_named_source_still_resolves_to_the_source_batch() {
+        // dbt literally names its first CTE `source`, which collides with ours.
+        validate_sql("WITH source AS (SELECT * FROM source) SELECT id FROM source").unwrap();
+    }
+
+    #[test]
+    fn a_real_table_inside_a_cte_body_is_still_rejected() {
+        // The CTE exemption must not become a hiding place.
+        let e = validate_sql("WITH x AS (SELECT * FROM products) SELECT * FROM x").unwrap_err();
         assert!(e.to_string().contains("products"), "got: {e}");
     }
 

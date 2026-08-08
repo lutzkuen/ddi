@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 
 use deltalake::datafusion::sql::parser::{DFParser, Statement};
 use deltalake::datafusion::sql::sqlparser::ast::{
-    Ident, ObjectName, Statement as SqlStatement, VisitMut, VisitorMut,
+    Ident, ObjectName, Query, Statement as SqlStatement, VisitMut, VisitorMut,
 };
 
 use crate::dbt::{Manifest, Node};
@@ -59,9 +59,11 @@ fn reject(name: &str, reason: impl Into<String>) -> Verdict {
 
 /// Materializations that produce a real table `ddi` could append to.
 ///
-/// A view has no storage to stream into. `ephemeral` is inlined into its consumers and
-/// never exists on its own.
-const STREAMABLE_MATERIALIZATIONS: &[&str] = &["table", "incremental"];
+/// A view has no storage to stream into, and `ephemeral` is inlined into its consumers
+/// and never exists on its own. `external` is included because that is how several
+/// adapters (dbt-duckdb, dbt-spark external tables) say "write this to storage" — which
+/// is precisely a table `ddi` can append to.
+const STREAMABLE_MATERIALIZATIONS: &[&str] = &["table", "incremental", "external"];
 
 /// Decide whether `unique_id` can be streamed.
 pub fn analyze(manifest: &Manifest, unique_id: &str) -> Verdict {
@@ -197,12 +199,25 @@ fn rewrite_to_source(sql: &str) -> std::result::Result<(String, BTreeSet<String>
 #[derive(Default)]
 struct RelationRewriter {
     seen: BTreeSet<String>,
+    ctes: BTreeSet<String>,
 }
 
 impl VisitorMut for RelationRewriter {
     type Break = ();
 
+    /// A query's CTE names are in scope for everything inside it. dbt's own staging
+    /// models are written as `with source as (...), renamed as (...) select * from
+    /// renamed`, so without this every model would look like it reads three tables.
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        self.ctes
+            .extend(crate::transform::validate::cte_names(query));
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_relation(&mut self, relation: &mut ObjectName) -> ControlFlow<Self::Break> {
+        if crate::transform::validate::is_cte(relation, &self.ctes) {
+            return ControlFlow::Continue(());
+        }
         // Record the fully-qualified name before flattening it, so a join against two
         // different tables is still visible as two names.
         self.seen.insert(relation.to_string());
@@ -352,6 +367,18 @@ mod tests {
              FROM bronze.orders",
         );
         assert!(!v.is_streamable());
+    }
+
+    #[test]
+    fn an_external_model_is_streamable() {
+        // How dbt-duckdb and dbt-spark spell "materialize this onto storage".
+        let mut m = manifest("SELECT order_id FROM bronze.orders", &[]);
+        m.nodes
+            .get_mut("model.p.orders_header")
+            .unwrap()
+            .config
+            .materialized = Some("external".into());
+        assert!(analyze(&m, "model.p.orders_header").is_streamable());
     }
 
     #[test]
