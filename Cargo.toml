@@ -1,0 +1,53 @@
+[package]
+name = "delta-delta-ingest"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Exactly-once, append-only, stateless Delta-to-Delta streaming. No checkpoint directory, no changelog reconciliation, no cluster."
+repository = "https://github.com/lutzkuen/ddi"
+readme = "README.md"
+keywords = ["delta", "deltalake", "streaming", "etl", "lakehouse"]
+categories = ["database", "command-line-utilities"]
+
+[[bin]]
+name = "ddi"
+path = "src/main.rs"
+
+[lib]
+name = "delta_delta_ingest"
+path = "src/lib.rs"
+
+[dependencies]
+# Pinned exactly: delta-rs is 0.x and churns. All calls are isolated behind
+# src/source/ and src/sink.rs so a bump touches a bounded surface (plan §5).
+deltalake = { version = "=0.32.4", features = ["datafusion"] }
+
+# arrow / datafusion / parquet are NOT declared directly: deltalake re-exports the
+# exact versions it was built against (deltalake::arrow, ::datafusion, ::parquet).
+# Declaring them separately resolves a second, conflicting copy — the `links = "lzma"`
+# collision. Always go through the re-exports.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+futures = "0.3"
+async-trait = "0.1"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+bytesize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

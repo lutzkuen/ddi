@@ -1,0 +1,44 @@
+# delta-delta-ingest — example configuration.
+#
+# Every value shown under [defaults] is the default; per-pipeline keys override it.
+
+[defaults]
+allowed_latency_secs      = 30       # poll interval once caught up
+max_bytes_per_batch       = "256MB"  # input bytes per batch
+max_files_per_batch       = 1000
+max_output_rows_per_batch = 5000000  # guards unnest amplification
+target_file_size          = "128MB"
+
+# Header grain: one row in, one row out.
+[[pipeline]]
+name       = "orders_header"
+# app_id is the OFFSET KEY. It must be unique across pipelines and stable forever —
+# changing it replays the source from starting_version.
+app_id     = "ddi.orders_header"
+source_uri = "abfss://lake@acct.dfs.core.windows.net/bronze/orders"
+target_uri = "abfss://lake@acct.dfs.core.windows.net/silver/orders"
+starting_version = 0
+# fail | skip_change_commits | ignore_changes
+change_policy    = "fail"
+transform_sql    = """
+SELECT order_id,
+       CAST(created_at AS TIMESTAMP)        AS created_at,
+       customer.id                          AS customer_id,
+       customer.country                     AS customer_country,
+       array_length(line_items)             AS line_count,
+       array_sum(line_items, 'price * qty') AS order_total
+FROM source
+WHERE order_status <> 'DRAFT'
+"""
+
+# Line-item grain: fan out from the same source into a second target.
+# Individually exactly-once, but NOT mutually atomic with the pipeline above.
+[[pipeline]]
+name       = "orders_lines"
+app_id     = "ddi.orders_lines"
+source_uri = "abfss://lake@acct.dfs.core.windows.net/bronze/orders"
+target_uri = "abfss://lake@acct.dfs.core.windows.net/silver/order_lines"
+transform_sql = """
+SELECT order_id, li.sku, li.qty, CAST(li.price AS DECIMAL(18,4)) AS price
+FROM (SELECT order_id, unnest(line_items) AS li FROM source)
+"""
