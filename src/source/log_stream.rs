@@ -14,10 +14,9 @@ use std::sync::Arc;
 
 use deltalake::kernel::{Action, Add, Remove, StructType};
 use deltalake::logstore::{get_actions, LogStore};
-use deltalake::{DeltaTable, DeltaTableBuilder};
+use deltalake::{DeltaTable, DeltaTableConfig};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
-use url::Url;
 
 use crate::error::{Error, Result};
 use crate::source::cursor::{StreamCursor, Version};
@@ -83,7 +82,6 @@ impl LogBatch {
 /// Builder / iterator over a table's commit log.
 pub struct LogStreamBuilder {
     log_store: Arc<dyn LogStore>,
-    table_url: Url,
     cursor: StreamCursor,
     max_files_per_batch: usize,
     max_bytes_per_batch: u64,
@@ -101,7 +99,6 @@ impl LogStreamBuilder {
     pub fn new(table: &DeltaTable) -> Self {
         Self {
             log_store: table.log_store(),
-            table_url: table.table_url().clone(),
             cursor: StreamCursor::at_version(0),
             max_files_per_batch: 1_000,
             max_bytes_per_batch: 256 * 1024 * 1024,
@@ -155,12 +152,10 @@ impl LogStreamBuilder {
         mut self,
         ts: chrono::DateTime<chrono::Utc>,
     ) -> Result<Self> {
-        let table = DeltaTableBuilder::from_url(self.table_url.clone())
-            .map_err(Error::Delta)?
-            .with_timestamp(ts)
-            .load()
-            .await
-            .map_err(Error::Delta)?;
+        // Reuse the log store rather than rebuilding one from the URL: it already
+        // carries the object-store credentials, and a rebuilt one would not.
+        let mut table = DeltaTable::new(self.log_store.clone(), DeltaTableConfig::default());
+        table.load_with_datetime(ts).await.map_err(Error::Delta)?;
         let v = table.version().unwrap_or(0);
         self.cursor = StreamCursor::at_version(v);
         Ok(self)
@@ -333,12 +328,8 @@ impl LogStreamBuilder {
         if let Some(s) = self.schema_cache.get(&version) {
             return Ok(s.clone());
         }
-        let table = DeltaTableBuilder::from_url(self.table_url.clone())
-            .map_err(Error::Delta)?
-            .with_version(version)
-            .load()
-            .await
-            .map_err(Error::Delta)?;
+        let mut table = DeltaTable::new(self.log_store.clone(), DeltaTableConfig::default());
+        table.load_version(version).await.map_err(Error::Delta)?;
         let snapshot = table.snapshot().map_err(Error::Delta)?;
         let schema = snapshot.schema();
         // Keep the cache small; schema changes are rare and we only ever look backwards

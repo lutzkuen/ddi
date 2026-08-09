@@ -270,7 +270,12 @@ impl Pipeline {
         for add in &batch.files {
             let path = StorePath::parse(&add.path)
                 .map_err(|e| Error::Other(format!("bad file path {:?}: {e}", add.path)))?;
-            let reader = ParquetObjectReader::new(store.clone(), path);
+            // Supply the size from the Add action rather than letting the reader probe
+            // for it. The probe is a suffix range request ("last N bytes"), which Azure
+            // Blob Storage does not implement — on local disk it works, so this only
+            // surfaces against real object storage.
+            let reader = ParquetObjectReader::new(store.clone(), path)
+                .with_file_size(add.size.max(0) as u64);
             let stream = ParquetRecordBatchStreamBuilder::new(reader)
                 .await
                 .map_err(|e| Error::Transform(format!("cannot open {:?}: {e}", add.path)))?
