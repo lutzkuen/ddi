@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # Everything except the tests that need an object store listening; those are
+      # `#[ignore]`d and run by the `object-store` job below.
+      - run: cargo test --all-targets
+
+  object-store:
+    name: object storage (Azurite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Azurite is Microsoft's Azure Storage emulator and speaks the real Blob protocol,
+      # so it exercises the paths a local filesystem cannot: object-store credentials,
+      # and the absence of suffix range requests.
+      - name: Start Azurite
+        run: |
+          npm install -g azurite
+          azurite-blob --skipApiVersionCheck --silent \
+            --location "${RUNNER_TEMP}/azurite" --blobPort 10000 --blobHost 127.0.0.1 &
+          # A 403 is a healthy answer here: it means Azurite is listening and rejecting
+          # the unsigned request. Plain curl exits 0 on any HTTP status, so connecting at
+          # all is the signal.
+          for _ in $(seq 1 30); do
+            curl -s -o /dev/null "http://127.0.0.1:10000/devstoreaccount1?comp=list" && break
+            sleep 1
+          done
+          curl -s -o /dev/null -w 'azurite responded: HTTP %{http_code}\n' \
+            "http://127.0.0.1:10000/devstoreaccount1?comp=list"
+
+      - name: Create container
+        run: az storage container create --name lake --connection-string "UseDevelopmentStorage=true"
+
+      - name: Streaming against object storage
+        run: cargo test --test azure_object_store -- --ignored --nocapture
+
+  dbt:
+    name: dbt end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dbt
+        run: pip install --quiet dbt-core dbt-duckdb deltalake pyarrow pandas
+
+      - run: cargo build --bin ddi
+
+      # Vanilla jaffle shop with no hooks, rebuilding the same Delta table ddi streams
+      # into. Asserts after every step that no order is missing and none is duplicated.
+      - name: Run the demo
+        env:
+          PY: python
+          DBT: dbt
+          DDI: target/debug/ddi
+        run: ./examples/dbt/run_demo.sh

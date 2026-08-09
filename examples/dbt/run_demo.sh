@@ -18,10 +18,13 @@ PY="${PY:-$ROOT/.venv-dbt/bin/python}"
 DBT="${DBT:-$ROOT/.venv-dbt/bin/dbt}"
 DDI="${DDI:-$ROOT/target/debug/ddi}"
 
+# `command -v` resolves both an explicit path and a bare name on PATH, which is what CI
+# passes.
 for bin in "$PY" "$DBT"; do
-  [ -x "$bin" ] || { echo "missing $bin — see examples/dbt/README.md for setup"; exit 1; }
+  command -v "$bin" >/dev/null 2>&1 || {
+    echo "missing $bin — see examples/dbt/README.md for setup"; exit 1; }
 done
-[ -x "$DDI" ] || { echo "missing $DDI — run: cargo build"; exit 1; }
+command -v "$DDI" >/dev/null 2>&1 || { echo "missing $DDI — run: cargo build"; exit 1; }
 
 rm -rf "$DDI_LAKE"; mkdir -p "$DDI_LAKE"
 export PYTHONPATH="$HERE/plugins"
