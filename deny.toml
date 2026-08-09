@@ -1,0 +1,43 @@
+# Licence policy, enforced in CI.
+#
+# ddi is Apache-2.0 and is meant to stay usable commercially. That depends on the whole
+# dependency tree, not just this crate, and a routine `cargo update` can pull in a new
+# transitive dependency under any licence at all. This turns that from something nobody
+# notices into a failed build.
+
+[licenses]
+# Everything permissive enough to link into a commercial product without conditions
+# beyond attribution.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "CC0-1.0",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "bzip2-1.0.6",
+    # File-level copyleft. Permits commercial and proprietary use; the obligation only
+    # applies to modifications of the MPL-licensed files themselves, which we do not make.
+    # Reaches us through deltalake-core -> dirs -> dirs-sys -> option-ext.
+    "MPL-2.0",
+]
+
+# A crate offered under several licences satisfies the policy if any one is allowed, which
+# is why `MIT OR Apache-2.0 OR LGPL-2.1-or-later` is fine: MIT is taken, the LGPL is not.
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"    # a 400-crate tree always has some; not a licence concern
+
+[advisories]
+# Security advisories are checked separately; a newly published CVE should not fail a
+# build that changed nothing.
+ignore = []

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
+authors = ["Lutz Künneke <lutz.kuenneke89@gmail.com>"]
 description = "Exactly-once, append-only, stateless Delta-to-Delta streaming. No checkpoint directory, no changelog reconciliation, no cluster."
 repository = "https://github.com/lutzkuen/ddi"
 readme = "README.md"

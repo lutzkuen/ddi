@@ -27,6 +27,18 @@ jobs:
       # `#[ignore]`d and run by the `object-store` job below.
       - run: cargo test --all-targets
 
+  licenses:
+    name: licence policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ddi is Apache-2.0 and meant to stay commercially usable, which depends on every
+      # transitive dependency too. A `cargo update` can change that silently; this makes
+      # it a failed build instead.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+
   object-store:
     name: object storage (Azurite)
     runs-on: ubuntu-latest

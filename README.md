@@ -622,4 +622,20 @@ rewrite.
 
 ## Licence
 
-Apache-2.0, matching delta-rs and kafka-delta-ingest.
+Apache-2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). Matching delta-rs and
+kafka-delta-ingest, and free for commercial use, modification and redistribution, with a
+patent grant.
+
+Every one of the ~434 crates in the dependency tree is permissive too (MIT, Apache-2.0,
+BSD, ISC, Zlib and similar). One is MPL-2.0 — `option-ext`, reached through
+`deltalake-core → dirs` — whose file-level copyleft imposes nothing on a consumer that
+does not modify it. There is no GPL, AGPL, SSPL or non-commercial code anywhere in the
+tree.
+
+That is a property of today's lockfile rather than a guarantee, so
+[`deny.toml`](deny.toml) encodes the policy and CI enforces it: a `cargo update` that
+pulls in something copyleft fails the build instead of going unnoticed.
+
+Distributing the **binary** rather than the source carries the attribution clauses of
+those dependencies with it. [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) lists them,
+and `scripts/third-party-notices.py` regenerates it from `Cargo.lock`.
