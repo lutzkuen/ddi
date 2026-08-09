@@ -112,6 +112,13 @@ pub struct PipelineConfig {
     /// instant as the rebuild's newest is assumed covered and dropped.
     #[serde(default)]
     pub dedup_key: Option<String>,
+
+    /// Fully qualified catalog names, so a location can be re-resolved while running.
+    /// Filled in from the dbt manifest.
+    #[serde(default)]
+    pub source_relation: Option<String>,
+    #[serde(default)]
+    pub target_relation: Option<String>,
 }
 
 /// Where the lake is and how to reach it. Deployment, not semantics.
@@ -163,6 +170,10 @@ pub struct ResolvedPipeline {
     pub dedup_key: Option<String>,
     /// How to reach object storage. The one thing a dbt project cannot tell us.
     pub storage: crate::storage::Storage,
+    /// Fully qualified catalog name of the source, when there is a catalog to ask.
+    pub source_relation: Option<String>,
+    /// Fully qualified catalog name of the target.
+    pub target_relation: Option<String>,
 }
 
 /// `ddi`'s own configuration, which is deliberately not where the work is described.
@@ -322,6 +333,8 @@ impl Config {
                     dedup_timestamp: p.dedup_timestamp.clone(),
                     dedup_key: p.dedup_key.clone(),
                     storage: crate::storage::Storage::new(self.storage.options.clone()),
+                    source_relation: p.source_relation.clone(),
+                    target_relation: p.target_relation.clone(),
                 })
             })
             .collect()

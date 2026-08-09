@@ -47,9 +47,15 @@ chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 bytesize = "1"
 
+# Already in the tree beneath the object store; declared here so the Trino client can
+# speak its HTTP protocol directly rather than taking a client dependency.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# dbt's profiles.yml. serde_norway is the maintained fork of serde_yaml.
+serde_norway = "0.9"
+
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "io-util"] }
 
 # Debug builds link deltalake + datafusion + arrow into every test binary, and their
 # debug info — not their code — is what makes those binaries enormous. Keeping full

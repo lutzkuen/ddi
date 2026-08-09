@@ -117,6 +117,8 @@ pub fn pipeline_cfg(name: &str, source: &str, target: &str) -> ResolvedPipeline 
         watermark_uri: None,
         dedup_timestamp: None,
         dedup_key: None,
+        source_relation: None,
+        target_relation: None,
         storage: delta_delta_ingest::storage::Storage::default(),
     }
 }

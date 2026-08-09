@@ -13,6 +13,7 @@
 
 pub mod analyze;
 pub mod convert;
+pub mod profiles;
 pub mod watermark;
 
 use std::collections::HashMap;
@@ -93,6 +94,15 @@ impl Node {
     /// `schema.table`, which is how the compiled SQL will refer to it.
     pub fn qualified(&self) -> String {
         format!("{}.{}", self.schema, self.relation())
+    }
+
+    /// `catalog.schema.table`, the name a catalog query needs. `None` when the manifest
+    /// records no database, in which case there is nothing to ask a catalog about.
+    pub fn fully_qualified(&self) -> Option<String> {
+        self.database
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .map(|d| format!("{d}.{}.{}", self.schema, self.relation()))
     }
 
     pub fn materialized(&self) -> &str {

@@ -137,9 +137,26 @@ azure_storage_account_key  = "..."
 
 ### Where tables live
 
-`ddi` reads locations from dbt wherever dbt records them — `location_root`, a source's
-`delta_table_path`, or `meta: {ddi_location: ...}`. If your adapter names relations
-without locating them, give `ddi` a template instead:
+**On Starburst/Trino, name a target and let the catalog answer.** A table name is not a
+location — the catalog entry points at a path, and that pointer can change without the
+name changing. `ddi` reads it with `SHOW CREATE TABLE`, using the credentials already in
+your `profiles.yml`:
+
+```bash
+ddi run -s orders_stg -t prod       # same shape as `dbt run -s orders_stg -t prod`
+```
+
+It re-resolves on every poll, so a table rebuilt at a new location is followed rather than
+silently abandoned — nothing in storage announces a move, so asking is the only way to
+know. If the cluster is briefly unreachable it keeps streaming from the last location it
+was given and warns.
+
+`--profile` picks the profile when the file holds more than one, and `--profiles-dir`
+overrides where it looks (default: `$DBT_PROFILES_DIR`, then `./`, then `~/.dbt`).
+
+Without `--target`, locations come from dbt wherever dbt records them — `location_root`, a
+source's `delta_table_path`, or `meta: {ddi_location: ...}`. If your adapter names
+relations without locating them, give `ddi` a template instead:
 
 ```toml
 [storage]

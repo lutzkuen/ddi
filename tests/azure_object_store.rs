@@ -197,6 +197,8 @@ fn pipeline(source: &str, target: &str) -> ResolvedPipeline {
         dedup_timestamp: Some("_timestamp".into()),
         dedup_key: Some("order_id".into()),
         storage: Storage::new(storage_options()),
+        source_relation: None,
+        target_relation: None,
     }
 }
 

@@ -94,6 +94,9 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
                     .to_string(),
             ),
             dedup_key: tgt.meta_str("ddi_key").map(str::to_string),
+            // Carried so a running pipeline can re-ask the catalog where these live.
+            source_relation: src.fully_qualified(),
+            target_relation: tgt.fully_qualified(),
         });
     }
     Ok(out)
