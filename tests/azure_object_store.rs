@@ -32,12 +32,14 @@ use delta_delta_ingest::config::ResolvedPipeline;
 use delta_delta_ingest::pipeline::Pipeline;
 use delta_delta_ingest::source::ChangePolicy;
 use delta_delta_ingest::storage::Storage;
-use deltalake::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use deltalake::arrow::array::{
+    ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+};
 use deltalake::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use deltalake::kernel::engine::arrow_conversion::TryIntoKernel;
 use deltalake::kernel::StructType;
 use deltalake::protocol::SaveMode;
-use deltalake::{ensure_table_uri, DeltaOps};
+use deltalake::{ensure_table_uri, DeltaTableBuilder};
 use futures::TryStreamExt;
 
 /// Azurite's well-known development account. Overridable so the same test can be pointed
@@ -122,8 +124,10 @@ fn raw_batch(ids: std::ops::RangeInclusive<i64>) -> RecordBatch {
 async fn create(uri: &str, schema: SchemaRef) {
     let delta: StructType = schema.as_ref().try_into_kernel().unwrap();
     let url = ensure_table_uri(uri).unwrap();
-    DeltaOps::try_from_url_with_storage_options(url, storage_options())
-        .await
+    DeltaTableBuilder::from_url(url)
+        .expect("table uri")
+        .with_storage_options(storage_options())
+        .build()
         .expect("open for create — is the container present and Azurite running?")
         .create()
         .with_columns(delta.fields().cloned().collect::<Vec<_>>())
@@ -134,9 +138,12 @@ async fn create(uri: &str, schema: SchemaRef) {
 
 async fn append(uri: &str, ids: std::ops::RangeInclusive<i64>) {
     let url = ensure_table_uri(uri).unwrap();
-    DeltaOps::try_from_url_with_storage_options(url, storage_options())
+    DeltaTableBuilder::from_url(url)
+        .expect("table uri")
+        .with_storage_options(storage_options())
+        .load()
         .await
-        .unwrap()
+        .expect("open for append")
         .write(vec![raw_batch(ids)])
         .with_save_mode(SaveMode::Append)
         .await
