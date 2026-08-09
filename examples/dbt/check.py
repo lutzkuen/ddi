@@ -4,6 +4,7 @@
     python check.py verify
 """
 import csv
+import gc
 import json
 import os
 import sys
@@ -57,9 +58,32 @@ def verify():
 
     if problems:
         print("  FAILED: " + "; ".join(problems))
-        sys.exit(1)
+        return 1
     print(f"  OK: {len(stg)} orders, each exactly once, JSON parsed and cast")
+    return 0
+
+
+def _exit(code):
+    """Leave without running interpreter teardown.
+
+    The Rust extension behind `deltalake` intermittently aborts while its runtime is
+    being torn down at exit — "terminate called without an active exception", after this
+    script has already done its work and printed its result. It is a teardown-order
+    problem in the library rather than anything this script or ddi does, but it turns a
+    passing check into a core dump and a red build.
+
+    Dropping the tables first gives the extension an ordered chance to clean up; leaving
+    through os._exit then skips the teardown where the abort happens. The exit code is
+    still the real one, so a genuine failure is still a failure.
+    """
+    gc.collect()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
 
 
 if __name__ == "__main__":
-    show(sys.argv[2]) if sys.argv[1] == "show" else verify()
+    if sys.argv[1] == "show":
+        show(sys.argv[2])
+        _exit(0)
+    _exit(verify())
