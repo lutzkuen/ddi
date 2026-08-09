@@ -161,6 +161,8 @@ pub struct ResolvedPipeline {
     pub dedup_timestamp: Option<String>,
     /// Row identity, for resolving ties at the watermark instant.
     pub dedup_key: Option<String>,
+    /// How to reach object storage. The one thing a dbt project cannot tell us.
+    pub storage: crate::storage::Storage,
 }
 
 /// `ddi`'s own configuration, which is deliberately not where the work is described.
@@ -319,6 +321,7 @@ impl Config {
                         .or_else(|| self.storage.watermark_uri.clone()),
                     dedup_timestamp: p.dedup_timestamp.clone(),
                     dedup_key: p.dedup_key.clone(),
+                    storage: crate::storage::Storage::new(self.storage.options.clone()),
                 })
             })
             .collect()

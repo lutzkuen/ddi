@@ -13,6 +13,7 @@ pub mod pipeline;
 pub mod schema;
 pub mod sink;
 pub mod source;
+pub mod storage;
 pub mod transform;
 
 pub use error::{Error, Result};

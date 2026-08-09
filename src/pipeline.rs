@@ -6,7 +6,7 @@ use std::time::Instant;
 use deltalake::arrow::array::RecordBatch;
 use deltalake::arrow::datatypes::SchemaRef;
 use deltalake::delta_datafusion::DataFusionMixins;
-use deltalake::{ensure_table_uri, open_table, DeltaTable};
+use deltalake::DeltaTable;
 use futures::TryStreamExt;
 use tracing::{info, warn};
 
@@ -53,19 +53,16 @@ pub struct Pipeline {
 impl Pipeline {
     /// Open both tables, resolve the resume point, and prepare the loop.
     pub async fn open(cfg: ResolvedPipeline) -> Result<Self> {
-        let source_url = ensure_table_uri(&cfg.source_uri).map_err(Error::Delta)?;
-        let target_url = ensure_table_uri(&cfg.target_uri).map_err(Error::Delta)?;
-        let source = open_table(source_url).await.map_err(|e| {
+        let source = cfg
+            .storage
+            .open(&cfg.source_uri)
+            .await
+            .map_err(|e| Error::Config(format!("pipeline {:?}: source: {e}", cfg.name)))?;
+        let target = cfg.storage.open(&cfg.target_uri).await.map_err(|e| {
             Error::Config(format!(
-                "pipeline {:?}: cannot open source {:?}: {e}",
-                cfg.name, cfg.source_uri
-            ))
-        })?;
-        let target = open_table(target_url).await.map_err(|e| {
-            Error::Config(format!(
-                "pipeline {:?}: cannot open target {:?}: {e}. This tool never creates the \
-                 target table — create it with external tooling first (plan §2.7).",
-                cfg.name, cfg.target_uri
+                "pipeline {:?}: target: {e}. This tool never creates the target table — \
+                 create it with external tooling first (plan §2.7).",
+                cfg.name
             ))
         })?;
 
@@ -238,8 +235,7 @@ impl Pipeline {
             }
             Err(e) => {
                 // Restore a usable handle so a retry can proceed.
-                let url = ensure_table_uri(&self.cfg.target_uri).map_err(Error::Delta)?;
-                self.target = open_table(url).await.map_err(Error::Delta)?;
+                self.target = self.cfg.storage.open(&self.cfg.target_uri).await?;
                 Err(e)
             }
         }
@@ -455,7 +451,7 @@ async fn resume_cursor(
         .watermark_uri
         .as_deref()
         .expect("checked above: one of watermark_uri or dedup_timestamp is set");
-    let store = watermark::WatermarkStore::new(uri);
+    let store = watermark::WatermarkStore::new(uri).with_storage(cfg.storage.clone());
     let Some(w) = store.last(&cfg.app_id).await? else {
         // Refusing is the whole point. Continuing from our own offset would drop every
         // row we streamed after dbt started reading, silently and for good.

@@ -250,9 +250,9 @@ manifest = "target/manifest.json"      # the source of truth
 [runtime]                              # how eagerly to run
 allowed_latency_secs = 30
 
-[storage]                              # how to reach the lake
-options = { azure_storage_account_name = "acct", azure_storage_account_key = "..." }
-# uri_template = "abfss://lake@acct.dfs.core.windows.net/{schema}/{name}"
+[storage.options]                      # how to authenticate
+azure_storage_account_name = "mylake"
+azure_storage_account_key  = "..."
 ```
 
 ```bash
@@ -436,6 +436,45 @@ whereas a gap is silent and permanent.
 
 `OPTIMIZE` on the target is not mistaken for a rebuild: its `Remove` actions carry
 `dataChange: false`.
+
+## Storage
+
+Tables are named by URI and the scheme picks the backend — a bare path or `file://` for
+local disk, `abfss://` or `az://` for Azure. Credentials are the one thing a dbt project
+cannot tell you: it knows *which* table, never how to reach it. So they are the only
+functional-looking thing in `ddi`'s own config.
+
+```toml
+[storage.options]
+azure_storage_account_name = "mylake"
+azure_storage_account_key  = "..."
+```
+
+Both URI shapes work:
+
+```text
+abfss://container@account.dfs.core.windows.net/path/to/table
+az://container/path/to/table            # account comes from the options
+```
+
+Any object-store key is accepted, so pick whichever credential the deployment has:
+
+| Instead of an account key | Set |
+|---|---|
+| SAS token | `azure_storage_sas_key` |
+| Bearer token | `azure_storage_token` |
+| Service principal | `azure_client_id`, `azure_client_secret`, `azure_tenant_id` |
+| Managed identity | nothing — it is used when no key is given |
+| Local development | `azure_use_azure_cli = "true"` |
+
+The same keys are read from the environment in upper case
+(`AZURE_STORAGE_ACCOUNT_NAME`), which is usually how a container gets them, so
+`[storage.options]` can be left out entirely.
+
+Other clouds are a feature flag away — `s3` and `gcs` on the `deltalake` dependency — since
+everything above [`src/storage.rs`](src/storage.rs) addresses tables by URI and never
+learns which backend answered. A URI whose backend was not compiled in says so rather than
+reporting a missing table.
 
 ## Commit classification
 

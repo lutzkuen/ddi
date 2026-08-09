@@ -143,6 +143,11 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
     match cli.command.unwrap_or(Command::Run) {
         Command::Validate => {
             for p in &pipelines {
+                // Resolving each backend touches no storage, but it does catch a URI
+                // whose scheme was not compiled in and credentials that cannot assemble
+                // — both of which would otherwise surface on the first batch.
+                p.storage.check(&p.source_uri)?;
+                p.storage.check(&p.target_uri)?;
                 println!(
                     "{:<24} {} -> {}  (app_id={}, change_policy={:?})",
                     p.name, p.source_uri, p.target_uri, p.app_id, p.change_policy

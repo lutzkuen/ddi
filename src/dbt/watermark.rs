@@ -45,7 +45,7 @@
 
 use deltalake::kernel::Action;
 use deltalake::logstore::get_actions;
-use deltalake::{ensure_table_uri, open_table, DeltaTable};
+use deltalake::DeltaTable;
 use futures::TryStreamExt;
 use tracing::warn;
 
@@ -56,11 +56,20 @@ use crate::source::Version;
 #[derive(Debug, Clone)]
 pub struct WatermarkStore {
     uri: String,
+    storage: crate::storage::Storage,
 }
 
 impl WatermarkStore {
     pub fn new(uri: impl Into<String>) -> Self {
-        Self { uri: uri.into() }
+        Self {
+            uri: uri.into(),
+            storage: crate::storage::Storage::default(),
+        }
+    }
+
+    pub fn with_storage(mut self, storage: crate::storage::Storage) -> Self {
+        self.storage = storage;
+        self
     }
 
     pub fn uri(&self) -> &str {
@@ -77,12 +86,10 @@ impl WatermarkStore {
         use deltalake::arrow::array::{Array, AsArray, RecordBatch};
         use deltalake::arrow::datatypes::Int64Type;
 
-        let url = ensure_table_uri(&self.uri).map_err(Error::Delta)?;
-        let table = open_table(url).await.map_err(|e| {
+        let table = self.storage.open(&self.uri).await.map_err(|e| {
             Error::Config(format!(
-                "cannot open the dbt watermark table {:?}: {e}. It must exist before a \
-                 pipeline that shares its target with dbt can start.",
-                self.uri
+                "{e}. The watermark table must exist before a pipeline that shares its \
+                 target with dbt can start."
             ))
         })?;
         let (_t, stream) = table.scan_table().await.map_err(Error::Delta)?;

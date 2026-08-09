@@ -21,7 +21,10 @@ path = "src/lib.rs"
 [dependencies]
 # Pinned exactly: delta-rs is 0.x and churns. All calls are isolated behind
 # src/source/ and src/sink.rs so a bump touches a bounded surface (plan §5).
-deltalake = { version = "=0.32.4", features = ["datafusion"] }
+# `azure` pulls in the ADLS Gen2 / Blob object store and registers the abfss:// and az://
+# handlers at load time. Storage backends are additive: adding "s3" or "gcs" here is all
+# another cloud needs, since everything above this line addresses tables by URI.
+deltalake = { version = "=0.32.4", features = ["datafusion", "azure"] }
 
 # arrow / datafusion / parquet are NOT declared directly: deltalake re-exports the
 # exact versions it was built against (deltalake::arrow, ::datafusion, ::parquet).
