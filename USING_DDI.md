@@ -200,7 +200,19 @@ ddi run                        # run continuously
 ddi run -s orders_stg          # just one model
 ```
 
-`ddi dbt check` is the one to run first:
+`ddi dbt check` is the one to run first. Read its three buckets carefully:
+
+- **streamable** — row-wise, and both ends on a Delta catalog.
+- **not streamable** — understood, and it cannot be. The reason names the construct.
+- **could not be judged** — the SQL was not accepted by this parser. Warehouse dialects
+  go well beyond what it covers, so expect a real number of these on a large project.
+  They are not rejections, and the summary reports the streamable count as a range.
+
+Pass `--target` and it will also ask the cluster which catalogs are actually Delta, and
+reject models on Iceberg or Hive ones. Worth doing on a mixed warehouse: a row-wise model
+over an Iceberg table looks streamable in the manifest, and the catalog name proves
+nothing — `delta.x.y` may be Iceberg and `lake.x.y` may be Delta.
+
 
 ```
 streamable  orders_stg       bronze.orders_raw -> main.orders_stg

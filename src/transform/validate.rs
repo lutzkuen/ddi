@@ -65,19 +65,35 @@ pub fn validate_sql(sql: &str) -> Result<Statement> {
         }
     };
 
-    check_query(&query)?;
+    check_query(&query, &BTreeSet::new())?;
     Ok(statement)
 }
 
-fn check_query(query: &Query) -> Result<()> {
-    if query.with.is_some() {
-        // CTEs are fine in principle but each one needs the same checks; walking them is
-        // what the visitor below does, so allow and let the visitor police the contents.
+/// Check one query, given the CTE names already in scope from enclosing queries.
+///
+/// `scope` matters because the checks recurse: a CTE body is examined on its own, and it
+/// may legitimately refer to a CTE its parent declared. Without inheriting those names,
+/// `WITH a AS (...), b AS (SELECT * FROM a) ...` would report `a` as a foreign table.
+fn check_query(query: &Query, scope: &BTreeSet<String>) -> Result<()> {
+    // Names this query adds, visible to its own CTE bodies and to its body.
+    let mut inner = scope.clone();
+    inner.extend(cte_names(query));
+
+    // A CTE body is a SELECT like any other and needs the same checks. The visitor below
+    // walks the whole tree, but it only knows about window functions, aggregate *calls*
+    // and foreign relations — it never sees GROUP BY, DISTINCT or a join, because those
+    // live on the Select node rather than in an expression. So `WITH base AS (SELECT
+    // DISTINCT ...) SELECT * FROM base` slipped through until this recursed.
+    for cte in query.with.iter().flat_map(|w| w.cte_tables.iter()) {
+        check_query(&cte.query, &inner)?;
     }
-    check_set_expr(&query.body)?;
+    check_set_expr(&query.body, &inner)?;
 
     // Window functions can appear in ORDER BY / expressions anywhere.
-    let mut v = StatefulConstructVisitor::default();
+    let mut v = StatefulConstructVisitor {
+        ctes: inner,
+        ..Default::default()
+    };
     let mut q = query.clone();
     let _ = q.visit(&mut v);
     if let Some(err) = v.found {
@@ -86,13 +102,13 @@ fn check_query(query: &Query) -> Result<()> {
     Ok(())
 }
 
-fn check_set_expr(body: &SetExpr) -> Result<()> {
+fn check_set_expr(body: &SetExpr, scope: &BTreeSet<String>) -> Result<()> {
     match body {
-        SetExpr::Select(select) => check_select(select),
-        SetExpr::Query(q) => check_query(q),
+        SetExpr::Select(select) => check_select(select, scope),
+        SetExpr::Query(q) => check_query(q, scope),
         SetExpr::SetOperation { left, right, .. } => {
-            check_set_expr(left)?;
-            check_set_expr(right)
+            check_set_expr(left, scope)?;
+            check_set_expr(right, scope)
         }
         SetExpr::Values(_) => Err(reject(
             "VALUES",
@@ -107,7 +123,7 @@ fn check_set_expr(body: &SetExpr) -> Result<()> {
     }
 }
 
-fn check_select(select: &Select) -> Result<()> {
+fn check_select(select: &Select, scope: &BTreeSet<String>) -> Result<()> {
     // GROUP BY — the headline rejection.
     let grouped = match &select.group_by {
         deltalake::datafusion::sql::sqlparser::ast::GroupByExpr::All(_) => true,
@@ -166,16 +182,16 @@ fn check_select(select: &Select) -> Result<()> {
                 "denormalise upstream; pinned-snapshot lookup joins are planned for v2.",
             ));
         }
-        check_table_factor(&twj.relation)?;
+        check_table_factor(&twj.relation, scope)?;
     }
 
     Ok(())
 }
 
-fn check_table_factor(tf: &TableFactor) -> Result<()> {
+fn check_table_factor(tf: &TableFactor, scope: &BTreeSet<String>) -> Result<()> {
     match tf {
         TableFactor::Table { .. } => Ok(()),
-        TableFactor::Derived { subquery, .. } => check_query(subquery),
+        TableFactor::Derived { subquery, .. } => check_query(subquery, scope),
         TableFactor::UNNEST { .. } => Ok(()),
         TableFactor::NestedJoin { .. } => Err(reject(
             "JOIN",
@@ -460,6 +476,52 @@ mod tests {
     fn a_second_table_in_a_derived_table_is_rejected() {
         let e = validate_sql("SELECT order_id FROM (SELECT order_id FROM products)").unwrap_err();
         assert!(e.to_string().contains("products"), "got: {e}");
+    }
+
+    // Every stateful construct, hidden one level down in a CTE. Reported from a real
+    // project: `WITH base AS (SELECT DISTINCT ...) SELECT ... FROM base` was accepted and
+    // would have streamed silently wrong output.
+    #[test]
+    fn distinct_inside_a_cte_is_rejected() {
+        let e =
+            validate_sql("WITH base AS (SELECT DISTINCT a, b FROM source) SELECT a, b FROM base")
+                .unwrap_err();
+        assert!(e.to_string().contains("DISTINCT"), "got: {e}");
+    }
+
+    #[test]
+    fn a_bare_group_by_inside_a_cte_is_rejected() {
+        // No aggregate function call, so nothing trips the expression visitor. Only
+        // walking the CTE's own SELECT catches it.
+        let e = validate_sql("WITH base AS (SELECT a FROM source GROUP BY a) SELECT a FROM base")
+            .unwrap_err();
+        assert!(e.to_string().contains("GROUP BY"), "got: {e}");
+    }
+
+    #[test]
+    fn a_join_inside_a_cte_is_rejected() {
+        let e = validate_sql(
+            "WITH base AS (SELECT x.a FROM source x JOIN source y ON x.a = y.a)              SELECT a FROM base",
+        )
+        .unwrap_err();
+        assert!(e.to_string().to_lowercase().contains("join"), "got: {e}");
+    }
+
+    #[test]
+    fn a_comma_join_inside_a_cte_is_rejected() {
+        let e =
+            validate_sql("WITH base AS (SELECT x.a FROM source x, source y) SELECT a FROM base")
+                .unwrap_err();
+        assert!(e.to_string().contains("cross join"), "got: {e}");
+    }
+
+    #[test]
+    fn a_stateful_construct_nested_two_ctes_deep_is_rejected() {
+        let e = validate_sql(
+            "WITH a AS (SELECT x FROM source), b AS (SELECT DISTINCT x FROM a)              SELECT x FROM b",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("DISTINCT"), "got: {e}");
     }
 
     #[test]

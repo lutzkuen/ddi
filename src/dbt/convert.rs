@@ -139,15 +139,26 @@ pub fn to_toml(manifest: &Manifest, cfg: &Config) -> Result<String> {
         out.push_str("# No streamable models found.\n\n");
     }
 
-    let rejected: Vec<Verdict> = analyze_all(manifest)
-        .into_iter()
-        .filter(|v| !v.is_streamable())
+    let all = analyze_all(manifest);
+    let rejected: Vec<&Verdict> = all
+        .iter()
+        .filter(|v| matches!(v, Verdict::Rejected { .. }))
         .collect();
     if !rejected.is_empty() {
         out.push_str("# ---------------------------------------------------------------\n");
         out.push_str("# Not streamable:\n");
         for v in rejected {
             if let Verdict::Rejected { name, reason } = v {
+                out.push_str(&format!("#   {name}: {reason}\n"));
+            }
+        }
+    }
+    let unknown: Vec<&Verdict> = all.iter().filter(|v| v.is_unknown()).collect();
+    if !unknown.is_empty() {
+        out.push_str("# ---------------------------------------------------------------\n");
+        out.push_str("# Could not be judged (this parser did not understand the SQL):\n");
+        for v in unknown {
+            if let Verdict::Unknown { name, reason } = v {
                 out.push_str(&format!("#   {name}: {reason}\n"));
             }
         }

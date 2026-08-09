@@ -47,6 +47,11 @@ impl Locator {
         self.client.is_some()
     }
 
+    /// The underlying client, for questions that are not about locations.
+    pub fn into_client(self) -> Option<TrinoClient> {
+        self.client
+    }
+
     /// Where `relation` lives now.
     ///
     /// `declared` is what dbt said, used when there is no catalog to ask. When the

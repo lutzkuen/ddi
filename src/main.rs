@@ -153,7 +153,7 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
     // before any pipelines exist — that is the point at which you are deciding what to
     // put in the config.
     if let Some(Command::Dbt(sub)) = &cli.command {
-        return dbt_command(sub, &cfg);
+        return dbt_command(sub, &cfg, &cli).await;
     }
 
     let all = cfg.resolve()?;
@@ -217,6 +217,44 @@ fn select(
         .collect())
 }
 
+/// The catalog of either end that is not a Delta catalog, if there is one.
+fn non_delta_catalog(
+    manifest: &delta_delta_ingest::dbt::Manifest,
+    s: &delta_delta_ingest::dbt::analyze::Streamable,
+    delta: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let target = manifest.node(&s.unique_id)?;
+    let source = target
+        .depends_on
+        .nodes
+        .first()
+        .and_then(|id| manifest.node(id));
+
+    [
+        target.database.as_deref(),
+        source.and_then(|n| n.database.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|c| !delta.contains(*c))
+    .map(str::to_string)
+}
+
+/// The first clause of a rejection, for grouping. The rest is the explanation.
+fn headline(reason: &str) -> String {
+    // Parser errors carry the offending token, which would make every one its own group.
+    if reason.starts_with("could not parse the compiled SQL") {
+        return "could not parse the compiled SQL".into();
+    }
+    let cut = reason
+        .find(" is not supported:")
+        .map(|i| i + " is not supported".len())
+        .or_else(|| reason.find(';'))
+        .or_else(|| reason.find(" — "))
+        .unwrap_or(reason.len().min(60));
+    reason[..cut.min(reason.len())].trim().to_string()
+}
+
 fn manifest_path(explicit: &Option<PathBuf>, cfg: &Config) -> delta_delta_ingest::Result<PathBuf> {
     explicit
         .clone()
@@ -228,7 +266,30 @@ fn manifest_path(explicit: &Option<PathBuf>, cfg: &Config) -> delta_delta_ingest
         })
 }
 
-fn dbt_command(sub: &DbtCommand, cfg: &Config) -> delta_delta_ingest::Result<()> {
+/// Catalogs that actually hold Delta tables, when there is a cluster to ask.
+///
+/// Without this, a model on an Iceberg or Hive catalog looks streamable: the SQL is
+/// row-wise and the manifest says nothing about storage format. The name is no guide
+/// either — `delta.x.y` may be Iceberg and `lake.x.y` may be Delta. Only the connector
+/// knows, and only the cluster knows the connector.
+async fn delta_catalogs(cli: &Cli) -> Option<std::collections::BTreeSet<String>> {
+    let client = match build_locator(cli) {
+        Ok(l) if l.is_active() => l.into_client()?,
+        _ => return None,
+    };
+    match client.delta_catalogs().await {
+        Ok(c) => {
+            info!(catalogs = ?c, "catalogs backed by a Delta connector");
+            Some(c)
+        }
+        Err(e) => {
+            warn!(error = %e, "could not list catalogs; storage format will not be checked");
+            None
+        }
+    }
+}
+
+async fn dbt_command(sub: &DbtCommand, cfg: &Config, cli: &Cli) -> delta_delta_ingest::Result<()> {
     use delta_delta_ingest::dbt::analyze::{analyze_all, Verdict};
     use delta_delta_ingest::dbt::Manifest;
 
@@ -239,9 +300,28 @@ fn dbt_command(sub: &DbtCommand, cfg: &Config) -> delta_delta_ingest::Result<()>
         } => {
             let path = manifest_path(manifest, cfg)?;
             let m = Manifest::from_path(&path)?;
-            let verdicts = analyze_all(&m);
+            let mut verdicts = analyze_all(&m);
 
-            let (mut ok, mut no) = (0, 0);
+            // A row-wise model on an Iceberg table is not a Delta→Delta pipeline, however
+            // streamable its SQL looks.
+            if let Some(delta) = delta_catalogs(cli).await {
+                for v in verdicts.iter_mut() {
+                    if let Verdict::Streamable(s) = v {
+                        if let Some(bad) = non_delta_catalog(&m, s, &delta) {
+                            *v = Verdict::Rejected {
+                                name: s.name.clone(),
+                                reason: format!(
+                                    "catalog {bad:?} is not backed by a Delta connector, so                                      this is not a Delta→Delta pipeline"
+                                ),
+                            };
+                        }
+                    }
+                }
+            }
+
+            let (mut ok, mut no, mut unknown) = (0usize, 0usize, 0usize);
+            let mut why: std::collections::BTreeMap<String, usize> = Default::default();
+
             for v in &verdicts {
                 match v {
                     Verdict::Streamable(s) => {
@@ -255,14 +335,41 @@ fn dbt_command(sub: &DbtCommand, cfg: &Config) -> delta_delta_ingest::Result<()>
                     }
                     Verdict::Rejected { name, reason } => {
                         no += 1;
+                        *why.entry(headline(reason)).or_default() += 1;
                         println!("no          {name:<28} {reason}");
+                    }
+                    Verdict::Unknown { name, reason } => {
+                        unknown += 1;
+                        *why.entry(headline(reason)).or_default() += 1;
+                        println!("unknown     {name:<28} {reason}");
                     }
                 }
             }
+
             println!(
-                "\n{ok} streamable, {no} not, of {} model(s).",
+                "\n{ok} streamable, {no} not streamable, {unknown} could not be judged, \
+                 of {} model(s).",
                 verdicts.len()
             );
+            if unknown > 0 {
+                // These are not models that cannot stream; they are models this parser
+                // could not read. Counting them as rejections would understate what is
+                // possible, which is a worse error than admitting the uncertainty.
+                println!(
+                    "\n{unknown} model(s) use SQL this parser does not accept, so nothing is \
+                     claimed about them either way.\nThe streamable count is somewhere \
+                     between {ok} and {}.",
+                    ok + unknown
+                );
+            }
+            if !why.is_empty() {
+                let mut counts: Vec<(&String, &usize)> = why.iter().collect();
+                counts.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                println!("\nBy reason:");
+                for (reason, n) in counts {
+                    println!("  {n:>5}  {reason}");
+                }
+            }
             Ok(())
         }
         DbtCommand::Convert { manifest, out } => {

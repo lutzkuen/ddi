@@ -34,19 +34,51 @@ pub struct Streamable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Streamable(Box<Streamable>),
-    Rejected { name: String, reason: String },
+    /// The model was understood, and it cannot be streamed.
+    Rejected {
+        name: String,
+        reason: String,
+    },
+    /// The model could not be understood, so nothing is claimed about it either way.
+    ///
+    /// Almost always SQL this parser does not accept — a warehouse dialect reaches well
+    /// beyond what DataFusion's parser covers. Counting these as rejections would
+    /// overstate what is known: they are not "cannot stream", they are "cannot tell", and
+    /// a project's real streamable count lies somewhere between the two.
+    Unknown {
+        name: String,
+        reason: String,
+    },
 }
 
 impl Verdict {
     pub fn name(&self) -> &str {
         match self {
             Verdict::Streamable(s) => &s.name,
-            Verdict::Rejected { name, .. } => name,
+            Verdict::Rejected { name, .. } | Verdict::Unknown { name, .. } => name,
         }
     }
 
     pub fn is_streamable(&self) -> bool {
         matches!(self, Verdict::Streamable(_))
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Verdict::Unknown { .. })
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Verdict::Streamable(_) => None,
+            Verdict::Rejected { reason, .. } | Verdict::Unknown { reason, .. } => Some(reason),
+        }
+    }
+}
+
+fn unknown(name: &str, reason: impl Into<String>) -> Verdict {
+    Verdict::Unknown {
+        name: name.to_string(),
+        reason: reason.into(),
     }
 }
 
@@ -122,7 +154,9 @@ pub fn analyze(manifest: &Manifest, unique_id: &str) -> Verdict {
     // only relation ddi registers.
     let (rewritten, seen) = match rewrite_to_source(sql) {
         Ok(v) => v,
-        Err(e) => return reject(&name, e),
+        // Not a rejection: this parser simply did not understand the SQL, which says
+        // nothing about whether the transformation is streamable.
+        Err(e) => return unknown(&name, e),
     };
 
     if seen.len() > 1 {

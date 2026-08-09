@@ -229,6 +229,48 @@ impl TrinoClient {
     }
 }
 
+impl TrinoClient {
+    /// Catalogs whose connector stores Delta tables.
+    ///
+    /// A catalog called `delta` need not be one, and one called `lake` may well be: the
+    /// name is a label, the connector is the fact. `system.metadata.catalogs` reports
+    /// both, which is the only way to tell a Delta table from an Iceberg or Hive one
+    /// without opening it — and in a mixed warehouse most tables are not Delta.
+    pub async fn delta_catalogs(&self) -> Result<std::collections::BTreeSet<String>> {
+        let result = self
+            .query("SELECT catalog_name, connector_name FROM system.metadata.catalogs")
+            .await?;
+        let name = result
+            .columns
+            .iter()
+            .position(|c| c == "catalog_name")
+            .unwrap_or(0);
+        let connector = result
+            .columns
+            .iter()
+            .position(|c| c == "connector_name")
+            .unwrap_or(1);
+
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let c = row.get(connector)?.as_str()?;
+                // Trino spells it `delta_lake`; Starburst has shipped `delta` too.
+                is_delta_connector(c)
+                    .then(|| row.get(name)?.as_str().map(str::to_string))
+                    .flatten()
+            })
+            .collect())
+    }
+}
+
+/// True for connectors that store Delta tables.
+pub fn is_delta_connector(connector: &str) -> bool {
+    let c = connector.to_ascii_lowercase();
+    c == "delta" || c == "delta_lake" || c == "delta-lake" || c.starts_with("delta_lake")
+}
+
 /// Pull `location = '...'` out of a `SHOW CREATE TABLE` result.
 ///
 /// Trino renders table properties as `WITH ( key = value, ... )`, and quotes string
@@ -277,6 +319,18 @@ mod tests {
                         format = 'PARQUET',\n\
                         location = 'abfss://lake@acct.dfs.core.windows.net/silver/orders_stg'\n\
                      )";
+
+    #[test]
+    fn only_delta_connectors_count_as_delta() {
+        assert!(is_delta_connector("delta_lake"));
+        assert!(is_delta_connector("DELTA"));
+        assert!(!is_delta_connector("iceberg"));
+        assert!(!is_delta_connector("hive"));
+        assert!(
+            !is_delta_connector("postgresql"),
+            "a catalog named `delta` on a postgres connector is not a Delta catalog"
+        );
+    }
 
     #[test]
     fn location_is_read_out_of_the_ddl() {

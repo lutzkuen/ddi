@@ -49,8 +49,19 @@ async fn spawn_fake_trino(initial: &str) -> FakeTrino {
             let n = sock.read(&mut buf).await.unwrap_or(0);
             let head = String::from_utf8_lossy(&buf[..n]).to_string();
 
-            // Trino hands back a nextUri first and results only once it is followed.
-            let body = if head.starts_with("GET /v1/next") {
+            // The catalogs query, answered on the first response so the test stays short.
+            let body = if head.contains("system.metadata.catalogs") {
+                serde_json::json!({
+                    "columns": [{"name": "catalog_name"}, {"name": "connector_name"}],
+                    "data": [
+                        ["delta", "delta_lake"],
+                        ["lake",  "delta_lake"],
+                        ["ice",   "iceberg"],
+                        ["hive",  "hive"],
+                    ],
+                })
+                .to_string()
+            } else if head.starts_with("GET /v1/next") {
                 let ddl = format!(
                     "CREATE TABLE hive.silver.orders_stg (order_id bigint)\nWITH (\n   \
                      format = 'PARQUET',\n   location = '{}'\n)",
@@ -195,6 +206,23 @@ async fn an_unreachable_catalog_falls_back_to_the_last_location_it_gave() {
         "an outage must not change where we think the table is"
     );
     assert!(!moved(&good, &during_outage));
+}
+
+#[tokio::test]
+async fn only_catalogs_on_a_delta_connector_are_reported_as_delta() {
+    // The question a mixed warehouse forces: most tables here are Iceberg, and a
+    // row-wise model over one of them is not a Delta-to-Delta pipeline however
+    // streamable its SQL looks. The catalog's *name* is no guide; the connector is.
+    let trino = spawn_fake_trino("s3://unused").await;
+    let delta = client(trino.port).delta_catalogs().await.unwrap();
+
+    assert!(delta.contains("delta"));
+    assert!(
+        delta.contains("lake"),
+        "a Delta catalog need not be called delta"
+    );
+    assert!(!delta.contains("ice"), "iceberg is not delta");
+    assert!(!delta.contains("hive"));
 }
 
 #[tokio::test]
