@@ -467,11 +467,18 @@ and reopens. The backoff resets the moment a step succeeds.
 one; worse, in `run` mode the failure was noticed only when every pipeline spawned before it
 had finished, which is never — so the stream died silently and nothing restarted it.
 
+The same holds one step earlier, at config load. A pipeline that cannot be correct is still
+refused before it starts, but it is refused *alone*: the others run, it is named in the log
+and reads `ddi_pipeline_config_valid 0`, and `ddi validate` still exits non-zero listing
+every fault so a CI gate keeps working. A typo in one entry of three hundred should not be
+one keystroke away from an outage.
+
 Because the process no longer exits when a stream dies, metrics stop being optional:
 
 | Signal | Meaning |
 |---|---|
 | `ddi_pipeline_up` | 1 while streaming, 0 while backing off. **The health signal.** |
+| `ddi_pipeline_config_valid` | 0 for a pipeline held back at load. `up = 0` is a stream that stopped; this is one that never started. |
 | `ddi_pipeline_seconds_since_progress` | Staleness. Still moves when a pipeline fails while *opening*, which lag does not. |
 | `ddi_pipeline_restarts_total` | Reopens after a failure. Climbing steadily = stuck on something a human must fix. |
 | `ddi_rows_rejected_total` | Rows sent to the data-quality table. |
@@ -789,6 +796,7 @@ correctness still holds (the `txn` action prevents double-apply) — it just was
 | `ddi_source_head_version` | gauge | Source head at the last poll. |
 | `ddi_source_lag_versions` | gauge | Source commits not yet consumed. |
 | `ddi_pipeline_up` | gauge | 1 while streaming, 0 while backing off after a failure. |
+| `ddi_pipeline_config_valid` | gauge | 1 when the configuration was accepted, 0 when the pipeline was held back at load and never started. |
 | `ddi_pipeline_seconds_since_progress` | gauge | Since the last completed step; -1 before the first. |
 | `ddi_pipeline_restarts_total` | counter | Reopens after a failure. |
 | `ddi_rows_rejected_total` | counter | Rows written to the data-quality table. |

@@ -125,24 +125,28 @@ pub fn to_toml(manifest: &Manifest, cfg: &Config) -> Result<String> {
          # in sync. It is written out only for reading, or for pinning.\n\n",
     );
 
-    for p in &derived {
-        out.push_str("[[pipeline]]\n");
-        out.push_str(&format!("name       = {:?}\n", p.name));
-        out.push_str(&format!("app_id     = {:?}\n", p.app_id));
-        out.push_str(&format!("source_uri = {:?}\n", p.source_uri));
-        out.push_str(&format!("target_uri = {:?}\n", p.target_uri));
-        if let Some(ts) = &p.dedup_timestamp {
-            out.push_str(&format!("dedup_timestamp = {ts:?}\n"));
+    // Serialised through serde rather than written field by field, and that is the whole
+    // point: a hand-written emitter silently drops every field added after it, and this one
+    // had already fallen behind `write_mode`, `upsert_key`, `upsert_lookback`, `dq_uri`,
+    // `change_policy` and both `*_relation`. Pinning a config through this command would
+    // then quietly turn an upserting pipeline back into an appending one — and the target it
+    // had been keeping to one row per key would start collecting duplicates, which is only
+    // discovered later when switching back to upsert fails the grain check.
+    //
+    // Deriving the output from the struct makes that class of bug impossible: a new field
+    // appears here the day it is added. `pinned_is_exactly_what_run_would_derive` holds it
+    // to that.
+    if !derived.is_empty() {
+        #[derive(serde::Serialize)]
+        struct Pinned<'a> {
+            #[serde(rename = "pipeline")]
+            pipeline: &'a [PipelineConfig],
         }
-        if let Some(k) = &p.dedup_key {
-            out.push_str(&format!("dedup_key       = {k:?}\n"));
-        }
-        if let Some(w) = &p.watermark_uri {
-            out.push_str(&format!("watermark_uri   = {w:?}\n"));
-        }
-        if let Some(sql) = &p.transform_sql {
-            out.push_str(&format!("transform_sql = \"\"\"\n{sql}\n\"\"\"\n"));
-        }
+        // Only the pipelines. `[storage]` is deliberately left out — it holds credentials,
+        // and this file is meant to be readable in a merge request.
+        let rendered = toml::to_string(&Pinned { pipeline: &derived })
+            .map_err(|e| Error::Config(format!("cannot render the derived pipelines: {e}")))?;
+        out.push_str(&rendered);
         out.push('\n');
     }
 
@@ -328,5 +332,97 @@ mod tests {
             "rejections listed: {toml}"
         );
         assert!(toml.contains("GROUP BY"), "with the reason: {toml}");
+    }
+
+    #[test]
+    fn pinned_is_exactly_what_run_would_derive() {
+        // The guarantee `ddi dbt convert` has to make: pinning a config and running the
+        // manifest directly do the same thing. A hand-written emitter cannot make it — it
+        // drops every field added after it was written, and this one had already lost
+        // write_mode, upsert_key, upsert_lookback, dq_uri, change_policy and both
+        // *_relation. The failure is silent and delayed: an upserting pipeline pinned to
+        // TOML comes back as an appending one, and the target quietly starts collecting
+        // duplicates.
+        //
+        // Comparing the whole struct through serde rather than field by field is what keeps
+        // this test honest as fields are added.
+        let mut manifest = fixture();
+        // A database on both ends, so source_relation/target_relation are populated and
+        // genuinely take part in the round trip rather than being None either way.
+        manifest
+            .sources
+            .get_mut("source.p.bronze.orders_raw")
+            .unwrap()
+            .database = Some("hive".into());
+        let n = manifest.nodes.get_mut("model.p.orders_stg").unwrap();
+        n.database = Some("hive".into());
+        for (k, v) in [
+            ("ddi_timestamp", "_timestamp"),
+            ("ddi_key", "order_id"),
+            ("ddi_write_mode", "upsert"),
+            ("ddi_upsert_key", "order_id"),
+            ("ddi_upsert_lookback", "48h"),
+            ("ddi_dq", "s3://lake/quarantine/orders"),
+        ] {
+            n.meta.insert(k.into(), serde_json::Value::String(v.into()));
+        }
+
+        let cfg = Config {
+            storage: storage(),
+            ..Default::default()
+        };
+        let derived = pipelines(&manifest, &cfg.storage).unwrap();
+        let toml = to_toml(&manifest, &cfg).unwrap();
+        let reparsed = Config::from_toml_str(&toml)
+            .unwrap_or_else(|e| panic!("does not parse: {e}\n\n{toml}"))
+            .pipelines;
+
+        assert_eq!(
+            serde_json::to_value(&derived).unwrap(),
+            serde_json::to_value(&reparsed).unwrap(),
+            "the pinned file must describe the same pipelines `ddi run` would derive.\n\n{toml}"
+        );
+
+        // And spelled out, because these are the ones that were being dropped.
+        assert!(toml.contains("write_mode = \"upsert\""), "{toml}");
+        assert!(toml.contains("upsert_key = \"order_id\""), "{toml}");
+        assert!(toml.contains("upsert_lookback = \"48h\""), "{toml}");
+        assert!(
+            toml.contains("dq_uri = \"s3://lake/quarantine/orders\""),
+            "{toml}"
+        );
+        assert!(toml.contains("change_policy"), "{toml}");
+        assert!(toml.contains("target_relation"), "{toml}");
+    }
+
+    #[test]
+    fn a_pinned_config_resolves_to_the_same_thing_as_the_manifest() {
+        // One level up from the last test: not just the same TOML, but the same running
+        // behaviour. `write_mode` surviving is what stops a deduplicated target silently
+        // reverting to append-only.
+        let mut manifest = fixture();
+        let n = manifest.nodes.get_mut("model.p.orders_stg").unwrap();
+        n.meta.insert(
+            "ddi_write_mode".into(),
+            serde_json::Value::String("upsert".into()),
+        );
+        n.meta.insert(
+            "ddi_key".into(),
+            serde_json::Value::String("order_id".into()),
+        );
+
+        let cfg = Config {
+            storage: storage(),
+            ..Default::default()
+        };
+        let toml = to_toml(&manifest, &cfg).unwrap();
+        let pinned = Config::from_toml_str(&toml).unwrap().resolve().unwrap();
+
+        assert_eq!(pinned.len(), 1);
+        assert!(
+            pinned[0].write_mode.is_upsert(),
+            "a pinned upsert pipeline must still upsert"
+        );
+        assert_eq!(pinned[0].upsert_key.as_deref(), Some("order_id"));
     }
 }

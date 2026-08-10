@@ -156,19 +156,41 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
         return dbt_command(sub, &cfg, &cli).await;
     }
 
-    let all = cfg.resolve()?;
-    let pipelines = select(all, &cli.select)?;
+    // Partial by design: one unusable entry in a config of three hundred must not keep the
+    // other two hundred and ninety-nine off the air. What cannot run is named, counted and
+    // exported; what can, runs.
+    let resolved = cfg.resolve_all()?;
+    let rejected = resolved.rejected;
+    let pipelines = select(resolved.pipelines, &cli.select, &rejected)?;
 
     // With a dbt target named, the catalog is the authority on where tables live.
     let locator = Arc::new(build_locator(&cli)?);
+    for r in &rejected {
+        error!(pipeline = %r.name, "held back: {}", r.reason);
+    }
     info!(
         config = %cli.config.display(),
         pipelines = pipelines.len(),
-        "config valid"
+        rejected = rejected.len(),
+        "config loaded"
     );
+    let command = cli.command.unwrap_or(Command::Run);
+    // `validate` still has something to say when nothing can run — that *is* its report.
+    if pipelines.is_empty() && !matches!(command, Command::Validate) {
+        return Err(delta_delta_ingest::Error::Config(format!(
+            "nothing can run: all {} pipeline(s) were held back. See the errors above.",
+            rejected.len()
+        )));
+    }
 
-    match cli.command.unwrap_or(Command::Run) {
+    match command {
         Command::Validate => {
+            // The gate stays strict. Reporting every fault rather than the first is the
+            // useful part — a merge request should not need three round trips to learn
+            // about three typos.
+            for r in &rejected {
+                println!("INVALID  {:<24} {}", r.name, r.reason);
+            }
             for p in &pipelines {
                 // Resolving each backend touches no storage, but it does catch a URI
                 // whose scheme was not compiled in and credentials that cannot assemble
@@ -188,11 +210,18 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
                 );
             }
             println!("\n{} pipeline(s) valid.", pipelines.len());
+            if !rejected.is_empty() {
+                // Non-zero, so a validation gate in CI actually gates.
+                return Err(delta_delta_ingest::Error::Config(format!(
+                    "{} pipeline(s) cannot run",
+                    rejected.len()
+                )));
+            }
             Ok(())
         }
         Command::Status => status(pipelines, locator).await,
-        Command::Once => run_all(pipelines, locator, cli.metrics_addr, true).await,
-        Command::Run => run_all(pipelines, locator, cli.metrics_addr, false).await,
+        Command::Once => run_all(pipelines, rejected, locator, cli.metrics_addr, true).await,
+        Command::Run => run_all(pipelines, rejected, locator, cli.metrics_addr, false).await,
         Command::Dbt(_) => unreachable!("handled above, before the config is resolved"),
     }
 }
@@ -204,12 +233,21 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
 fn select(
     pipelines: Vec<ResolvedPipeline>,
     wanted: &[String],
+    rejected: &[delta_delta_ingest::config::Rejection],
 ) -> delta_delta_ingest::Result<Vec<ResolvedPipeline>> {
     if wanted.is_empty() {
         return Ok(pipelines);
     }
     for w in wanted {
         if !pipelines.iter().any(|p| &p.name == w) {
+            // Say *why* it is not there. "matches no pipeline" for a name that is plainly in
+            // the config file sends people looking for a typo that is not the problem.
+            if let Some(r) = rejected.iter().find(|r| &r.name == w) {
+                return Err(delta_delta_ingest::Error::Config(format!(
+                    "--select {w:?} names a pipeline that was held back: {}",
+                    r.reason
+                )));
+            }
             let mut known: Vec<&str> = pipelines.iter().map(|p| p.name.as_str()).collect();
             known.sort();
             return Err(delta_delta_ingest::Error::Config(format!(
@@ -427,12 +465,29 @@ async fn status(
 
 async fn run_all(
     pipelines: Vec<ResolvedPipeline>,
+    rejected: Vec<delta_delta_ingest::config::Rejection>,
     locator: Arc<Locator>,
     metrics_addr: Option<String>,
     once: bool,
 ) -> delta_delta_ingest::Result<()> {
     let metrics = Metrics::new();
     let token = CancellationToken::new();
+
+    // Held-back pipelines get a metrics entry too, reading config_valid = 0. A stream that
+    // never started is otherwise invisible: it has no series at all, so a dashboard counting
+    // healthy pipelines cannot tell it apart from one that was never configured.
+    for r in &rejected {
+        metrics
+            .pipeline(&r.name)
+            .config_valid
+            .store(0, Ordering::Relaxed);
+    }
+    for p in &pipelines {
+        metrics
+            .pipeline(&p.name)
+            .config_valid
+            .store(1, Ordering::Relaxed);
+    }
 
     if let Some(addr) = metrics_addr {
         spawn_metrics_server(addr, metrics.clone(), token.clone());

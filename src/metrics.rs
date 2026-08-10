@@ -59,6 +59,12 @@ pub struct PipelineMetrics {
     /// Batches where *every* row was rejected. Far more likely an upstream schema change
     /// than data going bad, and otherwise invisible: the target just stops growing.
     pub batches_fully_rejected: AtomicU64,
+    /// 1 when this pipeline's configuration was accepted, 0 when it was held back at load.
+    ///
+    /// Distinct from `up`, and the distinction matters: `up = 0` means a stream that was
+    /// running has stopped, while `config_valid = 0` means one that never started. Without
+    /// it a typo in one entry of three hundred is visible only in the startup log.
+    pub config_valid: AtomicI64,
     /// Unix seconds at the last successful step. -1 until the first one.
     ///
     /// The lag gauge cannot cover a pipeline that fails while *opening*: it never reaches
@@ -145,7 +151,7 @@ impl Metrics {
         let map = self.pipelines.read().unwrap();
         let mut s = String::new();
 
-        let metrics: [MetricSpec; 18] = [
+        let metrics: [MetricSpec; 19] = [
             (
                 "ddi_batches_committed_total",
                 "counter",
@@ -197,6 +203,13 @@ impl Metrics {
                 "1 while this pipeline is streaming, 0 while it is backing off after a \
                  failure.",
                 |m| m.up.load(Ordering::Relaxed),
+            ),
+            (
+                "ddi_pipeline_config_valid",
+                "gauge",
+                "1 when this pipeline's configuration was accepted, 0 when it was held back \
+                 at load and never started.",
+                |m| m.config_valid.load(Ordering::Relaxed),
             ),
             (
                 "ddi_pipeline_seconds_since_progress",

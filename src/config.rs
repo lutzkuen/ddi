@@ -274,6 +274,29 @@ pub struct Config {
     pub pipelines: Vec<PipelineConfig>,
 }
 
+/// A pipeline that will not run, and why.
+#[derive(Clone, Debug)]
+pub struct Rejection {
+    pub name: String,
+    pub reason: String,
+}
+
+/// What a config amounts to: the pipelines that will run, and the ones that will not.
+#[derive(Clone, Debug, Default)]
+pub struct Resolved {
+    pub pipelines: Vec<ResolvedPipeline>,
+    /// Empty in the ordinary case. Anything here is a pipeline held back, named so an
+    /// operator can find it — and exported as `ddi_pipeline_config_valid 0` so a fleet does
+    /// not rely on somebody reading the startup log.
+    pub rejected: Vec<Rejection>,
+}
+
+impl Resolved {
+    pub fn is_empty(&self) -> bool {
+        self.pipelines.is_empty()
+    }
+}
+
 /// Refuse to feed one pipeline's upserted target to another pipeline that cannot read it.
 ///
 /// An upsert commit carries `Remove` actions with `dataChange: true`, so
@@ -289,9 +312,10 @@ pub struct Config {
 /// Only the last combination works, so it is the only one allowed to pass quietly. The other
 /// two are a configuration mistake that no amount of runtime care can repair, which puts the
 /// check here.
-fn check_upsert_cascades(pipelines: &[PipelineConfig]) -> Result<()> {
+fn cascade_conflicts(pipelines: &[PipelineConfig]) -> Vec<(String, String)> {
     use crate::source::ChangePolicy;
 
+    let mut out = Vec::new();
     for up in pipelines.iter().filter(|p| p.write_mode.is_upsert()) {
         for down in pipelines.iter().filter(|d| d.source_uri == up.target_uri) {
             let ok =
@@ -299,30 +323,33 @@ fn check_upsert_cascades(pipelines: &[PipelineConfig]) -> Result<()> {
             if ok {
                 continue;
             }
-            return Err(Error::Config(format!(
-                "pipeline {:?} upserts into {:?}, which pipeline {:?} reads as its source. An \
-                 upsert rewrites files, so every one of its commits carries a dataChange \
-                 Remove and reads downstream as a change commit. With change_policy = {:?} \
-                 that pipeline would {}. The only combination that survives is \
-                 change_policy = \"ignore_changes\" together with write_mode = \"upsert\" on \
-                 {:?}, keyed the same way, so re-emitted rows merge instead of accumulating.",
-                up.name,
-                up.target_uri,
-                down.name,
-                down.change_policy,
-                match down.change_policy {
-                    ChangePolicy::Fail => "stop on the first upsert commit",
-                    ChangePolicy::SkipChangeCommits =>
-                        "silently drop those commits whole — including keys they insert, which \
-                         would never arrive",
-                    ChangePolicy::IgnoreChanges =>
-                        "re-emit rewritten rows, duplicating them because it appends",
-                },
-                down.name,
-            )));
+            // The *reader* is held back, not the writer. The upserting pipeline is correct
+            // on its own; it is this one that cannot make sense of what it produces.
+            out.push((
+                down.name.clone(),
+                format!(
+                    "reads {:?} as its source, which pipeline {:?} upserts into. An upsert \
+                     rewrites files, so every one of its commits carries a dataChange Remove \
+                     and reads here as a change commit. With change_policy = {:?} this \
+                     pipeline would {}. The only combination that survives is \
+                     change_policy = \"ignore_changes\" together with write_mode = \"upsert\", \
+                     keyed the same way, so re-emitted rows merge instead of accumulating.",
+                    up.target_uri,
+                    up.name,
+                    down.change_policy,
+                    match down.change_policy {
+                        ChangePolicy::Fail => "stop on the first upsert commit",
+                        ChangePolicy::SkipChangeCommits =>
+                            "silently drop those commits whole — including keys they insert, \
+                             which would never arrive",
+                        ChangePolicy::IgnoreChanges =>
+                            "re-emit rewritten rows, duplicating them because it appends",
+                    },
+                ),
+            ));
         }
     }
-    Ok(())
+    out
 }
 
 fn parse_size(s: &str, field: &str) -> Result<u64> {
@@ -342,11 +369,17 @@ impl Config {
         Self::from_toml_str(&text)
     }
 
-    /// Fold in defaults, parse sizes, and validate every invariant that can be checked
-    /// without touching storage.
+    /// Every pipeline that can run, and every one that cannot with the reason.
     ///
-    /// A pipeline that cannot be correct must fail here, at load, not on its first batch.
-    pub fn resolve(&self) -> Result<Vec<ResolvedPipeline>> {
+    /// A pipeline that cannot be correct must be caught here, at load, not on its first
+    /// batch — but "caught" is not "fatal to everything else". One typo in one of three
+    /// hundred entries used to abort the process, which makes the config file a single point
+    /// of failure for the whole fleet and puts an editing mistake and an outage one
+    /// keystroke apart. So a bad pipeline is set aside, named, and left out of the run.
+    ///
+    /// Only what cannot be attributed to a single pipeline is still fatal: an unreadable
+    /// manifest, or nothing to run at all.
+    pub fn resolve_all(&self) -> Result<Resolved> {
         // The dbt project is the source of truth whenever there is one.
         let derived;
         let pipelines: &[PipelineConfig] = match &self.manifest {
@@ -370,146 +403,214 @@ impl Config {
             ));
         }
 
-        // app_id uniqueness: duplicates silently corrupt offsets, because two pipelines
-        // would read and overwrite the same txn key on (possibly) different targets.
-        let mut seen: HashMap<&str, &str> = HashMap::new();
+        let mut rejected: Vec<Rejection> = Vec::new();
+        let mut reject = |name: &str, reason: String| {
+            rejected.push(Rejection {
+                name: name.to_string(),
+                reason,
+            })
+        };
+
+        // Cross-pipeline checks first, because they condemn pipelines that are individually
+        // fine. Both sides of a collision are set aside: a shared app_id corrupts *both*
+        // pipelines' offsets, so there is no innocent party to keep running.
+        let mut by_app_id: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut by_name: HashMap<&str, usize> = HashMap::new();
         for p in pipelines {
-            if p.app_id.trim().is_empty() {
-                return Err(Error::Config(format!(
-                    "pipeline {:?}: app_id must not be empty — it is the offset key",
-                    p.name
-                )));
-            }
-            if let Some(prev) = seen.insert(&p.app_id, &p.name) {
-                return Err(Error::Config(format!(
-                    "duplicate app_id {:?} used by pipelines {:?} and {:?}. app_id is the \
-                     offset key; sharing one silently corrupts both pipelines' resume points.",
-                    p.app_id, prev, p.name
-                )));
+            by_app_id.entry(p.app_id.trim()).or_default().push(&p.name);
+            *by_name.entry(&p.name).or_default() += 1;
+        }
+        let mut condemned: HashMap<&str, String> = HashMap::new();
+        for (app_id, users) in &by_app_id {
+            if users.len() > 1 {
+                for name in users {
+                    condemned.entry(name).or_insert_with(|| {
+                        format!(
+                            "duplicate app_id {app_id:?}, also used by {}. app_id is the \
+                             offset key; sharing one silently corrupts every sharer's resume \
+                             point, so all of them are held back.",
+                            users
+                                .iter()
+                                .filter(|n| n != &name)
+                                .map(|n| format!("{n:?}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    });
+                }
             }
         }
-
-        let mut names = HashMap::new();
-        for p in pipelines {
-            if names.insert(&p.name, ()).is_some() {
-                return Err(Error::Config(format!(
-                    "duplicate pipeline name {:?}",
-                    p.name
-                )));
+        for (name, count) in &by_name {
+            if *count > 1 {
+                condemned.entry(name).or_insert_with(|| {
+                    format!(
+                        "duplicate pipeline name {name:?}: {count} entries share it, so \
+                             none of them can be addressed unambiguously"
+                    )
+                });
             }
         }
-
-        check_upsert_cascades(pipelines)?;
+        let cascades = cascade_conflicts(pipelines);
+        for (name, reason) in &cascades {
+            condemned
+                .entry(name.as_str())
+                .or_insert_with(|| reason.clone());
+        }
 
         let d = &self.runtime;
-        pipelines
-            .iter()
-            .map(|p| {
-                if let Some(sql) = &p.transform_sql {
-                    // Unwrap the inner Config message so the prefix is not doubled.
-                    validate_sql(sql).map_err(|e| {
-                        let detail = match e {
-                            Error::Config(m) => m,
-                            other => other.to_string(),
-                        };
-                        Error::Config(format!("pipeline {:?}: {detail}", p.name))
-                    })?;
-                }
+        let mut ok = Vec::new();
+        for p in pipelines {
+            if let Some(reason) = condemned.get(p.name.as_str()) {
+                reject(&p.name, reason.clone());
+                continue;
+            }
+            match self.resolve_one(p, d) {
+                Ok(r) => ok.push(r),
+                Err(e) => reject(
+                    &p.name,
+                    match e {
+                        Error::Config(m) => m,
+                        other => other.to_string(),
+                    },
+                ),
+            }
+        }
 
-                if p.source_uri == p.target_uri {
-                    return Err(Error::Config(format!(
-                        "pipeline {:?}: source_uri and target_uri are the same table; that \
-                         would feed the pipeline its own output",
-                        p.name
-                    )));
-                }
+        Ok(Resolved {
+            pipelines: ok,
+            rejected,
+        })
+    }
 
-                // The merge needs a key to merge on and a value to decide "newer" by.
-                // Neither can be inferred, and a pipeline missing one cannot be correct, so
-                // it fails here rather than on its first batch.
-                let upsert_key = p.upsert_key.clone().or_else(|| p.dedup_key.clone());
-                if p.write_mode.is_upsert() {
-                    if upsert_key.is_none() {
-                        return Err(Error::Config(format!(
-                            "pipeline {:?}: write_mode = \"upsert\" needs upsert_key (or \
-                             dedup_key, which it falls back to) — it is the column a row is \
-                             matched on. Without it every delivery would append another copy, \
-                             which is what append mode already does.",
-                            p.name
-                        )));
-                    }
-                    if p.dedup_timestamp.is_none() {
-                        return Err(Error::Config(format!(
-                            "pipeline {:?}: write_mode = \"upsert\" needs dedup_timestamp — it \
-                             is the column that decides whether an arriving row is newer than \
-                             the one already stored, and it bounds how much of the target the \
-                             merge has to read. In dbt: `meta: {{ddi_timestamp: _timestamp}}`.",
-                            p.name
-                        )));
-                    }
-                } else if p.upsert_key.is_some() || p.upsert_lookback.is_some() {
-                    return Err(Error::Config(format!(
-                        "pipeline {:?}: upsert_key/upsert_lookback are set but write_mode is \
-                         \"append\", so they do nothing. Set write_mode = \"upsert\", or \
-                         remove them.",
-                        p.name
-                    )));
-                }
-                let upsert_lookback = p
-                    .upsert_lookback
-                    .as_deref()
-                    .map(crate::upsert::Lookback::parse)
-                    .transpose()
-                    .map_err(|e| {
-                        let detail = match e {
-                            Error::Config(m) => m,
-                            other => other.to_string(),
-                        };
-                        Error::Config(format!("pipeline {:?}: {detail}", p.name))
-                    })?;
+    /// Every pipeline, or an error naming the ones that cannot run.
+    ///
+    /// The strict form, for callers that want a config to be all-or-nothing —
+    /// `ddi validate` and the tests. `ddi run` uses [`Self::resolve_all`].
+    pub fn resolve(&self) -> Result<Vec<ResolvedPipeline>> {
+        let r = self.resolve_all()?;
+        if let Some(first) = r.rejected.first() {
+            return Err(Error::Config(match r.rejected.len() {
+                1 => format!("pipeline {:?}: {}", first.name, first.reason),
+                n => format!(
+                    "{n} pipelines cannot run:\n{}",
+                    r.rejected
+                        .iter()
+                        .map(|x| format!("  {:?}: {}", x.name, x.reason))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            }));
+        }
+        Ok(r.pipelines)
+    }
 
-                let max_bytes = parse_size(
-                    p.max_bytes_per_batch
-                        .as_ref()
-                        .unwrap_or(&d.max_bytes_per_batch),
-                    "max_bytes_per_batch",
-                )?;
-                let target_file_size = parse_size(
-                    p.target_file_size.as_ref().unwrap_or(&d.target_file_size),
-                    "target_file_size",
-                )?;
+    /// One pipeline, with defaults folded in and every value parsed.
+    ///
+    /// Messages here name the fault, not the pipeline: the caller already knows which one it
+    /// is asking about, and repeats it when reporting.
+    fn resolve_one(&self, p: &PipelineConfig, d: &Defaults) -> Result<ResolvedPipeline> {
+        if p.app_id.trim().is_empty() {
+            return Err(Error::Config(
+                "app_id must not be empty — it is the offset key".into(),
+            ));
+        }
 
-                Ok(ResolvedPipeline {
-                    name: p.name.clone(),
-                    app_id: p.app_id.clone(),
-                    source_uri: p.source_uri.clone(),
-                    target_uri: p.target_uri.clone(),
-                    starting_version: p.starting_version,
-                    change_policy: p.change_policy,
-                    transform_sql: p.transform_sql.clone(),
-                    allowed_latency_secs: p.allowed_latency_secs.unwrap_or(d.allowed_latency_secs),
-                    max_bytes_per_batch: max_bytes,
-                    max_files_per_batch: p.max_files_per_batch.unwrap_or(d.max_files_per_batch),
-                    max_output_rows_per_batch: p
-                        .max_output_rows_per_batch
-                        .unwrap_or(d.max_output_rows_per_batch),
-                    target_file_size,
-                    watermark_uri: p
-                        .watermark_uri
-                        .clone()
-                        .or_else(|| self.storage.watermark_uri.clone()),
-                    dedup_timestamp: p.dedup_timestamp.clone(),
-                    dedup_key: p.dedup_key.clone(),
-                    write_mode: p.write_mode,
-                    upsert_key,
-                    upsert_lookback,
-                    dq_uri: p.dq_uri.clone(),
-                    storage: crate::storage::Storage::new(self.storage.options.clone()),
-                    source_relation: p.source_relation.clone(),
-                    target_relation: p.target_relation.clone(),
-                })
-            })
-            .collect()
+        if let Some(sql) = &p.transform_sql {
+            // Unwrap the inner Config message so the prefix is not doubled.
+            validate_sql(sql).map_err(|e| match e {
+                Error::Config(m) => Error::Config(m),
+                other => Error::Config(other.to_string()),
+            })?;
+        }
+
+        if p.source_uri == p.target_uri {
+            return Err(Error::Config(
+                "source_uri and target_uri are the same table; that would feed the pipeline \
+                 its own output"
+                    .into(),
+            ));
+        }
+
+        // The merge needs a key to merge on and a value to decide "newer" by. Neither can be
+        // inferred, and a pipeline missing one cannot be correct, so it is caught here
+        // rather than on its first batch.
+        let upsert_key = p.upsert_key.clone().or_else(|| p.dedup_key.clone());
+        if p.write_mode.is_upsert() {
+            if upsert_key.is_none() {
+                return Err(Error::Config(
+                    "write_mode = \"upsert\" needs upsert_key (or dedup_key, which it falls \
+                     back to) — it is the column a row is matched on. Without it every \
+                     delivery would append another copy, which is what append mode already \
+                     does."
+                        .into(),
+                ));
+            }
+            if p.dedup_timestamp.is_none() {
+                return Err(Error::Config(
+                    "write_mode = \"upsert\" needs dedup_timestamp — it is the column that \
+                     decides whether an arriving row is newer than the one already stored, \
+                     and it bounds how much of the target the merge has to read. In dbt: \
+                     `meta: {ddi_timestamp: _timestamp}`."
+                        .into(),
+                ));
+            }
+        } else if p.upsert_key.is_some() || p.upsert_lookback.is_some() {
+            return Err(Error::Config(
+                "upsert_key/upsert_lookback are set but write_mode is \"append\", so they do \
+                 nothing. Set write_mode = \"upsert\", or remove them."
+                    .into(),
+            ));
+        }
+        let upsert_lookback = p
+            .upsert_lookback
+            .as_deref()
+            .map(crate::upsert::Lookback::parse)
+            .transpose()
+            .map_err(|e| match e {
+                Error::Config(m) => Error::Config(m),
+                other => Error::Config(other.to_string()),
+            })?;
+
+        let max_bytes = parse_size(
+            p.max_bytes_per_batch
+                .as_ref()
+                .unwrap_or(&d.max_bytes_per_batch),
+            "max_bytes_per_batch",
+        )?;
+        let target_file_size = parse_size(
+            p.target_file_size.as_ref().unwrap_or(&d.target_file_size),
+            "target_file_size",
+        )?;
+
+        Ok(ResolvedPipeline {
+            name: p.name.clone(),
+            app_id: p.app_id.clone(),
+            source_uri: p.source_uri.clone(),
+            target_uri: p.target_uri.clone(),
+            starting_version: p.starting_version,
+            change_policy: p.change_policy,
+            transform_sql: p.transform_sql.clone(),
+            allowed_latency_secs: p.allowed_latency_secs.unwrap_or(d.allowed_latency_secs),
+            max_bytes_per_batch: max_bytes,
+            max_files_per_batch: p.max_files_per_batch.unwrap_or(d.max_files_per_batch),
+            max_output_rows_per_batch: p
+                .max_output_rows_per_batch
+                .unwrap_or(d.max_output_rows_per_batch),
+            target_file_size,
+            watermark_uri: p
+                .watermark_uri
+                .clone()
+                .or_else(|| self.storage.watermark_uri.clone()),
+            dedup_timestamp: p.dedup_timestamp.clone(),
+            dedup_key: p.dedup_key.clone(),
+            write_mode: p.write_mode,
+            upsert_key,
+            upsert_lookback,
+            dq_uri: p.dq_uri.clone(),
+            storage: crate::storage::Storage::new(self.storage.options.clone()),
+            source_relation: p.source_relation.clone(),
+            target_relation: p.target_relation.clone(),
+        })
     }
 }
 
@@ -682,6 +783,162 @@ write_mode = "upsert"
 dedup_timestamp = "_timestamp"
 dedup_key = "order_id"
 "#;
+
+    /// A config where the second of three pipelines cannot possibly work.
+    fn one_bad_of_three() -> Config {
+        let toml = r#"
+[[pipeline]]
+name = "good_a"
+app_id = "ddi.good_a"
+source_uri = "/tmp/bronze/a"
+target_uri = "/tmp/silver/a"
+
+[[pipeline]]
+name = "typo"
+app_id = "ddi.typo"
+source_uri = "/tmp/bronze/b"
+target_uri = "/tmp/silver/b"
+transform_sql = "SELECT customer_id, sum(total) FROM source GROUP BY customer_id"
+
+[[pipeline]]
+name = "good_b"
+app_id = "ddi.good_b"
+source_uri = "/tmp/bronze/c"
+target_uri = "/tmp/silver/c"
+"#;
+        Config::from_toml_str(toml).unwrap()
+    }
+
+    #[test]
+    fn one_unusable_pipeline_does_not_keep_the_others_off_the_air() {
+        // The whole point. A typo in one entry of a large config used to abort the process,
+        // which puts an editing mistake and a fleet outage one keystroke apart.
+        let r = one_bad_of_three().resolve_all().unwrap();
+
+        assert_eq!(
+            r.pipelines
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["good_a", "good_b"],
+            "the pipelines that can run, run"
+        );
+        assert_eq!(r.rejected.len(), 1);
+        assert_eq!(r.rejected[0].name, "typo");
+        assert!(
+            r.rejected[0].reason.contains("GROUP BY"),
+            "and the one that cannot is named with the reason: {}",
+            r.rejected[0].reason
+        );
+    }
+
+    #[test]
+    fn the_strict_form_still_refuses_the_whole_config() {
+        // `ddi validate` is a gate, so it must still fail — and now it names every fault
+        // rather than only the first.
+        let e = one_bad_of_three().resolve().unwrap_err().to_string();
+        assert!(e.contains("typo"), "names the pipeline: {e}");
+        assert!(e.contains("GROUP BY"), "and the reason: {e}");
+    }
+
+    #[test]
+    fn the_strict_form_lists_every_fault_not_just_the_first() {
+        let toml = r#"
+[[pipeline]]
+name = "a"
+app_id = "ddi.a"
+source_uri = "/tmp/same"
+target_uri = "/tmp/same"
+
+[[pipeline]]
+name = "b"
+app_id = "ddi.b"
+source_uri = "/tmp/x"
+target_uri = "/tmp/y"
+upsert_lookback = "whenever"
+"#;
+        let e = Config::from_toml_str(toml)
+            .unwrap()
+            .resolve()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("\"a\""), "first fault: {e}");
+        assert!(e.contains("\"b\""), "second fault too: {e}");
+    }
+
+    #[test]
+    fn both_sides_of_a_duplicate_app_id_are_held_back() {
+        // Neither is innocent: sharing an offset key corrupts every sharer's resume point,
+        // so keeping one of them running would be the dangerous half of the choice.
+        let toml = r#"
+[[pipeline]]
+name = "a"
+app_id = "ddi.shared"
+source_uri = "/tmp/bronze/a"
+target_uri = "/tmp/silver/a"
+
+[[pipeline]]
+name = "b"
+app_id = "ddi.shared"
+source_uri = "/tmp/bronze/b"
+target_uri = "/tmp/silver/b"
+
+[[pipeline]]
+name = "c"
+app_id = "ddi.c"
+source_uri = "/tmp/bronze/c"
+target_uri = "/tmp/silver/c"
+"#;
+        let r = Config::from_toml_str(toml).unwrap().resolve_all().unwrap();
+        assert_eq!(
+            r.pipelines
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"]
+        );
+        assert_eq!(r.rejected.len(), 2, "both sharers: {:?}", r.rejected);
+        assert!(r.rejected.iter().all(|x| x.reason.contains("app_id")));
+    }
+
+    #[test]
+    fn a_broken_cascade_holds_back_the_reader_not_the_writer() {
+        // The upserting pipeline is correct on its own; it is the one that cannot read what
+        // it produces that has to stand down.
+        let toml = format!(
+            "{UPSERT}\n[[pipeline]]\nname = \"gold\"\napp_id = \"ddi.gold\"\n\
+             source_uri = \"/tmp/silver/orders\"\ntarget_uri = \"/tmp/gold/orders\"\n\
+             change_policy = \"skip_change_commits\"\n"
+        );
+        let r = Config::from_toml_str(&toml).unwrap().resolve_all().unwrap();
+        assert_eq!(
+            r.pipelines
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["orders"],
+            "the upserting pipeline keeps running"
+        );
+        assert_eq!(r.rejected.len(), 1);
+        assert_eq!(r.rejected[0].name, "gold");
+        assert!(r.rejected[0].reason.contains("silently drop"));
+    }
+
+    #[test]
+    fn a_config_where_nothing_can_run_still_resolves_and_says_so() {
+        // Not an error at this level: the caller decides what "nothing to run" means.
+        // `ddi run` treats it as fatal, `ddi validate` reports it.
+        let toml = r#"
+[[pipeline]]
+name = "a"
+app_id = "ddi.a"
+source_uri = "/tmp/same"
+target_uri = "/tmp/same"
+"#;
+        let r = Config::from_toml_str(toml).unwrap().resolve_all().unwrap();
+        assert!(r.is_empty());
+        assert_eq!(r.rejected.len(), 1);
+    }
 
     #[test]
     fn append_is_the_default_write_mode() {

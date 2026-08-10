@@ -29,7 +29,10 @@ rows, because it could not be correct across batch boundaries:
 | materialized as a view | **no** — nothing to append to |
 
 Refusals happen when the config loads, not on the first batch, and the message says what
-to change. A pipeline that cannot be correct never starts.
+to change. A pipeline that cannot be correct never starts — **and only that pipeline**. The
+rest of the config runs, the held-back ones are named in the log and exported as
+`ddi_pipeline_config_valid 0`, and `ddi validate` still exits non-zero listing every fault,
+so a CI gate keeps working. One typo in one of three hundred entries is not a fleet outage.
 
 ---
 
@@ -193,7 +196,8 @@ az://container/path/to/table          # account comes from the options
 
 ```bash
 ddi dbt check                  # which models can be streamed, and why not
-ddi validate                   # resolve config + credentials, touch no data
+ddi validate                   # resolve config + credentials, touch no data; exits
+                               #   non-zero and lists every unusable pipeline
 ddi status                     # where each pipeline would resume from
 ddi once                       # run until caught up, then exit
 ddi run                        # run continuously
