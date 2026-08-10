@@ -152,6 +152,97 @@ async fn the_trino_spelling_of_unnest_expands_to_the_same_grain() {
     assert_eq!(rows, 3, "two line items plus one");
 }
 
+/// A bronze row whose whole payload is one JSON blob — the common shape, and the one the
+/// typed `line_items` fixture above does not cover.
+fn orders_with_json_payload() -> RecordBatch {
+    use deltalake::arrow::array::StringArray;
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("data", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                r#"{"status":"PAID","lines":[{"sku":"A","qty":2},{"sku":"B","qty":1}]}"#,
+                r#"{"status":"PAID","lines":[{"sku":"C","qty":7}]}"#,
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+async fn run_on(batch: RecordBatch, sql: &str) -> Vec<RecordBatch> {
+    SqlTransform::new(sql)
+        .apply(vec![batch])
+        .await
+        .expect("transform should succeed")
+}
+
+#[tokio::test]
+async fn an_array_cast_out_of_a_json_blob_can_be_unnested() {
+    // The shape bronze actually arrives in: the array does not exist as an array until the
+    // cast makes it one. Written exactly as Trino would, so the same model runs in both.
+    let out = run_on(
+        orders_with_json_payload(),
+        "SELECT o.order_id, \
+                json_extract_scalar(li, '$.sku')                  AS sku, \
+                CAST(json_extract_scalar(li, '$.qty') AS BIGINT)  AS qty \
+         FROM source o \
+         CROSS JOIN UNNEST(CAST(json_extract(o.data, '$.lines') AS ARRAY(JSON))) AS t(li)",
+    )
+    .await;
+
+    let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "two lines from order 1, one from order 2");
+
+    let b = &out[0];
+    let sku = deltalake::arrow::compute::cast(
+        b.column(b.schema().index_of("sku").unwrap()),
+        &DataType::Utf8,
+    )
+    .unwrap();
+    let sku = sku
+        .as_any()
+        .downcast_ref::<deltalake::arrow::array::StringArray>()
+        .unwrap();
+    let got: Vec<&str> = (0..sku.len()).map(|i| sku.value(i)).collect();
+    assert_eq!(got, vec!["A", "B", "C"]);
+}
+
+#[tokio::test]
+async fn an_order_with_no_lines_contributes_no_rows_rather_than_failing() {
+    use deltalake::arrow::array::StringArray;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("data", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some(r#"{"lines":[{"sku":"A"}]}"#),
+                Some(r#"{"status":"DRAFT"}"#), // no lines at all
+                None,                          // no payload at all
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let out = run_on(
+        batch,
+        "SELECT o.order_id, json_extract_scalar(li, '$.sku') AS sku \
+         FROM source o \
+         CROSS JOIN UNNEST(CAST(json_extract(o.data, '$.lines') AS ARRAY(JSON))) AS t(li)",
+    )
+    .await;
+    let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 1,
+        "a missing path is NULL and a NULL array expands to nothing, as in Trino"
+    );
+}
+
 #[tokio::test]
 async fn the_two_spellings_of_unnest_agree() {
     // The premise of the whole tool: the model means the same thing in the warehouse and

@@ -46,16 +46,107 @@
 
 use deltalake::datafusion::sql::parser::DFParser;
 use deltalake::datafusion::sql::sqlparser::ast::{
-    Query, Select, SetExpr, Statement as SqlStatement, TableFactor, TableWithJoins,
+    DataType, Expr, Query, Select, SelectItem, SetExpr, Statement as SqlStatement, TableFactor,
+    TableWithJoins, VisitMut, VisitorMut,
 };
+use std::ops::ControlFlow;
 
 use crate::error::{Error, Result};
 
+/// Turn `CAST(<json> AS ARRAY(JSON))` into the function that produces a real Arrow list.
+///
+/// # Why a cast has to become a function call
+///
+/// Bronze usually carries its payload as one JSON string, so the array to expand does not
+/// exist as an array until something makes it one. Trino spells that as a cast:
+///
+/// ```sql
+/// CROSS JOIN UNNEST(CAST(json_extract(o.data, '$.lines') AS ARRAY(JSON))) AS t(li)
+/// ```
+///
+/// Arrow has no cast from text to a list — no cast kernel parses JSON — so the cast is
+/// replaced by [`json_array_elements`](crate::transform::json), which does. Each element
+/// comes back as JSON text, which is exactly what `ARRAY(JSON)` promises: the element's
+/// shape is not decided here, it is decided by whatever reads it, with the same
+/// `json_extract_scalar` that works in both engines.
+///
+/// The type is recognised by how it renders rather than by matching `sqlparser`'s type
+/// enum. There is one type to spot, its spelling is fixed by Trino, and matching text does
+/// not care which dialect's parser produced it — `Array(JSON)`, `ARRAY(JSON)` and
+/// `ARRAY<JSON>` are all the same thing said three ways.
+pub(crate) fn rewrite_json_array_casts(query: &mut Query) -> Result<()> {
+    struct V(Option<Error>);
+    impl VisitorMut for V {
+        type Break = ();
+        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            let Expr::Cast {
+                expr: inner,
+                data_type,
+                ..
+            } = expr
+            else {
+                return ControlFlow::Continue(());
+            };
+            if !is_json_array(data_type) {
+                return ControlFlow::Continue(());
+            }
+            match parse_expr(&format!("json_array_elements({inner})")) {
+                Ok(replacement) => *expr = replacement,
+                Err(e) => {
+                    self.0 = Some(e);
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut v = V(None);
+    let _ = query.visit(&mut v);
+    match v.0 {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Is this the `ARRAY(JSON)` type, however the parser chose to render it?
+fn is_json_array(data_type: &DataType) -> bool {
+    let rendered: String = data_type
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    matches!(rendered.as_str(), "ARRAY(JSON)" | "ARRAY<JSON>")
+}
+
+/// Parse a single expression by parsing a query that projects it.
+fn parse_expr(expr: &str) -> Result<Expr> {
+    let select = parse_select(&format!("SELECT {expr} FROM source"))?;
+    match select.projection.into_iter().next() {
+        Some(SelectItem::UnnamedExpr(e)) => Ok(e),
+        Some(SelectItem::ExprWithAlias { expr, .. }) => Ok(expr),
+        _ => Err(Error::Config(format!(
+            "could not rewrite CAST(... AS ARRAY(JSON)): {expr}"
+        ))),
+    }
+}
+
 /// Rewrite every `CROSS JOIN UNNEST` in `query`, in place, including inside CTEs and
 /// subqueries.
+///
+/// The JSON cast is rewritten first, so an `UNNEST` over one sees a plain function call by
+/// the time it is examined and needs to know nothing about JSON.
 pub(crate) fn rewrite(query: &mut Query) -> Result<()> {
+    // Idempotent: by the time `validate_sql` calls this, the casts are usually already gone.
+    // Kept here so the entry point is complete on its own for any other caller.
+    rewrite_json_array_casts(query)?;
+    rewrite_unnest(query)
+}
+
+fn rewrite_unnest(query: &mut Query) -> Result<()> {
     for cte in query.with.iter_mut().flat_map(|w| w.cte_tables.iter_mut()) {
-        rewrite(&mut cte.query)?;
+        rewrite_unnest(&mut cte.query)?;
     }
     rewrite_set_expr(&mut query.body)
 }
@@ -63,7 +154,7 @@ pub(crate) fn rewrite(query: &mut Query) -> Result<()> {
 fn rewrite_set_expr(body: &mut SetExpr) -> Result<()> {
     match body {
         SetExpr::Select(select) => rewrite_select(select),
-        SetExpr::Query(q) => rewrite(q),
+        SetExpr::Query(q) => rewrite_unnest(q),
         SetExpr::SetOperation { left, right, .. } => {
             rewrite_set_expr(left)?;
             rewrite_set_expr(right)
@@ -76,7 +167,7 @@ fn rewrite_select(select: &mut Select) -> Result<()> {
     // Recurse first: a derived table may hold an UNNEST of its own.
     for twj in select.from.iter_mut() {
         if let TableFactor::Derived { subquery, .. } = &mut twj.relation {
-            rewrite(subquery)?;
+            rewrite_unnest(subquery)?;
         }
     }
 
@@ -221,11 +312,15 @@ fn base_alias(base: &TableFactor) -> String {
 
 /// Parse a `FROM` clause by parsing a query that has one.
 fn parse_from(from: &str) -> Result<Vec<TableWithJoins>> {
-    let sql = format!("SELECT 1 FROM {from}");
-    let mut statements = DFParser::parse_sql(&sql).map_err(|e| {
+    Ok(parse_select(&format!("SELECT 1 FROM {from}"))?.from)
+}
+
+/// Parse a whole `SELECT`, so fragments are built by the parser rather than by hand.
+fn parse_select(sql: &str) -> Result<Select> {
+    let mut statements = DFParser::parse_sql(sql).map_err(|e| {
         Error::Config(format!(
-            "could not rewrite CROSS JOIN UNNEST into a form this engine runs ({e}). The \
-             rewritten clause was: {from}"
+            "could not rewrite into a form this engine runs ({e}). The rewritten SQL was: \
+             {sql}"
         ))
     })?;
     let statement = statements.pop_front().ok_or_else(|| {
@@ -246,7 +341,7 @@ fn parse_from(from: &str) -> Result<Vec<TableWithJoins>> {
             "could not rewrite CROSS JOIN UNNEST: not a select".into(),
         ));
     };
-    Ok(select.from)
+    Ok(*select)
 }
 
 fn unsupported(what: &str, why: &str, instead: &str) -> Error {
@@ -311,6 +406,28 @@ mod tests {
         let got =
             rewritten("SELECT o.order_id, t FROM source o CROSS JOIN UNNEST(o.tags) AS t").unwrap();
         assert!(got.contains("unnest(o.tags) AS t"), "got: {got}");
+    }
+
+    #[test]
+    fn a_json_array_cast_becomes_the_function_that_builds_a_real_list() {
+        // The bronze shape: the array does not exist as an array until this makes it one.
+        // Arrow has no cast from text to a list, so the cast has to become a call.
+        let got = rewritten(
+            "SELECT o.id, li FROM source o \
+             CROSS JOIN UNNEST(CAST(json_extract(o.data, '$.lines') AS ARRAY<JSON>)) AS t(li)",
+        )
+        .unwrap();
+        assert!(
+            got.contains("unnest(json_array_elements(json_extract(o.data, '$.lines'))) AS li"),
+            "got: {got}"
+        );
+        assert!(!got.contains("CAST"), "the cast is gone: {got}");
+    }
+
+    #[test]
+    fn a_cast_to_something_else_is_left_alone() {
+        let got = rewritten("SELECT CAST(qty AS BIGINT) AS qty FROM source").unwrap();
+        assert!(got.contains("CAST(qty AS BIGINT)"), "got: {got}");
     }
 
     #[test]

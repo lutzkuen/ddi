@@ -26,12 +26,56 @@ fn reject(what: &str, why: &str, instead: &str) -> Error {
     Error::Config(format!("{what} is not supported: {why} Instead: {instead}"))
 }
 
+/// Render a statement and read it back with this engine's own parser.
+///
+/// Used to hand the query from the permissive parser to the native one once the syntax that
+/// needed the former has been rewritten away. It is not a formality: the two parsers
+/// disagree about the shape of what they read, not just about what they accept.
+fn reparse_natively(statement: &SqlStatement) -> Result<SqlStatement> {
+    let text = statement.to_string();
+    let mut parsed = DFParser::parse_sql(&text).map_err(|e| {
+        Error::Config(format!(
+            "transform_sql uses a dialect this engine cannot run, and rewriting did not \
+             resolve it ({e}). After rewriting it read: {text}"
+        ))
+    })?;
+    match parsed.pop_front() {
+        Some(Statement::Statement(inner)) => Ok(*inner),
+        _ => Err(Error::Config(format!(
+            "could not re-read transform_sql after rewriting it: {text}"
+        ))),
+    }
+}
+
+/// Parse, accepting a little more than this engine's own parser does.
+///
+/// Trino writes a parenthesised type — `CAST(x AS ARRAY(JSON))` — and DataFusion's parser
+/// insists on angle brackets, so a model containing the one construct that makes a JSON
+/// payload unnestable would not get as far as being read. Falling back to a parser that
+/// accepts the parenthesised form lets it in; the rewrite in
+/// [`crate::transform::unnest`] then removes it, and [`validate_sql`] proves what comes out
+/// parses here before anything is allowed to run.
+///
+/// The fallback is only ever consulted when this engine's parser has already refused, so a
+/// query it can read is never interpreted by the other one.
+fn parse_permissively(sql: &str) -> Result<std::collections::VecDeque<Statement>> {
+    use deltalake::datafusion::sql::sqlparser::dialect::ClickHouseDialect;
+
+    match DFParser::parse_sql(sql) {
+        Ok(s) => Ok(s),
+        Err(native) => DFParser::parse_sql_with_dialect(sql, &ClickHouseDialect {})
+            // Report the native error: it is the one that describes the engine the query
+            // will actually run on, and the fallback's complaint about a different grammar
+            // would only mislead.
+            .map_err(|_| Error::Config(format!("could not parse transform_sql: {native}"))),
+    }
+}
+
 /// Parse and validate a transform SQL statement.
 ///
 /// Returns the parsed statement so the caller does not parse twice.
 pub fn validate_sql(sql: &str) -> Result<Statement> {
-    let mut statements = DFParser::parse_sql(sql)
-        .map_err(|e| Error::Config(format!("could not parse transform_sql: {e}")))?;
+    let mut statements = parse_permissively(sql)?;
 
     if statements.is_empty() {
         return Err(Error::Config("transform_sql is empty".into()));
@@ -65,14 +109,41 @@ pub fn validate_sql(sql: &str) -> Result<Statement> {
         }
     };
 
-    // Trino's `CROSS JOIN UNNEST` is turned into the form this engine runs *before* the
-    // checks below see it, which is why the join check does not reject it. That ordering is
-    // the point: validation and execution then work on the same query, so a transform
-    // cannot be accepted here and fail on its first batch. See [`crate::transform::unnest`].
+    // Trino's spellings are turned into the forms this engine runs *before* the checks below
+    // see them, which is why the join check does not reject `CROSS JOIN UNNEST`. That
+    // ordering is the point: validation and execution then work on the same query, so a
+    // transform cannot be accepted here and fail on its first batch.
+    //
+    // The JSON cast goes first and alone, because it is the only construct the fallback
+    // parser was needed for. Rewriting it away means the query can be re-read by this
+    // engine's own parser — and it must be, because the two parsers do not agree on the
+    // *shape* of what they read: the fallback turns `UNNEST(...)` into an ordinary table
+    // function, which the unnest rewrite below would not recognise. Everything after this
+    // point therefore works on one parser's AST, whichever one let the text in.
+    crate::transform::unnest::rewrite_json_array_casts(&mut query)?;
+    if let SqlStatement::Query(q) = reparse_natively(&SqlStatement::Query(query.clone()))? {
+        query = q;
+    }
+
     crate::transform::unnest::rewrite(&mut query)?;
 
     check_query(&query, &BTreeSet::new())?;
-    Ok(Statement::Statement(Box::new(SqlStatement::Query(query))))
+
+    let rewritten = Statement::Statement(Box::new(SqlStatement::Query(query)));
+
+    // Everything above may have been read by the fallback parser, so prove the result is
+    // something *this* engine can read before letting it near a pipeline. Without this,
+    // a dialect difference elsewhere in the query would be discovered on the first batch —
+    // the failure mode this whole module exists to close.
+    let text = rewritten.to_string();
+    DFParser::parse_sql(&text).map_err(|e| {
+        Error::Config(format!(
+            "transform_sql uses a dialect this engine cannot run, and rewriting did not \
+             resolve it ({e}). After rewriting it read: {text}"
+        ))
+    })?;
+
+    Ok(rewritten)
 }
 
 /// Validate `sql` and return the text the engine should actually run.
@@ -437,6 +508,37 @@ mod tests {
         .to_string();
         assert!(e.contains("LATERAL VIEW"), "got: {e}");
         assert!(e.contains("CROSS JOIN UNNEST"), "points at the fix: {e}");
+    }
+
+    #[test]
+    fn an_array_cast_out_of_a_json_blob_is_accepted_in_either_spelling() {
+        // Trino writes `ARRAY(JSON)`; this engine's own parser insists on `ARRAY<JSON>`.
+        // Both have to mean the same thing, or a model that runs in the warehouse would be
+        // refused here — which is the whole reason the permissive parser exists.
+        let trino = normalise_sql(
+            "SELECT o.order_id, json_extract_scalar(li, '$.sku') AS sku FROM source o \
+             CROSS JOIN UNNEST(CAST(json_extract(o.data, '$.lines') AS ARRAY(JSON))) AS t(li)",
+        )
+        .expect("the Trino spelling is the one a dbt model contains");
+        let native = normalise_sql(
+            "SELECT o.order_id, json_extract_scalar(li, '$.sku') AS sku FROM source o \
+             CROSS JOIN UNNEST(CAST(json_extract(o.data, '$.lines') AS ARRAY<JSON>)) AS t(li)",
+        )
+        .unwrap();
+        assert_eq!(trino, native, "both spellings must resolve to one query");
+        assert!(
+            trino.contains("json_array_elements(json_extract(o.data, '$.lines'))"),
+            "the cast became the function that builds a real list: {trino}"
+        );
+    }
+
+    #[test]
+    fn a_json_array_cast_outside_unnest_is_still_rewritten() {
+        // It is a cast, not an unnest feature: wherever it appears it has to become the
+        // function, or the query would reach the engine with a cast no kernel implements.
+        let got =
+            normalise_sql("SELECT order_id, json_array_elements(data) AS l FROM source").unwrap();
+        assert!(got.contains("json_array_elements(data)"), "got: {got}");
     }
 
     #[test]

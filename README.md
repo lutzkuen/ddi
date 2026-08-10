@@ -188,6 +188,31 @@ The rewrite runs **before** validation, so the two forms cannot diverge: whateve
 there is no second table, nothing to pin and no cross-row state — so it is not caught by the
 join rejection. A join against another table still is.
 
+#### When the array is inside a JSON blob
+
+Bronze usually carries its payload as one JSON string, so the array does not exist as an
+array until something makes it one. Trino spells that as a cast, and so does ddi:
+
+```sql
+SELECT o.order_id,
+       json_extract_scalar(li, '$.sku')                 AS sku,
+       CAST(json_extract_scalar(li, '$.qty') AS BIGINT) AS qty
+FROM source o
+CROSS JOIN UNNEST(CAST(json_extract(o.data, '$.lines') AS ARRAY(JSON))) AS t(li)
+```
+
+Each element arrives as JSON text — which is what `ARRAY(JSON)` promises — so its fields come
+out with the same `json_extract_scalar` that works in the warehouse. Nothing about the
+element's shape is declared, and nothing needs to be.
+
+Arrow has no cast from text to a list, so the cast becomes `json_array_elements(...)`
+internally. Two consequences worth knowing:
+
+- A row whose path is missing, or is not an array, contributes **no rows** rather than
+  failing — a NULL array expands to nothing, as in Trino. Malformed JSON still stops the
+  pipeline, because the input is a typed column rather than arbitrary text.
+- A JSON `null` element becomes a SQL NULL element.
+
 Not supported, and refused at config load rather than on the first batch:
 
 | | |

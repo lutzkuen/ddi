@@ -178,12 +178,23 @@ enum Kind {
     IsScalar,
     /// `json_exists(json, path) -> boolean`
     Exists,
+    /// `json_array_elements(json) -> array<json>`
+    ///
+    /// The one function here that returns a *list*, and the reason it exists: `unnest`
+    /// needs a real Arrow list, and every other function in this module hands back text.
+    /// It is what `CAST(<json> AS ARRAY(JSON))` is rewritten into — see
+    /// [`crate::transform::unnest`].
+    ArrayElements,
 }
 
 impl Kind {
     fn arity(&self) -> usize {
         match self {
-            Kind::ArrayLength | Kind::Format | Kind::Parse | Kind::IsScalar => 1,
+            Kind::ArrayLength
+            | Kind::Format
+            | Kind::Parse
+            | Kind::IsScalar
+            | Kind::ArrayElements => 1,
             _ => 2,
         }
     }
@@ -192,9 +203,22 @@ impl Kind {
         match self {
             Kind::Size | Kind::ArrayLength => DataType::Int64,
             Kind::ArrayContains | Kind::IsScalar | Kind::Exists => DataType::Boolean,
+            Kind::ArrayElements => DataType::List(element_field()),
             _ => DataType::Utf8,
         }
     }
+}
+
+/// The element field of `json_array_elements`' result.
+///
+/// Named and shaped in one place because the declared return type and the array actually
+/// built have to agree exactly, or DataFusion rejects the result rather than the data.
+fn element_field() -> deltalake::arrow::datatypes::FieldRef {
+    Arc::new(deltalake::arrow::datatypes::Field::new(
+        "item",
+        DataType::Utf8,
+        true,
+    ))
 }
 
 /// Name → behaviour. Several names share one implementation, which is the point: the same
@@ -214,6 +238,9 @@ const FUNCTIONS: &[(&str, Kind)] = &[
     ("json_value", Kind::ExtractScalar),
     ("json_query", Kind::Extract),
     ("json_exists", Kind::Exists),
+    // Postgres/DuckDB lineage. Written directly it is not portable to Trino, which is why
+    // the documented spelling is `CAST(<json> AS ARRAY(JSON))` — rewritten to this.
+    ("json_array_elements", Kind::ArrayElements),
     // Other engines, same behaviour
     ("json_extract_string", Kind::ExtractScalar), // DuckDB
     ("get_json_object", Kind::ExtractScalar),     // Spark
@@ -284,6 +311,9 @@ impl ScalarUDFImpl for JsonFn {
         let mut text: Vec<Option<String>> = Vec::new();
         let mut nums: Vec<Option<i64>> = Vec::new();
         let mut bools: Vec<Option<bool>> = Vec::new();
+        // Only ArrayElements fills this. A row is `None` when the document was null or the
+        // path did not lead to an array; an element is `None` when it was JSON null.
+        let mut lists: Vec<Option<Vec<Option<String>>>> = Vec::new();
 
         for i in 0..rows {
             let arg2 = second.as_ref().map(|a| (a.is_null(i), a.value(i)));
@@ -291,6 +321,7 @@ impl ScalarUDFImpl for JsonFn {
                 match self.kind.return_type() {
                     DataType::Int64 => nums.push(None),
                     DataType::Boolean => bools.push(None),
+                    DataType::List(_) => lists.push(None),
                     _ => text.push(None),
                 }
                 continue;
@@ -304,6 +335,15 @@ impl ScalarUDFImpl for JsonFn {
                 Kind::Parse | Kind::Format => text.push(Some(raw.to_string())),
                 Kind::IsScalar => bools.push(Some(!doc.is_object() && !doc.is_array())),
                 Kind::ArrayLength => nums.push(doc.as_array().map(|a| a.len() as i64)),
+                // Each element back as JSON text, which is what `ARRAY(JSON)` means: the
+                // shape is not decided here, it is decided by whatever reads the elements.
+                // A non-array is NULL rather than an error, matching every other path
+                // lookup in this module; malformed JSON already errored above.
+                Kind::ArrayElements => lists.push(doc.as_array().map(|a| {
+                    a.iter()
+                        .map(|v| (!v.is_null()).then(|| v.to_string()))
+                        .collect()
+                })),
                 Kind::ArrayContains => {
                     let needle = arg2.expect("arity 2").1;
                     // Trino compares against a typed value; from SQL text, the honest
@@ -352,6 +392,22 @@ impl ScalarUDFImpl for JsonFn {
         Ok(ColumnarValue::Array(match self.kind.return_type() {
             DataType::Int64 => Arc::new(Int64Array::from(nums)) as ArrayRef,
             DataType::Boolean => Arc::new(BooleanArray::from(bools)) as ArrayRef,
+            DataType::List(_) => {
+                use deltalake::arrow::array::{ListBuilder, StringBuilder};
+                let mut b = ListBuilder::new(StringBuilder::new()).with_field(element_field());
+                for row in lists {
+                    match row {
+                        Some(items) => {
+                            for it in items {
+                                b.values().append_option(it);
+                            }
+                            b.append(true);
+                        }
+                        None => b.append(false),
+                    }
+                }
+                Arc::new(b.finish()) as ArrayRef
+            }
             _ => Arc::new(StringArray::from(text)) as ArrayRef,
         }))
     }
