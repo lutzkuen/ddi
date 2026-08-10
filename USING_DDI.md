@@ -20,7 +20,7 @@ rows, because it could not be correct across batch boundaries:
 |---|---|
 | cast / rename / filter | yes |
 | parse a JSON payload | yes |
-| unnest an array to child grain | yes |
+| unnest an array to child grain | yes — `CROSS JOIN UNNEST`, as your warehouse writes it |
 | `array_sum` / `array_length` etc. within a row | yes |
 | `GROUP BY`, aggregates | **no** |
 | `JOIN`, or reading a second table | **no** |

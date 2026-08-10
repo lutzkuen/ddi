@@ -25,10 +25,21 @@ pub struct SqlTransform {
 }
 
 impl SqlTransform {
-    /// Build a transform. The SQL must already have passed
-    /// [`crate::transform::validate::validate_sql`].
+    /// Build a transform, normalising any dialect spelling this engine does not run.
+    ///
+    /// Normalising here rather than only in `Config::resolve` is what makes the two
+    /// impossible to disagree: whoever builds a transform — the resolver, a test, a library
+    /// consumer — gets the same query, so one cannot accept what the other refuses. The
+    /// rewrite is idempotent, so passing already-normalised SQL through it changes nothing.
+    ///
+    /// SQL that will not parse is kept verbatim rather than rejected: this constructor
+    /// cannot fail, and [`crate::transform::validate::validate_sql`] has already refused it
+    /// in every path that reaches a running pipeline. Keeping it means the real planning
+    /// error surfaces instead of a rewriting one.
     pub fn new(sql: impl Into<String>) -> Self {
-        Self { sql: sql.into() }
+        let sql = sql.into();
+        let sql = crate::transform::validate::normalise_sql(&sql).unwrap_or(sql);
+        Self { sql }
     }
 
     pub fn sql(&self) -> &str {

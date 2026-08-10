@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::source::{ChangePolicy, Version};
-use crate::transform::validate::validate_sql;
+use crate::transform::validate::normalise_sql;
 
 fn default_allowed_latency() -> u64 {
     30
@@ -515,13 +515,17 @@ impl Config {
             ));
         }
 
-        if let Some(sql) = &p.transform_sql {
-            // Unwrap the inner Config message so the prefix is not doubled.
-            validate_sql(sql).map_err(|e| match e {
+        // Validated *and normalised*: a dialect spelling this engine does not run — Trino's
+        // `CROSS JOIN UNNEST` — is rewritten here, once, so the pipeline executes the same
+        // query the validator approved. The model's own text stays in `PipelineConfig`, so
+        // `ddi dbt convert` still pins what dbt wrote.
+        let transform_sql = match &p.transform_sql {
+            Some(sql) => Some(normalise_sql(sql).map_err(|e| match e {
                 Error::Config(m) => Error::Config(m),
                 other => Error::Config(other.to_string()),
-            })?;
-        }
+            })?),
+            None => None,
+        };
 
         if p.source_uri == p.target_uri {
             return Err(Error::Config(
@@ -589,7 +593,7 @@ impl Config {
             target_uri: p.target_uri.clone(),
             starting_version: p.starting_version,
             change_policy: p.change_policy,
-            transform_sql: p.transform_sql.clone(),
+            transform_sql,
             allowed_latency_secs: p.allowed_latency_secs.unwrap_or(d.allowed_latency_secs),
             max_bytes_per_batch: max_bytes,
             max_files_per_batch: p.max_files_per_batch.unwrap_or(d.max_files_per_batch),

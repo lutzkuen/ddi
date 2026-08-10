@@ -135,7 +135,7 @@ directory*. Every accepted feature preserves it.
 | Operation | Cross-row state | Output append-only | Status |
 |---|---|---|---|
 | cast / rename / filter | no | yes | **supported** |
-| unnest / explode | no | yes | **supported** |
+| unnest / explode | no | yes | **supported**, in Trino's spelling or DataFusion's |
 | intra-row array agg | no | yes | **supported** (`array_sum` etc.) |
 | upsert on a key | no (the *target* holds it) | no | **supported**, opt-in — see [Upserting](#upserting) |
 | lookup join vs. pinned snapshot | no | yes | v2 |
@@ -163,6 +163,38 @@ append-only output, and with it the ability to cascade into a downstream pipelin
 not itself upserting — but it needs no cross-row state of its own, because the state is the
 target table. Restating a key is answered by the row and the key, not by a window. So it is
 a per-pipeline mode rather than a rejection, and `append` is still the default.
+
+### Unnesting to child grain
+
+Expanding an array to child grain is row-local — every output row comes from exactly one
+input row — so it has always been supported. Write it the way your warehouse does:
+
+```sql
+-- Trino / Starburst / Athena / ANSI, and what a dbt model contains
+SELECT o.order_id, li.sku, li.qty
+FROM source o
+CROSS JOIN UNNEST(o.line_items) AS t(li)
+```
+
+That is rewritten internally to the engine's own spelling, which you can also write directly:
+
+```sql
+SELECT order_id, li.sku, li.qty
+FROM (SELECT order_id, unnest(line_items) AS li FROM source)
+```
+
+The rewrite runs **before** validation, so the two forms cannot diverge: whatever
+`ddi validate` accepts is what executes. `UNNEST` of a column of the same row is not a join —
+there is no second table, nothing to pin and no cross-row state — so it is not caught by the
+join rejection. A join against another table still is.
+
+Not supported, and refused at config load rather than on the first batch:
+
+| | |
+|---|---|
+| `WITH ORDINALITY` | The element's position would need generating per row, and the only spelling for that is a window function. Carry the position in the elements, or add it downstream. |
+| More than one `UNNEST` | Each multiplies the row count by the next, and `max_output_rows_per_batch` is calibrated for a single expansion. Chain pipelines instead. |
+| Spark `LATERAL VIEW` / `explode()` | Not implemented by this engine. Write the ANSI form above. |
 
 ### Intra-row aggregation
 

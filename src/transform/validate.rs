@@ -54,7 +54,7 @@ pub fn validate_sql(sql: &str) -> Result<Statement> {
         ));
     };
 
-    let query = match inner.as_ref() {
+    let mut query = match inner.as_ref() {
         SqlStatement::Query(q) => q.clone(),
         _ => {
             return Err(reject(
@@ -65,8 +65,29 @@ pub fn validate_sql(sql: &str) -> Result<Statement> {
         }
     };
 
+    // Trino's `CROSS JOIN UNNEST` is turned into the form this engine runs *before* the
+    // checks below see it, which is why the join check does not reject it. That ordering is
+    // the point: validation and execution then work on the same query, so a transform
+    // cannot be accepted here and fail on its first batch. See [`crate::transform::unnest`].
+    crate::transform::unnest::rewrite(&mut query)?;
+
     check_query(&query, &BTreeSet::new())?;
-    Ok(statement)
+    Ok(Statement::Statement(Box::new(SqlStatement::Query(query))))
+}
+
+/// Validate `sql` and return the text the engine should actually run.
+///
+/// Identical to what was written, except where a dialect spelling had to be rewritten into
+/// one this engine executes — today only Trino's `CROSS JOIN UNNEST`; see
+/// [`crate::transform::unnest`].
+///
+/// The config keeps the model's own text; only the *resolved* pipeline carries this. That
+/// way `ddi dbt convert` still pins what dbt says, and what runs is still what dbt meant.
+pub fn normalise_sql(sql: &str) -> Result<String> {
+    match validate_sql(sql)? {
+        Statement::Statement(inner) => Ok(inner.to_string()),
+        other => Ok(other.to_string()),
+    }
 }
 
 /// Check one query, given the CTE names already in scope from enclosing queries.
@@ -155,6 +176,19 @@ fn check_select(select: &Select, scope: &BTreeSet<String>) -> Result<()> {
             "deduplication is cross-row state: rows in an earlier batch are already \
              committed and cannot be compared against.",
             "deduplicate downstream with a MERGE, or accept append-only duplicates.",
+        ));
+    }
+
+    // Spark's `LATERAL VIEW explode(...)`. The parser accepts it, so without this it passed
+    // the load-time gate and then failed on the first batch with "This feature is not
+    // implemented: LATERAL VIEWS" — exactly the outcome this module exists to prevent.
+    if !select.lateral_views.is_empty() {
+        return Err(reject(
+            "LATERAL VIEW",
+            "this engine does not implement Spark's LATERAL VIEW.",
+            "write it as ANSI SQL — `FROM source o CROSS JOIN UNNEST(o.<array>) AS t(x)` — \
+             which is rewritten to the engine's own spelling automatically and means the \
+             same thing.",
         ));
     }
 
@@ -390,6 +424,41 @@ mod tests {
     #[test]
     fn struct_field_access_is_accepted() {
         validate_sql("SELECT customer.id AS customer_id FROM source").unwrap();
+    }
+
+    #[test]
+    fn spark_lateral_view_is_refused_at_load_not_on_the_first_batch() {
+        // It parses, so it used to sail through the gate and then fail at planning time —
+        // the one thing this module exists to prevent.
+        let e = validate_sql(
+            "SELECT order_id, li FROM source LATERAL VIEW explode(line_items) t AS li",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("LATERAL VIEW"), "got: {e}");
+        assert!(e.contains("CROSS JOIN UNNEST"), "points at the fix: {e}");
+    }
+
+    #[test]
+    fn the_trino_spelling_of_unnest_is_accepted() {
+        // Row-local: no second table, nothing to pin, no cross-row state. It was rejected as
+        // a JOIN until the rewrite ran before these checks.
+        validate_sql(
+            "SELECT o.order_id, li.sku FROM source o CROSS JOIN UNNEST(o.line_items) AS t(li)",
+        )
+        .expect("UNNEST of this row's own column is not a join");
+        validate_sql("SELECT o.order_id, li.sku FROM source o, UNNEST(o.line_items) AS t(li)")
+            .expect("the older comma spelling means the same thing");
+    }
+
+    #[test]
+    fn a_real_join_is_still_rejected() {
+        // The rewrite must not have opened a door: a join against another table is still
+        // unpinned and still refused.
+        let e = validate_sql("SELECT a.x FROM source a CROSS JOIN customers c")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("JOIN"), "got: {e}");
     }
 
     #[test]

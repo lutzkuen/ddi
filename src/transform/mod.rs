@@ -12,6 +12,7 @@ use crate::error::Result;
 pub mod json;
 pub mod sql;
 pub mod udf;
+pub mod unnest;
 pub mod validate;
 
 pub use sql::SqlTransform;

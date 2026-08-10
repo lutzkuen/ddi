@@ -142,6 +142,33 @@ async fn unnest_expands_to_line_item_grain() {
 }
 
 #[tokio::test]
+async fn the_trino_spelling_of_unnest_expands_to_the_same_grain() {
+    // The form a dbt-trino model actually contains. It used to be rejected as a JOIN, which
+    // it is not: UNNEST of a column of this same row reads no second table.
+    let out = run("SELECT o.order_id, li.sku, li.qty FROM source o \
+         CROSS JOIN UNNEST(o.line_items) AS t(li)")
+    .await;
+    let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "two line items plus one");
+}
+
+#[tokio::test]
+async fn the_two_spellings_of_unnest_agree() {
+    // The premise of the whole tool: the model means the same thing in the warehouse and
+    // here. If these ever diverge, one of the two engines is being lied to.
+    let trino =
+        run("SELECT o.order_id, li.sku FROM source o CROSS JOIN UNNEST(o.line_items) AS t(li)")
+            .await;
+    let datafusion =
+        run("SELECT order_id, li.sku FROM (SELECT order_id, unnest(line_items) AS li FROM source)")
+            .await;
+    let count = |b: &Vec<deltalake::arrow::array::RecordBatch>| -> usize {
+        b.iter().map(|x| x.num_rows()).sum()
+    };
+    assert_eq!(count(&trino), count(&datafusion));
+}
+
+#[tokio::test]
 async fn a_missing_struct_field_is_a_clear_error_listing_what_exists() {
     let err = SqlTransform::new("SELECT array_sum(line_items, 'nope') AS t FROM source")
         .apply(vec![orders_with_line_items()])
