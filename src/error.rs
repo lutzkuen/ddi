@@ -28,10 +28,17 @@ pub enum Error {
     /// never a code change.
     #[error(
         "source version {version} contains a dataChange Remove action (a DELETE, UPDATE or \
-         MERGE on the source table). This tool is append-only, so those rows cannot be \
+         MERGE on the source table). This pipeline is append-only, so those rows cannot be \
          propagated. Set change_policy = \"skip_change_commits\" to skip such commits \
          entirely, or \"ignore_changes\" to emit the Adds from them (which may duplicate \
-         rewritten rows downstream)."
+         rewritten rows downstream).\n\
+         \n\
+         If the source is itself the target of a ddi pipeline running write_mode = \
+         \"upsert\", every one of its commits looks like this, and neither of those two is \
+         the right answer on its own: \"skip_change_commits\" would drop whole commits \
+         including the keys they insert. Set change_policy = \"ignore_changes\" *and* \
+         write_mode = \"upsert\" here too, keyed the same way, so the re-emitted rows merge \
+         onto their keys instead of accumulating."
     )]
     ChangeCommit { version: u64 },
 

@@ -8,17 +8,19 @@ use deltalake::arrow::datatypes::SchemaRef;
 use deltalake::delta_datafusion::DataFusionMixins;
 use deltalake::DeltaTable;
 use futures::TryStreamExt;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::ResolvedPipeline;
 use crate::dbt::watermark;
 use crate::dedup::{self, Dedup};
+use crate::dq::DataQuality;
 use crate::error::{Error, Result};
 use crate::offset::OffsetStore;
-use crate::schema::SchemaCoercer;
-use crate::sink::Sink;
+use crate::schema::{Rejected, SchemaCoercer};
+use crate::sink::{Sink, UpsertStats};
 use crate::source::{LogBatch, LogStreamBuilder, StreamCursor, Version};
 use crate::transform::{Identity, SqlTransform, Transform};
+use crate::upsert::{self, MergePlan};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepOutcome {
@@ -30,10 +32,21 @@ pub enum StepOutcome {
         files: usize,
         rows: usize,
         target_version: Option<Version>,
+        /// What the merge did, when this pipeline upserts. `None` in append mode.
+        upsert: Option<UpsertStats>,
+        /// Rows the target would not take, written to the data-quality table instead.
+        rejected: usize,
     },
-    /// Source commits existed but produced no rows (all filtered out, or all skipped).
-    /// The offset still advances so the same commits are not re-read forever.
-    Skipped { through_version: Version },
+
+    /// Source commits existed but produced no rows for the target — every row was filtered
+    /// out, already covered, or rejected. The offset still advances so the same commits are
+    /// not re-read forever.
+    Skipped {
+        through_version: Version,
+        /// Rows the target would not take. Non-zero here is the loud case: the batch had
+        /// rows and *none* of them made it, which is usually a schema change upstream.
+        rejected: usize,
+    },
 }
 
 pub struct Pipeline {
@@ -48,6 +61,9 @@ pub struct Pipeline {
     /// What the target already held when this pipeline opened. Rows it covers are
     /// suppressed, because a rebuild already wrote them.
     dedup: Dedup,
+    /// Where rows the target will not take are put. `None` when there is no such table, in
+    /// which case a bad row still stops the pipeline — see [`crate::dq`].
+    dq: Option<DataQuality>,
 }
 
 impl Pipeline {
@@ -115,6 +131,42 @@ impl Pipeline {
             None => Dedup::default(),
         };
 
+        if cfg.write_mode.is_upsert() {
+            // resolve() guarantees both of these are set for an upsert pipeline.
+            let key = cfg.upsert_key.as_deref().expect("checked in resolve");
+            let sequence = cfg.dedup_timestamp.as_deref().expect("checked in resolve");
+            upsert::preflight(&target, &target_schema, key, sequence, cfg.upsert_lookback)
+                .await
+                .map_err(|e| Error::Config(format!("pipeline {:?}: {e}", cfg.name)))?;
+            info!(
+                pipeline = %cfg.name,
+                upsert_key = %key,
+                sequence = %sequence,
+                lookback = ?cfg.upsert_lookback,
+                "rows will replace the key they already have, when they are newer"
+            );
+        }
+
+        // Whether bad rows can be set aside is decided here, once, rather than on the batch
+        // that meets one — so an operator learns which mode a pipeline is in from its
+        // startup line, not from an incident.
+        let dq_uri = cfg.dq_uri();
+        let dq = DataQuality::open(&cfg.storage, &dq_uri, &cfg.app_id, &cfg.name).await?;
+        match &dq {
+            Some(_) => info!(
+                pipeline = %cfg.name,
+                dq_uri = %dq_uri,
+                "rows the target will not take will be written here instead of stopping the \
+                 pipeline"
+            ),
+            None => info!(
+                pipeline = %cfg.name,
+                dq_uri = %dq_uri,
+                "no data-quality table; a row the target will not take stops this pipeline \
+                 (which then retries). Create the table to have such rows set aside instead."
+            ),
+        }
+
         Ok(Self {
             cfg,
             source,
@@ -125,6 +177,7 @@ impl Pipeline {
             offsets,
             coercer: SchemaCoercer::new(target_schema),
             dedup,
+            dq,
         })
     }
 
@@ -159,19 +212,43 @@ impl Pipeline {
         // 3. Transform. Stateless, row-local, validated at config load.
         let output = self.transform.apply(input).await?;
 
-        // 4. Cast to the target schema. Hard-fail on mismatch — no silent nulls.
+        // Which target columns the transform actually produced, read *before* coercion —
+        // afterwards every target column is present, because that is what coercion does,
+        // and the ones it invented are nulls an upsert must not write. See
+        // `SchemaCoercer::columns_present_in`.
+        let produced: Vec<String> = output
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .map(|b| self.coercer.columns_present_in(b))
+            .unwrap_or_default();
+
+        // 4. Cast to the target schema. Never a silent null: either the whole batch fails,
+        // or the rows that will not convert are set aside for the data-quality table and
+        // the rest goes on. Which of those happens is decided once, at open, by whether
+        // there is a table to set them aside in.
         let mut coerced = Vec::with_capacity(output.len());
+        let mut rejects: Vec<Rejected> = Vec::new();
         for b in &output {
             if b.num_rows() == 0 {
                 continue;
             }
-            let c = self.coercer.coerce(b)?;
+            let c = match self.dq.is_some() {
+                true => {
+                    let split = self.coercer.coerce_quarantining(b)?;
+                    if let Some(bad) = split.bad {
+                        rejects.push(bad);
+                    }
+                    split.good
+                }
+                false => self.coercer.coerce(b)?,
+            };
             let c = self.dedup.apply(c)?;
             if c.num_rows() > 0 {
                 coerced.push(c);
             }
         }
         let out_rows: usize = coerced.iter().map(|b| b.num_rows()).sum();
+        let rejected_rows: usize = rejects.iter().map(Rejected::len).sum();
 
         // Unnest amplification guard (plan §3): a 64 MB source file must not become 6 GB
         // of RAM downstream. Checked after the transform because that is when the real
@@ -190,20 +267,64 @@ impl Pipeline {
         // fully-filtered commit would be re-read forever.
         let txn_version = self.offsets.txn_version_for(batch.end)?;
 
+        // 4b. Rejects go to their own table *before* the target commits, and they are the
+        // only thing here that is not covered by the batch's own atomicity — two tables
+        // cannot share one Delta commit. Writing them first is what makes the failure mode
+        // a duplicate rather than a gap: a crash in between replays the batch, and the
+        // reject is written again unless the data-quality table's own txn action says it
+        // is already there. See `crate::dq`.
+        if rejected_rows > 0 {
+            let written = self.write_rejects(&rejects, txn_version).await?;
+            if in_rows > 0 && out_rows == 0 {
+                // Every row failed. That is far more likely to be an upstream type change
+                // than a batch of uniformly bad data, and it is invisible in the target —
+                // which simply stops growing — so it is said out loud here.
+                warn!(
+                    pipeline = %self.cfg.name,
+                    through_version = through,
+                    rejected = rejected_rows,
+                    reason = rejects
+                        .first()
+                        .and_then(|r| r.reasons.first())
+                        .map(String::as_str)
+                        .unwrap_or("unknown"),
+                    "every row in this batch went to the data-quality table. If this repeats, \
+                     the source's schema has probably changed rather than its data going bad."
+                );
+            }
+            debug!(
+                pipeline = %self.cfg.name,
+                rejected = rejected_rows,
+                written,
+                "rows the target would not take"
+            );
+        }
+
         if coerced.is_empty() {
             // Nothing to write, but the source version was still consumed, so the offset
             // must advance or these commits would be re-read forever. A zero-row batch in
             // the target schema (rather than an empty batch *list*, which delta-rs
             // rejects) commits the txn action with no data attached.
+            //
+            // Always the append writer, never the merge, whatever the write mode: delta-rs
+            // declines to commit a merge that produced no actions, which would take the
+            // txn action down with it and strand the offset here forever.
             let empty = RecordBatch::new_empty(self.coercer.target());
             self.commit(vec![empty], txn_version).await?;
             return Ok(StepOutcome::Skipped {
                 through_version: through,
+                rejected: rejected_rows,
             });
         }
 
-        // 5+6. Write parquet and commit the Add actions AND the txn action atomically.
-        self.commit(coerced, txn_version).await?;
+        // 5+6. Write parquet and commit the data actions AND the txn action atomically.
+        let (out_rows, upsert) = if self.cfg.write_mode.is_upsert() {
+            let stats = self.upsert(coerced, produced, txn_version).await?;
+            (stats.rows_written(), Some(stats))
+        } else {
+            self.commit(coerced, txn_version).await?;
+            (out_rows, None)
+        };
 
         let target_version = self.target.version();
         info!(
@@ -222,7 +343,127 @@ impl Pipeline {
             files,
             rows: out_rows,
             target_version,
+            upsert,
+            rejected: rejected_rows,
         })
+    }
+
+    /// Write this batch's rejects to the data-quality table.
+    ///
+    /// Errors rather than swallowing: if the rejects cannot be recorded, the target must not
+    /// commit either, or the offset would advance past rows that went nowhere. Failing here
+    /// leaves the whole batch to be retried, which is why the write is idempotent.
+    async fn write_rejects(&mut self, rejects: &[Rejected], txn_version: i64) -> Result<usize> {
+        let Some(dq) = self.dq.as_mut() else {
+            // Unreachable: rejects are only produced when a table was opened.
+            return Err(Error::Other(
+                "internal: rows were rejected but there is no data-quality table".into(),
+            ));
+        };
+        let now = chrono::Utc::now().naive_utc().and_utc().timestamp_micros();
+        dq.write(rejects, txn_version, now).await
+    }
+
+    /// Collapse the batch to one row per key, work out how much of the target the merge has
+    /// to see, and merge.
+    async fn upsert(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        update_columns: Vec<String>,
+        txn_version: i64,
+    ) -> Result<UpsertStats> {
+        let key = self.cfg.upsert_key.as_deref().expect("checked in resolve");
+        let sequence = self
+            .cfg
+            .dedup_timestamp
+            .as_deref()
+            .expect("checked in resolve");
+
+        let batch = upsert::collapse(&batches, key, sequence)?;
+        let collapsed_away: usize =
+            batches.iter().map(|b| b.num_rows()).sum::<usize>() - batch.num_rows();
+
+        // A merge reads the target, so unlike a blind append it can lose a commit race —
+        // and the writer most likely to be racing is the nightly rebuild this tool is built
+        // to coexist with. delta-rs reports the conflict rather than replanning, because
+        // the plan it holds was built against files that no longer exist.
+        //
+        // Replanning is exactly what is needed, and it is safe to do: merging by key is
+        // idempotent, so redoing the work cannot double-apply it. A blind retry of the same
+        // plan would not be — it would merge against a stale window.
+        for attempt in 1..=MERGE_ATTEMPTS {
+            let plan = MergePlan::resolve(
+                &self.target,
+                &batch,
+                key,
+                sequence,
+                self.cfg.upsert_lookback,
+                update_columns.clone(),
+            )?;
+            self.warn_about_window(&plan);
+
+            let table = std::mem::replace(&mut self.target, DeltaTable::new_in_memory());
+            match self
+                .sink
+                .upsert(table, batch.clone(), txn_version, &plan)
+                .await
+            {
+                Ok((t, stats)) => {
+                    self.target = t;
+                    info!(
+                        pipeline = %self.cfg.name,
+                        updated = stats.updated,
+                        inserted = stats.inserted,
+                        collapsed_away,
+                        target_files_scanned = stats.files_scanned,
+                        window = %plan.window.lower_bound_display(),
+                        window_bounded = plan.window.is_bounded(),
+                        window_clamped = plan.window.clamped,
+                        candidate_files = plan.window.candidate_files,
+                        attempt,
+                        "merged"
+                    );
+                    return Ok(stats);
+                }
+                Err(e) => {
+                    // Restore a usable handle either way.
+                    self.target = self.cfg.storage.open(&self.cfg.target_uri).await?;
+                    if !is_commit_conflict(&e) || attempt == MERGE_ATTEMPTS {
+                        return Err(e);
+                    }
+                    warn!(
+                        pipeline = %self.cfg.name,
+                        attempt,
+                        of = MERGE_ATTEMPTS,
+                        error = %e,
+                        "another writer committed to the target while this merge was running; \
+                         replanning against what it left behind"
+                    );
+                }
+            }
+        }
+        unreachable!("the loop returns on its last attempt")
+    }
+
+    fn warn_about_window(&self, plan: &MergePlan) {
+        if plan.window.clamped {
+            warn!(
+                pipeline = %self.cfg.name,
+                lower_bound = %plan.window.lower_bound_display(),
+                candidate_files = plan.window.candidate_files,
+                "upsert_lookback stopped the merge window short of what the target's \
+                 statistics asked for. A key in this batch may have an older row below the \
+                 floor; it will be inserted alongside rather than replacing it. Raise \
+                 upsert_lookback, or remove it to let completeness win."
+            );
+        } else if !plan.window.is_bounded() {
+            warn!(
+                pipeline = %self.cfg.name,
+                reason = plan.window.unbounded_because.unwrap_or("unknown"),
+                "the merge has to read the whole target: its statistics cannot rule any file \
+                 out. Correct, but the cost grows with the table."
+            );
+        }
     }
 
     async fn commit(&mut self, batches: Vec<RecordBatch>, txn_version: i64) -> Result<()> {
@@ -308,6 +549,31 @@ impl Pipeline {
             }
         }
     }
+}
+
+/// How many times a merge is replanned against a concurrent writer before giving up.
+///
+/// Small on purpose. A couple of attempts absorbs a rebuild landing mid-merge; a pipeline
+/// that cannot win in three is contending with something that needs looking at, and
+/// spinning would only hide it.
+const MERGE_ATTEMPTS: u32 = 3;
+
+/// Did this fail because somebody else committed first?
+///
+/// Only this class is worth replanning for. A cast failure or a missing column would fail
+/// the same way every time.
+fn is_commit_conflict(e: &Error) -> bool {
+    use deltalake::kernel::transaction::TransactionError;
+    use deltalake::DeltaTableError;
+
+    matches!(
+        e,
+        Error::Delta(DeltaTableError::Transaction {
+            source: TransactionError::CommitConflict(_)
+                | TransactionError::VersionAlreadyExists(_)
+                | TransactionError::MaxCommitAttempts(_),
+        })
+    )
 }
 
 /// A Delta table's own identity, which survives nothing but the table itself.

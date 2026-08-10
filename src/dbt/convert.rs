@@ -94,6 +94,17 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
                     .to_string(),
             ),
             dedup_key: tgt.meta_str("ddi_key").map(str::to_string),
+            // Upserting is declared next to the model too, for the same reason the
+            // timestamp is: the grain of a table is a property of the model, not of how
+            // this daemon happens to be deployed.
+            write_mode: match tgt.meta_str("ddi_write_mode") {
+                Some("upsert") => crate::config::WriteMode::Upsert,
+                _ => crate::config::WriteMode::Append,
+            },
+            upsert_key: tgt.meta_str("ddi_upsert_key").map(str::to_string),
+            // Defaults to <target>__ddi_dq; declared only when it lives somewhere else.
+            dq_uri: tgt.meta_str("ddi_dq").map(str::to_string),
+            upsert_lookback: tgt.meta_str("ddi_upsert_lookback").map(str::to_string),
             // Carried so a running pipeline can re-ask the catalog where these live.
             source_relation: src.fully_qualified(),
             target_relation: tgt.fully_qualified(),

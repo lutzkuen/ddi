@@ -229,10 +229,10 @@ its first batch.
 ### Metrics
 
 `ddi run --metrics-addr 0.0.0.0:9100` serves Prometheus text on `/metrics`, labelled by
-pipeline: `ddi_rows_written_total`, `ddi_source_lag_versions`,
+pipeline: `ddi_pipeline_up`, `ddi_rows_written_total`, `ddi_source_lag_versions`,
 `ddi_last_source_version`, `ddi_errors_total`, and others.
 
-Alert on `ddi_source_lag_versions` for backlog and `increase(ddi_errors_total[5m])` for a
+Alert on `ddi_pipeline_up == 0` for a down stream, `ddi_source_lag_versions` for backlog and `increase(ddi_errors_total[5m])` for a
 stopped pipeline. There is no dead-letter queue by design, so any error means a pipeline
 has stopped and needs a human.
 
@@ -279,6 +279,7 @@ that gets backfilled.
 | `OPTIMIZE` on either table | Ignored — those commits carry `dataChange: false` |
 | `DELETE`/`UPDATE` upstream | Skipped, never propagated (see `change_policy`) |
 | `DELETE` of old rows in the target | Left deleted |
+| Same key delivered again with changes | Appended as a second row — or, under `ddi_write_mode: upsert`, replaces the stored one |
 | Target dropped and recreated | Refilled from scratch |
 | Source dropped and recreated | Starts over, emitting only what is missing |
 
@@ -292,8 +293,10 @@ history.
 
 - **Decimals, not doubles.** If bronze declares prices as `double`, precision was already
   lost before `ddi` saw the row. Use `decimal(18,4)` at bronze.
-- **A cast that cannot be done exactly is an error**, never a silent NULL. There is no
-  dead-letter queue: bad input stops the pipeline.
+- **A cast that cannot be done exactly is never a silent NULL.** Where the model's target
+  has a `__ddi_dq` table next to it, the offending *rows* go there with the reason attached
+  and the rest of the batch commits; where it does not, the batch fails. Either way the
+  target only holds values that survived the cast. See below.
 - **Unnest amplification.** A row with a 10k-element array becomes 10k rows. Batches are
   bounded on input bytes *and* `max_output_rows_per_batch`.
 - **`app_id` is the offset key** and must be stable forever. It is derived from the model
@@ -302,14 +305,82 @@ history.
   supported mode. Delta's optimistic concurrency keeps it correct, but it wastes work.
 - **Deletion vectors in the source** are an explicit error, never a silent wrong result.
 
+### Bad rows, and streams that break
+
+Running one pipeline, "stop and wait for a human" is the right answer to a malformed value.
+Running three hundred, it is an outage. Two things changed:
+
+**A row the target will not take goes to `<target>__ddi_dq`** — derived, so nothing needs
+configuring — and the rest of the batch commits. Create the table and quarantining is on;
+leave it out and a bad row still fails the pipeline, because silently discarding rejects
+because nobody made somewhere to put them is worse than stopping.
+
+```sql
+CREATE TABLE silver.orders__ddi_dq (
+  app_id VARCHAR, pipeline VARCHAR, source_version BIGINT,
+  column_name VARCHAR, reason VARCHAR, payload VARCHAR, _timestamp TIMESTAMP(6)
+) WITH (location = 'abfss://.../silver/orders__ddi_dq')
+```
+
+Nothing is nulled and nothing is dropped — `payload` holds the row as it arrived, so you can
+see what broke and replay it once the upstream is fixed. A *structural* problem (a column the
+model never selects, a transform that will not plan) is not quarantined: it is the same on
+every batch, so it fails the pipeline instead of leaving a target that quietly never grows.
+
+**A pipeline that fails no longer takes the others down.** It backs off and reopens, its
+peers keep running, and `ddi_pipeline_up` says which of them are healthy. That makes metrics
+worth turning on: `--metrics-addr 127.0.0.1:9100`, then alert on `ddi_pipeline_up == 0 for
+10m` and `increase(ddi_batches_fully_rejected_total[15m]) > 0` — the second catches an
+upstream type change, where every row is quarantined and the target silently stops growing.
+
 ### Deletes and updates upstream
 
-`ddi` is append-only. By default a `DELETE`, `UPDATE` or `MERGE` on the source stops the
-pipeline rather than guessing. To carry on, set a policy per pipeline:
+By default a `DELETE`, `UPDATE` or `MERGE` on the source stops the pipeline rather than
+guessing. To carry on, set a policy per pipeline:
 
 - `fail` (default) — stop on any change commit
 - `skip_change_commits` — consume and ignore those commits
 - `ignore_changes` — emit their new files, accepting that rewritten rows appear twice
+
+### One row per key, instead of one per delivery
+
+A pipeline is append-only unless you say otherwise, so an order that is placed, then paid,
+then shipped leaves three rows in silver. To have silver hold only the latest:
+
+```yaml
+models:
+  - name: orders_stg
+    meta:
+      ddi_write_mode: upsert
+      ddi_timestamp:  _timestamp   # decides which of two rows is newer
+      ddi_key:        order_id     # what a row is matched on
+```
+
+A delivery replaces the stored row when its `ddi_timestamp` is greater, and is inserted when
+the key is new. Re-delivering something older is a no-op, so a replay cannot roll the target
+backwards. Exactly-once is unchanged — the offset still rides in the merge's own commit.
+
+The merge only reads the part of the target that could hold the keys in the batch, worked out
+from the target's own file statistics without opening any data files. Where those statistics
+cannot answer — a key column past `delta.dataSkippingNumIndexedCols`, or a writer that
+recorded none — it reads the whole table instead: slower, never wrong. `ddi_upsert_lookback:
+"48h"` puts a floor under how far back it will reach, which bounds the cost but means a
+correction older than the floor is inserted alongside the row it should have replaced. That
+case is logged and counted in `ddi_upsert_window_clamped_total`; alert on it.
+
+Two things to know before switching a running pipeline over:
+
+- **The target must already hold one row per key.** `ddi` checks at startup and refuses
+  otherwise. A merge matches on the stored row, so it would update every duplicate rather
+  than collapse them. Rebuild the table with
+  `QUALIFY row_number() OVER (PARTITION BY order_id ORDER BY _timestamp DESC) = 1` first.
+- **An upserted target cannot feed an appending `ddi` pipeline.** A merge rewrites files, so
+  its commits read downstream as change commits — and `skip_change_commits` would silently
+  drop the keys they insert. A downstream pipeline must be on `ignore_changes` *and*
+  `upsert`, keyed the same way. `ddi validate` rejects the rest.
+
+Columns the model does not select are left alone on an update. If an enrichment job owns a
+column in silver, an upsert will not blank it.
 
 ---
 
@@ -324,6 +395,9 @@ pipeline rather than guessing. To carry on, set a policy per pipeline:
 | `Account must be specified` | Credentials are not reaching storage; check `[storage.options]` |
 | `target ... was rewritten ... but no dedup_timestamp` | The batch rebuilt the table and `ddi` has no way to tell what it covered; set `ddi_timestamp` |
 | `source ... has gone backwards` / `different id` | The source was dropped and recreated; `ddi` restarts from the beginning if `ddi_timestamp` is set |
+| `the target already holds ... more than once` | Switching to `upsert` on a table that accumulated duplicates while append-only; collapse it to one row per key first |
+| `upserts into ... which pipeline ... reads as its source` | A downstream pipeline cannot read an upserted target unless it also upserts on the same key with `ignore_changes` |
+| `write_mode = "upsert" needs upsert_key` | Set `ddi_key` on the model (or `upsert_key` in the TOML) |
 
 Logs are quiet by default. `RUST_LOG=debug,delta_delta_ingest=trace` for detail.
 

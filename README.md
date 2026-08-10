@@ -137,6 +137,7 @@ directory*. Every accepted feature preserves it.
 | cast / rename / filter | no | yes | **supported** |
 | unnest / explode | no | yes | **supported** |
 | intra-row array agg | no | yes | **supported** (`array_sum` etc.) |
+| upsert on a key | no (the *target* holds it) | no | **supported**, opt-in — see [Upserting](#upserting) |
 | lookup join vs. pinned snapshot | no | yes | v2 |
 | `GROUP BY` aggregation | **yes** | **no** | **rejected — different product** |
 
@@ -153,10 +154,15 @@ It is rejected even when a group provably cannot span a batch. Accepting `GROUP 
 invites `GROUP BY customer_id`, which silently emits partial sums. Safe by construction beats
 safe by convention.
 
-Aggregation would force upsert output (killing the ability to cascade this tool into itself),
-make exactly-once depend on merge-commit atomicity, and drag in watermarks the moment anyone
-asks for windows. If it is ever wanted it is a separate binary with separate guarantees — not
-a flag.
+Aggregation would drag in watermarks the moment anyone asks for windows, and a group that
+spans batches has no correct partial answer. If it is ever wanted it is a separate binary
+with separate guarantees — not a flag.
+
+Upserting is the one thing on that list that turned out to be separable. It gives up
+append-only output, and with it the ability to cascade into a downstream pipeline that is
+not itself upserting — but it needs no cross-row state of its own, because the state is the
+target table. Restating a key is answered by the row and the key, not by a window. So it is
+a per-pipeline mode rather than a rejection, and `append` is still the default.
 
 ### Intra-row aggregation
 
@@ -390,6 +396,204 @@ the target already holds, so only genuinely missing rows are emitted. Without a
 `dedup_timestamp` there is nothing to filter on and starting over would append the whole
 table a second time, so it stops and says so.
 
+## Bad rows, and broken streams
+
+Two different failures used to have the same answer — stop — and at one pipeline watched by a
+person that was right. At three hundred it is not: the chance that *some* stream meets a
+malformed value approaches one, and "wait for a human" turns a single bad row into an outage.
+
+### A row the target will not take
+
+Bronze says `amount` is text. Silver says it is a `BIGINT`. Most rows convert; the one that
+says `"n/a"` does not. That row goes to a **data-quality table**, and the rest of the batch
+commits:
+
+```
+<target_uri>__ddi_dq
+```
+
+Derived from the target, so a fleet needs no per-pipeline configuration; override with
+`dq_uri` (or `meta.ddi_dq`) where it belongs somewhere else. Like every table here, `ddi`
+never creates it — and that absence is the switch. **No table, no quarantine:** a bad row
+still fails the pipeline, because quietly discarding rejects on the grounds that nobody made
+somewhere to put them is the one outcome worse than stopping. The startup line says which
+mode a pipeline is in.
+
+```sql
+CREATE TABLE silver.orders__ddi_dq (
+  app_id          VARCHAR,
+  pipeline        VARCHAR,
+  source_version  BIGINT,   -- the batch's last source version, not the row's
+  column_name     VARCHAR,  -- the column that rejected it
+  reason          VARCHAR,
+  payload         VARCHAR,  -- the row as it arrived, as JSON
+  _timestamp      TIMESTAMP(6)
+) WITH (location = 'abfss://.../silver/orders__ddi_dq')
+```
+
+What is **not** given up is the part that matters: nothing is nulled to make it fit and
+nothing is dropped. The target holds only values that survived the cast, and every rejected
+row is queryable with the reason attached:
+
+```sql
+SELECT reason, count(*) FROM silver.orders__ddi_dq
+WHERE _timestamp > now() - interval '1' day GROUP BY reason
+```
+
+Two things are deliberately *not* quarantined:
+
+- **A structural mismatch** — a target column the transform does not produce at all, a
+  transform that will not plan. It is identical on every batch and belongs to no row, so
+  setting rows aside would leave a target that silently never grows. It fails the pipeline.
+- **A bad value inside a `struct`, `list` or `map`.** Arrow pushes a lenient cast down into
+  the *children* and keeps the parent's null buffer, so an unconvertible element becomes a
+  `NULL` inside a row that still looks valid from the outside — undetectable per row, and it
+  would reach the target. Nested columns therefore keep the strict cast: one bad value fails
+  the batch.
+
+Rejects are written **before** the target commits, in their own commit. Two tables cannot
+share one Delta commit, so the ordering is the guarantee: a crash in between replays the
+batch, which can duplicate a reject but can never lose one. Even that is usually avoided —
+the data-quality commit carries a `txn` action of its own under `<app_id>.dq`, and a replay
+of the same batch finds it and skips.
+
+### A stream that cannot make progress
+
+A pipeline that hits something it cannot handle no longer ends. It backs off — 1s, doubling
+to 5 minutes, jittered so three hundred of them do not return in lockstep after an outage —
+and reopens. The backoff resets the moment a step succeeds.
+
+**Its peers are never touched.** Previously the first pipeline to fail cancelled every other
+one; worse, in `run` mode the failure was noticed only when every pipeline spawned before it
+had finished, which is never — so the stream died silently and nothing restarted it.
+
+Because the process no longer exits when a stream dies, metrics stop being optional:
+
+| Signal | Meaning |
+|---|---|
+| `ddi_pipeline_up` | 1 while streaming, 0 while backing off. **The health signal.** |
+| `ddi_pipeline_seconds_since_progress` | Staleness. Still moves when a pipeline fails while *opening*, which lag does not. |
+| `ddi_pipeline_restarts_total` | Reopens after a failure. Climbing steadily = stuck on something a human must fix. |
+| `ddi_rows_rejected_total` | Rows sent to the data-quality table. |
+| `ddi_batches_fully_rejected_total` | Batches where *every* row was rejected. |
+
+Alert on `ddi_pipeline_up == 0 for 10m` and on
+`increase(ddi_batches_fully_rejected_total[15m]) > 0`. The second one matters more than it
+looks: there is no bad-row threshold, so an upstream type change quarantines the whole batch
+and the target simply stops growing — no error, no lag, nothing else to notice it by.
+`ddi_errors_total` is now a *rate* of retried attempts, not a page: a pipeline that lost one
+commit race and recovered a second later increments it.
+
+## Upserting
+
+Append-only silver holds every version of a row. If an order is placed, then paid, then
+shipped, silver holds three rows for it and something downstream has to pick the last one.
+`write_mode = "upsert"` makes silver hold one row per key instead:
+
+```toml
+[[pipeline]]
+name            = "orders_stg"
+app_id          = "ddi.orders_stg"
+source_uri      = "/lake/bronze/orders"
+target_uri      = "/lake/silver/orders"
+write_mode      = "upsert"
+dedup_timestamp = "_timestamp"   # decides which of two rows is newer
+upsert_key      = "order_id"     # defaults to dedup_key
+upsert_lookback = "48h"          # optional; a cost ceiling, not a correctness knob
+```
+
+or, in dbt, next to the model:
+
+```yaml
+models:
+  - name: orders_stg
+    meta:
+      ddi_write_mode: upsert
+      ddi_timestamp:  _timestamp
+      ddi_key:        order_id
+```
+
+The rule is `WHEN MATCHED AND source._timestamp > target._timestamp THEN UPDATE`, plus
+`WHEN NOT MATCHED THEN INSERT`. Re-delivering a row that is older than the stored one is a
+no-op, so a replay after a rebuild cannot roll the target backwards.
+
+Exactly-once is unchanged: `CommitProperties::with_application_transaction` puts the `txn`
+action in the merge's own commit, so data and offset still advance together or not at all.
+
+### The bounded window
+
+A merge has to read the target, which an append never does. Reading all of it on every batch
+is what makes naive MERGE-on-a-stream unusable, so the merge is given a predicate:
+
+```sql
+MERGE INTO target t USING batch s
+  ON  t.order_id = s.order_id
+  AND t._timestamp >= <lo>
+```
+
+`<lo>` comes from the target's own transaction log, and no data files are opened to compute
+it. Delta records `minValues`/`maxValues` per file, so walking the live files answers "which
+of these could hold one of the keys I am holding?" directly; `<lo>` is then the *lowest*
+`_timestamp` any of them holds. A file the statistics rule out is never read.
+
+Two details do the real work:
+
+- **The minimum is taken over every candidate file, not just the old ones.** The predicate is
+  the `ON` clause of an outer join, so a target row below `<lo>` is unmatched even when its
+  file is read — and an unmatched row means `INSERT`, i.e. a duplicate key. Taking the
+  minimum over all candidates puts `<lo>` at or under the first row of every file still in
+  play. This matters because ddi's own merges create files that straddle any cut-off: a
+  matched file is rewritten whole, old rows copied in beside the new ones.
+- **The keys are tested as a set, not as a range.** A batch of today's orders plus one
+  re-delivered ancient one spans nearly the whole key space as a range but touches only two
+  regions of it as a set.
+
+Where the statistics run out — a key column past `delta.dataSkippingNumIndexedCols` (32 by
+default), a writer that recorded none, a type that will not line up — the window opens to the
+whole target. Slow, and correct. Truncated string statistics are handled rather than trusted:
+a `maxValues` of `"ord"` may stand for `"ordz"`, so it never rules a file out.
+
+### `upsert_lookback`
+
+A floor: the window will not open below `min(batch timestamp) - upsert_lookback` however far
+back the statistics say it should. It buys bounded cost when the statistics cannot bound
+anything themselves — a UUID key, where every file's key range overlaps every other.
+
+It is not free, and the trade is explicit. When the floor wins, a key in that batch may have
+an older row below it that will not be matched, and it is inserted alongside instead of
+replacing it. That is logged at `warn` and counted in
+`ddi_upsert_window_clamped_total` — **alert on it.** Leave `upsert_lookback` unset and
+completeness always wins.
+
+### What it costs, and what it rules out
+
+| | Append | Upsert |
+|---|---|---|
+| Reads the target | never | the part the window admits |
+| Rows per key | one per delivery | one |
+| Commit contains | `Add` | `Add` + `dataChange` `Remove` |
+| Concurrent-writer conflicts | cannot happen | possible; replanned and retried |
+| Can feed a downstream `ddi` | yes | only one that also upserts |
+
+That last row is the real cost. A merge rewrites files, so every upsert commit carries a
+`dataChange` `Remove` and reads downstream as a change commit. `change_policy =
+"skip_change_commits"` would drop those commits **including the keys they insert**, silently.
+The only combination that survives is a downstream on `ignore_changes` *and*
+`write_mode = "upsert"`, keyed the same way — and `ddi validate` rejects the others rather
+than letting you find out in production.
+
+Two more things are checked before the first batch rather than during it: the target must not
+be `delta.appendOnly`, and it must not already hold a key twice. The second is what an
+append-only target looks like after a key was restated, and a merge would keep those
+duplicates forever — it matches on the stored row, so it updates every copy rather than
+collapsing them. Collapse the target first:
+
+```sql
+CREATE OR REPLACE TABLE silver.orders AS
+SELECT * FROM silver.orders
+QUALIFY row_number() OVER (PARTITION BY order_id ORDER BY _timestamp DESC) = 1
+```
+
 ### JSON payloads
 
 Bronze often carries a payload as text, so Trino's JSON functions are implemented here
@@ -536,11 +740,17 @@ correctness still holds (the `txn` action prevents double-apply) — it just was
 - **Target table creation.** External tooling, same as KDI.
 - **Schema evolution.** Read the target schema, cast, fail on mismatch.
 - **Aggregations, stream-stream joins, windows, watermarks.**
-- **Dead-letter queue.** Input is typed Parquet, not arbitrary JSON. A cast failure is a
-  pipeline failure and stops the world.
-- **Deduplication / restatement.** If Kafka emits order v1 then a corrected v2, append-only
-  silver holds both. Dedup-to-latest is genuinely stateful — leave it to a downstream MERGE.
-- **Deletion propagation.**
+- **Silently repairing bad data.** A value that will not convert is never nulled or dropped
+  to make it fit. It is either the whole batch's problem, or it goes to a
+  [data-quality table](#bad-rows-and-broken-streams) with the reason attached — and in both
+  cases the target only ever holds values that survived the cast.
+- **Deduplication / restatement in append mode.** If Kafka emits order v1 then a corrected
+  v2, append-only silver holds both, and that is the mode's promise rather than a gap. Where
+  you want one row per key, [`write_mode = "upsert"`](#upserting) does it here instead of in
+  a downstream MERGE — at the cost of reading part of the target on every batch, and of the
+  target no longer being an append-only table.
+- **Deletion propagation.** Not even in upsert mode: a merge here inserts and updates, never
+  deletes. A key that disappears upstream keeps its last known row.
 - **Deletion vectors** in the source: explicit unsupported error, never a silent wrong result.
 
 ## Operational notes
@@ -573,11 +783,34 @@ correctness still holds (the `txn` action prevents double-apply) — it just was
 | `ddi_batches_committed_total` | counter | Batches committed. |
 | `ddi_rows_written_total` | counter | Rows written to targets. |
 | `ddi_files_read_total` | counter | Source data files read. |
-| `ddi_errors_total` | counter | Step errors. A step error stops the pipeline. |
+| `ddi_errors_total` | counter | Failed attempts. A failure retries with backoff; this is a rate, not a page. |
 | `ddi_commits_skipped_total` | counter | Source commits consumed that produced no rows. |
 | `ddi_last_source_version` | gauge | Last source version **durably committed** (the `txn` value). |
 | `ddi_source_head_version` | gauge | Source head at the last poll. |
 | `ddi_source_lag_versions` | gauge | Source commits not yet consumed. |
+| `ddi_pipeline_up` | gauge | 1 while streaming, 0 while backing off after a failure. |
+| `ddi_pipeline_seconds_since_progress` | gauge | Since the last completed step; -1 before the first. |
+| `ddi_pipeline_restarts_total` | counter | Reopens after a failure. |
+| `ddi_rows_rejected_total` | counter | Rows written to the data-quality table. |
+| `ddi_batches_fully_rejected_total` | counter | Batches where every row was rejected. |
+
+Upsert pipelines export five more. All stay at zero in append mode, which is the honest
+reading: it never updates a row and never reads the target back.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `ddi_upsert_rows_updated_total` | counter | Stored rows replaced by a newer delivery of the same key. |
+| `ddi_upsert_rows_inserted_total` | counter | Rows inserted for a key the target did not hold. |
+| `ddi_upsert_target_files_scanned_total` | counter | Target files a merge had to open. |
+| `ddi_upsert_window_unbounded_total` | counter | Merges that read the whole target because its statistics could not bound the window. |
+| `ddi_upsert_window_clamped_total` | counter | Merges where `upsert_lookback` held the window above what completeness required. |
+
+`ddi_upsert_window_clamped_total` is the one to alert on: each increment is a batch where a
+key may have been inserted alongside an older row instead of replacing it. Watch
+`ddi_upsert_target_files_scanned_total / ddi_batches_committed_total` for how well the window
+is doing its job, and treat a rising `ddi_upsert_window_unbounded_total` as a sign the key
+column has no usable statistics — usually because it sits past
+`delta.dataSkippingNumIndexedCols`.
 
 Lag is measured from the **cursor**, not from `ddi_last_source_version`. The two differ
 whenever commits are consumed without producing a commit of our own: a run of `OPTIMIZE` on
@@ -587,9 +820,16 @@ head would page an operator every time bronze compacts. `ddi_last_source_version
 the number to look at when reasoning about *restart* behaviour — it is what a restart resumes
 from.
 
-Alert on `ddi_source_lag_versions` for backlog and on `increase(ddi_errors_total[5m])` for a
-stopped pipeline. There is no dead-letter queue by design, so a non-zero error count means a
-pipeline has stopped and needs a human.
+Alert on **`ddi_pipeline_up == 0 for 10m`** for a stream that is down, on
+**`increase(ddi_batches_fully_rejected_total[15m]) > 0`** for a target that has silently
+stopped growing, and on `ddi_source_lag_versions` for backlog. Use
+`ddi_pipeline_seconds_since_progress` rather than lag where the failure might be in startup:
+a pipeline that cannot open never reaches the code that records head and cursor, so its lag
+gauge keeps the value it had while healthy.
+
+`ddi_errors_total` is deliberately *not* the page. A failure now retries with backoff, so one
+lost commit race increments it and recovers a second later; a permanently stuck stream and a
+momentary blip look identical in the counter and quite different in `ddi_pipeline_up`.
 
 ## v1 limits
 

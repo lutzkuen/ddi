@@ -9,6 +9,17 @@ max_files_per_batch       = 1000
 max_output_rows_per_batch = 5000000  # guards unnest amplification
 target_file_size          = "128MB"
 
+# A row the target will not take — a price that says "n/a" against a DECIMAL column — is
+# written to <target_uri>__ddi_dq with the reason attached, and the rest of the batch
+# commits. That table is never created here: make it, and rejects are set aside; leave it
+# out, and a bad row fails the pipeline instead (which then backs off and retries rather
+# than stopping the other pipelines). Set dq_uri per pipeline to put it somewhere else.
+#
+#   CREATE TABLE silver.orders__ddi_dq (
+#     app_id VARCHAR, pipeline VARCHAR, source_version BIGINT,
+#     column_name VARCHAR, reason VARCHAR, payload VARCHAR, _timestamp TIMESTAMP(6)
+#   ) WITH (location = 'abfss://lake@acct.dfs.core.windows.net/silver/orders__ddi_dq')
+
 # Header grain: one row in, one row out.
 [[pipeline]]
 name       = "orders_header"
@@ -30,6 +41,30 @@ SELECT order_id,
 FROM source
 WHERE order_status <> 'DRAFT'
 """
+
+# Current-state grain: one row per order, not one per delivery of it.
+#
+# Bronze is a log — placed, then paid, then shipped, all carrying the same order_id — and
+# append mode would keep all three. Upsert replaces the stored row when a newer one arrives.
+# The cost: the merge reads part of the target on every batch, and the target stops being an
+# append-only table, so only an upserting pipeline can read it downstream.
+[[pipeline]]
+name       = "orders_current"
+app_id     = "ddi.orders_current"
+source_uri = "abfss://lake@acct.dfs.core.windows.net/bronze/orders"
+target_uri = "abfss://lake@acct.dfs.core.windows.net/silver/orders_current"
+# append (default) | upsert
+write_mode = "upsert"
+# Which of two rows for the same key is newer. Required for upsert, and must be
+# non-decreasing in the order rows reach the source.
+dedup_timestamp = "_timestamp"
+# What a row is matched on. Defaults to dedup_key.
+upsert_key      = "order_id"
+# Optional cost ceiling: never look further back than this, however far the target's file
+# statistics say the window should reach. Omit it and completeness always wins — correct,
+# and occasionally a full-table merge. When the floor bites, it is logged and counted in
+# ddi_upsert_window_clamped_total.
+upsert_lookback = "48h"
 
 # Line-item grain: fan out from the same source into a second target.
 # Individually exactly-once, but NOT mutually atomic with the pipeline above.

@@ -175,8 +175,15 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
                 // — both of which would otherwise surface on the first batch.
                 p.storage.check(&p.source_uri)?;
                 p.storage.check(&p.target_uri)?;
+                // write_mode is shown because it changes what the target *is*, not just how
+                // fast it fills: an upserted table holds one row per key and can only be
+                // read downstream by another upserting pipeline.
+                let mode = match p.upsert_key.as_deref() {
+                    Some(k) if p.write_mode.is_upsert() => format!("upsert on {k}"),
+                    _ => "append".to_string(),
+                };
                 println!(
-                    "{:<24} {} -> {}  (app_id={}, change_policy={:?})",
+                    "{:<24} {} -> {}  (app_id={}, change_policy={:?}, write_mode={mode})",
                     p.name, p.source_uri, p.target_uri, p.app_id, p.change_policy
                 );
             }
@@ -429,14 +436,26 @@ async fn run_all(
 
     if let Some(addr) = metrics_addr {
         spawn_metrics_server(addr, metrics.clone(), token.clone());
+    } else if !once {
+        // Worth saying out loud now that a failure is local and survivable. The process no
+        // longer exits when a stream dies, so without metrics there is nothing left but
+        // interleaved log lines to tell you which of them did.
+        warn!(
+            "no --metrics-addr: a pipeline that fails now retries instead of stopping the \
+             process, so ddi_pipeline_up is the only signal that one is down. Consider \
+             --metrics-addr 127.0.0.1:9100."
+        );
     }
 
-    let mut handles = Vec::new();
+    // A JoinSet rather than a Vec of handles, so a task that ends is noticed when it ends.
+    // Awaiting handles in spawn order meant a pipeline that died was invisible until every
+    // pipeline before it finished — which, in `run` mode, is never.
+    let mut tasks = tokio::task::JoinSet::new();
     for cfg in pipelines {
         let m = metrics.clone();
         let t = token.clone();
         let l = locator.clone();
-        handles.push(tokio::spawn(async move { drive(cfg, l, m, t, once).await }));
+        tasks.spawn(async move { drive(cfg, l, m, t, once).await });
     }
 
     // Graceful shutdown: let the in-flight step finish. A step is atomic, so stopping
@@ -451,18 +470,22 @@ async fn run_all(
     };
 
     let mut failed = false;
-    for h in handles {
-        match h.await {
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
+                // No `token.cancel()`. One stream's failure is not the fleet's: with
+                // hundreds of them, a single malformed value used to take every healthy
+                // pipeline down with it. In `run` mode a pipeline retries rather than
+                // returning, so getting here at all means `--once` gave up.
                 error!("pipeline failed: {e}");
                 failed = true;
-                token.cancel();
             }
             Err(e) => {
+                // A panic is a bug rather than a data problem, and it has already unwound
+                // this one task. The others keep going; the exit code reports it.
                 error!("pipeline task panicked: {e}");
                 failed = true;
-                token.cancel();
             }
         }
     }
@@ -476,7 +499,55 @@ async fn run_all(
     Ok(())
 }
 
-/// One tokio task per pipeline. No coordination between them: masterless, like KDI.
+/// Holds `ddi_pipeline_up` at 1, and clears it on the way out.
+///
+/// A guard rather than a pair of stores because the ways out are not all returns: a panic in
+/// an arrow kernel unwinds the task, and a plain `store(0)` on the error path would never
+/// run. The gauge would then sit at 1 for a stream that no longer exists — the one reading
+/// an operator must be able to trust.
+struct Up(Arc<delta_delta_ingest::metrics::PipelineMetrics>);
+
+impl Up {
+    fn held(m: &Arc<delta_delta_ingest::metrics::PipelineMetrics>) -> Self {
+        m.up.store(1, Ordering::Relaxed);
+        Self(m.clone())
+    }
+}
+
+impl Drop for Up {
+    fn drop(&mut self) {
+        self.0.up.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The first retry delay after a pipeline fails. Doubles from here.
+const RETRY_MIN: Duration = Duration::from_secs(1);
+/// The ceiling on that doubling.
+///
+/// Generous on purpose. Reopening a pipeline is not free — it rereads the target to find its
+/// watermark — so a stream stuck on something only a human can fix must not spend the whole
+/// interval between fixes rescanning. Five minutes keeps that affordable while still
+/// recovering on its own within one poll of somebody repairing the cause. Nothing is lost by
+/// waiting, because the backoff resets the moment a step succeeds.
+const RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// One tokio task per pipeline, supervised. No coordination between them: masterless,
+/// like KDI.
+///
+/// # Why this retries rather than returning
+///
+/// A pipeline used to return its first error, which ended the task for good — and the join
+/// loop then cancelled every other pipeline. At one pipeline that reads as "stop the world
+/// and let a human look". At three hundred it reads as "any one stream can take down the
+/// other two hundred and ninety-nine", which is not a trade anybody would choose.
+///
+/// So a failure is now local and temporary: this pipeline backs off and tries again, its
+/// peers never notice, and `ddi_pipeline_up` says which of them are healthy. Nothing is
+/// swallowed — the error is logged every time and `ddi_errors_total` counts it — but the
+/// process keeps serving the streams that are fine.
+///
+/// Retrying is safe for the same reason a crash is: a step is atomic, so a failed one
+/// changed nothing and simply happens again.
 async fn drive(
     cfg: ResolvedPipeline,
     locator: Arc<Locator>,
@@ -485,11 +556,107 @@ async fn drive(
     once: bool,
 ) -> delta_delta_ingest::Result<()> {
     let name = cfg.name.clone();
-    let idle = Duration::from_secs(cfg.allowed_latency_secs.max(1));
     let m = metrics.pipeline(&name);
+    let mut backoff = RETRY_MIN;
+    let mut attempts = 0u32;
 
-    let mut current = locator.refresh(&cfg).await;
+    loop {
+        let progressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let outcome = attempt(&cfg, &locator, &m, &token, once, &progressed).await;
+
+        // Any successful step means the cause cleared, so the next failure starts over at a
+        // second rather than inheriting five minutes of penalty from an outage last week.
+        if progressed.load(Ordering::Relaxed) {
+            backoff = RETRY_MIN;
+            attempts = 0;
+        }
+
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                m.errors.fetch_add(1, Ordering::Relaxed);
+                m.up.store(0, Ordering::Relaxed);
+
+                // `--once` is a batch run: something is waiting on the exit code, so
+                // retrying forever would hang it. Report and let run_all sum up.
+                if once {
+                    error!(pipeline = %name, "{e}");
+                    return Err(e);
+                }
+                if token.is_cancelled() {
+                    return Ok(());
+                }
+
+                attempts += 1;
+                let wait = jitter(backoff, &name, attempts);
+                error!(
+                    pipeline = %name,
+                    retry_in_ms = wait.as_millis() as u64,
+                    attempt = attempts,
+                    "pipeline failed; retrying. Other pipelines are unaffected. {e}"
+                );
+                m.restarts.fetch_add(1, Ordering::Relaxed);
+                sleep_or_cancel(wait, &token).await;
+                if token.is_cancelled() {
+                    // Otherwise shutdown pays for one more full reopen, per pipeline.
+                    return Ok(());
+                }
+                backoff = RETRY_MAX.min(backoff * 2);
+            }
+        }
+    }
+}
+
+/// Sleep, but wake immediately on shutdown rather than making Ctrl-C wait out a backoff.
+async fn sleep_or_cancel(total: Duration, token: &CancellationToken) {
+    const TICK: Duration = Duration::from_millis(200);
+    let mut left = total;
+    while left > Duration::ZERO && !token.is_cancelled() {
+        let step = TICK.min(left);
+        tokio::time::sleep(step).await;
+        left -= step;
+    }
+}
+
+/// Spread a retry by up to ±25%.
+///
+/// Three hundred pipelines knocked over by one object-store outage must not come back in
+/// lockstep and cause the next one — each reopen rereads a target. Derived from the name
+/// *and the attempt number* rather than an RNG: no dependency, reproducible, and varying per
+/// attempt so two pipelines that happen to hash alike drift apart instead of staying
+/// phase-locked forever.
+fn jitter(d: Duration, name: &str, attempt: u32) -> Duration {
+    let seed = name.bytes().fold(attempt as u64, |a, b| {
+        a.wrapping_mul(31).wrapping_add(b as u64)
+    });
+    // 0..=50, so the factor runs from 0.75 to 1.25.
+    let factor = 75 + seed % 51;
+    Duration::from_millis((d.as_millis() as u64).saturating_mul(factor) / 100)
+}
+
+/// Open the pipeline and run it until it is done, cancelled, or fails.
+///
+/// Sets `progressed` on the first successful step, which is what tells the supervisor the
+/// cause cleared and the backoff may reset.
+async fn attempt(
+    cfg: &ResolvedPipeline,
+    locator: &Arc<Locator>,
+    m: &Arc<delta_delta_ingest::metrics::PipelineMetrics>,
+    token: &CancellationToken,
+    once: bool,
+    progressed: &Arc<std::sync::atomic::AtomicBool>,
+) -> delta_delta_ingest::Result<()> {
+    let name = cfg.name.clone();
+    let idle = Duration::from_secs(cfg.allowed_latency_secs.max(1));
+
+    if token.is_cancelled() {
+        return Ok(());
+    }
+    let mut current = locator.refresh(cfg).await;
     let mut pipeline = Pipeline::open(current.clone()).await?;
+    // Cleared on the way out however this returns — including an unwind — so a panicked
+    // task cannot leave the fleet's health gauge claiming it is fine.
+    let _up = Up::held(m);
 
     loop {
         if token.is_cancelled() {
@@ -527,6 +694,8 @@ async fn drive(
 
         match outcome {
             Ok(StepOutcome::CaughtUp) => {
+                progressed.store(true, Ordering::Relaxed);
+                m.mark_progress();
                 if once {
                     info!(pipeline = %name, "caught up");
                     return Ok(());
@@ -537,23 +706,61 @@ async fn drive(
                 through_version,
                 files,
                 rows,
+                upsert,
+                rejected,
                 ..
             }) => {
+                // A step that got this far means the pipeline is working, whatever happened
+                // before it. Clearing `up` here rather than only on open makes the gauge
+                // track reality during a flapping outage.
+                progressed.store(true, Ordering::Relaxed);
+                m.mark_progress();
+                m.rows_rejected
+                    .fetch_add(rejected as u64, Ordering::Relaxed);
+                if rejected > 0 && rows == 0 {
+                    m.batches_fully_rejected.fetch_add(1, Ordering::Relaxed);
+                }
                 m.batches_committed.fetch_add(1, Ordering::Relaxed);
                 m.rows_written.fetch_add(rows as u64, Ordering::Relaxed);
                 m.files_read.fetch_add(files as u64, Ordering::Relaxed);
                 m.last_source_version
                     .store(through_version as i64, Ordering::Relaxed);
+                if let Some(u) = upsert {
+                    m.rows_updated
+                        .fetch_add(u.updated as u64, Ordering::Relaxed);
+                    m.rows_inserted
+                        .fetch_add(u.inserted as u64, Ordering::Relaxed);
+                    m.target_files_scanned
+                        .fetch_add(u.files_scanned as u64, Ordering::Relaxed);
+                    if !u.window_bounded {
+                        m.upsert_window_unbounded.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if u.window_clamped {
+                        m.upsert_window_clamped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
-            Ok(StepOutcome::Skipped { through_version }) => {
+            Ok(StepOutcome::Skipped {
+                through_version,
+                rejected,
+            }) => {
+                progressed.store(true, Ordering::Relaxed);
+                m.mark_progress();
+                m.rows_rejected
+                    .fetch_add(rejected as u64, Ordering::Relaxed);
+                if rejected > 0 {
+                    // Nothing reached the target and everything was rejected — the shape an
+                    // upstream type change takes. Counted separately because the target
+                    // simply stops growing, which no other metric would show.
+                    m.batches_fully_rejected.fetch_add(1, Ordering::Relaxed);
+                }
                 m.commits_skipped.fetch_add(1, Ordering::Relaxed);
                 m.last_source_version
                     .store(through_version as i64, Ordering::Relaxed);
             }
             Err(e) => {
-                // A cast failure or a change commit under ChangePolicy::Fail should stop
-                // the world, not spin. There is no dead-letter queue by design.
-                m.errors.fetch_add(1, Ordering::Relaxed);
+                // Hand it to the supervisor above, which backs off and reopens. Not counted
+                // here: `drive` does that once, so a retry is one error, not two.
                 return Err(e);
             }
         }

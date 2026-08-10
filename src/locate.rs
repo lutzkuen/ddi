@@ -153,6 +153,10 @@ mod tests {
             watermark_uri: None,
             dedup_timestamp: None,
             dedup_key: None,
+            write_mode: Default::default(),
+            upsert_key: None,
+            upsert_lookback: None,
+            dq_uri: None,
             storage: Default::default(),
         }
     }

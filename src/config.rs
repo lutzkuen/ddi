@@ -54,6 +54,29 @@ impl Default for Defaults {
     }
 }
 
+/// How a batch reaches the target.
+///
+/// Mirrors [`ChangePolicy`]'s shape: a small snake_case enum with the safe option as the
+/// default, so a typo cannot silently pick the riskier one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteMode {
+    /// Every row is a new row. The original mode, and still the default: the target keeps
+    /// its whole history and this tool never reads it back.
+    #[default]
+    Append,
+    /// A row replaces the one already stored under its key, when it is newer. The target
+    /// holds one row per key, at the cost of reading part of it on every batch. See
+    /// [`crate::upsert`].
+    Upsert,
+}
+
+impl WriteMode {
+    pub fn is_upsert(self) -> bool {
+        matches!(self, WriteMode::Upsert)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
@@ -113,6 +136,31 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub dedup_key: Option<String>,
 
+    /// Append every row, or merge it onto the key it already has. See [`crate::upsert`].
+    #[serde(default)]
+    pub write_mode: WriteMode,
+
+    /// Row identity for `write_mode = "upsert"`. Defaults to `dedup_key`.
+    #[serde(default)]
+    pub upsert_key: Option<String>,
+
+    /// Where rows that will not fit the target go, instead of stopping the pipeline.
+    ///
+    /// Defaults to `<target_uri>__ddi_dq`, so a fleet of pipelines needs no per-pipeline
+    /// setting. The table is never created here; where it does not exist, bad rows keep
+    /// failing the pipeline (which now retries rather than giving up). See [`crate::dq`].
+    #[serde(default)]
+    pub dq_uri: Option<String>,
+
+    /// The furthest back the merge window is allowed to reach — `"48h"`, `"90m"`, or a
+    /// bare number for a numeric sequence column.
+    ///
+    /// A cost ceiling, not a correctness knob. Left unset, the window opens exactly as far
+    /// as the target's own file statistics say it must, which is always right and
+    /// occasionally means reading the whole table. Set, it stops there and says so.
+    #[serde(default)]
+    pub upsert_lookback: Option<String>,
+
     /// Fully qualified catalog names, so a location can be re-resolved while running.
     /// Filled in from the dbt manifest.
     #[serde(default)]
@@ -168,12 +216,35 @@ pub struct ResolvedPipeline {
     pub dedup_timestamp: Option<String>,
     /// Row identity, for resolving ties at the watermark instant.
     pub dedup_key: Option<String>,
+    /// Append, or merge onto the key already stored.
+    pub write_mode: WriteMode,
+    /// Row identity for the merge. Always `Some` once `write_mode` is `Upsert` — resolve
+    /// rejects the combination otherwise.
+    pub upsert_key: Option<String>,
+    /// How far back the merge window may reach. `None` means "as far as the target's
+    /// statistics require".
+    pub upsert_lookback: Option<crate::upsert::Lookback>,
+    /// An explicit data-quality table, when the derived one will not do. Kept unresolved
+    /// so that a target which moves takes its rejects with it — see [`Self::dq_uri`].
+    pub dq_uri: Option<String>,
     /// How to reach object storage. The one thing a dbt project cannot tell us.
     pub storage: crate::storage::Storage,
     /// Fully qualified catalog name of the source, when there is a catalog to ask.
     pub source_relation: Option<String>,
     /// Fully qualified catalog name of the target.
     pub target_relation: Option<String>,
+}
+
+impl ResolvedPipeline {
+    /// Where this pipeline's rejected rows go.
+    ///
+    /// Derived from the target unless it was set explicitly, so a fleet needs no
+    /// per-pipeline configuration and a table that relocates takes its rejects along.
+    pub fn dq_uri(&self) -> String {
+        self.dq_uri
+            .clone()
+            .unwrap_or_else(|| crate::dq::uri_for(&self.target_uri))
+    }
 }
 
 /// `ddi`'s own configuration, which is deliberately not where the work is described.
@@ -201,6 +272,57 @@ pub struct Config {
     /// is set these are ignored — the manifest wins, so there is one place to look.
     #[serde(default, rename = "pipeline")]
     pub pipelines: Vec<PipelineConfig>,
+}
+
+/// Refuse to feed one pipeline's upserted target to another pipeline that cannot read it.
+///
+/// An upsert commit carries `Remove` actions with `dataChange: true`, so
+/// [`crate::source::classify`] calls it a `Change` commit — the same class as a `DELETE` or
+/// `MERGE` upstream. None of the three change policies is a safe default downstream:
+///
+/// - `fail` stops the pipeline on the first upsert commit.
+/// - `skip_change_commits` drops the whole commit **including its `Add`s**, so keys inserted
+///   by that merge never reach the downstream target. Silent, permanent loss.
+/// - `ignore_changes` re-emits the rewritten rows, which is right only if the downstream is
+///   itself upserting on the same key — otherwise it duplicates them.
+///
+/// Only the last combination works, so it is the only one allowed to pass quietly. The other
+/// two are a configuration mistake that no amount of runtime care can repair, which puts the
+/// check here.
+fn check_upsert_cascades(pipelines: &[PipelineConfig]) -> Result<()> {
+    use crate::source::ChangePolicy;
+
+    for up in pipelines.iter().filter(|p| p.write_mode.is_upsert()) {
+        for down in pipelines.iter().filter(|d| d.source_uri == up.target_uri) {
+            let ok =
+                down.change_policy == ChangePolicy::IgnoreChanges && down.write_mode.is_upsert();
+            if ok {
+                continue;
+            }
+            return Err(Error::Config(format!(
+                "pipeline {:?} upserts into {:?}, which pipeline {:?} reads as its source. An \
+                 upsert rewrites files, so every one of its commits carries a dataChange \
+                 Remove and reads downstream as a change commit. With change_policy = {:?} \
+                 that pipeline would {}. The only combination that survives is \
+                 change_policy = \"ignore_changes\" together with write_mode = \"upsert\" on \
+                 {:?}, keyed the same way, so re-emitted rows merge instead of accumulating.",
+                up.name,
+                up.target_uri,
+                down.name,
+                down.change_policy,
+                match down.change_policy {
+                    ChangePolicy::Fail => "stop on the first upsert commit",
+                    ChangePolicy::SkipChangeCommits =>
+                        "silently drop those commits whole — including keys they insert, which \
+                         would never arrive",
+                    ChangePolicy::IgnoreChanges =>
+                        "re-emit rewritten rows, duplicating them because it appends",
+                },
+                down.name,
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_size(s: &str, field: &str) -> Result<u64> {
@@ -277,6 +399,8 @@ impl Config {
             }
         }
 
+        check_upsert_cascades(pipelines)?;
+
         let d = &self.runtime;
         pipelines
             .iter()
@@ -299,6 +423,50 @@ impl Config {
                         p.name
                     )));
                 }
+
+                // The merge needs a key to merge on and a value to decide "newer" by.
+                // Neither can be inferred, and a pipeline missing one cannot be correct, so
+                // it fails here rather than on its first batch.
+                let upsert_key = p.upsert_key.clone().or_else(|| p.dedup_key.clone());
+                if p.write_mode.is_upsert() {
+                    if upsert_key.is_none() {
+                        return Err(Error::Config(format!(
+                            "pipeline {:?}: write_mode = \"upsert\" needs upsert_key (or \
+                             dedup_key, which it falls back to) — it is the column a row is \
+                             matched on. Without it every delivery would append another copy, \
+                             which is what append mode already does.",
+                            p.name
+                        )));
+                    }
+                    if p.dedup_timestamp.is_none() {
+                        return Err(Error::Config(format!(
+                            "pipeline {:?}: write_mode = \"upsert\" needs dedup_timestamp — it \
+                             is the column that decides whether an arriving row is newer than \
+                             the one already stored, and it bounds how much of the target the \
+                             merge has to read. In dbt: `meta: {{ddi_timestamp: _timestamp}}`.",
+                            p.name
+                        )));
+                    }
+                } else if p.upsert_key.is_some() || p.upsert_lookback.is_some() {
+                    return Err(Error::Config(format!(
+                        "pipeline {:?}: upsert_key/upsert_lookback are set but write_mode is \
+                         \"append\", so they do nothing. Set write_mode = \"upsert\", or \
+                         remove them.",
+                        p.name
+                    )));
+                }
+                let upsert_lookback = p
+                    .upsert_lookback
+                    .as_deref()
+                    .map(crate::upsert::Lookback::parse)
+                    .transpose()
+                    .map_err(|e| {
+                        let detail = match e {
+                            Error::Config(m) => m,
+                            other => other.to_string(),
+                        };
+                        Error::Config(format!("pipeline {:?}: {detail}", p.name))
+                    })?;
 
                 let max_bytes = parse_size(
                     p.max_bytes_per_batch
@@ -332,6 +500,10 @@ impl Config {
                         .or_else(|| self.storage.watermark_uri.clone()),
                     dedup_timestamp: p.dedup_timestamp.clone(),
                     dedup_key: p.dedup_key.clone(),
+                    write_mode: p.write_mode,
+                    upsert_key,
+                    upsert_lookback,
+                    dq_uri: p.dq_uri.clone(),
                     storage: crate::storage::Storage::new(self.storage.options.clone()),
                     source_relation: p.source_relation.clone(),
                     target_relation: p.target_relation.clone(),
@@ -498,5 +670,95 @@ change_polcy = "ignore_changes"
     #[test]
     fn empty_config_is_rejected() {
         assert!(Config::from_toml_str("").unwrap().resolve().is_err());
+    }
+
+    const UPSERT: &str = r#"
+[[pipeline]]
+name = "orders"
+app_id = "ddi.orders"
+source_uri = "/tmp/bronze/orders"
+target_uri = "/tmp/silver/orders"
+write_mode = "upsert"
+dedup_timestamp = "_timestamp"
+dedup_key = "order_id"
+"#;
+
+    #[test]
+    fn append_is_the_default_write_mode() {
+        let r = Config::from_toml_str(BASE).unwrap().resolve().unwrap();
+        assert_eq!(r[0].write_mode, WriteMode::Append);
+        assert!(!r[0].write_mode.is_upsert());
+    }
+
+    #[test]
+    fn upsert_falls_back_to_dedup_key_for_its_identity() {
+        let r = Config::from_toml_str(UPSERT).unwrap().resolve().unwrap();
+        assert_eq!(r[0].write_mode, WriteMode::Upsert);
+        assert_eq!(r[0].upsert_key.as_deref(), Some("order_id"));
+    }
+
+    #[test]
+    fn upsert_without_a_key_is_rejected_at_load() {
+        let toml = UPSERT.replace("dedup_key = \"order_id\"\n", "");
+        let e = Config::from_toml_str(&toml).unwrap().resolve().unwrap_err();
+        assert!(e.to_string().contains("upsert_key"), "got: {e}");
+    }
+
+    #[test]
+    fn upsert_without_a_sequence_column_is_rejected_at_load() {
+        let toml = UPSERT.replace("dedup_timestamp = \"_timestamp\"\n", "");
+        let e = Config::from_toml_str(&toml).unwrap().resolve().unwrap_err();
+        assert!(e.to_string().contains("dedup_timestamp"), "got: {e}");
+    }
+
+    #[test]
+    fn upsert_settings_on_an_append_pipeline_are_rejected_rather_than_ignored() {
+        // A knob that silently does nothing is how someone ends up believing their target
+        // is deduplicated when it is not.
+        let toml = format!("{BASE}upsert_lookback = \"48h\"\n");
+        let e = Config::from_toml_str(&toml).unwrap().resolve().unwrap_err();
+        assert!(e.to_string().contains("write_mode"), "got: {e}");
+    }
+
+    #[test]
+    fn a_lookback_that_is_not_a_duration_or_a_number_is_rejected_at_load() {
+        let toml = format!("{UPSERT}upsert_lookback = \"whenever\"\n");
+        let e = Config::from_toml_str(&toml).unwrap().resolve().unwrap_err();
+        assert!(e.to_string().contains("orders"), "names the pipeline: {e}");
+        assert!(e.to_string().contains("48h"), "shows the spelling: {e}");
+    }
+
+    #[test]
+    fn feeding_an_upsert_target_to_an_appending_pipeline_is_rejected() {
+        // The cascade trap. An upsert commit reads downstream as a change commit, and
+        // `skip_change_commits` — the setting that looks safest — drops the whole commit
+        // including the keys it inserted.
+        let toml = format!(
+            "{UPSERT}\n[[pipeline]]\nname = \"gold\"\napp_id = \"ddi.gold\"\n\
+             source_uri = \"/tmp/silver/orders\"\ntarget_uri = \"/tmp/gold/orders\"\n\
+             change_policy = \"skip_change_commits\"\n"
+        );
+        let e = Config::from_toml_str(&toml).unwrap().resolve().unwrap_err();
+        let e = e.to_string();
+        assert!(
+            e.contains("orders") && e.contains("gold"),
+            "names both: {e}"
+        );
+        assert!(e.contains("silently drop"), "says what goes wrong: {e}");
+        assert!(e.contains("ignore_changes"), "says the fix: {e}");
+    }
+
+    #[test]
+    fn cascading_upsert_into_upsert_with_ignore_changes_is_allowed() {
+        // The one combination that survives: the downstream re-reads rewritten rows and
+        // merges them onto the same key, so re-emission is a no-op rather than a duplicate.
+        let toml = format!(
+            "{UPSERT}\n[[pipeline]]\nname = \"gold\"\napp_id = \"ddi.gold\"\n\
+             source_uri = \"/tmp/silver/orders\"\ntarget_uri = \"/tmp/gold/orders\"\n\
+             change_policy = \"ignore_changes\"\nwrite_mode = \"upsert\"\n\
+             dedup_timestamp = \"_timestamp\"\ndedup_key = \"order_id\"\n"
+        );
+        let r = Config::from_toml_str(&toml).unwrap().resolve().unwrap();
+        assert_eq!(r.len(), 2);
     }
 }

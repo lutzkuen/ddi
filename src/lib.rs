@@ -6,6 +6,7 @@
 pub mod config;
 pub mod dbt;
 pub mod dedup;
+pub mod dq;
 pub mod error;
 pub mod locate;
 pub mod metrics;
@@ -14,8 +15,10 @@ pub mod pipeline;
 pub mod schema;
 pub mod sink;
 pub mod source;
+pub mod stats;
 pub mod storage;
 pub mod transform;
 pub mod trino;
+pub mod upsert;
 
 pub use error::{Error, Result};

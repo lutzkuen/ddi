@@ -26,9 +26,70 @@ pub struct PipelineMetrics {
     /// `OPTIMIZE` on the source advances the cursor but writes no `txn` action. Lag is
     /// measured from this one, so compaction on the source does not read as backlog.
     pub cursor_version: AtomicI64,
+
+    // Upsert only. All zero on an append pipeline, which is the honest reading: it never
+    // updates a row and never reads the target back.
+    /// Stored rows replaced by a newer delivery of the same key.
+    pub rows_updated: AtomicU64,
+    /// Keys the target did not already hold.
+    pub rows_inserted: AtomicU64,
+    /// Target files a merge had to open. The number the merge window exists to keep down —
+    /// watch it against `ddi_batches_committed_total` for files-per-batch.
+    pub target_files_scanned: AtomicU64,
+    /// Batches whose merge window could not be bounded at all, so the whole target was
+    /// read. Anything but zero means the target's statistics cannot answer the question —
+    /// usually the key column sitting past `delta.dataSkippingNumIndexedCols`.
+    pub upsert_window_unbounded: AtomicU64,
+    /// Batches where `upsert_lookback` held the window above what the statistics asked for.
+    /// **Each one may have inserted a key alongside an older row instead of replacing it**,
+    /// so this is the metric to alert on.
+    pub upsert_window_clamped: AtomicU64,
+
+    /// 1 while this pipeline is streaming, 0 while it is backing off after a failure.
+    ///
+    /// With hundreds of streams in one process, "is the process alive" stopped being a
+    /// useful question — it is alive whenever *any* stream is. This is the per-stream
+    /// answer, and the one to build a health check on.
+    pub up: AtomicI64,
+    /// How many times this pipeline has been reopened after a failure. A number that keeps
+    /// climbing is a stream stuck in a loop on something a human has to fix.
+    pub restarts: AtomicU64,
+    /// Rows the target would not take, written to the data-quality table instead.
+    pub rows_rejected: AtomicU64,
+    /// Batches where *every* row was rejected. Far more likely an upstream schema change
+    /// than data going bad, and otherwise invisible: the target just stops growing.
+    pub batches_fully_rejected: AtomicU64,
+    /// Unix seconds at the last successful step. -1 until the first one.
+    ///
+    /// The lag gauge cannot cover a pipeline that fails while *opening*: it never reaches
+    /// the code that records head and cursor, so both keep the values they had when it was
+    /// healthy and the backlog alert stays quiet while the stream is hours dead. Staleness
+    /// is the reading that survives that, whatever the failure was.
+    pub last_progress_unixtime: AtomicI64,
 }
 
 impl PipelineMetrics {
+    /// Note that this pipeline just did something successfully.
+    pub fn mark_progress(&self) {
+        self.up.store(1, Ordering::Relaxed);
+        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            self.last_progress_unixtime
+                .store(d.as_secs() as i64, Ordering::Relaxed);
+        }
+    }
+
+    /// Seconds since this pipeline last made progress, or -1 before its first step.
+    pub fn seconds_since_progress(&self) -> i64 {
+        let last = self.last_progress_unixtime.load(Ordering::Relaxed);
+        if last < 0 {
+            return -1;
+        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.as_secs() as i64 - last).max(0))
+            .unwrap_or(-1)
+    }
+
     /// How far behind the source head this pipeline is, in commits.
     ///
     /// Counts commits *not yet consumed*: the cursor points at the next commit to read,
@@ -72,6 +133,7 @@ impl Metrics {
                     last_source_version: AtomicI64::new(-1),
                     source_head_version: AtomicI64::new(-1),
                     cursor_version: AtomicI64::new(-1),
+                    last_progress_unixtime: AtomicI64::new(-1),
                     ..Default::default()
                 })
             })
@@ -83,7 +145,7 @@ impl Metrics {
         let map = self.pipelines.read().unwrap();
         let mut s = String::new();
 
-        let metrics: [MetricSpec; 8] = [
+        let metrics: [MetricSpec; 18] = [
             (
                 "ddi_batches_committed_total",
                 "counter",
@@ -128,6 +190,70 @@ impl Metrics {
                 "gauge",
                 "Source commits behind head.",
                 |m| m.lag(),
+            ),
+            (
+                "ddi_pipeline_up",
+                "gauge",
+                "1 while this pipeline is streaming, 0 while it is backing off after a \
+                 failure.",
+                |m| m.up.load(Ordering::Relaxed),
+            ),
+            (
+                "ddi_pipeline_seconds_since_progress",
+                "gauge",
+                "Seconds since this pipeline last completed a step; -1 before its first. \
+                 Unlike lag, this still moves when a pipeline fails while opening.",
+                |m| m.seconds_since_progress(),
+            ),
+            (
+                "ddi_pipeline_restarts_total",
+                "counter",
+                "Times this pipeline was reopened after a failure.",
+                |m| m.restarts.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_rows_rejected_total",
+                "counter",
+                "Rows the target would not take, written to the data-quality table instead.",
+                |m| m.rows_rejected.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_batches_fully_rejected_total",
+                "counter",
+                "Batches where every row was rejected; usually an upstream schema change.",
+                |m| m.batches_fully_rejected.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_upsert_rows_updated_total",
+                "counter",
+                "Stored rows replaced by a newer delivery of the same key.",
+                |m| m.rows_updated.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_upsert_rows_inserted_total",
+                "counter",
+                "Rows inserted for a key the target did not hold.",
+                |m| m.rows_inserted.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_upsert_target_files_scanned_total",
+                "counter",
+                "Target files opened by a merge. What the merge window bounds.",
+                |m| m.target_files_scanned.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_upsert_window_unbounded_total",
+                "counter",
+                "Merges that had to read the whole target because its statistics could not \
+                 bound the window.",
+                |m| m.upsert_window_unbounded.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_upsert_window_clamped_total",
+                "counter",
+                "Merges where upsert_lookback held the window above what completeness \
+                 required; each may have inserted a key alongside an older row.",
+                |m| m.upsert_window_clamped.load(Ordering::Relaxed) as i64,
             ),
         ];
 

@@ -193,6 +193,14 @@ pub async fn target_state(target: &DeltaTable, app_id: &str, max_scan: u64) -> R
         let actions = get_actions(v, &raw)?;
 
         // Ours: any commit carrying our txn action. Everything before it is irrelevant.
+        //
+        // This test MUST come before the `Remove` test below, and the order is load-bearing
+        // rather than stylistic. An upsert pipeline (`write_mode = "upsert"`) writes its
+        // data, its `Remove`s and its `txn` action in one commit, so its own commits look
+        // exactly like a foreign rewrite to the second test. Checking ours first is what
+        // stops the daemon diagnosing itself as a dbt rebuild and rescanning on every
+        // restart — or, with `watermark_uri` set and no watermark row, refusing to start at
+        // all. Pinned by `an_upsert_commit_of_ours_is_not_a_foreign_rebuild`.
         if actions
             .iter()
             .any(|a| matches!(a, Action::Txn(t) if t.app_id == app_id))
@@ -200,7 +208,8 @@ pub async fn target_state(target: &DeltaTable, app_id: &str, max_scan: u64) -> R
             return Ok(TargetState::OursOrUntouched);
         }
 
-        // Someone else's rewrite: a Remove that actually deleted data.
+        // Someone else's rewrite: a Remove that actually deleted data, in a commit that
+        // carries no txn of ours (established immediately above).
         if actions
             .iter()
             .any(|a| matches!(a, Action::Remove(r) if r.data_change))
