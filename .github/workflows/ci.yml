@@ -27,6 +27,32 @@ jobs:
       # `#[ignore]`d and run by the `object-store` job below.
       - run: cargo test --all-targets
 
+  image:
+    name: container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The image was never built here, which is how a binary that could not start got
+      # published: `docker build` does not execute what it copies, so the build stage
+      # succeeded and the breakage waited for whoever first ran the container.
+      #
+      # The Dockerfile's own smoke test is what makes this job worth its minutes — building
+      # alone would still have gone green. Between them, a glibc mismatch between the build
+      # and runtime stages fails here rather than in somebody's deployment.
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: ddi:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # Again from the outside, because the in-image RUN proves it starts during the build
+      # and this proves it starts the way an operator will invoke it.
+      - run: docker run --rm ddi:ci --version
+
   licenses:
     name: licence policy
     runs-on: ubuntu-latest
