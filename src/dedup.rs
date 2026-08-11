@@ -41,6 +41,7 @@ use deltalake::arrow::compute::{cast, filter_record_batch};
 use deltalake::arrow::datatypes::DataType;
 use deltalake::DeltaTable;
 use futures::TryStreamExt;
+use tracing::debug;
 
 use crate::error::{Error, Result};
 use crate::source::Version;
@@ -64,14 +65,35 @@ pub struct Dedup {
 impl Dedup {
     /// Read the cut-off out of the target table.
     ///
-    /// One pass over the target per pipeline start — not per batch.
+    /// One streaming pass over two of the target's columns, once per pipeline start — not
+    /// per batch, and never the whole table.
+    ///
+    /// # What this is careful about, and why
+    ///
+    /// The question is small — the highest timestamp, and the keys tied at it — but the
+    /// table it is asked of is not. An earlier version answered it by collecting the whole
+    /// target into a `MemTable` and running `SELECT max(...)` over that, which read *every*
+    /// column of every row into memory. On a silver table whose rows carry JSON blobs
+    /// (product descriptions, line-item arrays, images) that is gigabytes to compute one
+    /// scalar, it is paid again on every restart, and it grows with the table — so a
+    /// pipeline that had been fine gets slower until it cannot start at all, and the
+    /// crash-loop makes it worse rather than better.
+    ///
+    /// Two things fix that, and both matter:
+    ///
+    /// - **Only the two columns involved are read.** The projection is pushed into the Delta
+    ///   scan, so the parquet reader never decodes the rest.
+    /// - **The pass is streaming.** The running answer is a single timestamp and the keys
+    ///   tied with it, so memory is bounded by the size of *that* — small by construction —
+    ///   rather than by the size of the table. A batch that cannot beat the running maximum
+    ///   is dropped as soon as it has been looked at.
     pub async fn read(
         target: &DeltaTable,
         timestamp_column: &str,
         key_column: Option<&str>,
     ) -> Result<Self> {
-        use deltalake::datafusion::datasource::MemTable;
-        use deltalake::datafusion::prelude::SessionContext;
+        use deltalake::arrow::row::{OwnedRow, RowConverter, SortField};
+        use std::cmp::Ordering;
 
         let mut out = Self {
             timestamp_column: timestamp_column.to_string(),
@@ -79,76 +101,120 @@ impl Dedup {
             ..Default::default()
         };
 
-        let (_t, stream) = target.clone().scan_table().await.map_err(Error::Delta)?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(|e| {
+        // Fail on a missing column here rather than letting the scan report it, so the
+        // message still names what the table does have.
+        use deltalake::delta_datafusion::DataFusionMixins;
+        let schema = target
+            .snapshot()
+            .map_err(Error::Delta)?
+            .snapshot()
+            .read_schema();
+        for wanted in [Some(timestamp_column), key_column].into_iter().flatten() {
+            if schema.index_of(wanted).is_err() {
+                return Err(Error::Config(format!(
+                    "dedup column {wanted:?} is not in the target table. Columns: [{}]",
+                    schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+
+        let (_t, mut stream) = target
+            .clone()
+            .scan_table()
+            .with_columns(projection(timestamp_column, key_column))
+            .await
+            .map_err(Error::Delta)?;
+
+        // The running answer: the highest timestamp seen, the row encoding used to compare
+        // against it, and the keys that share it.
+        let mut best: Option<OwnedRow> = None;
+        let mut converter: Option<RowConverter> = None;
+        let mut rows_scanned = 0usize;
+
+        while let Some(batch) = stream.try_next().await.map_err(|e| {
             Error::Other(format!(
                 "dedup: cannot scan the target to read its watermark: {e}"
             ))
-        })?;
-        let Some(schema) = batches.first().map(|b| b.schema()) else {
-            return Ok(out); // empty target: nothing covered yet
-        };
-        if schema.index_of(timestamp_column).is_err() {
-            return Err(Error::Config(format!(
-                "dedup timestamp column {timestamp_column:?} is not in the target table. \
-                 Columns: [{}]",
-                schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
-
-        let ctx = SessionContext::new();
-        let provider = MemTable::try_new(schema, vec![batches])
-            .map_err(|e| Error::Other(format!("dedup: {e}")))?;
-        ctx.register_table("target", std::sync::Arc::new(provider))
-            .map_err(|e| Error::Other(format!("dedup: cannot register target: {e}")))?;
-
-        let ts = quote(timestamp_column);
-        let rows = ctx
-            .sql(&format!("SELECT max({ts}) AS m FROM target"))
-            .await
-            .map_err(|e| Error::Other(format!("dedup: max({timestamp_column}) failed: {e}")))?
-            .collect()
-            .await
-            .map_err(|e| Error::Other(format!("dedup: max({timestamp_column}) failed: {e}")))?;
-
-        for b in rows {
-            if b.num_rows() == 1 && !b.column(0).is_null(0) {
-                out.watermark = Some(b.column(0).slice(0, 1));
+        })? {
+            if batch.num_rows() == 0 {
+                continue;
             }
-        }
-        let Some(_) = out.watermark else {
-            return Ok(out);
-        };
+            rows_scanned += batch.num_rows();
 
-        // Keys sharing the maximum timestamp. Only these need individual resolution.
-        if let Some(key) = key_column {
-            let k = quote(key);
-            let rows = ctx
-                .sql(&format!(
-                    "SELECT DISTINCT CAST({k} AS VARCHAR) AS k FROM target \
-                     WHERE {ts} = (SELECT max({ts}) FROM target)"
-                ))
-                .await
-                .map_err(|e| Error::Config(format!("dedup: key column {key:?}: {e}")))?
-                .collect()
-                .await
-                .map_err(|e| Error::Config(format!("dedup: key column {key:?}: {e}")))?;
-            for b in rows {
-                let col = cast(b.column(0), &DataType::Utf8)
-                    .map_err(|e| Error::Other(format!("dedup: key to text: {e}")))?;
-                let col = col.as_any().downcast_ref::<StringArray>().expect("utf8");
-                for i in 0..col.len() {
-                    if !col.is_null(i) {
-                        out.boundary_keys.insert(col.value(i).to_string());
+            let ts = column(&batch, timestamp_column)?;
+            // A byte-comparable encoding, so any Delta type orders correctly without a
+            // match arm per type — the same device `upsert::collapse` uses.
+            let conv = match &converter {
+                Some(c) => c,
+                None => {
+                    converter = Some(
+                        RowConverter::new(vec![SortField::new(ts.data_type().clone())]).map_err(
+                            |e| {
+                                Error::Schema(format!(
+                                    "dedup timestamp {timestamp_column:?} cannot be ordered: {e}"
+                                ))
+                            },
+                        )?,
+                    );
+                    converter.as_ref().expect("just set")
+                }
+            };
+            let encoded = conv
+                .convert_columns(std::slice::from_ref(&ts))
+                .map_err(|e| Error::Other(format!("dedup: cannot order the target: {e}")))?;
+
+            let keys = match key_column {
+                Some(k) => {
+                    let col = column(&batch, k)?;
+                    Some(cast(&col, &DataType::Utf8).map_err(|e| {
+                        Error::Config(format!("dedup key column {k:?} is not comparable: {e}"))
+                    })?)
+                }
+                None => None,
+            };
+
+            for i in 0..batch.num_rows() {
+                // `max` ignores nulls, as the SQL it replaces did.
+                if ts.is_null(i) {
+                    continue;
+                }
+                let row = encoded.row(i);
+                let cmp = match &best {
+                    Some(b) => row.cmp(&b.row()),
+                    None => Ordering::Greater,
+                };
+                match cmp {
+                    Ordering::Greater => {
+                        best = Some(row.owned());
+                        out.watermark = Some(ts.slice(i, 1));
+                        // A new maximum makes every key gathered so far irrelevant.
+                        out.boundary_keys.clear();
+                    }
+                    Ordering::Equal => {}
+                    Ordering::Less => continue,
+                }
+                if let Some(keys) = &keys {
+                    let keys = keys.as_any().downcast_ref::<StringArray>().expect("utf8");
+                    if !keys.is_null(i) {
+                        out.boundary_keys.insert(keys.value(i).to_string());
                     }
                 }
             }
         }
+
+        debug!(
+            timestamp_column,
+            key_column,
+            rows_scanned,
+            boundary_keys = out.boundary_keys.len(),
+            watermark_known = out.watermark.is_some(),
+            "read the target's watermark"
+        );
         Ok(out)
     }
 
@@ -224,6 +290,23 @@ impl Dedup {
     }
 }
 
+/// The only columns this needs to read.
+///
+/// Its own function so the one property that matters can be asserted directly: everything
+/// else in the target — the JSON payloads, the descriptions, the image blobs — is never
+/// decoded. Reading them to compute one `max()` is what used to make a restart cost
+/// gigabytes and grow with the table.
+///
+/// Deduplicated, because the two are allowed to be the same column — a monotonic id is both
+/// a sequence and an identity — and a projection naming it twice is rejected by the scan.
+fn projection<'a>(timestamp_column: &'a str, key_column: Option<&'a str>) -> Vec<&'a str> {
+    let mut wanted = vec![timestamp_column];
+    if let Some(k) = key_column.filter(|k| *k != timestamp_column) {
+        wanted.push(k);
+    }
+    wanted
+}
+
 fn column(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
     let idx = batch.schema().index_of(name).map_err(|_| {
         Error::Schema(format!(
@@ -238,11 +321,6 @@ fn column(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
         ))
     })?;
     Ok(batch.column(idx).clone())
-}
-
-/// Quote an identifier so a column called `order` or `_timestamp` survives the planner.
-fn quote(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 // ---------------------------------------------------------------- bounded rescan
@@ -380,6 +458,25 @@ mod tests {
     fn ids(b: &RecordBatch) -> Vec<i64> {
         let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         (0..a.len()).map(|i| a.value(i)).collect()
+    }
+
+    #[test]
+    fn only_the_timestamp_and_the_key_are_ever_read() {
+        // The regression this guards is a performance one, which is why it is asserted on
+        // the projection rather than on a timing: a target whose rows carry JSON blobs cost
+        // gigabytes per restart when every column was collected to compute one max().
+        assert_eq!(
+            projection("_timestamp", Some("order_id")),
+            ["_timestamp", "order_id"]
+        );
+        assert_eq!(projection("_timestamp", None), ["_timestamp"]);
+    }
+
+    #[test]
+    fn a_column_that_is_both_sequence_and_key_is_named_once() {
+        // A monotonic id is a legitimate choice for both, and a projection naming it twice
+        // is rejected by the scan — which is how this first showed up.
+        assert_eq!(projection("id", Some("id")), ["id"]);
     }
 
     #[test]

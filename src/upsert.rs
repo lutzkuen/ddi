@@ -706,66 +706,75 @@ pub async fn preflight(
 /// stay wrong. Switching a pipeline to upsert has to start from a target that already holds
 /// the grain it claims.
 ///
-/// One scan at startup, alongside the one [`crate::dedup::Dedup::read`] already does.
+/// # Cost
+///
+/// One streaming pass over the key column alone — the projection is pushed into the Delta
+/// scan, so no other column is decoded. Memory is bounded by the number of *distinct* keys
+/// rather than by the table, and the walk stops at the first few duplicates it finds:
+/// knowing that the grain is broken is the whole answer, and three examples are enough to
+/// act on.
+///
+/// It is still proportional to the key count, which is why it happens once at startup rather
+/// than per batch. See [`crate::dedup::Dedup::read`] for the same reasoning applied to the
+/// watermark.
 async fn assert_one_row_per_key(target: &DeltaTable, key_column: &str) -> Result<()> {
-    use deltalake::arrow::array::{Array, AsArray, RecordBatch};
-    use deltalake::datafusion::datasource::MemTable;
-    use deltalake::datafusion::prelude::SessionContext;
+    use deltalake::arrow::array::{Array, StringArray};
     use futures::TryStreamExt;
+    use std::collections::{HashMap, HashSet};
 
-    let (_t, stream) = target.clone().scan_table().await.map_err(Error::Delta)?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(|e| {
+    /// Enough to show the operator the shape of the problem without gathering all of it.
+    const EXAMPLES: usize = 3;
+
+    let (_t, mut stream) = target
+        .clone()
+        .scan_table()
+        .with_columns([key_column])
+        .await
+        .map_err(Error::Delta)?;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut repeated: HashMap<String, usize> = HashMap::new();
+    let mut rows_scanned = 0usize;
+
+    'scan: while let Some(batch) = stream.try_next().await.map_err(|e| {
         Error::Other(format!(
             "upsert: cannot scan the target to check its grain: {e}"
         ))
-    })?;
-    let Some(schema) = batches.first().map(|b| b.schema()) else {
-        return Ok(()); // empty target: nothing to be duplicated yet
-    };
+    })? {
+        rows_scanned += batch.num_rows();
+        let col = column(&batch, key_column)?;
+        let text = cast(&col, &DataType::Utf8).map_err(|e| {
+            Error::Config(format!("upsert key {key_column:?} is not comparable: {e}"))
+        })?;
+        let text = text.as_any().downcast_ref::<StringArray>().expect("utf8");
 
-    let ctx = SessionContext::new();
-    let provider = MemTable::try_new(schema, vec![batches])
-        .map_err(|e| Error::Other(format!("upsert: {e}")))?;
-    ctx.register_table("target", std::sync::Arc::new(provider))
-        .map_err(|e| Error::Other(format!("upsert: cannot register target: {e}")))?;
-
-    let k = quote(key_column);
-    let rows = ctx
-        .sql(&format!(
-            "SELECT CAST({k} AS VARCHAR) AS k, count(*) AS n FROM target \
-             GROUP BY {k} HAVING count(*) > 1 ORDER BY n DESC LIMIT 3"
-        ))
-        .await
-        .map_err(|e| Error::Config(format!("upsert key {key_column:?}: {e}")))?
-        .collect()
-        .await
-        .map_err(|e| Error::Config(format!("upsert key {key_column:?}: {e}")))?;
-
-    let mut examples = Vec::new();
-    for b in &rows {
-        let keys = b.column(0).as_string_opt::<i32>();
-        let counts = b.column(1);
-        for i in 0..b.num_rows() {
-            let key = keys
-                .filter(|a| !a.is_null(i))
-                .map(|a| a.value(i).to_string())
-                .unwrap_or_else(|| "NULL".into());
-            let n = deltalake::arrow::compute::cast(
-                counts,
-                &deltalake::arrow::datatypes::DataType::Int64,
-            )
-            .ok()
-            .and_then(|c| {
-                c.as_primitive_opt::<deltalake::arrow::datatypes::Int64Type>()
-                    .map(|a| a.value(i))
-            })
-            .unwrap_or_default();
-            examples.push(format!("{key:?} ({n} rows)"));
+        for i in 0..batch.num_rows() {
+            let key = if text.is_null(i) {
+                "NULL"
+            } else {
+                text.value(i)
+            };
+            if !seen.insert(key.to_string()) {
+                let n = repeated.entry(key.to_string()).or_insert(1);
+                *n += 1;
+                if repeated.len() >= EXAMPLES {
+                    // The answer is already "no"; counting the rest only costs time.
+                    break 'scan;
+                }
+            }
         }
     }
-    if examples.is_empty() {
+
+    if repeated.is_empty() {
+        tracing::debug!(key_column, rows_scanned, "the target holds one row per key");
         return Ok(());
     }
+
+    let mut examples: Vec<String> = repeated
+        .into_iter()
+        .map(|(k, n)| format!("{k:?} ({n}+ rows)"))
+        .collect();
+    examples.sort();
 
     Err(Error::Config(format!(
         "the target already holds {key_column:?} more than once — for example {}. A merge \

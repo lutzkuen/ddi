@@ -423,6 +423,19 @@ not an option.
 `watermark_uri` remains the better choice where you can set it: exact, no rescan, and no
 ordering requirement on any column.
 
+### What the watermark costs to read
+
+Once per pipeline start, never per batch — and only two columns. The timestamp and the key
+are projected into the Delta scan, so the parquet reader never decodes the rest of the row,
+and the pass is streaming: the running answer is one timestamp plus the keys tied with it, so
+memory is bounded by that rather than by the table.
+
+This matters more than it sounds. Reading the whole row instead is gigabytes on a silver
+table whose rows carry JSON payloads, it is paid again on every restart, and it grows with
+the table — so a pipeline that had been starting fine gets slower until it cannot start at
+all, and a crash-loop makes it worse rather than better. The startup line reports
+`rows_scanned` at debug level if you want to see what a start is costing.
+
 ### What else happens to a shared table
 
 [`tests/hardening.rs`](tests/hardening.rs) runs `orders_raw -> orders_stg` through each of
