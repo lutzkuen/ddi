@@ -8,14 +8,24 @@
 //! lakehouse other tools write, which is the whole premise of this one.
 //!
 //! So the rule these tests pin down is: **the table's Delta schema is authoritative, and a
-//! physical column that differs from it in precision alone is coerced on read.** Anything
-//! that would lose information still fails, and says so in the words it always has.
+//! physical column that differs from it in precision alone is widened on read.** Nothing
+//! else changes — everything that used to be refused still is, in the words it always used,
+//! and everything that used to be accepted still is. A change that narrows what is refused
+//! must not quietly refuse something new, and the Spark INT96 test below is here because
+//! this one very nearly did.
 //!
 //! The fixtures matter more than the assertions here, because nobody writes this bug by
-//! accident — it has to be built. `trinoize_checkpoint` and `demote_to_millis` construct
-//! exactly the two artefacts a Trino `OPTIMIZE` leaves: a checkpoint whose `stats_parsed`
-//! is typed after the table's columns at millisecond precision, and data files rewritten
-//! the same way.
+//! accident — it has to be built. `trinoize_checkpoint` and `retype_file_timestamps`
+//! construct exactly the two artefacts a Trino `OPTIMIZE` leaves: a checkpoint whose
+//! `stats_parsed` is typed after the table's columns at millisecond precision, and data
+//! files rewritten the same way.
+//!
+//! Several of these tests would pass with the fix reverted, because `SchemaCoercer` already
+//! absorbs a precision difference one batch at a time. The ones that genuinely pin it are
+//! `one_batch_spanning_two_writers_is_still_one_batch`, where a `transform_sql` forces two
+//! files to become one schema, and `a_timestamp_landing_in_a_numeric_column_carries_the_
+//! declared_unit`, where the unit reaches the target as a number. Both were checked by
+//! reverting the call site and watching them fail.
 
 mod common;
 
@@ -494,15 +504,17 @@ async fn a_table_opened_that_way_is_still_fully_writable() {
     // merely *had* a Trino checkpoint would stop accepting data — a worse failure than the
     // one this replaces.
     //
-    // `checkpointInterval = 2` makes that hook fire during the test rather than 100 commits
-    // later, which is the whole point of setting it.
+    // The hook itself is invoked explicitly at the end rather than by interval. `ddi` folds
+    // a batch of source commits into a single target commit, so which target version the
+    // interval lands on is not this test's to predict, and a test that quietly stops
+    // exercising the thing it names is worse than no test.
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     let source = root.join("source").to_str().unwrap().to_string();
     let target = root.join("target").to_str().unwrap().to_string();
 
     create_ts_table(&source).await;
-    create_ts_table_with(&target, &[("delta.checkpointInterval", "2")]).await;
+    create_ts_table(&target).await;
 
     // Give the target a checkpoint of Trino's making, so it can only be opened by replay.
     let t = append_ts(&target, &[(0, T0)]).await;
@@ -517,7 +529,6 @@ async fn a_table_opened_that_way_is_still_fully_writable() {
         "the fixture must leave the target unopenable the ordinary way"
     );
 
-    // Several commits, so the post-commit checkpoint hook runs through the filtered store.
     for row in [(1i64, T1), (2, T2), (3, T2 + 1_000_000)] {
         append_ts(&source, &[row]).await;
     }
@@ -532,10 +543,9 @@ async fn a_table_opened_that_way_is_still_fully_writable() {
         "every row committed through the filtered store must be in the table"
     );
 
-    // delta-rs writes a checkpoint of its own as a post-commit hook, on whatever handle it
-    // was given — here, the filtered one. Doing it explicitly rather than waiting for the
-    // interval keeps the test deterministic: `ddi` folds a batch of source commits into one
-    // target commit, so which version the hook lands on is not the test's to predict.
+    // What the post-commit hook does, on whatever handle it was given — here, the filtered
+    // one. It writes the checkpoint parquet and then *reads it back* to record its size,
+    // which is the read a wrapper that hid checkpoints unconditionally would fail.
     let t = Storage::default().open(&target).await.unwrap();
     deltalake::checkpoints::create_checkpoint(&t, None)
         .await
@@ -618,6 +628,65 @@ async fn one_batch_spanning_two_writers_is_still_one_batch() {
         read_timestamps(&target).await,
         vec![(1, T0), (2, T1), (3, T2)],
         "and the transform must see one schema, not two"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timestamp_landing_in_a_numeric_column_carries_the_declared_unit() {
+    // The sharpest form of the 1000x error, because nothing about it looks wrong. A target
+    // that stores the instant as a BIGINT — an epoch column, which bronze layers are full
+    // of — gets whatever unit the source column happened to be *read* at. Before this,
+    // that was whichever engine last wrote the file: microseconds from delta-rs, and
+    // milliseconds from anything Trino had compacted, into the same column, silently.
+    //
+    // Reading at the declared precision first is what makes the answer a property of the
+    // table rather than of the writer.
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let source = root.join("source").to_str().unwrap().to_string();
+    let target = root.join("target").to_str().unwrap().to_string();
+
+    create_ts_table(&source).await;
+    std::fs::create_dir_all(&target).unwrap();
+    DeltaTable::try_from_url(ensure_table_uri(&target).unwrap())
+        .await
+        .unwrap()
+        .create()
+        .with_columns(vec![
+            StructField::new("id", DeltaDataType::Primitive(PrimitiveType::Long), false),
+            StructField::new(
+                "kafka_timestamp",
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                true,
+            ),
+        ])
+        .with_save_mode(SaveMode::ErrorIfExists)
+        .await
+        .unwrap();
+
+    append_ts(&source, &[(1, T0)]).await;
+    demote_to_millis(&source, 1);
+
+    let mut p = Pipeline::open(common::pipeline_cfg("epoch", &source, &target))
+        .await
+        .expect("the pipeline must open");
+    p.run_until_caught_up().await.expect("and it must run");
+
+    use futures::TryStreamExt;
+    let t = Storage::default().open(&target).await.unwrap();
+    let (_t, stream) = t.scan_table().await.unwrap();
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    let stored = batches[0]
+        .column(batches[0].schema().index_of("kafka_timestamp").unwrap())
+        .as_primitive::<deltalake::arrow::datatypes::Int64Type>()
+        .value(0);
+
+    assert_eq!(
+        stored,
+        T0,
+        "microseconds, because that is what the table declares the source column to be — \
+         not {} milliseconds, which is what the file happens to hold",
+        T0 / 1000
     );
 }
 

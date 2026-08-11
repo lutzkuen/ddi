@@ -209,15 +209,8 @@ impl Storage {
     /// checkpoint's own parquet footer, so an operator learns *which* engine did it rather
     /// than having to infer it from the schedule.
     async fn say_once(&self, uri: &str) {
-        static SAID: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-        let said = SAID.get_or_init(|| Mutex::new(HashSet::new()));
-        {
-            let mut said = said
-                .lock()
-                .expect("checkpoint-warning set is never poisoned");
-            if !said.insert(uri.to_string()) {
-                return;
-            }
+        if !first_mention_of(uri) {
+            return;
         }
         let writer = self
             .checkpoint_writer(uri)
@@ -274,6 +267,18 @@ impl Storage {
             .created_by()
             .map(str::to_string)
     }
+}
+
+/// True the first time a table is named, false ever after.
+///
+/// Process-wide, because the `Storage` that asks is cloned into every pipeline and reopened
+/// on every recovery, and the point is one line per table rather than one per open.
+fn first_mention_of(uri: &str) -> bool {
+    static SAID: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SAID.get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("checkpoint-warning set is never poisoned")
+        .insert(uri.to_string())
 }
 
 /// Is this the failure of a checkpoint this build cannot parse?
@@ -586,6 +591,71 @@ mod tests {
         no("_sidecars/whatever.parquet");
     }
 
+    #[tokio::test]
+    async fn the_engine_that_wrote_the_checkpoint_is_read_out_of_its_footer() {
+        // What turns "something is wrong with this table" into a name the operator can act
+        // on, and what the README prints. Only the parquet footer is read, so the fixture
+        // needs to be a parquet file at the right path and nothing more.
+        use deltalake::arrow::array::{Int64Array, RecordBatch};
+        use deltalake::arrow::datatypes::{DataType, Field, Schema};
+        use deltalake::parquet::arrow::ArrowWriter;
+        use deltalake::parquet::file::properties::WriterProperties;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("_delta_log")).unwrap();
+
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)])),
+            vec![std::sync::Arc::new(Int64Array::from(vec![1i64])) as _],
+        )
+        .unwrap();
+        // Two of them, because the *newest* is the one that matters.
+        for (version, writer) in [(1u64, "parquet-rs version 58.4.0"), (2, TRINO)] {
+            let f = std::fs::File::create(
+                root.join(format!("_delta_log/{version:020}.checkpoint.parquet")),
+            )
+            .unwrap();
+            let props = WriterProperties::builder()
+                .set_created_by(writer.into())
+                .build();
+            let mut w = ArrowWriter::try_new(f, batch.schema(), Some(props)).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+
+        let got = Storage::default()
+            .checkpoint_writer(root.to_str().unwrap())
+            .await;
+        assert_eq!(got.as_deref(), Some(TRINO));
+    }
+
+    const TRINO: &str = "parquet-mr-trino version 480-e.5";
+
+    #[tokio::test]
+    async fn a_table_with_no_checkpoint_at_all_names_nobody_rather_than_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("_delta_log")).unwrap();
+        assert!(Storage::default()
+            .checkpoint_writer(root.to_str().unwrap())
+            .await
+            .is_none());
+    }
+
+    #[test]
+    fn a_table_is_mentioned_once_however_often_it_is_reopened() {
+        // `open` is also the recovery path after a failed commit, so a line per open would
+        // bury the batches around it.
+        let uri = "abfss://c@a.dfs.core.windows.net/lake/raw/orders";
+        assert!(first_mention_of(uri), "the first open says so");
+        assert!(!first_mention_of(uri), "and every one after it does not");
+        assert!(
+            first_mention_of("abfss://c@a.dfs.core.windows.net/lake/raw/other"),
+            "per table, not once per process"
+        );
+    }
+
     #[test]
     fn a_checkpoint_written_through_the_wrapper_is_not_one_of_the_hidden_ones() {
         // delta-rs writes a checkpoint as a post-commit hook and reads it straight back to
@@ -619,6 +689,12 @@ mod tests {
         assert!(is_unreadable_checkpoint(&kernel(
             "Kernel error: External error: External error: Schema error: Invalid data type \
              for Delta Lake: Timestamp(ms)"
+        )));
+        // The other shape the same cause takes, when the mismatch is caught by the
+        // projection rather than by the physical-type conversion.
+        assert!(is_unreadable_checkpoint(&kernel(
+            "Schema error: stats_parsed field maxValues has type Timestamp(Millisecond, \
+             None) but requested Timestamp(Microsecond, Some(\"UTC\"))"
         )));
         // Everything else must fail on the spot rather than paying for a second open.
         assert!(!is_unreadable_checkpoint(&kernel(
