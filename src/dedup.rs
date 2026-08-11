@@ -146,6 +146,14 @@ impl Dedup {
             }
             rows_scanned += batch.num_rows();
 
+            // As the table declares its columns, not as whichever engine wrote each file
+            // happened to type them. delta-rs's scan already projects onto the table schema,
+            // so today this changes nothing and costs nothing — it is here to make that a
+            // property of this function rather than of a pinned dependency's internals. What
+            // it guards is severe: a watermark read at millisecond precision from a
+            // Trino-compacted file would sit a thousandfold below every microsecond row, so
+            // nothing would ever be suppressed. See [`crate::schema::read_as_declared`].
+            let batch = crate::schema::read_as_declared(batch, &schema)?;
             let ts = column(&batch, timestamp_column)?;
             // A byte-comparable encoding, so any Delta type orders correctly without a
             // match arm per type — the same device `upsert::collapse` uses.

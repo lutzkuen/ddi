@@ -725,6 +725,13 @@ async fn assert_one_row_per_key(target: &DeltaTable, key_column: &str) -> Result
     /// Enough to show the operator the shape of the problem without gathering all of it.
     const EXAMPLES: usize = 3;
 
+    use deltalake::delta_datafusion::DataFusionMixins;
+    let declared = target
+        .snapshot()
+        .map_err(Error::Delta)?
+        .snapshot()
+        .read_schema();
+
     let (_t, mut stream) = target
         .clone()
         .scan_table()
@@ -742,6 +749,11 @@ async fn assert_one_row_per_key(target: &DeltaTable, key_column: &str) -> Result
         ))
     })? {
         rows_scanned += batch.num_rows();
+        // As the table declares the key, not as each file happens to type it. The scan
+        // already does this, so it is free; what it guards is that the same instant written
+        // by two engines at two precisions stringifies two different ways below, and the
+        // duplicate they represent would go unnoticed.
+        let batch = crate::schema::read_as_declared(batch, &declared)?;
         let col = column(&batch, key_column)?;
         let text = cast(&col, &DataType::Utf8).map_err(|e| {
             Error::Config(format!("upsert key {key_column:?} is not comparable: {e}"))

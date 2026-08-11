@@ -775,6 +775,59 @@ the source replays the whole table downstream.
 - `skip_change_commits` — skip those commits entirely.
 - `ignore_changes` — emit their `Add`s; rewritten rows are duplicated downstream.
 
+## Tables other engines also write
+
+`ddi`'s premise is that it can be pointed at a lakehouse other tools write, so it has to
+read what those tools leave behind. The one that shows up in practice is precision.
+
+The Delta protocol defines `timestamp` as **microseconds**. Trino writes **milliseconds** —
+into the data files its `OPTIMIZE` rewrites, and into the `stats_parsed` of the checkpoints
+it leaves behind. Nothing else in a typical estate objects: an append-only writer never
+reads the data back, and Trino reads what Trino wrote. A spec-enforcing reader is the first
+thing to notice, and without care it is the only thing that stops.
+
+So `ddi` is liberal in what it accepts, along one axis only:
+
+> **The table's Delta schema is authoritative. A physical column that differs from it in
+> precision alone is coerced on read.**
+
+- A `timestamp[ms]` data file is read as the declared `timestamp[us, tz=UTC]`. A column
+  written with no timezone at all is read as UTC, because that is what Delta's
+  UTC-adjusted `timestamp` means — never as local. `timestamp_ntz` keeps meaning what it
+  means.
+- A checkpoint whose `stats_parsed` carries types the protocol does not have no longer
+  decides whether the table opens. `ddi` replays the commit log instead and says so once,
+  naming the engine that wrote it:
+
+  ```text
+  WARN "abfss://…/erp_variant_article_changed" carries a checkpoint written by
+       parquet-mr-trino version 480-e.5 whose stats_parsed types do not match the table
+       schema; replaying the log instead. This is usually an OPTIMIZE from another engine.
+  ```
+
+  Opening is slower — every commit since version 0 is read — and the snapshot is identical.
+  Nothing is lost: a checkpoint's only exclusive content is `stats_parsed`, a pre-decoded
+  copy of statistics `ddi` never reads. [`src/stats.rs`](src/stats.rs) parses the `stats`
+  JSON string, which the commits carry verbatim.
+
+  Only the checkpoints that were *already there* are stepped over. A table opened this way
+  stays fully writable, and the checkpoint delta-rs writes on its way through is well-typed
+  and visible — so the table heals itself, and the slow open stops being needed. Where log
+  retention has already removed the commits the bad checkpoint stands in for, there is
+  nothing left to replay; `ddi` says exactly that rather than failing obscurely.
+
+Only a **widening** between two timestamps is performed, and nothing else is newly refused
+either. A file *finer* than the schema — Spark writes Delta timestamps as INT96, which
+decodes as nanoseconds however the table is declared — is passed through to the coercer that
+has always narrowed it. A `string` where the schema says `timestamp` is not a precision
+difference at all, and fails exactly as it always has. The point of the rule is to narrow
+what is refused, not to refuse more.
+
+If you hit the checkpoint failure on a build that predates this, deleting the offending
+`*.checkpoint.parquet` and `_last_checkpoint` forces the same log replay by hand, and is
+safe while the JSON commits are still inside log retention. It does not help where
+`OPTIMIZE` also rewrote data files — but it tells the two failures apart quickly.
+
 ## Fan-out
 
 One source, many targets is the common shape for order data:

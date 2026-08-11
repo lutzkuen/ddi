@@ -92,10 +92,24 @@ impl WatermarkStore {
                  target with dbt can start."
             ))
         })?;
+        use deltalake::delta_datafusion::DataFusionMixins;
+        let declared = table
+            .snapshot()
+            .map_err(Error::Delta)?
+            .snapshot()
+            .read_schema();
+
         let (_t, stream) = table.scan_table().await.map_err(Error::Delta)?;
         let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(|e| {
             Error::Other(format!("cannot read watermark table {:?}: {e}", self.uri))
         })?;
+        // As the table declares its columns. This table is written by dbt, against whatever
+        // warehouse the project targets, so it is the likeliest of all of them to be typed
+        // by an engine with its own ideas about precision.
+        let batches: Vec<RecordBatch> = batches
+            .into_iter()
+            .map(|b| crate::schema::read_as_declared(b, &declared))
+            .collect::<Result<_>>()?;
 
         let mut best: Option<Version> = None;
         for b in &batches {

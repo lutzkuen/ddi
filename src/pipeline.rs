@@ -492,6 +492,14 @@ impl Pipeline {
     ///
     /// Delta keeps partition column values in the `Add` action rather than in the parquet
     /// file, so they are re-attached here.
+    ///
+    /// The files are read as the source table's schema declares them, not as they happen to
+    /// be typed on disk. `OPTIMIZE` run by another engine rewrites files at that engine's
+    /// idea of precision — Trino writes `timestamp` as milliseconds — and every one of them
+    /// is a legal member of a table whose schema says microseconds. See
+    /// [`crate::schema::read_as_declared`]. Without it a batch spanning one Trino-written
+    /// file and one delta-rs-written file would not even be a batch: two schemas, one
+    /// transform.
     async fn scan(&self, batch: &LogBatch) -> Result<Vec<RecordBatch>> {
         use deltalake::parquet::arrow::async_reader::{
             ParquetObjectReader, ParquetRecordBatchStreamBuilder,
@@ -499,6 +507,7 @@ impl Pipeline {
         use deltalake::Path as StorePath;
 
         let store = self.source.log_store().object_store(None);
+        let declared = arrow_schema_of(&batch.schema)?;
         let partition_cols: Vec<String> = self
             .source
             .snapshot()
@@ -529,6 +538,10 @@ impl Pipeline {
                 .map_err(|e| Error::Transform(format!("read failed for {:?}: {e}", add.path)))?;
 
             for b in batches {
+                // Before the partition columns, which come from the log as text and are
+                // cast by the coercer, not from the file.
+                let b = crate::schema::read_as_declared(b, &declared)
+                    .map_err(|e| Error::Schema(format!("{:?}: {e}", add.path)))?;
                 out.push(if partition_cols.is_empty() {
                     b
                 } else {
@@ -574,6 +587,22 @@ fn is_commit_conflict(e: &Error) -> bool {
                 | TransactionError::MaxCommitAttempts(_),
         })
     )
+}
+
+/// A Delta schema as Arrow sees it.
+///
+/// The source's own declaration of what its columns are, which is what a data file has to
+/// be read as however it happens to be typed on disk.
+fn arrow_schema_of(schema: &deltalake::kernel::StructType) -> Result<SchemaRef> {
+    use deltalake::arrow::datatypes::Schema;
+    use deltalake::kernel::engine::arrow_conversion::TryIntoArrow;
+
+    let s: Schema = schema.try_into_arrow().map_err(|e| {
+        Error::Schema(format!(
+            "the source's schema is not expressible in Arrow: {e}"
+        ))
+    })?;
+    Ok(Arc::new(s))
 }
 
 /// A Delta table's own identity, which survives nothing but the table itself.
