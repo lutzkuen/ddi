@@ -153,8 +153,9 @@ impl LogStreamBuilder {
         ts: chrono::DateTime<chrono::Utc>,
     ) -> Result<Self> {
         // Reuse the log store rather than rebuilding one from the URL: it already
-        // carries the object-store credentials, and a rebuilt one would not.
-        let mut table = DeltaTable::new(self.log_store.clone(), DeltaTableConfig::default());
+        // carries the object-store credentials, and a rebuilt one would not. Without
+        // files, for the reasons in `schema_at`: the answer is a version number.
+        let mut table = DeltaTable::new(self.log_store.clone(), without_files());
         table.load_with_datetime(ts).await.map_err(Error::Delta)?;
         let v = table.version().unwrap_or(0);
         self.cursor = StreamCursor::at_version(v);
@@ -324,11 +325,24 @@ impl LogStreamBuilder {
     }
 
     /// Schema as of `version`, cached.
+    ///
+    /// Loaded **without files**, and that is not only an optimisation. The schema lives in
+    /// the `metaData` action, so the list of live files is answering a question nobody
+    /// asked — on a large source it is the whole file set of the table, rebuilt whenever a
+    /// batch reaches a version this has not seen.
+    ///
+    /// It is also what keeps this readable on a lakehouse other engines compact. Delta-rs
+    /// replays protocol and metadata from the commits alone and only reads a checkpoint's
+    /// *file* actions when files are required — so a checkpoint another engine wrote at a
+    /// precision the protocol does not have is never parsed here. Without this, a table
+    /// whose newest checkpoint is fine still fails the moment a batch asks for the schema
+    /// at a version an older, foreign checkpoint covers: `open` steps over such a
+    /// checkpoint, but only for the version it opens at.
     async fn schema_at(&mut self, version: Version) -> Result<Arc<StructType>> {
         if let Some(s) = self.schema_cache.get(&version) {
             return Ok(s.clone());
         }
-        let mut table = DeltaTable::new(self.log_store.clone(), DeltaTableConfig::default());
+        let mut table = DeltaTable::new(self.log_store.clone(), without_files());
         table.load_version(version).await.map_err(Error::Delta)?;
         let snapshot = table.snapshot().map_err(Error::Delta)?;
         let schema = snapshot.schema();
@@ -339,6 +353,19 @@ impl LogStreamBuilder {
         }
         self.schema_cache.insert(version, schema.clone());
         Ok(schema)
+    }
+}
+
+/// Load the log, but not the list of files it leaves live.
+///
+/// Both uses here ask the log a question about *itself* — what the schema was, which
+/// version a timestamp lands on — and neither needs to know which files survived. Saying so
+/// is what stops delta-rs materialising them, which costs a full replay of the file set and,
+/// on a table another engine has compacted, means parsing that engine's checkpoint.
+fn without_files() -> DeltaTableConfig {
+    DeltaTableConfig {
+        require_files: false,
+        ..Default::default()
     }
 }
 

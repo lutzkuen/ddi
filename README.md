@@ -816,6 +816,13 @@ So `ddi` is liberal in what it accepts, along one axis only:
   retention has already removed the commits the bad checkpoint stands in for, there is
   nothing left to replay; `ddi` says exactly that rather than failing obscurely.
 
+  A table compacted more than once has *older* checkpoints too, and the newest being
+  readable says nothing about them. `ddi` never parses those, because the only questions it
+  asks about an earlier version — what the schema was, which version a timestamp lands on —
+  are answered from the commits alone, and it asks them without requesting the file list
+  that would make delta-rs read a checkpoint. That is also why it is fast: those calls used
+  to rebuild the source's entire file set once per version.
+
 Only a **widening** between two timestamps is performed, and nothing else is newly refused
 either. A file *finer* than the schema — Spark writes Delta timestamps as INT96, which
 decodes as nanoseconds however the table is declared — is passed through to the coercer that

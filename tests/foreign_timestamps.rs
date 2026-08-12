@@ -368,6 +368,29 @@ async fn read_timestamps(path: &str) -> Vec<(i64, i64)> {
     out
 }
 
+/// Append through a handle that can survive a foreign checkpoint, which a plain
+/// `open_table` cannot once one is the newest thing in the log.
+async fn append_healed(path: &str, rows: &[(i64, i64)]) {
+    let t = Storage::default().open(path).await.unwrap();
+    let b = RecordBatch::try_new(
+        ts_arrow_schema(),
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(
+                TimestampMicrosecondArray::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())
+                    .with_timezone("UTC"),
+            ) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    t.write(vec![b])
+        .with_save_mode(SaveMode::Append)
+        .await
+        .unwrap();
+}
+
 // ------------------------------------------------------------- part 1: the checkpoint
 
 #[tokio::test(flavor = "multi_thread")]
@@ -440,6 +463,62 @@ async fn the_watermark_is_the_same_with_that_checkpoint_and_without_it() {
         of(&trino).await,
         of(&plain).await,
         "ignoring the checkpoint must not change a single answer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreign_checkpoint_below_the_newest_one_does_not_stop_the_stream() {
+    // `open` steps over a checkpoint it cannot parse — but only the one it opens at. A
+    // table that has been compacted more than once has *older* checkpoints too, and the
+    // newest may be perfectly readable while an earlier one is not. Such a table opens, its
+    // watermark reads, its preflight passes, and then a batch reaches a version the old
+    // checkpoint covers and the stream stops. It stops on every batch after that, because
+    // reopening finds nothing wrong with the version it opens at.
+    //
+    // This is what production hit, and it is worth being exact about where: not in the
+    // merge, and not in any read of a data file, but in asking the log what the schema was
+    // at a version — a question whose answer is in `metaData` and needs no files at all.
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let source = root.join("source").to_str().unwrap().to_string();
+    let target = root.join("target").to_str().unwrap().to_string();
+
+    create_ts_table(&source).await;
+    create_ts_table(&target).await;
+
+    // A compaction at v2 leaves a checkpoint this build cannot parse.
+    append_ts(&source, &[(1, T0)]).await;
+    let t = append_ts(&source, &[(2, T1)]).await;
+    deltalake::checkpoints::create_checkpoint(&t, None)
+        .await
+        .unwrap();
+    trinoize_checkpoint(&source, 2);
+
+    // Streaming continues, and a later checkpoint — written by anything that emits
+    // microseconds — buries it. From here the table opens perfectly well.
+    append_healed(&source, &[(3, T2)]).await;
+    append_healed(&source, &[(4, T2)]).await;
+    let t = Storage::default().open(&source).await.unwrap();
+    deltalake::checkpoints::create_checkpoint(&t, None)
+        .await
+        .unwrap();
+    deltalake::open_table(ensure_table_uri(&source).unwrap())
+        .await
+        .expect("the newest checkpoint is fine, so the table opens the ordinary way");
+
+    // One file per batch, so the stream has to ask for the schema at each version in turn —
+    // including the one the unreadable checkpoint is newest for.
+    let mut cfg = common::pipeline_cfg("under-a-newer-checkpoint", &source, &target);
+    cfg.max_files_per_batch = 1;
+    let mut p = Pipeline::open(cfg).await.expect("the pipeline must open");
+    p.run_until_caught_up()
+        .await
+        .expect("and must not stop at the version the old checkpoint covers");
+
+    assert_eq!(
+        read_timestamps(&target).await,
+        vec![(1, T0), (2, T1), (3, T2), (4, T2)],
+        "every commit must arrive, not just the ones above the buried checkpoint"
     );
 }
 

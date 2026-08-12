@@ -149,6 +149,16 @@ impl Storage {
     /// `_last_checkpoint` alone is not enough, since the kernel also finds checkpoints by
     /// listing `_delta_log`.
     ///
+    /// # What this does not cover
+    ///
+    /// The version it opens at, and no other. A table compacted more than once carries
+    /// older checkpoints too, and the newest being readable says nothing about them — so a
+    /// *later* load of an *earlier* version can still meet one, on a handle that opened
+    /// perfectly well. The answer is not to widen this: it is for such a load not to need
+    /// files, because a checkpoint's file actions are the only part delta-rs parses eagerly.
+    /// See [`crate::source::log_stream`], where both version-targeted loads ask the log
+    /// about itself and say so.
+    ///
     /// # Why version 0 is checked first
     ///
     /// "The same snapshot, only slower" holds only while every commit still exists. Once a
