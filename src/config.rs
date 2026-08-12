@@ -40,6 +40,19 @@ pub struct Defaults {
     pub max_files_per_batch: usize,
     #[serde(default = "default_max_output_rows")]
     pub max_output_rows_per_batch: usize,
+
+    /// How much memory the whole process may use, divided across the pipelines in it.
+    ///
+    /// Unset means "whatever the container says", and if the container says nothing either
+    /// then nothing is bounded — which is the behaviour there has always been, and the
+    /// right one for a local run. Set it to take a tighter bound than the cgroup's, or to
+    /// get one at all outside a container.
+    ///
+    /// It is a *process* number rather than a per-pipeline one on purpose: pipelines all
+    /// start at once, and it is that simultaneity which turns a survivable allocation into
+    /// an OOM. See [`crate::budget`].
+    #[serde(default)]
+    pub max_memory: Option<String>,
 }
 
 impl Default for Defaults {
@@ -50,6 +63,7 @@ impl Default for Defaults {
             target_file_size: default_target_file_size(),
             max_files_per_batch: default_max_files(),
             max_output_rows_per_batch: default_max_output_rows(),
+            max_memory: None,
         }
     }
 }
@@ -359,6 +373,21 @@ fn parse_size(s: &str, field: &str) -> Result<u64> {
 }
 
 impl Config {
+    /// The process's memory budget, resolved against the config and the container.
+    ///
+    /// Called once at startup, with the pipelines that are actually going to run — not the
+    /// ones written down, since a rejected pipeline allocates nothing and dividing by it
+    /// would make everyone else's share too small.
+    pub fn budget(&self, running: usize) -> Result<crate::budget::Budget> {
+        let configured = self
+            .runtime
+            .max_memory
+            .as_deref()
+            .map(|s| parse_size(s, "runtime.max_memory"))
+            .transpose()?;
+        Ok(crate::budget::Budget::resolve(configured, running))
+    }
+
     pub fn from_toml_str(s: &str) -> Result<Self> {
         toml::from_str(s).map_err(|e| Error::Config(format!("invalid config: {e}")))
     }

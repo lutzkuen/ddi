@@ -168,12 +168,31 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
     for r in &rejected {
         error!(pipeline = %r.name, "held back: {}", r.reason);
     }
+    // Divided by what will actually run, not by what was written down: a held-back pipeline
+    // allocates nothing, and counting it would make everyone else's share too small.
+    let budget = cfg.budget(pipelines.len())?;
+    budget.clone().install();
+
     info!(
         config = %cli.config.display(),
         pipelines = pipelines.len(),
         rejected = rejected.len(),
+        memory_per_pipeline = ?budget.per_pipeline(),
         "config loaded"
     );
+    match budget.per_pipeline() {
+        Some(b) => info!(
+            bytes = b,
+            "each pipeline may use about {} — DataFusion spills at it, and batches are sized \
+             so what they decode to fits inside it",
+            bytesize::ByteSize(b)
+        ),
+        None => info!(
+            "no memory budget: neither [runtime] max_memory nor a container limit. Nothing \
+             here is bounded by size, which is fine on a workstation and worth setting in a \
+             container."
+        ),
+    }
     let command = cli.command.unwrap_or(Command::Run);
     // `validate` still has something to say when nothing can run — that *is* its report.
     if pipelines.is_empty() && !matches!(command, Command::Validate) {

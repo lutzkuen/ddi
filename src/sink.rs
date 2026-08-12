@@ -144,7 +144,8 @@ impl Sink {
         let rows = batch.num_rows();
         let target_schema = batch.schema();
 
-        let ctx = SessionContext::new();
+        let session = std::sync::Arc::new(crate::budget::session(&table)?);
+        let ctx = SessionContext::new_with_state((*session).clone());
         let source = ctx
             .read_batch(batch)
             .map_err(|e| Error::Other(format!("upsert: cannot register the batch: {e}")))?;
@@ -168,6 +169,10 @@ impl Sink {
             // `t.key = s.key` into a static key range and skip target files by it. The
             // batch is an in-memory table, so re-planning it is cheap.
             .with_streaming(false)
+            // The merge reads the target and joins it against the batch, and both of those
+            // are DataFusion's to hold. Giving it the pipeline's share is what makes a
+            // merge window that turned out wider than expected spill instead of OOM.
+            .with_session_state(session)
             .with_commit_properties(self.properties(source_version));
 
         merge = merge

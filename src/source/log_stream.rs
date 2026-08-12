@@ -93,6 +93,12 @@ pub struct LogStreamBuilder {
     /// Source head as of the last `next_batch` poll. `None` before the first poll.
     /// Recorded rather than re-fetched: `next_batch` already pays for this read.
     head: Option<Version>,
+    /// What decoding this source's files has cost, per byte the log said they were.
+    ///
+    /// Shared with the pipeline, which updates it after every read. It is the only thing
+    /// that connects `max_bytes_per_batch` — a count of *compressed* bytes — to the memory
+    /// the batch will actually occupy.
+    amplification: Arc<crate::budget::Amplification>,
 }
 
 impl LogStreamBuilder {
@@ -106,6 +112,31 @@ impl LogStreamBuilder {
             allow_commit_splitting: false,
             schema_cache: HashMap::new(),
             head: None,
+            amplification: Arc::new(crate::budget::Amplification::default()),
+        }
+    }
+
+    /// The running estimate this stream sizes its batches by, for the reader to update.
+    pub fn amplification(&self) -> Arc<crate::budget::Amplification> {
+        self.amplification.clone()
+    }
+
+    /// The most bytes this batch may *combine*, as opposed to the most one commit may be.
+    ///
+    /// Two limits, and the distinction is the whole of the design. `max_bytes_per_batch` is
+    /// a contract: a commit that fits it has always been delivered, and a memory budget
+    /// must not turn a pipeline that worked yesterday into one that errors today. The
+    /// budget's limit is advice about how much to put together at once, so it only ever
+    /// stops accumulation early — the first commit of a batch is admitted against the
+    /// configured limit however tight memory is.
+    ///
+    /// That is enough, because the shape that kills the process is not one enormous commit.
+    /// It is a cold pipeline filling 256 MB of *compressed* budget with many files, all
+    /// decoded at once into five or six times that.
+    fn combined_ceiling(&self) -> u64 {
+        match crate::budget::current().bytes_per_batch(self.amplification.get()) {
+            Some(b) => self.max_bytes_per_batch.min(b),
+            None => self.max_bytes_per_batch,
         }
     }
 
@@ -255,7 +286,15 @@ impl LogStreamBuilder {
 
             let commit_bytes: u64 = remaining.iter().map(|a| a.size.max(0) as u64).sum();
             let fits_files = files.len() + remaining.len() <= self.max_files_per_batch;
-            let fits_bytes = bytes + commit_bytes <= self.max_bytes_per_batch;
+            // Nothing accumulated yet, so this commit is measured against the configured
+            // limit alone — see `combined_ceiling`. Only a batch that is already carrying
+            // something is asked to stop early for memory.
+            let ceiling = if files.is_empty() {
+                self.max_bytes_per_batch
+            } else {
+                self.combined_ceiling()
+            };
+            let fits_bytes = bytes + commit_bytes <= ceiling;
 
             if fits_files && fits_bytes {
                 files.extend_from_slice(remaining);

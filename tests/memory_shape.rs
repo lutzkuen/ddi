@@ -309,6 +309,12 @@ async fn batch_decode_amplification() {
         on_disk as f64 / 1048576.0
     );
 
+    if let Ok(b) = std::env::var("BUDGET_MB") {
+        let bytes: u64 = b.parse::<u64>().unwrap() * 1024 * 1024;
+        delta_delta_ingest::budget::Budget::resolve(Some(bytes), 1).install();
+        println!("  (budget installed: {b} MiB for one pipeline)");
+    }
+
     let mut cfg = common::pipeline_cfg("decode", &source, &target);
     // Admit the whole table in one batch, as a cold pipeline with a 256MB budget does.
     cfg.max_bytes_per_batch = 8 * 1024 * 1024 * 1024;
@@ -317,8 +323,14 @@ async fn batch_decode_amplification() {
     let mut p = Pipeline::open(cfg).await.unwrap();
     let before = rss_mib();
     let peak = Peak::start();
-    p.step().await.unwrap();
-    peak.finish("one step over the whole table", before);
+    let mut steps = 0;
+    while !matches!(
+        p.step().await.unwrap(),
+        delta_delta_ingest::pipeline::StepOutcome::CaughtUp
+    ) {
+        steps += 1;
+    }
+    peak.finish(&format!("catching up in {steps} step(s)"), before);
     println!(
         "  amplification vs parquet on disk: {:.1}x",
         (rss_mib() - before).max(0.0) * 1048576.0 / on_disk as f64

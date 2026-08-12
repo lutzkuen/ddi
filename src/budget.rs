@@ -136,16 +136,21 @@ pub fn current() -> Budget {
     INSTALLED.get().cloned().unwrap_or_else(Budget::unbounded)
 }
 
+/// A DataFusion runtime holding this pipeline's share, with somewhere to spill to.
+pub fn runtime() -> Result<Arc<deltalake::datafusion::execution::runtime_env::RuntimeEnv>> {
+    RuntimeEnvBuilder::new()
+        .with_memory_pool(current().pool())
+        .build_arc()
+        .map_err(|e| Error::Other(format!("cannot build a bounded session: {e}")))
+}
+
 /// A DataFusion session bounded by the budget, able to read `table`.
 ///
 /// The object-store registration is not optional: a session this tool builds itself does
 /// not carry the one delta-rs would have registered, and a scan through it would fail to
 /// find the table's files.
 pub fn session(table: &DeltaTable) -> Result<SessionState> {
-    let runtime = RuntimeEnvBuilder::new()
-        .with_memory_pool(current().pool())
-        .build_arc()
-        .map_err(|e| Error::Other(format!("cannot build a bounded session: {e}")))?;
+    let runtime = runtime()?;
 
     let log_store = table.log_store();
     let url = log_store.root_url().clone();

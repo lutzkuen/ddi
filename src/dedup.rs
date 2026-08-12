@@ -127,6 +127,10 @@ impl Dedup {
             .clone()
             .scan_table()
             .with_columns(projection(timestamp_column, key_column))
+            // Bounded like everything else, so a target whose files are enormous throttles
+            // rather than growing. The pass itself is already streaming; this covers what
+            // the scan holds underneath it.
+            .with_session_state(std::sync::Arc::new(crate::budget::session(target)?))
             .await
             .map_err(Error::Delta)?;
 

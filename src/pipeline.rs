@@ -64,6 +64,8 @@ pub struct Pipeline {
     /// Where rows the target will not take are put. `None` when there is no such table, in
     /// which case a bad row still stops the pipeline — see [`crate::dq`].
     dq: Option<DataQuality>,
+    /// What decoding this source costs, shared with the stream that sizes batches by it.
+    amplification: Arc<crate::budget::Amplification>,
 }
 
 impl Pipeline {
@@ -98,6 +100,7 @@ impl Pipeline {
             .with_change_policy(cfg.change_policy)
             .with_max_files_per_batch(cfg.max_files_per_batch)
             .with_max_bytes_per_batch(cfg.max_bytes_per_batch);
+        let amplification = stream.amplification();
 
         let transform: Box<dyn Transform> = match &cfg.transform_sql {
             Some(sql) => Box::new(SqlTransform::new(sql.clone())),
@@ -178,6 +181,7 @@ impl Pipeline {
             coercer: SchemaCoercer::new(target_schema),
             dedup,
             dq,
+            amplification,
         })
     }
 
@@ -208,6 +212,13 @@ impl Pipeline {
         // 2. Read those files as Arrow.
         let input = self.scan(&batch).await?;
         let in_rows: usize = input.iter().map(|b| b.num_rows()).sum();
+
+        // What that cost, so the next batch can be sized by it rather than by a constant.
+        // `max_bytes_per_batch` counts the compressed bytes the log recorded; this is what
+        // they became once decoded, and the ratio between them is the whole reason a
+        // 256 MB setting can hold a gigabyte and a half.
+        let decoded: u64 = input.iter().map(|b| b.get_array_memory_size() as u64).sum();
+        self.amplification.observe(batch.total_bytes(), decoded);
 
         // 3. Transform. Stateless, row-local, validated at config load.
         let output = self.transform.apply(input).await?;

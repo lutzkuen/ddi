@@ -99,7 +99,11 @@ impl WatermarkStore {
             .snapshot()
             .read_schema();
 
-        let (_t, stream) = table.scan_table().await.map_err(Error::Delta)?;
+        let (_t, stream) = table
+            .scan_table()
+            .with_session_state(std::sync::Arc::new(crate::budget::session(&table)?))
+            .await
+            .map_err(Error::Delta)?;
         let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(|e| {
             Error::Other(format!("cannot read watermark table {:?}: {e}", self.uri))
         })?;

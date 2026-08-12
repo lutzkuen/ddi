@@ -718,6 +718,53 @@ whereas a gap is silent and permanent.
 `OPTIMIZE` on the target is not mistaken for a rebuild: its `Remove` actions carry
 `dataChange: false`.
 
+## Memory
+
+```toml
+[runtime]
+max_memory = "6GB"      # optional; the container's own limit is used when unset
+```
+
+One number for the process, divided by the pipelines running in it — because they all start
+at once, and it is that simultaneity which turns a survivable allocation into an OOM. When
+`max_memory` is unset the cgroup's limit is read and three quarters of it used; when there is
+no limit either, nothing is bounded, which is the right answer on a workstation.
+
+It covers two things, and they are not the same mechanism:
+
+- **DataFusion**, through the memory pool every session `ddi` builds — the SQL transform, the
+  merge, the target scans, the upsert's grain check. Those consumers spill rather than grow.
+- **The batch**, which matters more. `max_bytes_per_batch` counts *compressed parquet bytes*,
+  and what the process holds is that decoded into Arrow for every file at once. Measured on a
+  realistic table the gap is about 5×, so a 256 MB setting can be 1.4 GB resident — per
+  pipeline, on the first batch after a cold start, when every pipeline is furthest behind and
+  asking for the most.
+
+  So a batch stops accumulating when what it has *already decoded* would fill its share. The
+  ratio is measured after every batch rather than assumed, because a constant chosen here is
+  a constant to get wrong later.
+
+Measured, on 90 MiB of parquet in 8 files:
+
+| `max_memory` | batches | peak RSS |
+|---|---|---|
+| unset | 1 | +413 MiB |
+| 512 MiB | 4 | +119 MiB |
+| 256 MiB | 8 | +89 MiB |
+
+The floor is one commit: a commit that fits `max_bytes_per_batch` is always delivered, however
+tight the budget. A budget makes batches smaller and more numerous; it never refuses one, and
+it never stalls a pipeline that worked before it was set.
+
+`tests/memory_shape.rs` is the probe those numbers come from. It is `#[ignore]`d because it
+builds multi-million-row tables, and it is in the repository because every memory incident
+here was first diagnosed by correlation from outside the process, and twice that was wrong:
+
+```bash
+cargo test --profile release-lean --test memory_shape -- --ignored --nocapture --test-threads=1
+ROWS=6000000 BUDGET_MB=512 cargo test --profile release-lean --test memory_shape -- --ignored --nocapture
+```
+
 ## Storage
 
 Tables are named by URI and the scheme picks the backend — a bare path or `file://` for

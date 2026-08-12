@@ -60,7 +60,16 @@ impl SqlTransform {
             // Grain-preserving transforms need no repartitioning, and keeping it off makes
             // output row order track input order, which makes tests deterministic.
             .with_target_partitions(1);
-        let ctx = SessionContext::new_with_config(config);
+        // Built against the process's memory budget, so a transform that sorts or groups
+        // spills rather than growing. The batch it is handed is already bounded by
+        // `max_bytes_per_batch`; this bounds what the transform makes of it.
+        let ctx = SessionContext::new_with_state(
+            deltalake::datafusion::execution::session_state::SessionStateBuilder::new()
+                .with_config(config)
+                .with_runtime_env(crate::budget::runtime()?)
+                .with_default_features()
+                .build(),
+        );
         register_udfs(&ctx);
 
         let provider = MemTable::try_new(schema, vec![batches])
