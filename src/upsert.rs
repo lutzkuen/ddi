@@ -718,74 +718,74 @@ pub async fn preflight(
 /// than per batch. See [`crate::dedup::Dedup::read`] for the same reasoning applied to the
 /// watermark.
 async fn assert_one_row_per_key(target: &DeltaTable, key_column: &str) -> Result<()> {
-    use deltalake::arrow::array::{Array, StringArray};
-    use futures::TryStreamExt;
-    use std::collections::{HashMap, HashSet};
+    use deltalake::arrow::array::{Array, AsArray, Int64Array};
+    use deltalake::datafusion::prelude::SessionContext;
 
     /// Enough to show the operator the shape of the problem without gathering all of it.
     const EXAMPLES: usize = 3;
 
-    use deltalake::delta_datafusion::DataFusionMixins;
-    let declared = target
-        .snapshot()
-        .map_err(Error::Delta)?
-        .snapshot()
-        .read_schema();
-
-    let (_t, mut stream) = target
-        .clone()
-        .scan_table()
-        .with_columns([key_column])
+    // Asked as an aggregate rather than answered by hand, and the reason is memory. The
+    // obvious implementation — stream the key column and keep a `HashSet` of what has been
+    // seen — is O(distinct keys) resident, on every start, for the life of the check. At
+    // ~74 bytes per key that is a third of a gigabyte on a six-million-row target, held by
+    // every upsert pipeline at once, at exactly the moment every other pipeline is also
+    // starting. It is the same shape [`crate::dedup::Dedup::read`] used to have.
+    //
+    // DataFusion's grouped aggregate answers the identical question, exits on the same
+    // three examples, and lives inside the session's memory pool — so it spills rather than
+    // grows, and it is bounded by [`crate::config::Runtime::max_memory`] like everything
+    // else rather than being a special case that budget has to know about.
+    let provider = target
+        .table_provider()
         .await
-        .map_err(Error::Delta)?;
+        .map_err(|e| Error::Other(format!("upsert: cannot read the target's grain: {e}")))?;
 
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut repeated: HashMap<String, usize> = HashMap::new();
-    let mut rows_scanned = 0usize;
+    let ctx = SessionContext::new_with_state(crate::budget::session(target)?);
+    ctx.register_table("target", provider)
+        .map_err(|e| Error::Other(format!("upsert: cannot register the target: {e}")))?;
 
-    'scan: while let Some(batch) = stream.try_next().await.map_err(|e| {
-        Error::Other(format!(
-            "upsert: cannot scan the target to check its grain: {e}"
-        ))
-    })? {
-        rows_scanned += batch.num_rows();
-        // As the table declares the key, not as each file happens to type it. The scan
-        // already does this, so it is free; what it guards is that the same instant written
-        // by two engines at two precisions stringifies two different ways below, and the
-        // duplicate they represent would go unnoticed.
-        let batch = crate::schema::read_as_declared(batch, &declared)?;
-        let col = column(&batch, key_column)?;
-        let text = cast(&col, &DataType::Utf8).map_err(|e| {
+    let key = quote(key_column);
+    let sql = format!(
+        "SELECT {key} AS k, count(*) AS n FROM target GROUP BY {key} \
+         HAVING count(*) > 1 LIMIT {EXAMPLES}"
+    );
+    let found = ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| Error::Config(format!("upsert key {key_column:?} cannot be grouped: {e}")))?
+        .collect()
+        .await
+        .map_err(|e| {
+            Error::Other(format!(
+                "upsert: cannot scan the target to check its grain: {e}"
+            ))
+        })?;
+
+    let mut examples: Vec<String> = Vec::new();
+    for b in &found {
+        let keys = cast(b.column(0), &DataType::Utf8).map_err(|e| {
             Error::Config(format!("upsert key {key_column:?} is not comparable: {e}"))
         })?;
-        let text = text.as_any().downcast_ref::<StringArray>().expect("utf8");
-
-        for i in 0..batch.num_rows() {
-            let key = if text.is_null(i) {
+        let keys = keys.as_string::<i32>();
+        let counts = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count(*) is int64");
+        for i in 0..b.num_rows() {
+            let k = if keys.is_null(i) {
                 "NULL"
             } else {
-                text.value(i)
+                keys.value(i)
             };
-            if !seen.insert(key.to_string()) {
-                let n = repeated.entry(key.to_string()).or_insert(1);
-                *n += 1;
-                if repeated.len() >= EXAMPLES {
-                    // The answer is already "no"; counting the rest only costs time.
-                    break 'scan;
-                }
-            }
+            examples.push(format!("{k:?} ({} rows)", counts.value(i)));
         }
     }
 
-    if repeated.is_empty() {
-        tracing::debug!(key_column, rows_scanned, "the target holds one row per key");
+    if examples.is_empty() {
+        tracing::debug!(key_column, "the target holds one row per key");
         return Ok(());
     }
-
-    let mut examples: Vec<String> = repeated
-        .into_iter()
-        .map(|(k, n)| format!("{k:?} ({n}+ rows)"))
-        .collect();
     examples.sort();
 
     Err(Error::Config(format!(
