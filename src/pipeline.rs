@@ -426,9 +426,12 @@ impl Pipeline {
                     return Ok(stats);
                 }
                 Err(e) => {
-                    // Restore a usable handle either way.
+                    // Restore a usable handle either way — and note that reopening is what
+                    // makes the second of these two worth retrying at all, because
+                    // `Storage::open` is where a checkpoint this build cannot parse gets
+                    // stepped over.
                     self.target = self.cfg.storage.open(&self.cfg.target_uri).await?;
-                    if !is_commit_conflict(&e) || attempt == MERGE_ATTEMPTS {
+                    if !worth_replanning(&e) || attempt == MERGE_ATTEMPTS {
                         return Err(e);
                     }
                     warn!(
@@ -571,6 +574,15 @@ impl Pipeline {
 /// spinning would only hide it.
 const MERGE_ATTEMPTS: u32 = 3;
 
+/// Is this a merge worth trying again against a freshly opened target?
+///
+/// Both members of this set are the same situation seen from two sides: another writer got
+/// to the target first. Everything else — a cast failure, a missing column — would fail the
+/// same way every time, and retrying would only make the log harder to read.
+fn worth_replanning(e: &Error) -> bool {
+    is_commit_conflict(e) || is_foreign_checkpoint(e)
+}
+
 /// Did this fail because somebody else committed first?
 ///
 /// Only this class is worth replanning for. A cast failure or a missing column would fail
@@ -587,6 +599,23 @@ fn is_commit_conflict(e: &Error) -> bool {
                 | TransactionError::MaxCommitAttempts(_),
         })
     )
+}
+
+/// Did this fail on a checkpoint another engine wrote, met part-way through a merge?
+///
+/// The one that is easy to miss, because nothing about the merge is wrong. Losing a commit
+/// race sends delta-rs into conflict resolution, which brings the snapshot up to the
+/// winner's version — and *that* reads any checkpoint above the version this handle was
+/// opened at. A compaction by another engine lands a commit and a checkpoint together, so
+/// the two arrive as a pair, and if that engine writes `timestamp` at a precision the Delta
+/// protocol does not have, the rebuild cannot parse it.
+///
+/// Nothing was committed when this happens, so it retries exactly like the conflict it
+/// really is. What makes the retry work rather than repeat is the reopen above: the handle
+/// it replans against has stepped over that checkpoint. The target's own data files have
+/// nothing to do with it — this reproduces with every file at the declared precision.
+fn is_foreign_checkpoint(e: &Error) -> bool {
+    matches!(e, Error::Delta(d) if crate::storage::is_unreadable_checkpoint(d))
 }
 
 /// A Delta schema as Arrow sees it.

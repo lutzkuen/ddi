@@ -823,6 +823,13 @@ So `ddi` is liberal in what it accepts, along one axis only:
   that would make delta-rs read a checkpoint. That is also why it is fast: those calls used
   to rebuild the source's entire file set once per version.
 
+  A compaction can also land *while a merge is running*. It commits and checkpoints
+  together, so an upsert that loses the race meets that checkpoint during conflict
+  resolution — above the version its handle was opened at, and so read rather than skipped.
+  Nothing is committed when that happens, so it is replanned against a freshly opened target
+  exactly like the commit conflict it is. None of this depends on the target's own files:
+  it happens with every one of them at the declared precision.
+
 Only a **widening** between two timestamps is performed, and nothing else is newly refused
 either. A file *finer* than the schema — Spark writes Delta timestamps as INT96, which
 decodes as nanoseconds however the table is declared — is passed through to the coercer that

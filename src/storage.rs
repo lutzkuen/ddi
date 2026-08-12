@@ -302,7 +302,7 @@ fn first_mention_of(uri: &str) -> bool {
 ///
 /// The kernel reports it as an Arrow schema error several layers of `External error:` down,
 /// so the text is all there is to match on.
-fn is_unreadable_checkpoint(e: &deltalake::DeltaTableError) -> bool {
+pub fn is_unreadable_checkpoint(e: &deltalake::DeltaTableError) -> bool {
     let msg = e.to_string();
     msg.contains("Invalid data type for Delta Lake")
         || (msg.contains("stats_parsed") && msg.contains("Schema error"))

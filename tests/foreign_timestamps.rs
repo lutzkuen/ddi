@@ -861,6 +861,55 @@ async fn upserting_across_the_two_spellings_collapses_on_the_key() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_that_loses_a_race_to_a_compaction_replans_instead_of_failing() {
+    // The other half of "open protects only the version it opens at", and the one that has
+    // nothing to do with data files: every file here is at the declared precision.
+    //
+    // A merge that loses a commit race sends delta-rs into conflict resolution, which brings
+    // the snapshot up to the winner's version — and that reads any checkpoint sitting above
+    // the version this handle was opened at. A compaction lands a commit and a checkpoint
+    // together, so they arrive as a pair. Nothing was committed when it fails, which is
+    // exactly the situation the replan loop already exists for; it simply did not recognise
+    // this as one of its own.
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let source = root.join("source").to_str().unwrap().to_string();
+    let target = root.join("target").to_str().unwrap().to_string();
+
+    create_ts_table(&source).await;
+    create_ts_table(&target).await;
+    append_ts(&target, &[(1, T0)]).await;
+    append_ts(&source, &[(1, T2), (2, T2)]).await;
+
+    // ddi opens the target. There is no checkpoint yet, so this is an ordinary open and the
+    // handle carries no protection at all — which is the point.
+    let mut cfg = common::pipeline_cfg("raced-compaction", &source, &target);
+    cfg.dedup_timestamp = Some("kafka_timestamp".into());
+    cfg.upsert_key = Some("id".into());
+    cfg.write_mode = delta_delta_ingest::config::WriteMode::Upsert;
+    let mut p = Pipeline::open(cfg).await.expect("the pipeline must open");
+
+    // Now the compaction lands, above the version that handle holds: a commit, and a
+    // checkpoint another engine wrote.
+    append_ts(&target, &[(3, T1)]).await;
+    let t = Storage::default().open(&target).await.unwrap();
+    deltalake::checkpoints::create_checkpoint(&t, None)
+        .await
+        .unwrap();
+    trinoize_checkpoint(&target, 2);
+
+    p.run_until_caught_up()
+        .await
+        .expect("the merge must replan against a reopened target, not fail the batch");
+
+    assert_eq!(
+        read_timestamps(&target).await,
+        vec![(1, T2), (2, T2), (3, T1)],
+        "key 1 replaced, key 2 inserted, and the row the other writer added left alone"
+    );
+}
+
 // ------------------------------------------------------ what must still be refused
 
 #[tokio::test(flavor = "multi_thread")]
