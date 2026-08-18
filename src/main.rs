@@ -300,7 +300,6 @@ fn non_delta_catalog(
                 .node(&lookup.unique_id)
                 .and_then(|node| node.database.as_deref())
         }))
-        .into_iter()
         .flatten()
         .find(|c| !delta.contains(*c))
         .map(str::to_string)

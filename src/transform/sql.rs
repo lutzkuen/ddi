@@ -13,7 +13,6 @@ use deltalake::arrow::array::RecordBatch;
 use deltalake::arrow::datatypes::SchemaRef;
 use deltalake::datafusion::datasource::MemTable;
 use deltalake::datafusion::prelude::{SessionConfig, SessionContext};
-use deltalake::delta_datafusion::DataFusionMixins;
 
 use crate::error::{Error, Result};
 use crate::lookup::LookupSnapshot;

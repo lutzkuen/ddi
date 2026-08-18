@@ -404,7 +404,7 @@ impl Pipeline {
         if self.cfg.lookups.is_empty() {
             return Ok(Vec::new());
         }
-        let timestamp = batch.through_log_timestamp.clone().ok_or_else(|| {
+        let timestamp = batch.through_log_timestamp.ok_or_else(|| {
             Error::Config(format!(
                 "pipeline {:?}: source commit {} has no Delta-log timestamp for pinned lookup selection",
                 self.cfg.name, batch.through_version

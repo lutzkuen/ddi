@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use deltalake::kernel::{Action, Add, Remove, StructType};
-use deltalake::logstore::object_store::ObjectStore;
+use deltalake::logstore::object_store::ObjectStoreExt;
 use deltalake::logstore::{commit_uri_from_version, get_actions, LogStore};
 use deltalake::{DeltaTable, DeltaTableConfig};
 use serde::{Deserialize, Serialize};
