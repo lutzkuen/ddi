@@ -43,6 +43,8 @@
 //! duplicates rows rather than dropping them. That asymmetry is deliberate: duplicates
 //! are visible and the next dbt run erases them, whereas a gap is silent and permanent.
 
+use std::collections::BTreeMap;
+
 use deltalake::kernel::Action;
 use deltalake::logstore::get_actions;
 use deltalake::DeltaTable;
@@ -247,9 +249,16 @@ pub async fn target_state(target: &DeltaTable, app_id: &str, max_scan: u64) -> R
 /// What our own last commit to the target recorded about itself.
 #[derive(Debug, Clone, Default)]
 pub struct OurLastCommit {
+    /// Target version of the newest commit carrying this pipeline's txn action. `None` means
+    /// this app id has never written the target (or the bounded scan could not find it).
+    pub commit_version: Option<Version>,
     /// The source table id we were reading. `None` for commits written before this was
     /// recorded, or when we have never written to this target.
     pub source_table_id: Option<String>,
+    /// Delta identities of the pinned lookups that produced the commit. A table recreated at
+    /// the same URI has a new id; resuming against it would silently change an old join.
+    /// Empty for pre-lookup commits and for tables we have never written.
+    pub lookup_table_ids: BTreeMap<String, String>,
 }
 
 /// Walk the target log backwards for the most recent commit that carries our txn action,
@@ -289,7 +298,24 @@ pub async fn our_last_commit(
                     .map(str::to_string),
                 _ => None,
             });
-            return Ok(OurLastCommit { source_table_id });
+            let lookup_table_ids = actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitInfo(ci) => Some(&ci.info),
+                    _ => None,
+                })
+                .flat_map(|info| info.iter())
+                .filter_map(|(key, value)| {
+                    let name = key.strip_prefix("ddi.lookup.")?.strip_suffix(".tableId")?;
+                    let id = value.as_str()?;
+                    Some((name.to_string(), id.to_string()))
+                })
+                .collect();
+            return Ok(OurLastCommit {
+                commit_version: Some(v),
+                source_table_id,
+                lookup_table_ids,
+            });
         }
 
         if v == 0 {

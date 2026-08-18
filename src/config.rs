@@ -1,13 +1,14 @@
 //! Configuration: N pipelines in one process.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::lookup::{LookupConfig, ResolvedLookup};
 use crate::source::{ChangePolicy, Version};
-use crate::transform::validate::normalise_sql;
+use crate::transform::validate::normalise_sql_with_lookups;
 
 fn default_allowed_latency() -> u64 {
     30
@@ -102,6 +103,10 @@ pub struct PipelineConfig {
 
     pub source_uri: String,
     pub target_uri: String,
+
+    /// Small Delta tables joined as pinned snapshots while processing a source batch.
+    #[serde(default)]
+    pub lookups: Vec<LookupConfig>,
 
     #[serde(default)]
     pub starting_version: Version,
@@ -216,6 +221,8 @@ pub struct ResolvedPipeline {
     pub app_id: String,
     pub source_uri: String,
     pub target_uri: String,
+    /// Pinned Delta lookup relations available to `transform_sql`.
+    pub lookups: Vec<ResolvedLookup>,
     pub starting_version: Version,
     pub change_policy: ChangePolicy,
     pub transform_sql: Option<String>,
@@ -548,18 +555,51 @@ impl Config {
         // `CROSS JOIN UNNEST` — is rewritten here, once, so the pipeline executes the same
         // query the validator approved. The model's own text stays in `PipelineConfig`, so
         // `ddi dbt convert` still pins what dbt wrote.
-        let transform_sql = match &p.transform_sql {
-            Some(sql) => Some(normalise_sql(sql).map_err(|e| match e {
-                Error::Config(m) => Error::Config(m),
-                other => Error::Config(other.to_string()),
-            })?),
-            None => None,
-        };
-
         if p.source_uri == p.target_uri {
             return Err(Error::Config(
                 "source_uri and target_uri are the same table; that would feed the pipeline \
                  its own output"
+                    .into(),
+            ));
+        }
+
+        let mut lookup_names = BTreeSet::new();
+        let mut lookups = Vec::with_capacity(p.lookups.len());
+        for lookup in &p.lookups {
+            let lookup = crate::lookup::resolve(lookup)?;
+            if !lookup_names.insert(lookup.name.clone()) {
+                return Err(Error::Config(format!(
+                    "lookup {:?} is declared more than once",
+                    lookup.name
+                )));
+            }
+            if lookup.uri == p.source_uri || lookup.uri == p.target_uri {
+                return Err(Error::Config(format!(
+                    "lookup {:?} points at a streaming source or target; a lookup must be a \
+                     separate, read-only Delta table",
+                    lookup.name
+                )));
+            }
+            lookups.push(lookup);
+        }
+
+        // Declared lookups are the only additional relations a transform may join. The
+        // normaliser validates their narrow join shape and rewrites dialect spellings such as
+        // Trino's CROSS JOIN UNNEST once, so the pipeline executes exactly what it approved.
+        let transform_sql = match &p.transform_sql {
+            Some(sql) => Some(normalise_sql_with_lookups(sql, &lookup_names).map_err(
+                |e| match e {
+                    Error::Config(m) => Error::Config(m),
+                    other => Error::Config(other.to_string()),
+                },
+            )?),
+            None => None,
+        };
+
+        if !lookups.is_empty() && transform_sql.is_none() {
+            return Err(Error::Config(
+                "lookups are declared but transform_sql is empty; a lookup must be joined by \
+                 a SELECT transformation"
                     .into(),
             ));
         }
@@ -620,6 +660,7 @@ impl Config {
             app_id: p.app_id.clone(),
             source_uri: p.source_uri.clone(),
             target_uri: p.target_uri.clone(),
+            lookups,
             starting_version: p.starting_version,
             change_policy: p.change_policy,
             transform_sql,

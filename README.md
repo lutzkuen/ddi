@@ -138,7 +138,7 @@ directory*. Every accepted feature preserves it.
 | unnest / explode | no | yes | **supported**, in Trino's spelling or DataFusion's |
 | intra-row array agg | no | yes | **supported** (`array_sum` etc.) |
 | upsert on a key | no (the *target* holds it) | no | **supported**, opt-in — see [Upserting](#upserting) |
-| lookup join vs. pinned snapshot | no | yes | v2 |
+| pinned Delta lookup via `LEFT JOIN` | no | yes | **supported**, declared and version-pinned per source commit |
 | `GROUP BY` aggregation | **yes** | **no** | **rejected — different product** |
 
 `GROUP BY` is rejected at config-load time, not at runtime, and the error names the
@@ -186,7 +186,8 @@ FROM (SELECT order_id, unnest(line_items) AS li FROM source)
 The rewrite runs **before** validation, so the two forms cannot diverge: whatever
 `ddi validate` accepts is what executes. `UNNEST` of a column of the same row is not a join —
 there is no second table, nothing to pin and no cross-row state — so it is not caught by the
-join rejection. A join against another table still is.
+join rejection. An arbitrary join against another table still is; the constrained pinned-lookup
+exception is documented below.
 
 #### When the array is inside a JSON blob
 
@@ -236,40 +237,55 @@ FROM source
 Also `array_min` and `array_avg`. For real Rust, implement the `Transform` trait — an escape
 hatch that does not require forking.
 
-### Lookups against a second table
+### Pinned Delta lookups
 
-Not in v1. A transform may read exactly one table — the batch it was handed, registered as
-`source` — and anything else is rejected at config load:
+A transformation still has exactly one streaming input, registered as `source`. It may also
+enrich that batch from a small, declared Delta lookup using only a direct `LEFT JOIN … ON`:
 
+```toml
+[[pipeline]]
+name = "order_items"
+source_uri = "abfss://lake@acct/.../order_created"
+target_uri = "abfss://lake@acct/.../order_items"
+transform_sql = """
+SELECT o.order_id, o.currency, fx_rates.exchange_rate
+FROM source AS o
+LEFT JOIN fx_rates
+  ON fx_rates.currency = o.currency
+ AND fx_rates.starting_date = o.order_date
+"""
+
+[[pipeline.lookups]]
+name = "fx_rates"                         # SQL relation name
+uri = "abfss://lake@acct/.../fx_rates"
 ```
-the table "products" is not supported: a transform may only read the batch it was given,
-which is registered as "source". Reading a second table means joining against something
-that can change between batches, which makes the output non-reproducible. Instead:
-denormalise upstream, or enrich downstream; pinned-snapshot lookup joins are planned for v2.
-```
 
-This covers `JOIN`, a comma-separated `FROM` list, a second table inside a derived table,
-and a second table inside a `WHERE ... IN (SELECT ...)` subquery.
+This is deliberately not a general second-source join. Inner/right/full/cross joins,
+comma joins, lookup subqueries (`IN`, `EXISTS`, scalar subqueries), a lookup as the primary
+`FROM`, and unbounded `ON true` predicates are rejected. The predicate must contain an equality
+between a lookup-qualified field and a source- or source-derived-CTE field. The lookup itself
+must have a uniqueness/non-overlap data contract for its key; SQL alone cannot prove that a
+join is one-to-one.
 
-The problem is not the join, it is the *pinning*. This tool's entire restart story is that a
-source version number reproduces a batch exactly. Join to `products` unpinned and the same
-source version yields different output depending on when it is replayed, so a restart stops
-being a no-op and exactly-once quietly becomes exactly-once-modulo-the-dimension.
+Before processing a source data commit, ddi selects the newest lookup Delta version whose log
+object timestamp is **strictly before** the source log object's millisecond. It records the
+selected lookup version and Delta table id in the same target commit as the source `txn` offset.
+The strict boundary means that a lookup commit appearing later in the same millisecond cannot
+change a failed batch's retry. If raw source history predates a lookup table, a
+`pre_history_version` must be explicitly approved and configured; ddi otherwise stops rather
+than silently applying a future lookup snapshot. Source and lookup log objects must use a
+comparable, stable object-store `last_modified` clock (normally the same lake/account), which is
+the clock Delta itself uses for timestamp travel.
 
-Until v2, three options that keep the property:
+The table id is checked at startup and again for every selected snapshot. Dropping/recreating
+or relocating a lookup at the same URI is therefore a hard error: choose a new app id and
+rebuild the target rather than mixing two dimensions in one stream. Keep both the lookup's log
+and data files through the maximum source replay horizon. A lookup correction only affects
+newly processed source commits; replay/rebuild is the explicit way to re-enrich old output.
 
-- **Denormalise upstream** — resolve the product attributes in whatever writes bronze. Best
-  when the attributes are part of the event's meaning at the time it happened (the price
-  actually charged).
-- **Enrich downstream** — let `ddi` land silver at source grain, and join to the dimension in
-  a downstream view or job. Best when you want current attributes, not historical ones.
-- **Inline it** — for a genuinely static handful of values, a `CASE` expression in the
-  transform is stateless and reproducible.
-
-v2's shape is to pin the dimension at a specific version and record that version in the
-commit alongside the source offset, so a replay resolves the same rows it did the first
-time. The `txn` action already carries the source offset; a pinned lookup needs the same
-treatment for every table it reads.
+Use this for compact, keyed relations such as daily FX rates. It is not a substitute for
+joining a many-gigabyte historical RRP/COGS table into every 5,000-row source batch; materialize
+a compact lookup with a documented key first, or enrich downstream.
 
 ## Running alongside dbt
 

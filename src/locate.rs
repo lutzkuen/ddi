@@ -121,13 +121,23 @@ impl Locator {
         out.target_uri = self
             .locate(cfg.target_relation.as_deref(), &cfg.target_uri)
             .await;
+        for (current, refreshed) in cfg.lookups.iter().zip(out.lookups.iter_mut()) {
+            refreshed.uri = self.locate(current.relation.as_deref(), &current.uri).await;
+        }
         out
     }
 }
 
 /// True when a refresh moved either end of the pipeline.
 pub fn moved(before: &ResolvedPipeline, after: &ResolvedPipeline) -> bool {
-    before.source_uri != after.source_uri || before.target_uri != after.target_uri
+    before.source_uri != after.source_uri
+        || before.target_uri != after.target_uri
+        || before.lookups.len() != after.lookups.len()
+        || before
+            .lookups
+            .iter()
+            .zip(after.lookups.iter())
+            .any(|(before, after)| before.uri != after.uri)
 }
 
 #[cfg(test)]
@@ -140,6 +150,7 @@ mod tests {
             app_id: "ddi.orders_stg".into(),
             source_uri: "abfss://lake@a.dfs.core.windows.net/bronze/orders".into(),
             target_uri: "abfss://lake@a.dfs.core.windows.net/silver/orders".into(),
+            lookups: vec![],
             source_relation: Some("hive.bronze.orders".into()),
             target_relation: Some("hive.silver.orders".into()),
             starting_version: 0,

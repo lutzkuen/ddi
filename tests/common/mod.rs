@@ -106,6 +106,7 @@ pub fn pipeline_cfg(name: &str, source: &str, target: &str) -> ResolvedPipeline 
         app_id: format!("ddi.test.{name}"),
         source_uri: source.into(),
         target_uri: target.into(),
+        lookups: vec![],
         starting_version: 0,
         change_policy: ChangePolicy::Fail,
         transform_sql: None,

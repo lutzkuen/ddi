@@ -6,29 +6,44 @@
 //!
 //! Rejections carry the reason, because "no" is only useful if it says what to change.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
-use deltalake::datafusion::sql::parser::{DFParser, Statement};
+use deltalake::datafusion::sql::parser::Statement;
 use deltalake::datafusion::sql::sqlparser::ast::{
     Ident, ObjectName, Query, Statement as SqlStatement, VisitMut, VisitorMut,
 };
 
 use crate::dbt::{Manifest, Node};
 use crate::transform::sql::SOURCE_TABLE;
-use crate::transform::validate::validate_sql;
+use crate::transform::validate::validate_sql_with_lookups;
 
 /// A model that can be streamed, with everything needed to build a pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Streamable {
     pub unique_id: String,
     pub name: String,
+    /// Manifest id of the one relation whose Delta log advances this pipeline.
+    pub source_unique_id: String,
     /// `schema.table` of the single upstream relation.
     pub source_relation: String,
+    /// Small, pinned Delta relations available only as LEFT JOIN lookups.
+    pub lookups: Vec<StreamableLookup>,
     /// `schema.table` of the model itself.
     pub target_relation: String,
     /// The compiled SQL rewritten to read `source`. `None` for a straight copy.
     pub transform_sql: Option<String>,
+}
+
+/// One dbt-declared lookup relation used by a streamable model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamableLookup {
+    pub unique_id: String,
+    /// The validated SQL alias declared as `meta.ddi_lookup` on the source.
+    pub name: String,
+    pub relation: String,
+    /// Optional explicit lookup snapshot for source commits older than the lookup table.
+    pub pre_history_version: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,50 +146,111 @@ pub fn analyze(manifest: &Manifest, unique_id: &str) -> Verdict {
         );
     };
 
-    // Exactly one upstream, because a pipeline reads exactly one source table.
-    let upstream: Vec<&Node> = node
-        .depends_on
-        .nodes
-        .iter()
-        .filter_map(|id| manifest.node(id))
-        .collect();
-    if upstream.len() != 1 {
+    // Exactly one dependency owns the streaming cursor. A source annotated with
+    // `meta: {ddi_lookup: fx_rates}` is different: it is a small Delta table joined as a
+    // snapshot and never advances output on its own.
+    let mut sources: Vec<(&str, &Node)> = Vec::new();
+    let mut lookups: Vec<(&str, &Node, String)> = Vec::new();
+    for id in &node.depends_on.nodes {
+        let Some(upstream) = manifest.node(id) else {
+            return reject(
+                &name,
+                format!("depends on {id:?}, which is absent from the manifest"),
+            );
+        };
+        match upstream.meta_str("ddi_lookup") {
+            Some(lookup_name) => lookups.push((id, upstream, lookup_name.to_string())),
+            None => sources.push((id, upstream)),
+        }
+    }
+    if sources.len() != 1 {
         return reject(
             &name,
             format!(
-                "depends on {} upstream relations; ddi streams from exactly one. Denormalise \
-                 upstream, or split the model.",
-                upstream.len()
+                "depends on {} streaming relations; ddi streams from exactly one. Mark a \
+                 small, static Delta source with meta.ddi_lookup when it is a pinned lookup, \
+                 or split the model.",
+                sources.len()
             ),
         );
     }
-    let source = upstream[0];
+    let (source_unique_id, source) = sources[0];
 
-    // Rewrite whatever the compiled SQL calls the upstream table to `source`, which is the
-    // only relation ddi registers.
-    let (rewritten, seen) = match rewrite_to_source(sql) {
+    let mut lookup_names = BTreeSet::new();
+    let mut streamable_lookups = Vec::with_capacity(lookups.len());
+    for (unique_id, lookup, lookup_name) in lookups {
+        if !crate::lookup::valid_name(&lookup_name) {
+            return reject(
+                &name,
+                format!(
+                    "lookup source {} declares ddi_lookup={lookup_name:?}; it must be a \
+                     lowercase SQL identifier and must not be \"source\"",
+                    lookup.qualified()
+                ),
+            );
+        }
+        if !lookup_names.insert(lookup_name.clone()) {
+            return reject(
+                &name,
+                format!("declares the lookup name {lookup_name:?} more than once"),
+            );
+        }
+        let pre_history_version = match lookup.meta_value("ddi_lookup_pre_history_version") {
+            None => None,
+            Some(value) => match value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+            {
+                Some(version) => Some(version),
+                None => {
+                    return reject(
+                        &name,
+                        format!(
+                            "lookup source {} declares ddi_lookup_pre_history_version={value}; it must be a non-negative Delta version",
+                            lookup.qualified()
+                        ),
+                    );
+                }
+            },
+        };
+        streamable_lookups.push(StreamableLookup {
+            unique_id: unique_id.to_string(),
+            name: lookup_name,
+            relation: lookup.qualified(),
+            pre_history_version,
+        });
+    }
+
+    let mut replacements = BTreeMap::new();
+    add_relation_replacements(&mut replacements, source, SOURCE_TABLE);
+    for lookup in &streamable_lookups {
+        let lookup_node = manifest
+            .node(&lookup.unique_id)
+            .expect("lookups came from this manifest");
+        add_relation_replacements(&mut replacements, lookup_node, &lookup.name);
+    }
+
+    // Rewrite the dbt relations into the names the DataFusion session actually registers.
+    let rewrite = match rewrite_relations(sql, &replacements) {
         Ok(v) => v,
         // Not a rejection: this parser simply did not understand the SQL, which says
         // nothing about whether the transformation is streamable.
         Err(e) => return unknown(&name, e),
     };
 
-    if seen.len() > 1 {
-        let mut names: Vec<&str> = seen.iter().map(|s| s.as_str()).collect();
-        names.sort();
+    if !rewrite.unknown.is_empty() {
         return reject(
             &name,
             format!(
-                "the compiled SQL reads {} relations ({}); ddi registers only the source \
-                 batch. A lookup against a second table is a v2 feature.",
-                seen.len(),
-                names.join(", ")
+                "the compiled SQL reads relation(s) that are not declared as its streaming \
+                 source or a ddi_lookup: {}",
+                rewrite.unknown.into_iter().collect::<Vec<_>>().join(", ")
             ),
         );
     }
 
     // The real gate: the same validator the daemon applies to any transform_sql.
-    if let Err(e) = validate_sql(&rewritten) {
+    if let Err(e) = validate_sql_with_lookups(&rewrite.sql, &lookup_names) {
         let detail = match e {
             crate::Error::Config(m) => m,
             other => other.to_string(),
@@ -185,9 +261,11 @@ pub fn analyze(manifest: &Manifest, unique_id: &str) -> Verdict {
     Verdict::Streamable(Box::new(Streamable {
         unique_id: unique_id.to_string(),
         name,
+        source_unique_id: source_unique_id.to_string(),
         source_relation: source.qualified(),
+        lookups: streamable_lookups,
         target_relation: node.qualified(),
-        transform_sql: Some(rewritten),
+        transform_sql: Some(rewrite.sql),
     }))
 }
 
@@ -200,15 +278,38 @@ pub fn analyze_all(manifest: &Manifest) -> Vec<Verdict> {
         .collect()
 }
 
-/// Replaces every table reference with `source`, returning the rewritten SQL and the set
-/// of distinct relation names that were replaced.
-///
-/// Collecting the names is what lets the caller tell a single-source model from a join:
-/// after the rewrite they would all read `source`, so the distinction has to be captured
-/// on the way through.
-fn rewrite_to_source(sql: &str) -> std::result::Result<(String, BTreeSet<String>), String> {
-    let mut statements =
-        DFParser::parse_sql(sql).map_err(|e| format!("could not parse the compiled SQL: {e}"))?;
+/// A compiled model after physical dbt relation names became session-local aliases.
+struct RewrittenSql {
+    sql: String,
+    unknown: BTreeSet<String>,
+}
+
+/// Add both forms dbt may put in compiled SQL: `schema.table` and
+/// `catalog.schema.table`.
+fn add_relation_replacements(
+    replacements: &mut BTreeMap<String, String>,
+    node: &Node,
+    alias: &str,
+) {
+    replacements.insert(relation_key(&node.qualified()), alias.to_string());
+    if let Some(fully_qualified) = node.fully_qualified() {
+        replacements.insert(relation_key(&fully_qualified), alias.to_string());
+    }
+}
+
+/// Replaces every declared dbt relation with its DataFusion session alias. A relation that
+/// did not come from the model's one source or a declared lookup is deliberately retained
+/// and reported rather than silently rewritten to `source`.
+fn rewrite_relations(
+    sql: &str,
+    replacements: &BTreeMap<String, String>,
+) -> std::result::Result<RewrittenSql, String> {
+    // Use the same permissive front-end as the runtime validator. In particular, dbt models
+    // use Trino's `ARRAY(JSON)` spelling before the unnest normaliser turns it into the
+    // DataFusion form. Treating that model as "unknown" here would make `ddi dbt check`
+    // disagree with the daemon that actually runs it.
+    let mut statements = crate::transform::validate::parse_permissively(sql)
+        .map_err(|e| format!("could not parse the compiled SQL: {e}"))?;
 
     if statements.len() > 1 {
         return Err(format!(
@@ -225,14 +326,21 @@ fn rewrite_to_source(sql: &str) -> std::result::Result<(String, BTreeSet<String>
     };
     let mut inner: SqlStatement = *inner;
 
-    let mut v = RelationRewriter::default();
+    let mut v = RelationRewriter {
+        replacements: replacements.clone(),
+        ..Default::default()
+    };
     let _ = inner.visit(&mut v);
-    Ok((inner.to_string(), v.seen))
+    Ok(RewrittenSql {
+        sql: inner.to_string(),
+        unknown: v.unknown,
+    })
 }
 
 #[derive(Default)]
 struct RelationRewriter {
-    seen: BTreeSet<String>,
+    replacements: BTreeMap<String, String>,
+    unknown: BTreeSet<String>,
     ctes: BTreeSet<String>,
 }
 
@@ -252,12 +360,23 @@ impl VisitorMut for RelationRewriter {
         if crate::transform::validate::is_cte(relation, &self.ctes) {
             return ControlFlow::Continue(());
         }
-        // Record the fully-qualified name before flattening it, so a join against two
-        // different tables is still visible as two names.
-        self.seen.insert(relation.to_string());
-        *relation = ObjectName::from(vec![Ident::new(SOURCE_TABLE)]);
+        let key = relation_key(&relation.to_string());
+        match self.replacements.get(&key) {
+            Some(alias) => *relation = ObjectName::from(vec![Ident::new(alias)]),
+            None => {
+                self.unknown.insert(relation.to_string());
+            }
+        }
         ControlFlow::Continue(())
     }
+}
+
+fn relation_key(relation: &str) -> String {
+    relation
+        .split('.')
+        .map(|part| part.trim_matches('"').to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 #[cfg(test)]
@@ -356,7 +475,7 @@ mod tests {
         let Verdict::Rejected { reason, .. } = analyze(&m, "model.p.orders_header") else {
             panic!("a join must not be streamable");
         };
-        assert!(reason.contains("reads 2 relations"), "got: {reason}");
+        assert!(reason.contains("not declared"), "got: {reason}");
         assert!(reason.contains("bronze.products"), "name it: {reason}");
     }
 
@@ -454,12 +573,136 @@ mod tests {
 
     #[test]
     fn a_fully_qualified_three_part_name_is_rewritten() {
-        let v = verdict("SELECT order_id FROM hive.bronze.orders");
+        let mut m = manifest("SELECT order_id FROM hive.bronze.orders", &[]);
+        m.sources
+            .get_mut("source.p.bronze.orders")
+            .unwrap()
+            .database = Some("hive".into());
+        let v = analyze(&m, "model.p.orders_header");
         let Verdict::Streamable(s) = v else {
             panic!("expected streamable");
         };
         let sql = s.transform_sql.unwrap();
         assert!(!sql.contains("hive"), "catalog must not survive: {sql}");
+    }
+
+    #[test]
+    fn a_declared_lookup_is_rewritten_and_left_joined() {
+        let mut m = manifest(
+            "WITH items AS (SELECT order_id, currency FROM bronze.orders) \
+             SELECT items.order_id, fx.exchange_rate \
+             FROM items LEFT JOIN bronze.exchange_rates AS fx \
+             ON fx.currency = items.currency",
+            &["source.p.bronze.exchange_rates"],
+        );
+        m.sources.insert(
+            "source.p.bronze.exchange_rates".to_string(),
+            Node {
+                name: "exchange_rates".into(),
+                resource_type: "source".into(),
+                schema: "bronze".into(),
+                meta: HashMap::from([(
+                    "ddi_lookup".into(),
+                    serde_json::Value::String("fx".into()),
+                )]),
+                ..Default::default()
+            },
+        );
+
+        let Verdict::Streamable(s) = analyze(&m, "model.p.orders_header") else {
+            panic!("a declared left lookup join must be streamable");
+        };
+        assert_eq!(s.lookups.len(), 1);
+        assert_eq!(s.lookups[0].name, "fx");
+        let sql = s.transform_sql.as_deref().unwrap();
+        assert!(sql.contains("LEFT JOIN fx"), "got: {sql}");
+        assert!(!sql.contains("bronze.exchange_rates"), "got: {sql}");
+    }
+
+    #[test]
+    fn a_lookup_model_can_fan_out_trino_json_arrays() {
+        let mut m = manifest(
+            "SELECT o.order_id, fx.exchange_rate, entry \
+             FROM bronze.orders AS o \
+             CROSS JOIN UNNEST(CAST(json_extract(o.data, '$.entries') AS ARRAY(JSON))) \
+             AS items(entry) \
+             LEFT JOIN bronze.exchange_rates AS fx ON fx.currency = o.currency",
+            &["source.p.bronze.exchange_rates"],
+        );
+        m.sources.insert(
+            "source.p.bronze.exchange_rates".to_string(),
+            Node {
+                name: "exchange_rates".into(),
+                resource_type: "source".into(),
+                schema: "bronze".into(),
+                meta: HashMap::from([(
+                    "ddi_lookup".into(),
+                    serde_json::Value::String("fx".into()),
+                )]),
+                ..Default::default()
+            },
+        );
+
+        let Verdict::Streamable(s) = analyze(&m, "model.p.orders_header") else {
+            panic!("a fan-out plus declared lookup must be streamable");
+        };
+        let sql = s.transform_sql.as_deref().unwrap();
+        assert!(sql.contains("fx"), "got: {sql}");
+        assert!(!sql.contains("bronze.orders"), "got: {sql}");
+    }
+
+    #[test]
+    fn a_declared_lookup_may_use_a_different_sql_alias() {
+        let mut m = manifest(
+            "SELECT o.order_id, fx.exchange_rate FROM bronze.orders AS o \
+             LEFT JOIN bronze.exchange_rates AS fx ON fx.currency = o.currency",
+            &["source.p.bronze.exchange_rates"],
+        );
+        m.sources.insert(
+            "source.p.bronze.exchange_rates".to_string(),
+            Node {
+                name: "exchange_rates".into(),
+                resource_type: "source".into(),
+                schema: "bronze".into(),
+                meta: HashMap::from([(
+                    "ddi_lookup".into(),
+                    serde_json::Value::String("fx_rates".into()),
+                )]),
+                ..Default::default()
+            },
+        );
+
+        let Verdict::Streamable(s) = analyze(&m, "model.p.orders_header") else {
+            panic!("the SQL alias should not have to equal meta.ddi_lookup");
+        };
+        let sql = s.transform_sql.as_deref().unwrap();
+        assert!(sql.contains("LEFT JOIN fx_rates AS fx"), "got: {sql}");
+    }
+
+    #[test]
+    fn a_lookup_must_use_left_join_on() {
+        let mut m = manifest(
+            "SELECT o.order_id FROM bronze.orders AS o \
+             INNER JOIN bronze.exchange_rates AS fx ON fx.currency = o.currency",
+            &["source.p.bronze.exchange_rates"],
+        );
+        m.sources.insert(
+            "source.p.bronze.exchange_rates".to_string(),
+            Node {
+                name: "exchange_rates".into(),
+                resource_type: "source".into(),
+                schema: "bronze".into(),
+                meta: HashMap::from([(
+                    "ddi_lookup".into(),
+                    serde_json::Value::String("fx".into()),
+                )]),
+                ..Default::default()
+            },
+        );
+        let Verdict::Rejected { reason, .. } = analyze(&m, "model.p.orders_header") else {
+            panic!("inner joins cannot be lookup joins");
+        };
+        assert!(reason.contains("LEFT JOIN"), "got: {reason}");
     }
 
     #[test]

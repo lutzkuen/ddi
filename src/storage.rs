@@ -132,6 +132,68 @@ impl Storage {
         )))
     }
 
+    /// Open the snapshot selected by Delta's timestamp rule.
+    ///
+    /// [`Self::open`] only has to read the checkpoint at the current head. A historic lookup
+    /// can legitimately need an older snapshot whose checkpoint is foreign and unreadable even
+    /// when the head opens normally, so the same replay fallback has to cover the time-travel
+    /// load itself. This keeps a pinned lookup from failing only when an old source batch is
+    /// retried.
+    pub async fn open_at_datetime(
+        &self,
+        uri: &str,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<DeltaTable> {
+        let url = ensure_table_uri(uri)
+            .map_err(|e| Error::Config(format!("{uri:?} is not a usable table URI: {e}")))?;
+        let mut table = self.open(uri).await?;
+        match table.load_with_datetime(timestamp).await {
+            Ok(()) => Ok(table),
+            Err(first) if is_unreadable_checkpoint(&first) => {
+                self.say_once(uri).await;
+                let mut replay = self.open_replaying_the_log(&url).await.map_err(|second| {
+                    Error::Config(format!(
+                        "cannot load lookup {uri:?} at {timestamp}: {first}. Replaying its \
+                         log to bypass the foreign checkpoint also failed: {second}"
+                    ))
+                })?;
+                replay
+                    .load_with_datetime(timestamp)
+                    .await
+                    .map_err(Error::Delta)?;
+                Ok(replay)
+            }
+            Err(e) => Err(Error::Delta(e)),
+        }
+    }
+
+    /// Open one historic Delta version, including the checkpoint-replay fallback needed when a
+    /// lookup's selected version predates a foreign checkpoint at the current head.
+    pub async fn open_at_version(
+        &self,
+        uri: &str,
+        version: crate::source::Version,
+    ) -> Result<DeltaTable> {
+        let url = ensure_table_uri(uri)
+            .map_err(|e| Error::Config(format!("{uri:?} is not a usable table URI: {e}")))?;
+        let mut table = self.open(uri).await?;
+        match table.load_version(version).await {
+            Ok(()) => Ok(table),
+            Err(first) if is_unreadable_checkpoint(&first) => {
+                self.say_once(uri).await;
+                let mut replay = self.open_replaying_the_log(&url).await.map_err(|second| {
+                    Error::Config(format!(
+                        "cannot load lookup {uri:?} at version {version}: {first}. Replaying \
+                         its log to bypass the foreign checkpoint also failed: {second}"
+                    ))
+                })?;
+                replay.load_version(version).await.map_err(Error::Delta)?;
+                Ok(replay)
+            }
+            Err(e) => Err(Error::Delta(e)),
+        }
+    }
+
     /// Open a table from its commit log alone, as if it had no checkpoint.
     ///
     /// The checkpoint is a derived cache of the commits, so a snapshot built without it is

@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use deltalake::arrow::array::RecordBatch;
 
 use crate::error::Result;
+use crate::lookup::LookupSnapshot;
 
 pub mod json;
 pub mod sql;
@@ -26,6 +27,24 @@ pub use validate::validate_sql;
 #[async_trait]
 pub trait Transform: Send + Sync {
     async fn apply(&self, input: Vec<RecordBatch>) -> Result<Vec<RecordBatch>>;
+
+    /// Apply the transform with the source batch's pinned lookup snapshots.
+    ///
+    /// Most transforms are still source-only. SQL transforms override this to register lookup
+    /// tables in their fresh DataFusion session; a custom Rust transform has to opt in rather
+    /// than accidentally reading a second relation without documenting its semantics.
+    async fn apply_with_lookups(
+        &self,
+        input: Vec<RecordBatch>,
+        lookups: &[LookupSnapshot],
+    ) -> Result<Vec<RecordBatch>> {
+        if !lookups.is_empty() {
+            return Err(crate::Error::Transform(
+                "this transform does not support pinned lookup snapshots".into(),
+            ));
+        }
+        self.apply(input).await
+    }
 
     fn describe(&self) -> String {
         "transform".into()
