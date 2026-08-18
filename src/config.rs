@@ -54,6 +54,29 @@ pub struct Defaults {
     /// an OOM. See [`crate::budget`].
     #[serde(default)]
     pub max_memory: Option<String>,
+
+    /// How many merges may run at once across the whole process.
+    ///
+    /// A merge reads back a slice of the target it writes, so its cost is set by the target
+    /// rather than by the batch — which means `max_bytes_per_batch` and `max_memory` do not
+    /// bound it, and neither does dividing them further. Hundreds of pipelines starting
+    /// together scan hundreds of targets together, and that simultaneity is what turns a
+    /// survivable merge into an OOM. See [`crate::gate`].
+    ///
+    /// Unset means unbounded, which is the behaviour there has always been and the right one
+    /// for a local run. Watch `ddi_merge_queue_seconds_total` after setting it: a rate that
+    /// climbs towards 1 per merge slot means the limit, not the storage, is the throughput.
+    #[serde(default)]
+    pub max_concurrent_upsert_merges: Option<usize>,
+
+    /// How many startup uniqueness checks may run at once.
+    ///
+    /// Separate from the merge limit because the two overlap in time but not in kind: every
+    /// upsert pipeline preflights once, at startup, all at the same moment, and each one
+    /// reads its whole target. One limit covering both would have to be set for that burst
+    /// and would then throttle steady state for the rest of the run.
+    #[serde(default)]
+    pub max_concurrent_upsert_preflights: Option<usize>,
 }
 
 impl Default for Defaults {
@@ -65,6 +88,8 @@ impl Default for Defaults {
             max_files_per_batch: default_max_files(),
             max_output_rows_per_batch: default_max_output_rows(),
             max_memory: None,
+            max_concurrent_upsert_merges: None,
+            max_concurrent_upsert_preflights: None,
         }
     }
 }

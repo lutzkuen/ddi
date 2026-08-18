@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use delta_delta_ingest::config::{Config, ResolvedPipeline};
+use delta_delta_ingest::gate;
 use delta_delta_ingest::locate::{self, Locator};
 use delta_delta_ingest::metrics::Metrics;
 use delta_delta_ingest::pipeline::{Pipeline, StepOutcome};
@@ -172,6 +173,14 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
     // allocates nothing, and counting it would make everyone else's share too small.
     let budget = cfg.budget(pipelines.len())?;
     budget.clone().install();
+
+    // The count limit and the memory limit answer different questions and are deliberately
+    // not derived from one another: the budget bounds what one pipeline holds, the gate
+    // bounds how many of them are reading a target at the same instant. See `crate::gate`.
+    gate::install(gate::Gate::new(
+        cfg.runtime.max_concurrent_upsert_merges,
+        cfg.runtime.max_concurrent_upsert_preflights,
+    ));
 
     info!(
         config = %cli.config.display(),
@@ -813,6 +822,10 @@ async fn attempt(
                     if u.window_clamped {
                         m.upsert_window_clamped.fetch_add(1, Ordering::Relaxed);
                     }
+                    m.merges.fetch_add(1, Ordering::Relaxed);
+                    m.merge_millis.fetch_add(u.merge_millis, Ordering::Relaxed);
+                    m.merge_queue_millis
+                        .fetch_add(u.queue_millis, Ordering::Relaxed);
                 }
             }
             Ok(StepOutcome::Skipped {
