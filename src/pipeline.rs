@@ -150,6 +150,10 @@ impl Pipeline {
             // resolve() guarantees both of these are set for an upsert pipeline.
             let key = cfg.upsert_key.as_deref().expect("checked in resolve");
             let sequence = cfg.dedup_timestamp.as_deref().expect("checked in resolve");
+            // Held across the check, not just taken for it: `assert_one_row_per_key` reads
+            // the whole target, and every upsert pipeline in the process reaches this line
+            // within a second of every other. See `crate::gate`.
+            let _pass = crate::gate::current().preflight().await;
             upsert::preflight(&target, &target_schema, key, sequence, cfg.upsert_lookback)
                 .await
                 .map_err(|e| Error::Config(format!("pipeline {:?}: {e}", cfg.name)))?;
@@ -461,6 +465,14 @@ impl Pipeline {
             .as_deref()
             .expect("checked in resolve");
 
+        // Taken before the collapse rather than around the merge alone, so that everything
+        // proportional to the *batch* as well as everything proportional to the target sits
+        // inside one permit. `collapse` concatenates every row in hand and indexes them; on
+        // an accumulated batch that is the second-largest allocation in the process, and
+        // letting it run unbounded while merges are bounded would only move the OOM.
+        let pass = crate::gate::current().merge().await;
+        let merging = Instant::now();
+
         let batch = upsert::collapse(&batches, key, sequence)?;
         let collapsed_away: usize =
             batches.iter().map(|b| b.num_rows()).sum::<usize>() - batch.num_rows();
@@ -490,8 +502,10 @@ impl Pipeline {
                 .upsert(table, batch.clone(), txn_version, &plan)
                 .await
             {
-                Ok((t, stats)) => {
+                Ok((t, mut stats)) => {
                     self.target = t;
+                    stats.queue_millis = pass.queued.as_millis() as u64;
+                    stats.merge_millis = merging.elapsed().as_millis() as u64;
                     info!(
                         pipeline = %self.cfg.name,
                         updated = stats.updated,
@@ -503,6 +517,8 @@ impl Pipeline {
                         window_clamped = plan.window.clamped,
                         candidate_files = plan.window.candidate_files,
                         attempt,
+                        queue_ms = stats.queue_millis,
+                        merge_ms = stats.merge_millis,
                         "merged"
                     );
                     return Ok(stats);

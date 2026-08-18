@@ -250,6 +250,10 @@ impl Sink {
             committed: table.version() != before,
             window_bounded: plan.window.is_bounded(),
             window_clamped: plan.window.clamped,
+            // The caller owns both: the wait happened before this sink was entered, and the
+            // retry loop that may run this method more than once is out there too.
+            queue_millis: 0,
+            merge_millis: 0,
         };
 
         if stats.committed {
@@ -298,6 +302,15 @@ pub struct UpsertStats {
     /// True when `upsert_lookback` held the window above what completeness asked for, so a
     /// key may have been inserted alongside an older row instead of replacing it.
     pub window_clamped: bool,
+    /// Milliseconds spent waiting for a merge permit, before any work began.
+    ///
+    /// Filled in by the caller rather than here: the wait happens outside this sink, and a
+    /// sink that timed its own queue would be reporting a wait it never did.
+    pub queue_millis: u64,
+    /// Milliseconds spent merging, permit in hand, including any replanned attempts. Those
+    /// attempts really were spent, so counting only the last one would understate what the
+    /// target cost.
+    pub merge_millis: u64,
 }
 
 impl UpsertStats {
