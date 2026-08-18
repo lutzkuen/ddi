@@ -124,8 +124,18 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
             // this daemon happens to be deployed.
             write_mode: match tgt.meta_str("ddi_write_mode") {
                 Some("upsert") => crate::config::WriteMode::Upsert,
+                Some("staged_upsert") => crate::config::WriteMode::StagedUpsert,
                 _ => crate::config::WriteMode::Append,
             },
+            // Derived from the target, and deliberately not declarable in dbt: the stage is
+            // this tool's own working table, not part of the model the warehouse shares.
+            stage_uri: None,
+            // Set by the expansion, never by the manifest.
+            stage_for: None,
+            apply_max_bytes: tgt.meta_str("ddi_apply_max_bytes").map(str::to_string),
+            apply_max_latency_secs: tgt
+                .meta_value("ddi_apply_max_latency_secs")
+                .and_then(|v| v.as_u64()),
             upsert_key: tgt.meta_str("ddi_upsert_key").map(str::to_string),
             // `meta: {ddi_tiebreak: [kafka_partition, kafka_offset]}`. A single string is
             // accepted too, because one tie-breaker is the common case and writing it as a

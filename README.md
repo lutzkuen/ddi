@@ -687,6 +687,77 @@ SELECT * FROM silver.orders
 QUALIFY row_number() OVER (PARTITION BY order_id ORDER BY _timestamp DESC) = 1
 ```
 
+### Staged upserts
+
+A direct upsert pays for the target on every batch. That is the right trade when a batch
+touches a few files and the wrong one for a high-cardinality current-state stream: 5,000 rows
+carrying random keys touch *every* file, so the merge rewrites the whole state to apply a
+handful of changes. Nothing about the batch makes that cheaper — not better statistics, not
+sorting, not `upsert_lookback`, and not a smaller batch, which only multiplies a fixed cost
+by more batches.
+
+The cost is per *merge*, so the fix is fewer merges:
+
+```
+source ──▶ ingest ──▶ silver.style__ddi_stage ──▶ apply ──▶ silver.style
+           append,                                merge,
+           per commit                             per accumulation
+```
+
+```toml
+write_mode             = "staged_upsert"
+dedup_timestamp        = "_timestamp"
+upsert_key             = "style_id"
+apply_max_bytes        = "512MB"   # merge once per this much staged data
+apply_max_latency_secs = 900       # ...or this often, whichever comes first
+```
+
+or in dbt, `meta: {ddi_write_mode: staged_upsert, ddi_apply_max_bytes: 512MB}`.
+
+One configured pipeline becomes **two running ones**, `style__ingest` and `style__apply`,
+each with its own `txn` offset, its own metrics and its own backoff. That is the whole
+implementation: everything the two halves need — exactly-once, cursor resume, the merge
+window, the data-quality table — already worked for one source and one target, and splitting
+at config time means none of it had to change. The staging table is created from the target's
+schema if it is not there; it is the only table `ddi` ever creates, because it is the only one
+that is its own.
+
+Read the two halves' lag separately: `ddi_source_lag_versions{pipeline="style__ingest"}` is
+how far behind the raw stream is, and `{pipeline="style__apply"}` is how much has been staged
+but not yet merged.
+
+#### What it costs
+
+**The target is eventually consistent**, by up to `apply_max_latency_secs`. That is the
+bargain rather than a defect, and it is the number to publish to whoever reads the table.
+
+**The transform must produce every target column.** A staged row is written now and merged
+later, and by then a null cannot be told apart from a column the transform never mentioned —
+so merging it would erase whatever the target already held there. Plain `upsert` carries that
+distinction with the batch and can leave such columns alone; staging cannot, so it refuses
+rather than guessing. If something else owns a column of your target, use `upsert`.
+
+**Ties need a tie-breaker.** The apply half accumulates a different number of commits each
+time it runs, so "later in the batch" stops being a stable rule — see
+[`upsert_tiebreak`](#upsert_tiebreak).
+
+The staging table is private to the pair that owns it: its rows are appended by one half and
+consumed by the other, so `ddi validate` holds back any third pipeline that reads or writes
+one.
+
+### `upsert_tiebreak`
+
+Which row wins when two share a `dedup_timestamp`. Compared after the timestamp, left to
+right, against rows in hand *and* against the row already stored:
+
+```toml
+upsert_tiebreak = ["kafka_partition", "kafka_offset"]
+```
+
+Unset, a tie is settled by position in the batch — later in the batch is later in the source.
+That is true exactly as long as batch boundaries are, which under `staged_upsert` they are
+not. Every column named must be in the target, and none of them may be null.
+
 ### JSON payloads
 
 Bronze often carries a payload as text, so Trino's JSON functions are implemented here
@@ -771,6 +842,32 @@ Measured, on 90 MiB of parquet in 8 files:
 The floor is one commit: a commit that fits `max_bytes_per_batch` is always delivered, however
 tight the budget. A budget makes batches smaller and more numerous; it never refuses one, and
 it never stalls a pipeline that worked before it was set.
+
+### What memory cannot bound
+
+`max_memory` bounds what one pipeline holds. It is the right bound for the work a pipeline
+does to *itself* and the wrong one for the work it does to a **target**, because the target
+work is where pipelines stop being independent: a merge reads back a slice of the table it
+writes, and the startup uniqueness check reads all of it. Neither is proportional to the
+batch, so neither gets smaller when batches do — and dividing the budget more finely only
+makes each pipeline spill sooner while the same number of scans run at once.
+
+```toml
+[runtime]
+max_concurrent_upsert_merges     = 4   # optional; unset means unbounded
+max_concurrent_upsert_preflights = 8
+```
+
+Both are unset by default, which is the behaviour there has always been: a limit chosen here
+would be a limit chosen without knowing the fleet. They are separate because they overlap in
+time but not in kind — every upsert pipeline preflights once, at startup, all at the same
+instant, while merges happen forever at whatever rate commits arrive. One limit covering both
+would have to be set for the startup burst and would throttle steady state for the rest of
+the run.
+
+Waiting is measured, because from outside a queue and a stall look identical. Watch
+`ddi_merge_queue_milliseconds_total` against `ddi_merge_milliseconds_total`: queue time rising
+while merge time stays flat means the limit, not the storage, is the throughput.
 
 `tests/memory_shape.rs` is the probe those numbers come from. It is `#[ignore]`d because it
 builds multi-million-row tables, and it is in the repository because every memory incident
@@ -1010,6 +1107,11 @@ reading: it never updates a row and never reads the target back.
 | `ddi_upsert_rows_updated_total` | counter | Stored rows replaced by a newer delivery of the same key. |
 | `ddi_upsert_rows_inserted_total` | counter | Rows inserted for a key the target did not hold. |
 | `ddi_upsert_target_files_scanned_total` | counter | Target files a merge had to open. |
+| `ddi_merges_total` | counter | Merges started. The denominator for the two below. |
+| `ddi_merge_milliseconds_total` | counter | Time inside merges, permit in hand. |
+| `ddi_merge_queue_milliseconds_total` | counter | Time waiting for a merge permit — rising means `max_concurrent_upsert_merges` is the throughput, not the storage. |
+| `ddi_merges_in_flight` | gauge | Merges running right now, process-wide (no `pipeline` label). |
+| `ddi_preflights_in_flight` | gauge | Startup uniqueness checks running right now, process-wide. |
 | `ddi_upsert_window_unbounded_total` | counter | Merges that read the whole target because its statistics could not bound the window. |
 | `ddi_upsert_window_clamped_total` | counter | Merges where `upsert_lookback` held the window above what completeness required. |
 
