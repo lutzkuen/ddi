@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 
 use deltalake::datafusion::sql::parser::Statement;
 use deltalake::datafusion::sql::sqlparser::ast::{
-    Ident, ObjectName, Query, Statement as SqlStatement, VisitMut, VisitorMut,
+    Ident, ObjectName, Query, Statement as SqlStatement, TableFactor, VisitMut, VisitorMut,
 };
 
 use crate::dbt::{Manifest, Node};
@@ -356,15 +356,27 @@ impl VisitorMut for RelationRewriter {
         ControlFlow::Continue(())
     }
 
-    fn pre_visit_relation(&mut self, relation: &mut ObjectName) -> ControlFlow<Self::Break> {
-        if crate::transform::validate::is_cte(relation, &self.ctes) {
+    /// Resolve names at the table factor rather than at every relation-shaped `ObjectName`,
+    /// because only a plain named factor is a dbt relation at all. The permissive front-end
+    /// reads Trino's `CROSS JOIN UNNEST(...)` as a table-valued call whose "name" is `UNNEST`;
+    /// that is a fan-out of one row's own array, so there is nothing to resolve and nothing
+    /// undeclared about it. Every other non-plain factor is left alone for
+    /// `validate_sql_with_lookups`, which already rejects it in terms of what it is.
+    fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
+        if !crate::transform::validate::is_plain_table_relation(factor) {
             return ControlFlow::Continue(());
         }
-        let key = relation_key(&relation.to_string());
+        let TableFactor::Table { name, .. } = factor else {
+            return ControlFlow::Continue(());
+        };
+        if crate::transform::validate::is_cte(name, &self.ctes) {
+            return ControlFlow::Continue(());
+        }
+        let key = relation_key(&name.to_string());
         match self.replacements.get(&key) {
-            Some(alias) => *relation = ObjectName::from(vec![Ident::new(alias)]),
+            Some(alias) => *name = ObjectName::from(vec![Ident::new(alias)]),
             None => {
-                self.unknown.insert(relation.to_string());
+                self.unknown.insert(name.to_string());
             }
         }
         ControlFlow::Continue(())

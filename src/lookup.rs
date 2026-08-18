@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, Utc};
 use deltalake::logstore::commit_uri_from_version;
-use deltalake::logstore::object_store::ObjectStore;
+use deltalake::logstore::object_store::ObjectStoreExt;
 use deltalake::DeltaTable;
 use serde::{Deserialize, Serialize};
 

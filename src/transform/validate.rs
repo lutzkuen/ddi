@@ -526,7 +526,7 @@ fn check_lookup_join(join: &Join, lookups: &BTreeSet<String>) -> Result<()> {
     }
     if !relation_is_lookup(name, lookups) {
         return Err(reject(
-            &format!("the joined table {:?}", name),
+            &format!("the joined table {:?}", name.to_string()),
             "it is not a declared pinned lookup, so its snapshot cannot be reproduced on retry.",
             "declare it as a dbt source with meta.ddi_lookup, or enrich downstream.",
         ));
@@ -634,7 +634,7 @@ fn relation_is_lookup(relation: &ObjectName, lookups: &BTreeSet<String>) -> bool
 /// Only a normal named relation can be the source or a pinned lookup. `TableFactor::Table`
 /// also represents table-valued calls and several dialect-specific modifiers, none of which is
 /// a relation the executor registered in its isolated session.
-fn is_plain_table_relation(factor: &TableFactor) -> bool {
+pub(crate) fn is_plain_table_relation(factor: &TableFactor) -> bool {
     matches!(
         factor,
         TableFactor::Table {
@@ -999,6 +999,45 @@ mod tests {
     }
 
     #[test]
+    fn a_fan_out_may_carry_a_lookup_join_but_not_a_second_table() {
+        let lookups = lookup_names();
+
+        // The unnest rewrite moves the fan-out into a derived table and rebuilds the `FROM`,
+        // so the lookup join has to be carried across that rebuild rather than dropped with
+        // it. A lookup adds columns, never rows, so it is indifferent to the expansion.
+        validate_sql_with_lookups(
+            "SELECT o.order_id, li.sku, fx_rates.exchange_rate \
+             FROM source AS o \
+             CROSS JOIN UNNEST(o.line_items) AS t(li) \
+             LEFT JOIN fx_rates ON fx_rates.currency = o.currency",
+            &lookups,
+        )
+        .expect("a pinned lookup survives a fan-out of the row it enriches");
+
+        // Carrying joins over must not become a way to smuggle one past the checks: what is
+        // rejected beside a plain source is still rejected beside a fan-out.
+        for (sql, want) in [
+            (
+                "SELECT o.order_id, li.sku, p.name FROM source AS o \
+                 CROSS JOIN UNNEST(o.line_items) AS t(li) \
+                 LEFT JOIN products AS p ON p.sku = li.sku",
+                "products",
+            ),
+            (
+                "SELECT o.order_id, li.sku FROM source AS o \
+                 CROSS JOIN UNNEST(o.line_items) AS t(li) \
+                 INNER JOIN fx_rates ON fx_rates.currency = o.currency",
+                "JOIN",
+            ),
+        ] {
+            let e = validate_sql_with_lookups(sql, &lookups)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(want), "{sql}: {e}");
+        }
+    }
+
+    #[test]
     fn a_declared_lookup_can_only_be_a_direct_left_join() {
         let lookups = lookup_names();
         validate_sql_with_lookups(
@@ -1153,7 +1192,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.to_string().contains("products"), "got: {e}");
-        assert!(e.to_string().contains("denormalise"), "got: {e}");
+        assert!(e.to_string().contains("pinned lookup"), "got: {e}");
     }
 
     #[test]
