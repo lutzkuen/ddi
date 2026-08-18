@@ -121,6 +121,7 @@ pub fn pipeline_cfg(name: &str, source: &str, target: &str) -> ResolvedPipeline 
         write_mode: Default::default(),
         upsert_key: None,
         upsert_lookback: None,
+        upsert_tiebreak: Vec::new(),
         dq_uri: None,
         source_relation: None,
         target_relation: None,

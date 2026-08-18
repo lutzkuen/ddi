@@ -127,6 +127,17 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
                 _ => crate::config::WriteMode::Append,
             },
             upsert_key: tgt.meta_str("ddi_upsert_key").map(str::to_string),
+            // `meta: {ddi_tiebreak: [kafka_partition, kafka_offset]}`. A single string is
+            // accepted too, because one tie-breaker is the common case and writing it as a
+            // list of one is the kind of thing nobody remembers to do.
+            upsert_tiebreak: match tgt.meta_value("ddi_tiebreak") {
+                Some(serde_json::Value::Array(a)) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                Some(serde_json::Value::String(one)) => vec![one.clone()],
+                _ => Vec::new(),
+            },
             // Defaults to <target>__ddi_dq; declared only when it lives somewhere else.
             dq_uri: tgt.meta_str("ddi_dq").map(str::to_string),
             upsert_lookback: tgt.meta_str("ddi_upsert_lookback").map(str::to_string),

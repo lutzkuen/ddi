@@ -154,9 +154,16 @@ impl Pipeline {
             // the whole target, and every upsert pipeline in the process reaches this line
             // within a second of every other. See `crate::gate`.
             let _pass = crate::gate::current().preflight().await;
-            upsert::preflight(&target, &target_schema, key, sequence, cfg.upsert_lookback)
-                .await
-                .map_err(|e| Error::Config(format!("pipeline {:?}: {e}", cfg.name)))?;
+            upsert::preflight(
+                &target,
+                &target_schema,
+                key,
+                sequence,
+                cfg.upsert_lookback,
+                &cfg.upsert_tiebreak,
+            )
+            .await
+            .map_err(|e| Error::Config(format!("pipeline {:?}: {e}", cfg.name)))?;
             info!(
                 pipeline = %cfg.name,
                 upsert_key = %key,
@@ -473,7 +480,7 @@ impl Pipeline {
         let pass = crate::gate::current().merge().await;
         let merging = Instant::now();
 
-        let batch = upsert::collapse(&batches, key, sequence)?;
+        let batch = upsert::collapse(&batches, key, sequence, &self.cfg.upsert_tiebreak)?;
         let collapsed_away: usize =
             batches.iter().map(|b| b.num_rows()).sum::<usize>() - batch.num_rows();
 
@@ -493,6 +500,7 @@ impl Pipeline {
                 sequence,
                 self.cfg.upsert_lookback,
                 update_columns.clone(),
+                &self.cfg.upsert_tiebreak,
             )?;
             self.warn_about_window(&plan);
 

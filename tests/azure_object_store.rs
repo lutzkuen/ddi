@@ -200,6 +200,7 @@ fn pipeline(source: &str, target: &str) -> ResolvedPipeline {
         write_mode: Default::default(),
         upsert_key: None,
         upsert_lookback: None,
+        upsert_tiebreak: Vec::new(),
         dq_uri: None,
         storage: Storage::new(storage_options()),
         source_relation: None,

@@ -205,6 +205,19 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub upsert_lookback: Option<String>,
 
+    /// Columns that decide which row wins when two share a `dedup_timestamp`.
+    ///
+    /// Compared left to right after the timestamp, so `["kafka_partition", "kafka_offset"]`
+    /// reads as "later offset within the same partition wins". Every column must be in the
+    /// target, because the comparison is made against the row already stored as well as
+    /// between rows in hand.
+    ///
+    /// Without this, a tie is broken by position in the batch — which is only stable while
+    /// batch boundaries are, and they are not: a retry regroups commits, and
+    /// `write_mode = "staged_upsert"` regroups them by design. See [`crate::upsert`].
+    #[serde(default)]
+    pub upsert_tiebreak: Vec<String>,
+
     /// Fully qualified catalog names, so a location can be re-resolved while running.
     /// Filled in from the dbt manifest.
     #[serde(default)]
@@ -270,6 +283,9 @@ pub struct ResolvedPipeline {
     /// How far back the merge window may reach. `None` means "as far as the target's
     /// statistics require".
     pub upsert_lookback: Option<crate::upsert::Lookback>,
+    /// Columns compared after `dedup_timestamp` to settle a tie, left to right. Empty means
+    /// position in the batch decides, which is stable only while batches are.
+    pub upsert_tiebreak: Vec<String>,
     /// An explicit data-quality table, when the derived one will not do. Kept unresolved
     /// so that a target which moves takes its rejects with it — see [`Self::dq_uri`].
     pub dq_uri: Option<String>,
@@ -652,12 +668,42 @@ impl Config {
                         .into(),
                 ));
             }
-        } else if p.upsert_key.is_some() || p.upsert_lookback.is_some() {
+        } else if p.upsert_key.is_some()
+            || p.upsert_lookback.is_some()
+            || !p.upsert_tiebreak.is_empty()
+        {
             return Err(Error::Config(
-                "upsert_key/upsert_lookback are set but write_mode is \"append\", so they do \
-                 nothing. Set write_mode = \"upsert\", or remove them."
+                "upsert_key/upsert_lookback/upsert_tiebreak are set but write_mode is \
+                 \"append\", so they do nothing. Set write_mode = \"upsert\", or remove them."
                     .into(),
             ));
+        }
+
+        // A tie-breaker that repeats a column, or names the timestamp it is meant to break a
+        // tie *on*, cannot order anything the timestamp did not already order. Silently
+        // ignoring it would leave the pipeline believing it had a stable order.
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            for c in &p.upsert_tiebreak {
+                if c.trim().is_empty() {
+                    return Err(Error::Config(
+                        "upsert_tiebreak contains an empty column name".into(),
+                    ));
+                }
+                if Some(c) == p.dedup_timestamp.as_ref() {
+                    return Err(Error::Config(format!(
+                        "upsert_tiebreak lists {c:?}, which is already dedup_timestamp. A \
+                         column cannot break a tie against itself — the tie is that the two \
+                         rows agree on it."
+                    )));
+                }
+                if !seen.insert(c) {
+                    return Err(Error::Config(format!(
+                        "upsert_tiebreak lists {c:?} twice; the second comparison can never \
+                         decide anything the first did not."
+                    )));
+                }
+            }
         }
         let upsert_lookback = p
             .upsert_lookback
@@ -705,6 +751,7 @@ impl Config {
             write_mode: p.write_mode,
             upsert_key,
             upsert_lookback,
+            upsert_tiebreak: p.upsert_tiebreak.clone(),
             dq_uri: p.dq_uri.clone(),
             storage: crate::storage::Storage::new(self.storage.options.clone()),
             source_relation: p.source_relation.clone(),
