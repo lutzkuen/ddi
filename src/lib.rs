@@ -18,6 +18,7 @@ pub mod pipeline;
 pub mod schema;
 pub mod sink;
 pub mod source;
+pub mod stage;
 pub mod stats;
 pub mod storage;
 pub mod transform;

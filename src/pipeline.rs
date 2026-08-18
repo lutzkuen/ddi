@@ -80,6 +80,16 @@ impl Pipeline {
             .open(&cfg.source_uri)
             .await
             .map_err(|e| Error::Config(format!("pipeline {:?}: source: {e}", cfg.name)))?;
+        // The one table this tool creates, and only because it is the one table that is
+        // ours: a staging table's schema is the target's, so requiring it to be declared
+        // would be requiring the target's schema to be written down twice.
+        if let Some(model) = &cfg.stage_for {
+            cfg.storage
+                .create_like(&cfg.target_uri, model)
+                .await
+                .map_err(|e| Error::Config(format!("pipeline {:?}: stage: {e}", cfg.name)))?;
+        }
+
         let target = cfg.storage.open(&cfg.target_uri).await.map_err(|e| {
             Error::Config(format!(
                 "pipeline {:?}: target: {e}. This tool never creates the target table — \
@@ -265,6 +275,39 @@ impl Pipeline {
             .find(|b| b.num_rows() > 0)
             .map(|b| self.coercer.columns_present_in(b))
             .unwrap_or_default();
+
+        // A staged row is written now and merged later, and the mask above does not survive
+        // the trip. By then a null means only "null" — there is nothing left to say whether
+        // the transform declined to produce the column or produced nothing for it, and
+        // merging on the wrong reading would blank a stored value. So staging requires the
+        // transform to produce every column, which makes the two readings the same one.
+        //
+        // Checked here rather than at open because the transform's output schema is not
+        // known until it has run once. It is a property of the SQL, not of the batch, so a
+        // pipeline that passes this on its first batch passes it on all of them — until
+        // somebody edits the model, which is exactly when it should be caught.
+        if self.cfg.stage_for.is_some() && !produced.is_empty() {
+            let target_schema = self.coercer.target();
+            let missing: Vec<&str> = target_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .filter(|name| !produced.iter().any(|p| p == name))
+                .collect();
+            if !missing.is_empty() {
+                return Err(Error::Config(format!(
+                    "pipeline {:?}: write_mode = \"staged_upsert\" requires the transform to \
+                     produce every target column, and it does not produce: {}. A staged row \
+                     is merged long after it was written, by which point a null cannot be \
+                     told apart from a column the transform never mentioned — so merging it \
+                     would erase whatever the target already held there. Select the missing \
+                     columns, or use write_mode = \"upsert\", which carries that distinction \
+                     with the batch and can therefore leave them alone.",
+                    self.cfg.name,
+                    missing.join(", ")
+                )));
+            }
+        }
 
         // 4. Cast to the target schema. Never a silent null: either the whole batch fails,
         // or the rows that will not convert are set aside for the data-quality table and

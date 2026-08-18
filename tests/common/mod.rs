@@ -122,6 +122,7 @@ pub fn pipeline_cfg(name: &str, source: &str, target: &str) -> ResolvedPipeline 
         upsert_key: None,
         upsert_lookback: None,
         upsert_tiebreak: Vec::new(),
+        stage_for: None,
         dq_uri: None,
         source_relation: None,
         target_relation: None,

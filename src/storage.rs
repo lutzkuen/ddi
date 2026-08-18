@@ -139,6 +139,53 @@ impl Storage {
     /// when the head opens normally, so the same replay fallback has to cover the time-travel
     /// load itself. This keeps a pinned lookup from failing only when an old source batch is
     /// retried.
+    /// Create `uri` with the schema of `model_uri` if it is not already a Delta table.
+    ///
+    /// Used for one thing only: the staging table of a `staged_upsert`, whose schema is by
+    /// definition the target's. This tool otherwise never creates a table — the target and
+    /// the data-quality table are both somebody else's to declare — and the exception is
+    /// narrow on purpose. A stage is not a table anyone queries or models; it is this
+    /// pipeline's own working space, its location is derived rather than typed, and
+    /// requiring an operator to hand-write DDL for it would be asking them to restate the
+    /// target's schema in a second place that can then disagree with the first.
+    ///
+    /// Existing tables are left exactly as they are, including their schema: a stage that
+    /// has drifted from its target is a real problem, and silently rewriting it here would
+    /// destroy the evidence of whichever change caused it.
+    pub async fn create_like(&self, uri: &str, model_uri: &str) -> Result<()> {
+        if self.open(uri).await.is_ok() {
+            return Ok(());
+        }
+        let model = self.open(model_uri).await?;
+        let columns = model
+            .snapshot()
+            .map_err(Error::Delta)?
+            .schema()
+            .fields()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let url = ensure_table_uri(uri)
+            .map_err(|e| Error::Config(format!("{uri:?} is not a usable table URI: {e}")))?;
+        deltalake::DeltaTable::try_from_url(url)
+            .await
+            .map_err(Error::Delta)?
+            .create()
+            .with_columns(columns)
+            .with_storage_options(self.options.clone())
+            // Another process in the same fleet may be opening the same pipeline at the same
+            // instant. Losing that race is not an error — the table it wanted now exists.
+            .with_save_mode(deltalake::protocol::SaveMode::Ignore)
+            .await
+            .map_err(|e| {
+                Error::Config(format!(
+                    "cannot create the staging table {uri:?} from the schema of \
+                     {model_uri:?}: {e}"
+                ))
+            })?;
+        Ok(())
+    }
+
     pub async fn open_at_datetime(
         &self,
         uri: &str,
