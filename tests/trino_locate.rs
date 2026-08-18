@@ -133,6 +133,7 @@ fn pipeline(declared_source: &str, declared_target: &str) -> ResolvedPipeline {
         write_mode: Default::default(),
         upsert_key: None,
         upsert_lookback: None,
+        upsert_tiebreak: Vec::new(),
         dq_uri: None,
         storage: Default::default(),
     }

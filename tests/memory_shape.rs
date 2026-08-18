@@ -198,7 +198,7 @@ async fn startup_memory() {
     let target_schema = table.snapshot().unwrap().snapshot().read_schema();
     let before = rss_mib();
     let p = Peak::start();
-    delta_delta_ingest::upsert::preflight(&table, &target_schema, "id", "_timestamp", None)
+    delta_delta_ingest::upsert::preflight(&table, &target_schema, "id", "_timestamp", None, &[])
         .await
         .unwrap();
     p.finish("upsert::preflight", before);
