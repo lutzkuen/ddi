@@ -12,14 +12,23 @@
 
 use deltalake::datafusion::sql::parser::{DFParser, Statement};
 use deltalake::datafusion::sql::sqlparser::ast::{
-    Expr, ObjectName, Query, Select, SetExpr, Statement as SqlStatement, TableFactor, VisitMut,
-    VisitorMut,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Join,
+    JoinConstraint, JoinOperator, ObjectName, Query, Select, SetExpr, Statement as SqlStatement,
+    TableFactor, Value, VisitMut, VisitorMut,
 };
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 use crate::error::{Error, Result};
 use crate::transform::sql::SOURCE_TABLE;
+
+/// The only named-zone `from_unixtime` spelling currently used by our Trino models.
+///
+/// Keeping this explicit is important: a Unix epoch is an instant, whereas a timestamp
+/// without a timezone is a wall-clock value. The rewrite below first labels the epoch UTC,
+/// then changes its display/calendar timezone to this zone. It therefore has no dependency on
+/// the DataFusion session's otherwise-global timezone setting.
+const TRINO_FROM_UNIXTIME_TIME_ZONE: &str = "Europe/Amsterdam";
 
 /// A rejected construct, with the alternative spelled out.
 fn reject(what: &str, why: &str, instead: &str) -> Error {
@@ -58,7 +67,7 @@ fn reparse_natively(statement: &SqlStatement) -> Result<SqlStatement> {
 ///
 /// The fallback is only ever consulted when this engine's parser has already refused, so a
 /// query it can read is never interpreted by the other one.
-fn parse_permissively(sql: &str) -> Result<std::collections::VecDeque<Statement>> {
+pub(crate) fn parse_permissively(sql: &str) -> Result<std::collections::VecDeque<Statement>> {
     use deltalake::datafusion::sql::sqlparser::dialect::ClickHouseDialect;
 
     match DFParser::parse_sql(sql) {
@@ -75,6 +84,15 @@ fn parse_permissively(sql: &str) -> Result<std::collections::VecDeque<Statement>
 ///
 /// Returns the parsed statement so the caller does not parse twice.
 pub fn validate_sql(sql: &str) -> Result<Statement> {
+    validate_sql_with_lookups(sql, &BTreeSet::new())
+}
+
+/// Parse and validate a transform that may `LEFT JOIN` declared pinned lookup relations.
+///
+/// Lookups stay deliberately narrow: a source batch remains the only streaming input, while a
+/// lookup is a Delta snapshot registered for that batch. The caller supplies only the aliases
+/// that were declared in dbt; any other relation remains a configuration error.
+pub fn validate_sql_with_lookups(sql: &str, lookups: &BTreeSet<String>) -> Result<Statement> {
     let mut statements = parse_permissively(sql)?;
 
     if statements.is_empty() {
@@ -121,13 +139,14 @@ pub fn validate_sql(sql: &str) -> Result<Statement> {
     // function, which the unnest rewrite below would not recognise. Everything after this
     // point therefore works on one parser's AST, whichever one let the text in.
     crate::transform::unnest::rewrite_json_array_casts(&mut query)?;
+    rewrite_trino_from_unixtime(&mut query)?;
     if let SqlStatement::Query(q) = reparse_natively(&SqlStatement::Query(query.clone()))? {
         query = q;
     }
 
     crate::transform::unnest::rewrite(&mut query)?;
 
-    check_query(&query, &BTreeSet::new())?;
+    check_query(&query, &BTreeSet::new(), lookups)?;
 
     let rewritten = Statement::Statement(Box::new(SqlStatement::Query(query)));
 
@@ -149,16 +168,135 @@ pub fn validate_sql(sql: &str) -> Result<Statement> {
 /// Validate `sql` and return the text the engine should actually run.
 ///
 /// Identical to what was written, except where a dialect spelling had to be rewritten into
-/// one this engine executes — today only Trino's `CROSS JOIN UNNEST`; see
-/// [`crate::transform::unnest`].
+/// one this engine executes -- currently Trino's `CROSS JOIN UNNEST` and named-zone
+/// `from_unixtime`; see
+/// [`crate::transform::unnest`] and [`rewrite_trino_from_unixtime`].
 ///
 /// The config keeps the model's own text; only the *resolved* pipeline carries this. That
 /// way `ddi dbt convert` still pins what dbt says, and what runs is still what dbt meant.
 pub fn normalise_sql(sql: &str) -> Result<String> {
-    match validate_sql(sql)? {
+    normalise_sql_with_lookups(sql, &BTreeSet::new())
+}
+
+/// Validate and return the executable SQL for a transform with declared lookup aliases.
+pub fn normalise_sql_with_lookups(sql: &str, lookups: &BTreeSet<String>) -> Result<String> {
+    match validate_sql_with_lookups(sql, lookups)? {
         Statement::Statement(inner) => Ok(inner.to_string()),
         other => Ok(other.to_string()),
     }
+}
+
+/// Replace Trino's `from_unixtime(<seconds>, 'Europe/Amsterdam')` with the DataFusion
+/// equivalent.
+///
+/// `to_timestamp_seconds` converts its numeric input into a timestamp, but without a session
+/// timezone it is an unzoned timestamp. Casting that directly to Amsterdam would interpret the
+/// epoch as Amsterdam wall time, shifting the instant. The intermediate `AT TIME ZONE 'UTC'`
+/// gives the epoch its correct origin first; the second conversion changes only its named
+/// timezone. This preserves local dates across daylight-saving changes without changing the
+/// session timezone for unrelated expressions in the same transform.
+fn rewrite_trino_from_unixtime(query: &mut Query) -> Result<()> {
+    struct V(Option<Error>);
+
+    impl VisitorMut for V {
+        type Break = ();
+
+        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            let replacement = match from_unixtime_replacement(expr) {
+                Ok(replacement) => replacement,
+                Err(e) => {
+                    self.0 = Some(e);
+                    return ControlFlow::Break(());
+                }
+            };
+            if let Some(replacement) = replacement {
+                *expr = replacement;
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut v = V(None);
+    let _ = query.visit(&mut v);
+    match v.0 {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Return a replacement for one `from_unixtime` call, or `None` for every other function.
+fn from_unixtime_replacement(expr: &Expr) -> Result<Option<Expr>> {
+    let Expr::Function(function) = expr else {
+        return Ok(None);
+    };
+    if !function
+        .name
+        .to_string()
+        .eq_ignore_ascii_case("from_unixtime")
+    {
+        return Ok(None);
+    }
+
+    let unsupported = || {
+        reject(
+            "from_unixtime",
+            "this runtime supports only Trino's from_unixtime(<unix seconds>, \
+             'Europe/Amsterdam') form.",
+            "use that exact form, or express an explicit DataFusion timestamp conversion.",
+        )
+    };
+
+    let FunctionArguments::List(arguments) = &function.args else {
+        return Err(unsupported());
+    };
+    let [seconds, timezone] = arguments.args.as_slice() else {
+        return Err(unsupported());
+    };
+    let (
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(_)),
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(timezone))),
+    ) = (seconds, timezone)
+    else {
+        return Err(unsupported());
+    };
+    if !matches!(
+        &timezone.value,
+        Value::SingleQuotedString(zone) if zone == TRINO_FROM_UNIXTIME_TIME_ZONE
+    ) {
+        return Err(unsupported());
+    }
+    if function.uses_odbc_syntax
+        || !matches!(&function.parameters, FunctionArguments::None)
+        || arguments.duplicate_treatment.is_some()
+        || !arguments.clauses.is_empty()
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return Err(unsupported());
+    }
+
+    let mut converted = function.clone();
+    converted.name = ObjectName::from(Ident::new("to_timestamp_seconds"));
+    let FunctionArguments::List(arguments) = &mut converted.args else {
+        unreachable!("checked the function argument form above");
+    };
+    arguments.args.truncate(1);
+
+    let timestamp = Expr::Function(converted);
+    let as_utc = Expr::AtTimeZone {
+        timestamp: Box::new(timestamp),
+        time_zone: Box::new(timezone_literal("UTC")),
+    };
+    Ok(Some(Expr::AtTimeZone {
+        timestamp: Box::new(as_utc),
+        time_zone: Box::new(timezone_literal(TRINO_FROM_UNIXTIME_TIME_ZONE)),
+    }))
+}
+
+fn timezone_literal(value: &str) -> Expr {
+    Expr::Value(Value::SingleQuotedString(value.to_owned()).into())
 }
 
 /// Check one query, given the CTE names already in scope from enclosing queries.
@@ -166,10 +304,22 @@ pub fn normalise_sql(sql: &str) -> Result<String> {
 /// `scope` matters because the checks recurse: a CTE body is examined on its own, and it
 /// may legitimately refer to a CTE its parent declared. Without inheriting those names,
 /// `WITH a AS (...), b AS (SELECT * FROM a) ...` would report `a` as a foreign table.
-fn check_query(query: &Query, scope: &BTreeSet<String>) -> Result<()> {
+fn check_query(query: &Query, scope: &BTreeSet<String>, lookups: &BTreeSet<String>) -> Result<()> {
     // Names this query adds, visible to its own CTE bodies and to its body.
     let mut inner = scope.clone();
     inner.extend(cte_names(query));
+
+    if let Some(name) = cte_names(query)
+        .into_iter()
+        .find(|name| lookups.contains(name))
+    {
+        return Err(reject(
+            &format!("the CTE {name:?}"),
+            "it shadows a declared lookup relation, so the SQL would not use the pinned \
+             Delta snapshot it declared.",
+            "rename the CTE, or join the lookup by its declared name.",
+        ));
+    }
 
     // A CTE body is a SELECT like any other and needs the same checks. The visitor below
     // walks the whole tree, but it only knows about window functions, aggregate *calls*
@@ -177,13 +327,18 @@ fn check_query(query: &Query, scope: &BTreeSet<String>) -> Result<()> {
     // live on the Select node rather than in an expression. So `WITH base AS (SELECT
     // DISTINCT ...) SELECT * FROM base` slipped through until this recursed.
     for cte in query.with.iter().flat_map(|w| w.cte_tables.iter()) {
-        check_query(&cte.query, &inner)?;
+        check_query(&cte.query, &inner, lookups)?;
     }
-    check_set_expr(&query.body, &inner)?;
+    check_set_expr(&query.body, &inner, lookups)?;
 
-    // Window functions can appear in ORDER BY / expressions anywhere.
+    // Window functions and relation references can appear in ORDER BY / expressions anywhere.
+    // Count the lookup references that are valid direct LEFT JOINs before the general visitor
+    // walks expression subqueries too. A lookup inside `WHERE EXISTS (...)`, for example,
+    // would otherwise look registered but would let the lookup filter source rows.
+    let allowed_lookup_refs = lookup_join_count(query, lookups);
     let mut v = StatefulConstructVisitor {
         ctes: inner,
+        lookups: lookups.clone(),
         ..Default::default()
     };
     let mut q = query.clone();
@@ -191,16 +346,28 @@ fn check_query(query: &Query, scope: &BTreeSet<String>) -> Result<()> {
     if let Some(err) = v.found {
         return Err(err);
     }
+    if v.lookup_refs != allowed_lookup_refs {
+        return Err(reject(
+            "a lookup outside a direct LEFT JOIN",
+            "a pinned lookup may enrich a source row but may not drive a subquery, filter, or \
+             second source of rows.",
+            "reference the declared lookup only as `LEFT JOIN <lookup> ON ...`.",
+        ));
+    }
     Ok(())
 }
 
-fn check_set_expr(body: &SetExpr, scope: &BTreeSet<String>) -> Result<()> {
+fn check_set_expr(
+    body: &SetExpr,
+    scope: &BTreeSet<String>,
+    lookups: &BTreeSet<String>,
+) -> Result<()> {
     match body {
-        SetExpr::Select(select) => check_select(select, scope),
-        SetExpr::Query(q) => check_query(q, scope),
+        SetExpr::Select(select) => check_select(select, scope, lookups),
+        SetExpr::Query(q) => check_query(q, scope, lookups),
         SetExpr::SetOperation { left, right, .. } => {
-            check_set_expr(left, scope)?;
-            check_set_expr(right, scope)
+            check_set_expr(left, scope, lookups)?;
+            check_set_expr(right, scope, lookups)
         }
         SetExpr::Values(_) => Err(reject(
             "VALUES",
@@ -215,7 +382,11 @@ fn check_set_expr(body: &SetExpr, scope: &BTreeSet<String>) -> Result<()> {
     }
 }
 
-fn check_select(select: &Select, scope: &BTreeSet<String>) -> Result<()> {
+fn check_select(
+    select: &Select,
+    scope: &BTreeSet<String>,
+    lookups: &BTreeSet<String>,
+) -> Result<()> {
     // GROUP BY — the headline rejection.
     let grouped = match &select.group_by {
         deltalake::datafusion::sql::sqlparser::ast::GroupByExpr::All(_) => true,
@@ -263,8 +434,6 @@ fn check_select(select: &Select, scope: &BTreeSet<String>) -> Result<()> {
         ));
     }
 
-    // Joins: v1 has no pinned-snapshot machinery, so any join is unpinned by definition.
-    //
     // Two FROM items separated by a comma is a join written the old way. It has to be
     // caught here rather than by the per-item `joins` check below, which only sees the
     // `a JOIN b` spelling — and by the relation check in the visitor, which cannot tell
@@ -274,37 +443,262 @@ fn check_select(select: &Select, scope: &BTreeSet<String>) -> Result<()> {
             "a comma-separated FROM list (an implicit cross join)",
             "a join against a table that can change between batches makes output \
              non-reproducible, and joining the source to itself is cross-row state.",
-            "denormalise upstream; pinned-snapshot lookup joins are planned for v2.",
+            "LEFT JOIN a declared pinned lookup with an ON predicate, or enrich downstream.",
         ));
     }
 
     for twj in &select.from {
-        if !twj.joins.is_empty() {
-            return Err(reject(
-                "JOIN",
-                "a join against a table that can change between batches makes output \
-                 non-reproducible, and a self-join is cross-row state.",
-                "denormalise upstream; pinned-snapshot lookup joins are planned for v2.",
-            ));
+        check_base_table_factor(&twj.relation, scope, lookups)?;
+        for join in &twj.joins {
+            check_lookup_join(join, lookups)?;
         }
-        check_table_factor(&twj.relation, scope)?;
     }
 
     Ok(())
 }
 
-fn check_table_factor(tf: &TableFactor, scope: &BTreeSet<String>) -> Result<()> {
+fn check_base_table_factor(
+    tf: &TableFactor,
+    scope: &BTreeSet<String>,
+    lookups: &BTreeSet<String>,
+) -> Result<()> {
     match tf {
+        TableFactor::Table { .. } if !is_plain_table_relation(tf) => Err(reject(
+            "a table-valued or modified FROM relation",
+            "the stream executor registers only plain source and lookup relations, not table \
+             functions, time-travel references, samples, or engine-specific table modifiers.",
+            "read the plain source relation (or a source-derived CTE), optionally LEFT JOINing \
+             a declared lookup.",
+        )),
+        TableFactor::Table { name, .. } if relation_is_lookup(name, lookups) => Err(reject(
+            "a lookup as the primary FROM relation",
+            "a lookup does not advance an offset and cannot define the output grain.",
+            "start from source (or a source-derived CTE) and LEFT JOIN the lookup.",
+        )),
         TableFactor::Table { .. } => Ok(()),
-        TableFactor::Derived { subquery, .. } => check_query(subquery, scope),
+        TableFactor::Derived { subquery, .. } => check_query(subquery, scope, lookups),
         TableFactor::UNNEST { .. } => Ok(()),
         TableFactor::NestedJoin { .. } => Err(reject(
             "JOIN",
             "a join against a table that can change between batches makes output \
              non-reproducible.",
-            "denormalise upstream; pinned-snapshot lookup joins are planned for v2.",
+            "LEFT JOIN a declared pinned lookup with an ON predicate, or enrich downstream.",
         )),
-        _ => Ok(()),
+        other => Err(reject(
+            &format!("this FROM relation form ({other:?})"),
+            "the stream executor only registers the source batch and declared Delta lookups.",
+            "read source (or a source-derived CTE), optionally LEFT JOINing a declared lookup.",
+        )),
+    }
+}
+
+/// Lookup joins are intentionally more constrained than ordinary SQL joins. A lookup is a
+/// snapshot selected from the source commit's timestamp, not a second stream: it can enrich a
+/// source row, but it may not drive, filter, or cross-product the source batch.
+fn check_lookup_join(join: &Join, lookups: &BTreeSet<String>) -> Result<()> {
+    let on = match &join.join_operator {
+        JoinOperator::LeftOuter(JoinConstraint::On(on))
+        | JoinOperator::Left(JoinConstraint::On(on)) => on,
+        _ => {
+            return Err(reject(
+                "JOIN",
+                "only LEFT JOIN ... ON is safe for a pinned lookup; inner, right, full and cross \
+                 joins can remove or multiply source rows.",
+                "LEFT JOIN a declared lookup with an ON predicate, or enrich downstream.",
+            ));
+        }
+    };
+
+    let TableFactor::Table { name, alias, .. } = &join.relation else {
+        return Err(reject(
+            "JOIN to this relation form",
+            "a lookup must be a declared Delta table registered under its own name.",
+            "LEFT JOIN the declared lookup name directly.",
+        ));
+    };
+    if !is_plain_table_relation(&join.relation) {
+        return Err(reject(
+            "a table-valued or modified lookup relation",
+            "a pinned lookup must be the plain Delta relation registered for this batch, not a \
+             table function, time-travel reference, sample, or engine-specific modifier.",
+            "LEFT JOIN the declared lookup name directly.",
+        ));
+    }
+    if !relation_is_lookup(name, lookups) {
+        return Err(reject(
+            &format!("the joined table {:?}", name),
+            "it is not a declared pinned lookup, so its snapshot cannot be reproduced on retry.",
+            "declare it as a dbt source with meta.ddi_lookup, or enrich downstream.",
+        ));
+    }
+    // The relation is registered under its declared lookup name, but SQL may give it an
+    // ordinary table alias. The ON predicate has to use the alias when it has one.
+    let lookup_qualifier = alias
+        .as_ref()
+        .map(|alias| alias.name.value.to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            name.0
+                .first()
+                .and_then(|part| part.as_ident())
+                .expect("relation_is_lookup checked the single identifier")
+                .value
+                .to_ascii_lowercase()
+        });
+    if !has_lookup_key_equality(on, &lookup_qualifier) {
+        return Err(reject(
+            "the lookup JOIN predicate",
+            "it must contain an equality between a lookup-qualified column and a source- or \
+             CTE-qualified column. An unbounded predicate can multiply source rows.",
+            "join `lookup.key = source_or_cte.key` (additional AND conditions are fine).",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether an ON expression has at least one equality that relates the lookup to an existing
+/// source/CTE relation. This is intentionally narrow: it rejects `ON true` and predicates that
+/// only filter the lookup, both of which can turn an enrichment into a cross product.
+fn has_lookup_key_equality(expr: &Expr, lookup_name: &str) -> bool {
+    match expr {
+        Expr::Nested(inner) => has_lookup_key_equality(inner, lookup_name),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            has_lookup_key_equality(left, lookup_name)
+                || has_lookup_key_equality(right, lookup_name)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            let left_qualifiers = expression_qualifiers(left);
+            let right_qualifiers = expression_qualifiers(right);
+            let left_has_lookup = left_qualifiers.contains(lookup_name);
+            let right_has_lookup = right_qualifiers.contains(lookup_name);
+            let left_has_other = left_qualifiers
+                .iter()
+                .any(|name| name.as_str() != lookup_name);
+            let right_has_other = right_qualifiers
+                .iter()
+                .any(|name| name.as_str() != lookup_name);
+            // One side may compute or normalise a key (`lower(fx.currency)` is valid), but
+            // it may not also reference the other side. That rules out predicates such as
+            // `fx.k = coalesce(fx.k, source.k)`, which look keyed while still admitting every
+            // lookup row when `fx.k` is present.
+            (left_has_lookup && !left_has_other && right_has_other && !right_has_lookup)
+                || (right_has_lookup && !right_has_other && left_has_other && !left_has_lookup)
+        }
+        _ => false,
+    }
+}
+
+/// Relation qualifiers mentioned by an expression. Unqualified columns deliberately do not
+/// count: requiring both sides to be explicit is what lets the validator distinguish a key match
+/// from `lookup.active = true`.
+fn expression_qualifiers(expr: &Expr) -> BTreeSet<String> {
+    #[derive(Default)]
+    struct Qualifiers(BTreeSet<String>);
+
+    impl VisitorMut for Qualifiers {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+            if let Expr::CompoundIdentifier(parts) = expr {
+                if let Some(first) = parts.first() {
+                    self.0.insert(first.value.to_ascii_lowercase());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut copy = expr.clone();
+    let mut qualifiers = Qualifiers::default();
+    let _ = copy.visit(&mut qualifiers);
+    qualifiers.0
+}
+
+fn relation_is_lookup(relation: &ObjectName, lookups: &BTreeSet<String>) -> bool {
+    relation.0.len() == 1
+        && relation
+            .0
+            .first()
+            .and_then(|part| part.as_ident())
+            .map(|ident| lookups.contains(&ident.value.to_ascii_lowercase()))
+            .unwrap_or(false)
+}
+
+/// Only a normal named relation can be the source or a pinned lookup. `TableFactor::Table`
+/// also represents table-valued calls and several dialect-specific modifiers, none of which is
+/// a relation the executor registered in its isolated session.
+fn is_plain_table_relation(factor: &TableFactor) -> bool {
+    matches!(
+        factor,
+        TableFactor::Table {
+            args: None,
+            with_hints,
+            version: None,
+            with_ordinality: false,
+            partitions,
+            json_path: None,
+            sample: None,
+            index_hints,
+            ..
+        } if with_hints.is_empty() && partitions.is_empty() && index_hints.is_empty()
+    )
+}
+
+/// Number of lookup relation references that occur in the only permitted place: directly on a
+/// `LEFT JOIN ... ON`. It deliberately does not descend into expression subqueries; the generic
+/// visitor sees those references and rejects the mismatch with this count.
+fn lookup_join_count(query: &Query, lookups: &BTreeSet<String>) -> usize {
+    let ctes = query
+        .with
+        .iter()
+        .flat_map(|with| with.cte_tables.iter())
+        .map(|cte| lookup_join_count(&cte.query, lookups))
+        .sum::<usize>();
+    ctes + lookup_join_count_set(&query.body, lookups)
+}
+
+fn lookup_join_count_set(body: &SetExpr, lookups: &BTreeSet<String>) -> usize {
+    match body {
+        SetExpr::Select(select) => lookup_join_count_select(select, lookups),
+        SetExpr::Query(query) => lookup_join_count(query, lookups),
+        SetExpr::SetOperation { left, right, .. } => {
+            lookup_join_count_set(left, lookups) + lookup_join_count_set(right, lookups)
+        }
+        _ => 0,
+    }
+}
+
+fn lookup_join_count_select(select: &Select, lookups: &BTreeSet<String>) -> usize {
+    select
+        .from
+        .iter()
+        .map(|table_with_joins| {
+            lookup_join_count_factor(&table_with_joins.relation, lookups)
+                + table_with_joins
+                    .joins
+                    .iter()
+                    .map(|join| {
+                        usize::from(matches!(
+                            &join.relation,
+                            TableFactor::Table { name, .. } if relation_is_lookup(name, lookups)
+                        )) + lookup_join_count_factor(&join.relation, lookups)
+                    })
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+fn lookup_join_count_factor(factor: &TableFactor, lookups: &BTreeSet<String>) -> usize {
+    match factor {
+        TableFactor::Derived { subquery, .. } => lookup_join_count(subquery, lookups),
+        _ => 0,
     }
 }
 
@@ -339,6 +733,8 @@ pub(crate) fn is_cte(relation: &ObjectName, ctes: &BTreeSet<String>) -> bool {
 struct StatefulConstructVisitor {
     found: Option<Error>,
     ctes: BTreeSet<String>,
+    lookups: BTreeSet<String>,
+    lookup_refs: usize,
 }
 
 /// Aggregate function names that imply cross-row state.
@@ -398,10 +794,10 @@ impl VisitorMut for StatefulConstructVisitor {
     /// the `check_select` walk never reaches (an `IN (SELECT ... FROM products)` lives in
     /// the WHERE expression, not in the FROM list).
     ///
-    /// Only `source` is registered on the session, so any other name could only ever fail
-    /// at plan time — on the first batch, in production, from a daemon that started
-    /// clean and passed `ddi validate`. Naming it here keeps the promise that a pipeline
-    /// which cannot be correct never starts.
+    /// Only `source` and declared pinned lookups are registered on the session, so any other
+    /// name could only ever fail at plan time — on the first batch, in production, from a
+    /// daemon that started clean and passed `ddi validate`. Naming it here keeps the promise
+    /// that a pipeline which cannot be correct never starts.
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
         self.ctes.extend(cte_names(query));
         ControlFlow::Continue(())
@@ -422,17 +818,20 @@ impl VisitorMut for StatefulConstructVisitor {
             .unwrap_or(&full)
             .trim_matches('"')
             .to_ascii_lowercase();
-        if bare != SOURCE_TABLE {
+        if self.lookups.contains(&bare) {
+            self.lookup_refs += 1;
+            return ControlFlow::Continue(());
+        }
+        if relation.0.len() != 1 || bare != SOURCE_TABLE {
             self.found = Some(reject(
                 &format!("the table {full:?}"),
                 &format!(
                     "a transform may only read the batch it was given, which is registered \
-                     as {SOURCE_TABLE:?}. Reading a second table means joining against \
+                     as the unqualified relation {SOURCE_TABLE:?}. Reading a second table means joining against \
                      something that can change between batches, which makes the output \
                      non-reproducible."
                 ),
-                "denormalise upstream, or enrich downstream; pinned-snapshot lookup joins \
-                 are planned for v2.",
+                "LEFT JOIN a declared pinned lookup with an ON predicate, or enrich downstream.",
             ));
             return ControlFlow::Break(());
         }
@@ -479,6 +878,10 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("expected {sql:?} to be rejected"))
             .to_string()
+    }
+
+    fn lookup_names() -> BTreeSet<String> {
+        ["fx_rates".to_string()].into_iter().collect()
     }
 
     #[test]
@@ -542,6 +945,39 @@ mod tests {
     }
 
     #[test]
+    fn named_trino_from_unixtime_is_normalised_with_an_explicit_timezone() {
+        let got = normalise_sql(
+            "SELECT CAST(from_unixtime(event_epoch / 1000, 'Europe/Amsterdam') AS DATE) \
+             AS local_date FROM source",
+        )
+        .expect("the model's Trino spelling should be executable by DataFusion");
+
+        assert!(
+            got.contains("to_timestamp_seconds(event_epoch / 1000)"),
+            "the epoch conversion was retained: {got}"
+        );
+        assert!(
+            got.contains("AT TIME ZONE 'UTC'"),
+            "the epoch has an explicit UTC origin: {got}"
+        );
+        assert!(
+            got.contains("AT TIME ZONE 'Europe/Amsterdam'"),
+            "the calendar timezone remains Amsterdam: {got}"
+        );
+        assert!(
+            !got.to_ascii_lowercase().contains("from_unixtime"),
+            "the unsupported function was fully removed: {got}"
+        );
+    }
+
+    #[test]
+    fn unsupported_trino_from_unixtime_variant_is_rejected_at_config_load() {
+        let err = normalise_sql("SELECT from_unixtime(event_epoch, 'UTC') FROM source")
+            .expect_err("leaving an unsupported function for first-batch planning is unsafe");
+        assert!(err.to_string().contains("from_unixtime"), "got: {err}");
+    }
+
+    #[test]
     fn the_trino_spelling_of_unnest_is_accepted() {
         // Row-local: no second table, nothing to pin, no cross-row state. It was rejected as
         // a JOIN until the rewrite ran before these checks.
@@ -555,12 +991,89 @@ mod tests {
 
     #[test]
     fn a_real_join_is_still_rejected() {
-        // The rewrite must not have opened a door: a join against another table is still
-        // unpinned and still refused.
+        // The rewrite must not have opened a door: an undeclared relation is still refused.
         let e = validate_sql("SELECT a.x FROM source a CROSS JOIN customers c")
             .unwrap_err()
             .to_string();
         assert!(e.contains("JOIN"), "got: {e}");
+    }
+
+    #[test]
+    fn a_declared_lookup_can_only_be_a_direct_left_join() {
+        let lookups = lookup_names();
+        validate_sql_with_lookups(
+            "SELECT orders.order_id, fx_rates.exchange_rate \
+             FROM source AS orders LEFT JOIN fx_rates \
+             ON fx_rates.currency = orders.currency",
+            &lookups,
+        )
+        .expect("a declared pinned lookup may enrich a source row");
+
+        let e = validate_sql_with_lookups(
+            "SELECT order_id FROM source \
+             WHERE EXISTS (SELECT 1 FROM fx_rates)",
+            &lookups,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("direct LEFT JOIN"), "got: {e}");
+
+        let e = validate_sql_with_lookups(
+            "SELECT orders.order_id FROM source AS orders \
+             LEFT JOIN fx_rates ON true",
+            &lookups,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("equality"), "got: {e}");
+
+        for sql in [
+            "SELECT order_id FROM source()",
+            "SELECT orders.order_id FROM source AS orders \
+             LEFT JOIN fx_rates() ON fx_rates.currency = orders.currency",
+        ] {
+            let e = validate_sql_with_lookups(sql, &lookups)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("table-valued"), "{sql}: {e}");
+        }
+
+        for sql in [
+            "SELECT order_id FROM source WHERE currency IN (SELECT currency FROM fx_rates)",
+            "SELECT order_id, (SELECT exchange_rate FROM fx_rates LIMIT 1) AS rate FROM source",
+        ] {
+            let e = validate_sql_with_lookups(sql, &lookups)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("direct LEFT JOIN"), "{sql}: {e}");
+        }
+
+        validate_sql_with_lookups(
+            "WITH items AS (SELECT order_id, currency FROM source) \
+             SELECT items.order_id, fx_rates.exchange_rate \
+             FROM items LEFT JOIN fx_rates \
+             ON lower(fx_rates.currency) = lower(items.currency)",
+            &lookups,
+        )
+        .expect("a source-derived CTE may be enriched by a lookup");
+
+        validate_sql_with_lookups(
+            "SELECT orders.order_id, fx.exchange_rate \
+             FROM source AS orders LEFT JOIN fx_rates AS fx \
+             ON fx.currency = orders.currency",
+            &lookups,
+        )
+        .expect("a lookup may use a normal SQL alias");
+
+        let e = validate_sql_with_lookups(
+            "SELECT orders.order_id FROM source AS orders \
+             LEFT JOIN fx_rates AS fx \
+             ON fx.currency = coalesce(fx.currency, orders.currency)",
+            &lookups,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("equality"), "got: {e}");
     }
 
     #[test]
@@ -720,16 +1233,21 @@ mod tests {
     }
 
     #[test]
-    fn a_qualified_name_for_the_source_is_still_accepted() {
-        // Whatever the planner resolves it to, the trailing identifier is what matters.
-        validate_sql("SELECT order_id FROM public.source").unwrap();
+    fn a_qualified_name_for_the_source_is_rejected() {
+        // The executor registers precisely `source`, never a catalog/schema relation. Accepting
+        // a tail match would pass validation and then fail when the first batch is planned.
+        let e = validate_sql("SELECT order_id FROM public.source").unwrap_err();
+        assert!(e.to_string().contains("unqualified"), "got: {e}");
     }
 
     #[test]
     fn join_is_rejected() {
         let e = err_of("SELECT a.x FROM source a JOIN other b ON a.k = b.k");
         assert!(e.contains("JOIN"), "got: {e}");
-        assert!(e.contains("v2"), "should point at the v2 plan, got: {e}");
+        assert!(
+            e.contains("LEFT JOIN"),
+            "should point at the allowed shape, got: {e}"
+        );
     }
 
     #[test]

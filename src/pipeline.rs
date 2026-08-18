@@ -1,5 +1,6 @@
 //! The core loop.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -66,6 +67,9 @@ pub struct Pipeline {
     dq: Option<DataQuality>,
     /// What decoding this source costs, shared with the stream that sizes batches by it.
     amplification: Arc<crate::budget::Amplification>,
+    /// Identities checked when the pipeline opened. Re-checking every selected snapshot stops a
+    /// drop/recreate at the same URI from silently changing a lookup halfway through a run.
+    lookup_table_ids: BTreeMap<String, String>,
 }
 
 impl Pipeline {
@@ -84,6 +88,8 @@ impl Pipeline {
             ))
         })?;
 
+        let lookup_table_ids = validate_lookup_tables(&cfg, &source, &target).await?;
+
         let offsets = OffsetStore::new(&cfg.app_id, cfg.starting_version);
         let cursor = resume_cursor(&cfg, &offsets, &source, &target).await?;
 
@@ -99,11 +105,17 @@ impl Pipeline {
             .with_starting_cursor(cursor)
             .with_change_policy(cfg.change_policy)
             .with_max_files_per_batch(cfg.max_files_per_batch)
-            .with_max_bytes_per_batch(cfg.max_bytes_per_batch);
+            .with_max_bytes_per_batch(cfg.max_bytes_per_batch)
+            .with_pinned_lookup_snapshots(!cfg.lookups.is_empty());
         let amplification = stream.amplification();
 
+        let lookup_names = cfg
+            .lookups
+            .iter()
+            .map(|lookup| lookup.name.clone())
+            .collect::<BTreeSet<_>>();
         let transform: Box<dyn Transform> = match &cfg.transform_sql {
-            Some(sql) => Box::new(SqlTransform::new(sql.clone())),
+            Some(sql) => Box::new(SqlTransform::new_with_lookups(sql.clone(), &lookup_names)),
             None => Box::new(Identity),
         };
 
@@ -182,6 +194,7 @@ impl Pipeline {
             dedup,
             dq,
             amplification,
+            lookup_table_ids,
         })
     }
 
@@ -209,6 +222,12 @@ impl Pipeline {
         let files = batch.files.len();
         let through = batch.through_version;
 
+        // A lookup is selected from the source commit's timestamp before any input is read or
+        // target write is attempted. If anything below fails, retrying this source version asks
+        // for the same Delta snapshot rather than whatever FX happens to be latest then.
+        let lookup_snapshots = self.lookup_snapshots(&batch).await?;
+        self.sink.set_lookup_snapshots(&lookup_snapshots);
+
         // 2. Read those files as Arrow.
         let input = self.scan(&batch).await?;
         let in_rows: usize = input.iter().map(|b| b.num_rows()).sum();
@@ -221,7 +240,10 @@ impl Pipeline {
         self.amplification.observe(batch.total_bytes(), decoded);
 
         // 3. Transform. Stateless, row-local, validated at config load.
-        let output = self.transform.apply(input).await?;
+        let output = self
+            .transform
+            .apply_with_lookups(input, &lookup_snapshots)
+            .await?;
 
         // Which target columns the transform actually produced, read *before* coercion —
         // afterwards every target column is present, because that is what coercion does,
@@ -373,6 +395,55 @@ impl Pipeline {
         };
         let now = chrono::Utc::now().naive_utc().and_utc().timestamp_micros();
         dq.write(rejects, txn_version, now).await
+    }
+
+    async fn lookup_snapshots(
+        &self,
+        batch: &LogBatch,
+    ) -> Result<Vec<crate::lookup::LookupSnapshot>> {
+        if self.cfg.lookups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let timestamp = batch.through_log_timestamp.clone().ok_or_else(|| {
+            Error::Config(format!(
+                "pipeline {:?}: source commit {} has no Delta-log timestamp for pinned lookup selection",
+                self.cfg.name, batch.through_version
+            ))
+        })?;
+
+        let mut snapshots = Vec::with_capacity(self.cfg.lookups.len());
+        for lookup in &self.cfg.lookups {
+            let snapshot = lookup.snapshot(&self.cfg.storage, timestamp).await?;
+            let expected = self.lookup_table_ids.get(&snapshot.name).ok_or_else(|| {
+                Error::Config(format!(
+                    "pipeline {:?}: lookup {:?} was not present when the pipeline opened",
+                    self.cfg.name, snapshot.name
+                ))
+            })?;
+            let actual = snapshot.table_id.as_deref().ok_or_else(|| {
+                Error::Config(format!(
+                    "pipeline {:?}: lookup {:?} has no Delta table id",
+                    self.cfg.name, snapshot.name
+                ))
+            })?;
+            if actual != expected.as_str() {
+                return Err(Error::Config(format!(
+                    "pipeline {:?}: lookup {:?} changed Delta table id from {:?} to {:?}. \
+                     It was dropped, recreated, or redirected at the same URI; choose a new \
+                     app_id and rebuild the target before using the replacement.",
+                    self.cfg.name, snapshot.name, expected, actual
+                )));
+            }
+            info!(
+                pipeline = %self.cfg.name,
+                lookup = %snapshot.name,
+                lookup_version = snapshot.version,
+                source_log_timestamp = %timestamp,
+                "using pinned lookup snapshot"
+            );
+            snapshots.push(snapshot);
+        }
+        Ok(snapshots)
     }
 
     /// Collapse the batch to one row per key, work out how much of the target the merge has
@@ -650,12 +721,105 @@ fn arrow_schema_of(schema: &deltalake::kernel::StructType) -> Result<SchemaRef> 
 /// Read out of the serialized metadata because the kernel keeps the accessor private; the
 /// field name is part of the Delta protocol, so this is stable.
 fn table_id(t: &DeltaTable) -> Option<String> {
-    let snapshot = t.snapshot().ok()?;
-    serde_json::to_value(snapshot.metadata())
-        .ok()?
-        .get("id")?
-        .as_str()
-        .map(str::to_string)
+    crate::lookup::table_id(t)
+}
+
+/// Resolve every configured lookup once at startup and prove that no URI alias turns an
+/// enrichment into a source/self/feedback join. URI text is not a sufficient guard: object-store
+/// spellings can differ while resolving to the same Delta table, so protocol table ids are the
+/// authority.
+async fn validate_lookup_tables(
+    cfg: &ResolvedPipeline,
+    source: &DeltaTable,
+    target: &DeltaTable,
+) -> Result<BTreeMap<String, String>> {
+    let source_id = table_id(source).ok_or_else(|| {
+        Error::Config(format!(
+            "pipeline {:?}: source {:?} has no Delta table id",
+            cfg.name, cfg.source_uri
+        ))
+    })?;
+    let target_id = table_id(target).ok_or_else(|| {
+        Error::Config(format!(
+            "pipeline {:?}: target {:?} has no Delta table id",
+            cfg.name, cfg.target_uri
+        ))
+    })?;
+    if source_id == target_id {
+        return Err(Error::Config(format!(
+            "pipeline {:?}: source and target resolve to Delta table id {source_id:?}; \
+             the pipeline would feed its own output",
+            cfg.name
+        )));
+    }
+
+    let recorded =
+        watermark::our_last_commit(target, &cfg.app_id, watermark::DEFAULT_MAX_SCAN).await?;
+
+    let mut current = BTreeMap::new();
+    for lookup in &cfg.lookups {
+        let table = cfg.storage.open(&lookup.uri).await.map_err(|e| {
+            Error::Config(format!(
+                "pipeline {:?}: lookup {:?}: {e}",
+                cfg.name, lookup.name
+            ))
+        })?;
+        let id = table_id(&table).ok_or_else(|| {
+            Error::Config(format!(
+                "pipeline {:?}: lookup {:?} at {:?} has no Delta table id",
+                cfg.name, lookup.name, lookup.uri
+            ))
+        })?;
+        if id == source_id || id == target_id {
+            return Err(Error::Config(format!(
+                "pipeline {:?}: lookup {:?} resolves to the same Delta table as the {}. \
+                 A lookup must be a separate, read-only table.",
+                cfg.name,
+                lookup.name,
+                if id == source_id { "source" } else { "target" }
+            )));
+        }
+        if let Some((other_name, _)) = current.iter().find(|(_, other_id)| *other_id == &id) {
+            return Err(Error::Config(format!(
+                "pipeline {:?}: lookups {:?} and {:?} resolve to the same Delta table id \
+                 {id:?}; declare it only once.",
+                cfg.name, other_name, lookup.name
+            )));
+        }
+        current.insert(lookup.name.clone(), id);
+    }
+
+    if recorded.commit_version.is_some()
+        && recorded.lookup_table_ids.keys().collect::<BTreeSet<_>>()
+            != current.keys().collect::<BTreeSet<_>>()
+    {
+        return Err(Error::Config(format!(
+            "pipeline {:?}: its configured lookup set changed after it had already written \
+             target version {:?}. Choose a new app_id and rebuild the target rather than \
+             mixing enriched and unenriched rows under one stream.",
+            cfg.name, recorded.commit_version
+        )));
+    }
+    for (name, recorded_id) in recorded.lookup_table_ids {
+        let Some(current_id) = current.get(&name) else {
+            return Err(Error::Config(format!(
+                "pipeline {:?}: its most recent target commit used lookup {:?}, but that \
+                 lookup is no longer configured. Choose a new app_id and rebuild the target \
+                 before changing the lookup set.",
+                cfg.name, name
+            )));
+        };
+        if current_id != &recorded_id {
+            return Err(Error::Config(format!(
+                "pipeline {:?}: lookup {:?} changed Delta table id from {:?} to {:?}. \
+                 It was dropped, recreated, or relocated; choose a new app_id and rebuild \
+                 the target before using the replacement.",
+                cfg.name, name, recorded_id, current_id
+            )));
+        }
+    }
+
+    Ok(current)
 }
 
 /// Start over when the source is no longer the table we were reading.

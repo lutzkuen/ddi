@@ -12,8 +12,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use deltalake::kernel::{Action, Add, Remove, StructType};
-use deltalake::logstore::{get_actions, LogStore};
+use deltalake::logstore::object_store::ObjectStore;
+use deltalake::logstore::{commit_uri_from_version, get_actions, LogStore};
 use deltalake::{DeltaTable, DeltaTableConfig};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -67,6 +69,10 @@ pub struct LogBatch {
     pub schema: Arc<StructType>,
     /// Highest source version fully represented in `files`.
     pub through_version: Version,
+    /// Last-modified timestamp of `through_version`'s Delta log object, when a pipeline needs
+    /// deterministic lookup snapshots. It deliberately uses the same storage clock as Delta
+    /// time travel, not an optional writer-provided `commitInfo.timestamp`.
+    pub through_log_timestamp: Option<DateTime<Utc>>,
 }
 
 impl LogBatch {
@@ -87,6 +93,9 @@ pub struct LogStreamBuilder {
     max_bytes_per_batch: u64,
     policy: ChangePolicy,
     allow_commit_splitting: bool,
+    /// Lookup pipelines intentionally take one data commit per batch. That gives every source
+    /// version one deterministic lookup timestamp irrespective of byte/file batch settings.
+    pin_lookup_snapshots: bool,
     /// Schema cache keyed by the version it was read at, so a batch that spans many
     /// commits with no schema change costs one snapshot load, not one per commit.
     schema_cache: HashMap<Version, Arc<StructType>>,
@@ -110,6 +119,7 @@ impl LogStreamBuilder {
             max_bytes_per_batch: 256 * 1024 * 1024,
             policy: ChangePolicy::default(),
             allow_commit_splitting: false,
+            pin_lookup_snapshots: false,
             schema_cache: HashMap::new(),
             head: None,
             amplification: Arc::new(crate::budget::Amplification::default()),
@@ -174,6 +184,16 @@ impl LogStreamBuilder {
         self
     }
 
+    /// Process one source data commit at a time and pin lookup selection to its Delta-log
+    /// object timestamp.
+    ///
+    /// A lookup is selected as-of that timestamp. Taking one data commit avoids making the
+    /// snapshot depend on how several source commits happened to fit under a batch cap.
+    pub fn with_pinned_lookup_snapshots(mut self, yes: bool) -> Self {
+        self.pin_lookup_snapshots = yes;
+        self
+    }
+
     pub fn cursor(&self) -> StreamCursor {
         self.cursor
     }
@@ -225,6 +245,7 @@ impl LogStreamBuilder {
         let mut bytes: u64 = 0;
         let mut cursor = self.cursor;
         let mut through: Option<Version> = None;
+        let mut through_log_timestamp: Option<DateTime<Utc>> = None;
 
         while cursor.version <= latest {
             let version = cursor.version;
@@ -300,7 +321,13 @@ impl LogStreamBuilder {
                 files.extend_from_slice(remaining);
                 bytes += commit_bytes;
                 through = Some(version);
+                if self.pin_lookup_snapshots {
+                    through_log_timestamp = Some(self.commit_log_timestamp(version).await?);
+                }
                 cursor = cursor.next_version();
+                if self.pin_lookup_snapshots {
+                    break;
+                }
                 continue;
             }
 
@@ -340,6 +367,9 @@ impl LogStreamBuilder {
             // (bytes not re-read: we break out of the loop immediately below)
             cursor = cursor.advanced_by(take);
             through = Some(version);
+            if self.pin_lookup_snapshots {
+                through_log_timestamp = Some(self.commit_log_timestamp(version).await?);
+            }
             break;
         }
 
@@ -360,7 +390,25 @@ impl LogStreamBuilder {
             files,
             schema,
             through_version,
+            through_log_timestamp,
         }))
+    }
+
+    /// The timestamp Delta time travel itself uses for this commit: the log JSON object's
+    /// storage metadata. `commitInfo.timestamp` is supplied by writers and can be absent,
+    /// skewed, or rewritten independently of the object-store clock used by lookups.
+    async fn commit_log_timestamp(&self, version: Version) -> Result<DateTime<Utc>> {
+        let object = self
+            .log_store
+            .object_store(None)
+            .head(&commit_uri_from_version(Some(version)))
+            .await
+            .map_err(|e| {
+                Error::Other(format!(
+                    "cannot read Delta-log timestamp for source commit {version}: {e}"
+                ))
+            })?;
+        Ok(object.last_modified)
     }
 
     /// Schema as of `version`, cached.

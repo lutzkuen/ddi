@@ -176,6 +176,7 @@ fn pipeline(source: &str, target: &str) -> ResolvedPipeline {
         app_id: format!("ddi.it.{}", target.rsplit('/').next().unwrap()),
         source_uri: source.into(),
         target_uri: target.into(),
+        lookups: vec![],
         starting_version: 0,
         change_policy: ChangePolicy::Fail,
         // Parses JSON and casts, so the batch really has to read the parquet -- which is

@@ -216,6 +216,9 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
                 // — both of which would otherwise surface on the first batch.
                 p.storage.check(&p.source_uri)?;
                 p.storage.check(&p.target_uri)?;
+                for lookup in &p.lookups {
+                    p.storage.check(&lookup.uri)?;
+                }
                 // write_mode is shown because it changes what the target *is*, not just how
                 // fast it fills: an upserted table holds one row per key and can only be
                 // read downstream by another upserting pipeline.
@@ -288,20 +291,19 @@ fn non_delta_catalog(
     delta: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
     let target = manifest.node(&s.unique_id)?;
-    let source = target
-        .depends_on
-        .nodes
-        .first()
-        .and_then(|id| manifest.node(id));
+    let source = manifest.node(&s.source_unique_id);
 
-    [
-        target.database.as_deref(),
-        source.and_then(|n| n.database.as_deref()),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|c| !delta.contains(*c))
-    .map(str::to_string)
+    std::iter::once(target.database.as_deref())
+        .chain(std::iter::once(source.and_then(|n| n.database.as_deref())))
+        .chain(s.lookups.iter().map(|lookup| {
+            manifest
+                .node(&lookup.unique_id)
+                .and_then(|node| node.database.as_deref())
+        }))
+        .into_iter()
+        .flatten()
+        .find(|c| !delta.contains(*c))
+        .map(str::to_string)
 }
 
 /// The first clause of a rejection, for grouping. The rest is the explanation.
