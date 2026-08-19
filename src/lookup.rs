@@ -105,7 +105,7 @@ impl ResolvedLookup {
                 Err(SnapshotSelectionError::HistoryUnavailable(reason)) => {
                     return Err(Error::Config(format!(
                         "lookup {:?} cannot load a retained timestamp-pinned snapshot for source commit time {as_of}: {reason}. \
-                         Its historical Delta log or files were likely vacuumed; restore the history, use an approved \
+                         Its historical Delta log entries were most likely truncated by log retention; restore them, use an approved \
                          pre_history_version, or explicitly set table_id_change_policy = \"use_current\" to trade replay \
                          determinism for availability.",
                         self.name
@@ -175,15 +175,37 @@ impl ResolvedLookup {
             .map_err(|e| historical_log_timestamp_error(self, version, e))?
             .timestamp_millis();
         let used_pre_history = if selected_millis >= source_millis {
-            let baseline = self.pre_history_version.ok_or_else(|| {
-                Error::Config(format!(
-                    "lookup {:?} has no retained snapshot strictly before source commit time {as_of}. \
-                     Materialize the lookup before the source history, start the pipeline after it, \
-                     or configure an explicit pre_history_version whose historical contents are \
-                     approved for this backfill.",
-                    self.name
-                ))
-            })?;
+            let Some(baseline) = self.pre_history_version else {
+                // Nothing retained predates the source commit, and two different situations
+                // wear that shape. The lookup may genuinely have come into existence after
+                // this commit — nobody's fault, and only an approved pre_history_version can
+                // answer it. Or its earlier commits were truncated out from under us, which
+                // is the retention accident `use_current` exists to survive.
+                //
+                // Which one is readable from the version the selection clamped to. Delta time
+                // travel does not fail on a truncated log, it returns the oldest version it
+                // can still see, and version 0 is only ever missing because it was removed.
+                // So a clamp above 0 is retention, and anything else is a lookup younger than
+                // the source. Without this split the retention case reaches the caller as a
+                // plain config error and `use_current` never gets to make its trade — the
+                // shape that made the fallback look wired up while never firing.
+                return Err(if version > 0 {
+                    SnapshotSelectionError::HistoryUnavailable(format!(
+                        "the oldest commit still retained by lookup {:?} is version {version}, \
+                         which is not before source commit time {as_of}; everything earlier has \
+                         left its Delta log",
+                        self.name
+                    ))
+                } else {
+                    SnapshotSelectionError::Other(Error::Config(format!(
+                        "lookup {:?} has no retained snapshot strictly before source commit time {as_of}. \
+                         Materialize the lookup before the source history, start the pipeline after it, \
+                         or configure an explicit pre_history_version whose historical contents are \
+                         approved for this backfill.",
+                        self.name
+                    )))
+                });
+            };
             if baseline > head {
                 return Err(Error::Config(format!(
                     "lookup {:?} configures pre_history_version {baseline}, but its current head is {head}",

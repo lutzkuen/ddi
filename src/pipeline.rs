@@ -522,14 +522,30 @@ impl Pipeline {
             // Do not consume this marker yet. It is acknowledged only after the target txn
             // succeeds, so an error later in this step keeps the next attempt on the explicit
             // current-head path and preserves its provenance marker.
+            //
+            // It deliberately does *not* feed the decision below. The marker is a fact about
+            // the target — its last commit named an older lineage — and says nothing about
+            // this batch. A batch whose selected snapshot and head are both the current
+            // lineage is unambiguously pinnable, and substituting the head for it would
+            // enrich from a lookup commit written *after* the source commit, which is the one
+            // thing pinning exists to prevent. The batch that genuinely straddles the
+            // replacement is caught on its own evidence, by `selected != expected`.
             let changed_on_open = self.lookup_current_on_open.contains(&name);
-            let changed = lookup_table_id_changed(
+            let ambiguous = lookup_table_id_changed(
                 &expected,
                 &selected_id,
                 &head_id,
-                changed_on_open || current_due_to_unavailable_history,
+                current_due_to_unavailable_history,
             );
-            if changed {
+            // Either way this batch settles the marker: committing it records the current
+            // identity in target provenance, which is what the marker was waiting for.
+            if ambiguous || changed_on_open {
+                transitions.push(LookupTableIdTransition {
+                    name: name.clone(),
+                    table_id: head_id.clone(),
+                });
+            }
+            if ambiguous {
                 if lookup.table_id_change_policy == crate::lookup::LookupTableIdChangePolicy::Strict
                 {
                     return Err(Error::Config(format!(
@@ -552,7 +568,7 @@ impl Pipeline {
                         "lookup timestamp-pinned history is unavailable; using its current head because \
                          table_id_change_policy=use_current"
                     );
-                } else if !changed_on_open {
+                } else {
                     let from = if selected_id != expected {
                         selected_id.as_str()
                     } else {
@@ -570,10 +586,6 @@ impl Pipeline {
                         );
                     }
                 }
-                transitions.push(LookupTableIdTransition {
-                    name: name.clone(),
-                    table_id: head_id,
-                });
                 head.used_current = true;
                 snapshots.push(head);
                 continue;
@@ -850,15 +862,16 @@ impl Pipeline {
 const MERGE_ATTEMPTS: u32 = 3;
 
 /// Whether a source-timestamp-selected snapshot cannot safely retain ordinary timestamp
-/// pinning. The force-current flag covers a startup provenance mismatch or a selection that had
-/// to use the head because its timestamp-pinned history was unavailable.
+/// pinning — decided only from what this batch actually resolved to. Either id differing from
+/// the identity the target recorded means the batch straddles a replacement; the flag covers a
+/// selection that had to fall back to the head because its history was no longer retained.
 fn lookup_table_id_changed(
     expected: &str,
     selected: &str,
     head: &str,
-    force_current: bool,
+    history_unavailable: bool,
 ) -> bool {
-    force_current || selected != expected || head != expected
+    history_unavailable || selected != expected || head != expected
 }
 
 /// Apply transitions only after the target txn commits. Keeping this standalone makes the
