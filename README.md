@@ -295,13 +295,33 @@ table_id_change_policy = "use_current"
 
 This does **not** make routine updates non-deterministic: as long as the timestamp-selected
 snapshot and current head have the same Delta table id, ddi still uses that timestamp-pinned
-snapshot. If the table id changes, or if log/data retention has made the required historical
-snapshot unavailable while the current head can still open, ddi warns and substitutes the current
-head for that batch. It records `ddi.lookup.fx_rates.current = true` alongside the lookup version
-and id in the target commit. It is an intentional trade: data spanning the replacement or vacuumed
-history can no longer be replayed against its original lookup lineage. In dbt-derived config,
-declare the equivalent on the lookup source as `meta: {ddi_lookup: fx_rates,
-ddi_lookup_table_id_change_policy: use_current}`. `strict` remains the default.
+snapshot — including the first batch after a restart that crossed a replacement, which is
+pinnable whenever the batch itself lies wholly on one side of it. If the table id changes, or
+if **log** retention has removed the commits the required historical snapshot needs while the
+current head still opens, ddi warns and substitutes the current head for that batch. It
+records `ddi.lookup.fx_rates.current = true` alongside the lookup version and id in the target
+commit.
+
+It is an intentional trade, and worth reading twice before taking it: data spanning the
+replacement or the truncated history can no longer be replayed against its original lookup
+lineage, so a failed batch that retries after the lookup has moved on is enriched from the
+newer head. Rows the target rejects are written to the data-quality table *before* the batch
+commits, so a retried batch of that kind can leave quarantined rows reflecting a different
+lookup snapshot than the rows that eventually landed.
+
+What this does not cover is a vacuumed *data* file. Only the Delta log is consulted while
+selecting a snapshot, so a snapshot that resolves but whose parquet has been deleted fails
+during the join, as an ordinary read error, under both policies. Log retention on a lookup is
+what this setting survives; file retention still has to be long enough to read.
+
+In dbt-derived config, declare the equivalent on the lookup source as `meta: {ddi_lookup:
+fx_rates, ddi_lookup_table_id_change_policy: use_current}`.
+
+`strict` remains the default, and is now stricter than it was: it refuses as soon as *either*
+the timestamp-selected snapshot or the current head stops matching the identity the target
+recorded. It used to compare only the selected snapshot, which meant a replacement landing
+mid-run was tolerated until the next restart and then refused — the same answer, given later
+and from a different place.
 
 Use this for compact, keyed relations such as daily FX rates. It is not a substitute for
 joining a many-gigabyte historical RRP/COGS table into every 5,000-row source batch; materialize

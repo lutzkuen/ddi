@@ -112,14 +112,38 @@ fn fx_pipeline(
     target: &str,
     table_id_change_policy: LookupTableIdChangePolicy,
 ) -> delta_delta_ingest::config::ResolvedPipeline {
+    // The table-replacement policy is deliberately orthogonal to the explicit baseline
+    // for source history that predates every retained lookup log entry.
+    fx_pipeline_with(source, lookup, target, table_id_change_policy, Some(0))
+}
+
+/// The same pipeline without an approved pre-history baseline.
+///
+/// Most tests configure one, and that is exactly what hides the ordinary retention shape: a
+/// baseline turns "nothing retained predates this commit" into a different code path before
+/// the policy is ever consulted.
+fn fx_pipeline_without_baseline(
+    source: &str,
+    lookup: &str,
+    target: &str,
+    table_id_change_policy: LookupTableIdChangePolicy,
+) -> delta_delta_ingest::config::ResolvedPipeline {
+    fx_pipeline_with(source, lookup, target, table_id_change_policy, None)
+}
+
+fn fx_pipeline_with(
+    source: &str,
+    lookup: &str,
+    target: &str,
+    table_id_change_policy: LookupTableIdChangePolicy,
+    pre_history_version: Option<u64>,
+) -> delta_delta_ingest::config::ResolvedPipeline {
     let mut cfg = pipeline_cfg("fx-lookup", source, target);
     cfg.lookups = vec![resolve(&LookupConfig {
         name: "fx_rates".into(),
         uri: lookup.into(),
         relation: None,
-        // The table-replacement policy is deliberately orthogonal to the explicit baseline
-        // for source history that predates every retained lookup log entry.
-        pre_history_version: Some(0),
+        pre_history_version,
         table_id_change_policy,
     })
     .unwrap()];
@@ -627,4 +651,161 @@ async fn restart_after_a_lookup_replacement_requires_or_honours_the_opt_in_polic
     ))
     .await
     .expect("opt-in policy accepts the recorded/current id mismatch");
+}
+
+/// After a restart across a replacement, a batch that lies wholly inside the new lineage is
+/// still pinned.
+///
+/// The startup marker says the *target's* last commit named an older lineage. That is a fact
+/// about the target, not about this batch, and the two come apart the moment the pipeline
+/// restarts: the very next source commit may sit entirely after the replacement, with its
+/// timestamp-selected snapshot and the head agreeing on identity. Substituting the head there
+/// enriches from a lookup commit written *after* the source commit — the one thing pinning
+/// exists to prevent — and `use_current` promises not to do it while the ids agree.
+#[tokio::test(flavor = "multi_thread")]
+async fn use_current_still_pins_a_batch_that_lies_wholly_after_the_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let source = root.join("source").to_str().unwrap().to_string();
+    let lookup = root.join("fx_rates").to_str().unwrap().to_string();
+    let target = root.join("target").to_str().unwrap().to_string();
+
+    create_table(&source, source_schema()).await;
+    create_table(&lookup, lookup_schema()).await;
+    create_table(&target, target_schema()).await;
+    write_lookup(&lookup, 1.0).await;
+    write_source(&source, 41).await;
+    set_log_mtime(&lookup, 0, 1_700_000_200);
+    set_log_mtime(&lookup, 1, 1_700_000_201);
+    set_log_mtime(&source, 0, 1_700_000_202);
+    set_log_mtime(&source, 1, 1_700_000_203);
+
+    {
+        let mut pipeline = Pipeline::open(fx_pipeline(
+            &source,
+            &lookup,
+            &target,
+            LookupTableIdChangePolicy::UseCurrent,
+        ))
+        .await
+        .expect("the original pipeline opens");
+        pipeline
+            .run_until_caught_up()
+            .await
+            .expect("the original pipeline records the old lookup identity");
+    }
+
+    // The replacement, then two further lookup commits in the new lineage, then a source
+    // commit that falls between them.
+    create_or_replace_lookup(&lookup, 2.0).await;
+    set_log_mtime(&lookup, 2, 1_700_000_204);
+    set_log_mtime(&lookup, 3, 1_700_000_205);
+    write_source(&source, 42).await;
+    set_log_mtime(&source, 2, 1_700_000_206);
+    overwrite_lookup(&lookup, 3.0).await;
+    set_log_mtime(&lookup, 4, 1_700_000_207);
+
+    let mut pipeline = Pipeline::open(fx_pipeline(
+        &source,
+        &lookup,
+        &target,
+        LookupTableIdChangePolicy::UseCurrent,
+    ))
+    .await
+    .expect("the restarted pipeline opens");
+    pipeline
+        .run_until_caught_up()
+        .await
+        .expect("the restarted pipeline commits");
+
+    let rows = target_rows(&target).await;
+    assert_eq!(
+        rows,
+        vec![(41, Some(1.0)), (42, Some(2.0))],
+        "order 42 must be enriched from lookup version 3, the newest commit strictly before \
+         its source commit — 3.0 is version 4, written afterwards"
+    );
+
+    let commit = latest_target_commit(&target).await;
+    assert!(
+        !commit.contains("ddi.lookup.fx_rates.current"),
+        "a pinned batch must not be marked as having used the current head: {commit}"
+    );
+}
+
+/// Ordinary log retention, with no approved baseline to fall back to.
+///
+/// This is the shape the opt-in exists for and the one every other test misses: Delta time
+/// travel does not fail on a truncated log, it clamps to the oldest version it can still see.
+/// So "the lookup has no snapshot before this commit" arrives as an ordinary selection, and
+/// only the version it landed on says whether that is retention or a lookup younger than the
+/// source.
+#[tokio::test(flavor = "multi_thread")]
+async fn use_current_survives_truncated_lookup_history_without_a_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let source = root.join("source").to_str().unwrap().to_string();
+    let lookup = root.join("fx_rates").to_str().unwrap().to_string();
+    let target = root.join("target").to_str().unwrap().to_string();
+
+    create_table(&source, source_schema()).await;
+    create_table(&lookup, lookup_schema()).await;
+    create_table(&target, target_schema()).await;
+    write_lookup(&lookup, 1.0).await;
+    // Overwrite, so the surviving head holds one row per currency and the assertion below is
+    // about which snapshot was used rather than about join fan-out.
+    overwrite_lookup(&lookup, 2.0).await;
+    write_source(&source, 42).await;
+    set_log_mtime(&lookup, 0, 1_700_000_200);
+    set_log_mtime(&lookup, 1, 1_700_000_201);
+    // The only lookup commit still retained is later than the source commit.
+    set_log_mtime(&lookup, 2, 1_700_000_300);
+    set_log_mtime(&source, 0, 1_700_000_249);
+    set_log_mtime(&source, 1, 1_700_000_250);
+
+    checkpoint_then_remove_lookup_history(&lookup, 2).await;
+
+    let strict = Pipeline::open(fx_pipeline_without_baseline(
+        &source,
+        &lookup,
+        &target,
+        LookupTableIdChangePolicy::Strict,
+    ))
+    .await
+    .expect("strict opens; the head is still readable")
+    .run_until_caught_up()
+    .await;
+    let error = match strict {
+        Ok(_) => panic!("strict must not silently enrich from a snapshot it could not pin to"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("use_current"),
+        "strict must name the opt-in that trades determinism for availability: {message}"
+    );
+
+    let mut pipeline = Pipeline::open(fx_pipeline_without_baseline(
+        &source,
+        &lookup,
+        &target,
+        LookupTableIdChangePolicy::UseCurrent,
+    ))
+    .await
+    .expect("the opt-in pipeline opens");
+    pipeline
+        .run_until_caught_up()
+        .await
+        .expect("the opt-in pipeline falls back to the lookup head rather than failing");
+
+    assert_eq!(
+        target_rows(&target).await,
+        vec![(42, Some(2.0))],
+        "the surviving head is what use_current substitutes"
+    );
+    let commit = latest_target_commit(&target).await;
+    assert!(
+        commit.contains("\"ddi.lookup.fx_rates.current\":true"),
+        "and the substitution must be recorded in target provenance: {commit}"
+    );
 }
