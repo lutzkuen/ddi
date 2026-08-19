@@ -603,6 +603,17 @@ const RETRY_MAX: Duration = Duration::from_secs(300);
 ///
 /// Retrying is safe for the same reason a crash is: a step is atomic, so a failed one
 /// changed nothing and simply happens again.
+///
+/// # Why one failure still retries, but does not look like the others
+///
+/// A source file that has been vacuumed out from under the cursor will not come back on
+/// its own, so retrying it is, on its face, pointless. It still retries — restoring the
+/// file is one of the two recoveries, and a stream that gave up would need the whole
+/// process bounced to notice the fix, which at three hundred pipelines is the outage this
+/// loop exists to avoid. What changes is that it stops being indistinguishable from a
+/// storage blip: [`PipelineMetrics::observe_error`] raises `ddi_source_file_vacuumed` and
+/// holds it there, so the difference between "retrying, and it will work" and "retrying,
+/// and it never will" is a gauge rather than a guess.
 async fn drive(
     cfg: ResolvedPipeline,
     locator: Arc<Locator>,
@@ -629,8 +640,7 @@ async fn drive(
         match outcome {
             Ok(()) => return Ok(()),
             Err(e) => {
-                m.errors.fetch_add(1, Ordering::Relaxed);
-                m.up.store(0, Ordering::Relaxed);
+                m.observe_error(&e);
 
                 // `--once` is a batch run: something is waiting on the exit code, so
                 // retrying forever would hang it. Report and let run_all sum up.

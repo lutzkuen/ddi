@@ -65,6 +65,15 @@ pub struct PipelineMetrics {
     /// running has stopped, while `config_valid = 0` means one that never started. Without
     /// it a typo in one entry of three hundred is visible only in the startup log.
     pub config_valid: AtomicI64,
+    /// 1 while this pipeline is stopped on a source file the object store no longer has.
+    ///
+    /// The one failure the backoff cannot clear. Every other error is worth retrying —
+    /// storage blips, a commit race, a schema that is about to be fixed — so `up` flapping
+    /// to 0 and back is normal and paging on it would be noise. This one holds at 1 until
+    /// somebody restores the file or rebuilds the target, and it is the signal that says
+    /// which of the two a stuck stream is: a retry that will work eventually, or a retry
+    /// that will not.
+    pub source_file_vacuumed: AtomicI64,
     /// Unix seconds at the last successful step. -1 until the first one.
     ///
     /// The lag gauge cannot cover a pipeline that fails while *opening*: it never reaches
@@ -78,9 +87,35 @@ impl PipelineMetrics {
     /// Note that this pipeline just did something successfully.
     pub fn mark_progress(&self) {
         self.up.store(1, Ordering::Relaxed);
+        // A step that succeeded read whatever it needed, so whatever was missing is not
+        // missing any more. Cleared here rather than on reopen: reopening succeeds even
+        // while the file is still gone, so clearing there would flap the gauge once per
+        // retry instead of holding it up until the stream actually recovers.
+        self.source_file_vacuumed.store(0, Ordering::Relaxed);
         if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             self.last_progress_unixtime
                 .store(d.as_secs() as i64, Ordering::Relaxed);
+        }
+    }
+
+    /// Note that a step failed, and whether it failed in the one way waiting cannot fix.
+    ///
+    /// Lives here rather than inline in the supervisor so the classification is part of the
+    /// library the tests link, and so the three facts a failure changes stay in one place.
+    pub fn observe_error(&self, e: &crate::Error) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        self.up.store(0, Ordering::Relaxed);
+        // Raised, never lowered here. A later attempt failing some other way says nothing
+        // about the file: most of what an attempt does happens before the read that would
+        // find it missing — reopening both tables, resolving the resume point, building the
+        // batch — so a target that times out once, or a change commit further up the log,
+        // would otherwise drop the alert while the stream is still stuck on the same thing.
+        // Only a step that actually succeeded is evidence, and that clears it in
+        // `mark_progress`. Erring towards a gauge that stays 1 on a pipeline which still
+        // needs a human is the safe direction; erring the other way is a page that never
+        // arrives.
+        if matches!(e, crate::Error::SourceFileVacuumed { .. }) {
+            self.source_file_vacuumed.store(1, Ordering::Relaxed);
         }
     }
 
@@ -151,7 +186,7 @@ impl Metrics {
         let map = self.pipelines.read().unwrap();
         let mut s = String::new();
 
-        let metrics: [MetricSpec; 19] = [
+        let metrics: [MetricSpec; 20] = [
             (
                 "ddi_batches_committed_total",
                 "counter",
@@ -217,6 +252,14 @@ impl Metrics {
                 "Seconds since this pipeline last completed a step; -1 before its first. \
                  Unlike lag, this still moves when a pipeline fails while opening.",
                 |m| m.seconds_since_progress(),
+            ),
+            (
+                "ddi_source_file_vacuumed",
+                "gauge",
+                "1 while this pipeline is stopped on a source data file the object store no \
+                 longer has. Cleared only by a step that succeeds, so it does not flap. 0 \
+                 otherwise.",
+                |m| m.source_file_vacuumed.load(Ordering::Relaxed),
             ),
             (
                 "ddi_pipeline_restarts_total",
