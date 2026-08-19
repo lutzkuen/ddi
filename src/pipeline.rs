@@ -70,6 +70,14 @@ pub struct Pipeline {
     /// Identities checked when the pipeline opened. Re-checking every selected snapshot stops a
     /// drop/recreate at the same URI from silently changing a lookup halfway through a run.
     lookup_table_ids: BTreeMap<String, String>,
+    /// Lookups whose target provenance named a prior table id when this pipeline opened.
+    /// `use_current` accepts that deliberate migration once, recording the first new target
+    /// commit with the current head before returning to ordinary timestamp pinning.
+    lookup_current_on_open: BTreeSet<String>,
+    /// Table-id transitions already warned about in this process. A historical backfill can
+    /// cross the same replacement in many batches; it should be observable without flooding
+    /// the log once per source commit.
+    warned_lookup_table_id_changes: BTreeSet<(String, String, String)>,
 }
 
 impl Pipeline {
@@ -98,7 +106,7 @@ impl Pipeline {
             ))
         })?;
 
-        let lookup_table_ids = validate_lookup_tables(&cfg, &source, &target).await?;
+        let lookup_validation = validate_lookup_tables(&cfg, &source, &target).await?;
 
         let offsets = OffsetStore::new(&cfg.app_id, cfg.starting_version);
         let cursor = resume_cursor(&cfg, &offsets, &source, &target).await?;
@@ -215,7 +223,9 @@ impl Pipeline {
             dedup,
             dq,
             amplification,
-            lookup_table_ids,
+            lookup_table_ids: lookup_validation.table_ids,
+            lookup_current_on_open: lookup_validation.use_current_on_open,
+            warned_lookup_table_id_changes: BTreeSet::new(),
         })
     }
 
@@ -452,7 +462,7 @@ impl Pipeline {
     }
 
     async fn lookup_snapshots(
-        &self,
+        &mut self,
         batch: &LogBatch,
     ) -> Result<Vec<crate::lookup::LookupSnapshot>> {
         if self.cfg.lookups.is_empty() {
@@ -466,36 +476,79 @@ impl Pipeline {
         })?;
 
         let mut snapshots = Vec::with_capacity(self.cfg.lookups.len());
-        for lookup in &self.cfg.lookups {
-            let snapshot = lookup.snapshot(&self.cfg.storage, timestamp).await?;
-            let expected = self.lookup_table_ids.get(&snapshot.name).ok_or_else(|| {
+        // Clone the small config vector so accepting a replacement can update the identity
+        // map below without holding an immutable borrow of `self.cfg` across an await.
+        for lookup in self.cfg.lookups.clone() {
+            let available = lookup.snapshots(&self.cfg.storage, timestamp).await?;
+            let crate::lookup::LookupSnapshots { selected, mut head } = available;
+            let name = selected.name.clone();
+            let expected = self.lookup_table_ids.get(&name).cloned().ok_or_else(|| {
                 Error::Config(format!(
                     "pipeline {:?}: lookup {:?} was not present when the pipeline opened",
-                    self.cfg.name, snapshot.name
+                    self.cfg.name, name
                 ))
             })?;
-            let actual = snapshot.table_id.as_deref().ok_or_else(|| {
+            let selected_id = selected.table_id.clone().ok_or_else(|| {
                 Error::Config(format!(
                     "pipeline {:?}: lookup {:?} has no Delta table id",
-                    self.cfg.name, snapshot.name
+                    self.cfg.name, name
                 ))
             })?;
-            if actual != expected.as_str() {
-                return Err(Error::Config(format!(
-                    "pipeline {:?}: lookup {:?} changed Delta table id from {:?} to {:?}. \
-                     It was dropped, recreated, or redirected at the same URI; choose a new \
-                     app_id and rebuild the target before using the replacement.",
-                    self.cfg.name, snapshot.name, expected, actual
-                )));
+            let head_id = head.table_id.clone().ok_or_else(|| {
+                Error::Config(format!(
+                    "pipeline {:?}: lookup {:?} current head has no Delta table id",
+                    self.cfg.name, name
+                ))
+            })?;
+            let changed_on_open = self.lookup_current_on_open.remove(&name);
+            let changed = changed_on_open || selected_id != expected || head_id != expected;
+            if changed {
+                if lookup.table_id_change_policy == crate::lookup::LookupTableIdChangePolicy::Strict
+                {
+                    return Err(Error::Config(format!(
+                        "pipeline {:?}: lookup {:?} changed Delta table id from {:?} to selected {:?} (current head {:?}). \
+                         It was dropped, recreated, or redirected at the same URI; choose a new \
+                         app_id and rebuild the target before using the replacement.",
+                        self.cfg.name, name, expected, selected_id, head_id
+                    )));
+                }
+
+                // A table replacement makes a timestamp-selected snapshot ambiguous: it may
+                // belong to the prior table lineage even though the URI now resolves to a
+                // different one. This explicit opt-in uses the head we opened alongside that
+                // snapshot, avoiding a second open that could race another replacement.
+                if !changed_on_open {
+                    let from = if selected_id != expected {
+                        selected_id.as_str()
+                    } else {
+                        expected.as_str()
+                    };
+                    let warning_key = (name.clone(), from.to_string(), head_id.clone());
+                    if self.warned_lookup_table_id_changes.insert(warning_key) {
+                        warn!(
+                            pipeline = %self.cfg.name,
+                            lookup = %name,
+                            previous_table_id = %from,
+                            current_table_id = %head_id,
+                            "lookup Delta table id changed; using its current head because \
+                             table_id_change_policy=use_current"
+                        );
+                    }
+                }
+                self.lookup_table_ids.insert(name.clone(), head_id);
+                head.used_current = true;
+                snapshots.push(head);
+                continue;
             }
+
             info!(
                 pipeline = %self.cfg.name,
-                lookup = %snapshot.name,
-                lookup_version = snapshot.version,
+                lookup = %selected.name,
+                lookup_version = selected.version,
                 source_log_timestamp = %timestamp,
                 "using pinned lookup snapshot"
             );
-            snapshots.push(snapshot);
+            snapshots.push(selected);
         }
         Ok(snapshots)
     }
@@ -839,11 +892,19 @@ fn table_id(t: &DeltaTable) -> Option<String> {
 /// enrichment into a source/self/feedback join. URI text is not a sufficient guard: object-store
 /// spellings can differ while resolving to the same Delta table, so protocol table ids are the
 /// authority.
+struct LookupTableValidation {
+    table_ids: BTreeMap<String, String>,
+    /// Names for which the last target commit used a different lookup identity. The first
+    /// subsequent source batch is deliberately recorded against the current head when the
+    /// lookup explicitly chose `use_current`.
+    use_current_on_open: BTreeSet<String>,
+}
+
 async fn validate_lookup_tables(
     cfg: &ResolvedPipeline,
     source: &DeltaTable,
     target: &DeltaTable,
-) -> Result<BTreeMap<String, String>> {
+) -> Result<LookupTableValidation> {
     let source_id = table_id(source).ok_or_else(|| {
         Error::Config(format!(
             "pipeline {:?}: source {:?} has no Delta table id",
@@ -911,6 +972,7 @@ async fn validate_lookup_tables(
             cfg.name, recorded.commit_version
         )));
     }
+    let mut use_current_on_open = BTreeSet::new();
     for (name, recorded_id) in recorded.lookup_table_ids {
         let Some(current_id) = current.get(&name) else {
             return Err(Error::Config(format!(
@@ -921,16 +983,39 @@ async fn validate_lookup_tables(
             )));
         };
         if current_id != &recorded_id {
-            return Err(Error::Config(format!(
-                "pipeline {:?}: lookup {:?} changed Delta table id from {:?} to {:?}. \
-                 It was dropped, recreated, or relocated; choose a new app_id and rebuild \
-                 the target before using the replacement.",
-                cfg.name, name, recorded_id, current_id
-            )));
+            let lookup = cfg
+                .lookups
+                .iter()
+                .find(|lookup| lookup.name == name)
+                .expect("recorded lookup set was checked above");
+            match lookup.table_id_change_policy {
+                crate::lookup::LookupTableIdChangePolicy::Strict => {
+                    return Err(Error::Config(format!(
+                        "pipeline {:?}: lookup {:?} changed Delta table id from {:?} to {:?}. \
+                         It was dropped, recreated, or relocated; choose a new app_id and rebuild \
+                         the target before using the replacement.",
+                        cfg.name, name, recorded_id, current_id
+                    )));
+                }
+                crate::lookup::LookupTableIdChangePolicy::UseCurrent => {
+                    warn!(
+                        pipeline = %cfg.name,
+                        lookup = %name,
+                        previous_table_id = %recorded_id,
+                        current_table_id = %current_id,
+                        "lookup Delta table id changed since the last target commit; the next \
+                         batch will use its current head because table_id_change_policy=use_current"
+                    );
+                    use_current_on_open.insert(name);
+                }
+            }
         }
     }
 
-    Ok(current)
+    Ok(LookupTableValidation {
+        table_ids: current,
+        use_current_on_open,
+    })
 }
 
 /// Start over when the source is no longer the table we were reading.

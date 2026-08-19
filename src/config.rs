@@ -1192,6 +1192,39 @@ change_polcy = "ignore_changes"
     }
 
     #[test]
+    fn lookup_table_id_change_policy_parses_and_defaults_to_strict() {
+        let lookup = r#"
+[[pipeline.lookups]]
+name = "fx_rates"
+uri = "/tmp/fx_rates"
+"#;
+        let pipeline = BASE.replace(
+            "transform_sql = \"SELECT order_id FROM source\"",
+            "transform_sql = \"SELECT o.order_id FROM source AS o LEFT JOIN fx_rates AS fx ON fx.currency = o.currency\"",
+        );
+        let strict = Config::from_toml_str(&(pipeline.clone() + lookup))
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(
+            strict[0].lookups[0].table_id_change_policy,
+            crate::lookup::LookupTableIdChangePolicy::Strict
+        );
+
+        let mut current_toml = pipeline;
+        current_toml.push_str(lookup);
+        current_toml.push_str("table_id_change_policy = \"use_current\"\n");
+        let current = Config::from_toml_str(&current_toml)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(
+            current[0].lookups[0].table_id_change_policy,
+            crate::lookup::LookupTableIdChangePolicy::UseCurrent
+        );
+    }
+
+    #[test]
     fn empty_config_is_rejected() {
         assert!(Config::from_toml_str("").unwrap().resolve().is_err());
     }
