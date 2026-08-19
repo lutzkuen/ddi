@@ -100,7 +100,7 @@ impl ResolvedLookup {
                 Err(SnapshotSelectionError::HistoryUnavailable(_reason))
                     if self.table_id_change_policy == LookupTableIdChangePolicy::UseCurrent =>
                 {
-                    return self.current_snapshots(storage);
+                    return self.current_snapshots(storage).await;
                 }
                 Err(SnapshotSelectionError::HistoryUnavailable(reason)) => {
                     return Err(Error::Config(format!(
