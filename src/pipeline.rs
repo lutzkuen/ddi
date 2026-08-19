@@ -50,6 +50,21 @@ pub enum StepOutcome {
     },
 }
 
+/// Lookup snapshots selected for one source batch, plus table-id migrations that become true
+/// only if that batch's target transaction commits. Keeping the transition with the batch is
+/// important: a failure after lookup selection must retry with the same `use_current` decision
+/// and provenance marker, rather than silently returning to timestamp pinning.
+struct LookupBatch {
+    snapshots: Vec<crate::lookup::LookupSnapshot>,
+    transitions: Vec<LookupTableIdTransition>,
+}
+
+/// A lookup identity accepted by `use_current` for the source batch being committed.
+struct LookupTableIdTransition {
+    name: String,
+    table_id: String,
+}
+
 pub struct Pipeline {
     cfg: ResolvedPipeline,
     source: DeltaTable,
@@ -256,8 +271,8 @@ impl Pipeline {
         // A lookup is selected from the source commit's timestamp before any input is read or
         // target write is attempted. If anything below fails, retrying this source version asks
         // for the same Delta snapshot rather than whatever FX happens to be latest then.
-        let lookup_snapshots = self.lookup_snapshots(&batch).await?;
-        self.sink.set_lookup_snapshots(&lookup_snapshots);
+        let lookup_batch = self.lookup_snapshots(&batch).await?;
+        self.sink.set_lookup_snapshots(&lookup_batch.snapshots);
 
         // 2. Read those files as Arrow.
         let input = self.scan(&batch).await?;
@@ -273,7 +288,7 @@ impl Pipeline {
         // 3. Transform. Stateless, row-local, validated at config load.
         let output = self
             .transform
-            .apply_with_lookups(input, &lookup_snapshots)
+            .apply_with_lookups(input, &lookup_batch.snapshots)
             .await?;
 
         // Which target columns the transform actually produced, read *before* coercion —
@@ -408,6 +423,7 @@ impl Pipeline {
             // txn action down with it and strand the offset here forever.
             let empty = RecordBatch::new_empty(self.coercer.target());
             self.commit(vec![empty], txn_version).await?;
+            self.acknowledge_lookup_table_id_transitions(&lookup_batch.transitions);
             return Ok(StepOutcome::Skipped {
                 through_version: through,
                 rejected: rejected_rows,
@@ -422,6 +438,7 @@ impl Pipeline {
             self.commit(coerced, txn_version).await?;
             (out_rows, None)
         };
+        self.acknowledge_lookup_table_id_transitions(&lookup_batch.transitions);
 
         let target_version = self.target.version();
         info!(
@@ -461,12 +478,12 @@ impl Pipeline {
         dq.write(rejects, txn_version, now).await
     }
 
-    async fn lookup_snapshots(
-        &mut self,
-        batch: &LogBatch,
-    ) -> Result<Vec<crate::lookup::LookupSnapshot>> {
+    async fn lookup_snapshots(&mut self, batch: &LogBatch) -> Result<LookupBatch> {
         if self.cfg.lookups.is_empty() {
-            return Ok(Vec::new());
+            return Ok(LookupBatch {
+                snapshots: Vec::new(),
+                transitions: Vec::new(),
+            });
         }
         let timestamp = batch.through_log_timestamp.ok_or_else(|| {
             Error::Config(format!(
@@ -476,12 +493,14 @@ impl Pipeline {
         })?;
 
         let mut snapshots = Vec::with_capacity(self.cfg.lookups.len());
-        // Clone the small config vector so accepting a replacement can update the identity
-        // map below without holding an immutable borrow of `self.cfg` across an await.
+        let mut transitions = Vec::new();
+        // Clone the small config vector so warning bookkeeping below does not hold an immutable
+        // borrow of `self.cfg` across an await.
         for lookup in self.cfg.lookups.clone() {
             let available = lookup.snapshots(&self.cfg.storage, timestamp).await?;
             let crate::lookup::LookupSnapshots { selected, mut head } = available;
             let name = selected.name.clone();
+            let current_due_to_unavailable_history = selected.used_current;
             let expected = self.lookup_table_ids.get(&name).cloned().ok_or_else(|| {
                 Error::Config(format!(
                     "pipeline {:?}: lookup {:?} was not present when the pipeline opened",
@@ -500,8 +519,16 @@ impl Pipeline {
                     self.cfg.name, name
                 ))
             })?;
-            let changed_on_open = self.lookup_current_on_open.remove(&name);
-            let changed = changed_on_open || selected_id != expected || head_id != expected;
+            // Do not consume this marker yet. It is acknowledged only after the target txn
+            // succeeds, so an error later in this step keeps the next attempt on the explicit
+            // current-head path and preserves its provenance marker.
+            let changed_on_open = self.lookup_current_on_open.contains(&name);
+            let changed = lookup_table_id_changed(
+                &expected,
+                &selected_id,
+                &head_id,
+                changed_on_open || current_due_to_unavailable_history,
+            );
             if changed {
                 if lookup.table_id_change_policy == crate::lookup::LookupTableIdChangePolicy::Strict
                 {
@@ -515,9 +542,17 @@ impl Pipeline {
 
                 // A table replacement makes a timestamp-selected snapshot ambiguous: it may
                 // belong to the prior table lineage even though the URI now resolves to a
-                // different one. This explicit opt-in uses the head we opened alongside that
-                // snapshot, avoiding a second open that could race another replacement.
-                if !changed_on_open {
+                // different one. This explicit opt-in uses the coherently verified head returned
+                // alongside that snapshot, rather than reopening the URI here.
+                if current_due_to_unavailable_history {
+                    warn!(
+                        pipeline = %self.cfg.name,
+                        lookup = %name,
+                        current_table_id = %head_id,
+                        "lookup timestamp-pinned history is unavailable; using its current head because \
+                         table_id_change_policy=use_current"
+                    );
+                } else if !changed_on_open {
                     let from = if selected_id != expected {
                         selected_id.as_str()
                     } else {
@@ -535,7 +570,10 @@ impl Pipeline {
                         );
                     }
                 }
-                self.lookup_table_ids.insert(name.clone(), head_id);
+                transitions.push(LookupTableIdTransition {
+                    name: name.clone(),
+                    table_id: head_id,
+                });
                 head.used_current = true;
                 snapshots.push(head);
                 continue;
@@ -550,7 +588,21 @@ impl Pipeline {
             );
             snapshots.push(selected);
         }
-        Ok(snapshots)
+        Ok(LookupBatch {
+            snapshots,
+            transitions,
+        })
+    }
+
+    /// Mark accepted lookup identities only after the target has atomically committed the
+    /// source offset and snapshot provenance. Until then a transition remains pending with the
+    /// source batch and can be selected again after any failure.
+    fn acknowledge_lookup_table_id_transitions(&mut self, transitions: &[LookupTableIdTransition]) {
+        apply_lookup_table_id_transitions(
+            &mut self.lookup_table_ids,
+            &mut self.lookup_current_on_open,
+            transitions,
+        );
     }
 
     /// Collapse the batch to one row per key, work out how much of the target the merge has
@@ -796,6 +848,32 @@ impl Pipeline {
 /// that cannot win in three is contending with something that needs looking at, and
 /// spinning would only hide it.
 const MERGE_ATTEMPTS: u32 = 3;
+
+/// Whether a source-timestamp-selected snapshot cannot safely retain ordinary timestamp
+/// pinning. The force-current flag covers a startup provenance mismatch or a selection that had
+/// to use the head because its timestamp-pinned history was unavailable.
+fn lookup_table_id_changed(
+    expected: &str,
+    selected: &str,
+    head: &str,
+    force_current: bool,
+) -> bool {
+    force_current || selected != expected || head != expected
+}
+
+/// Apply transitions only after the target txn commits. Keeping this standalone makes the
+/// failure boundary explicit and testable: an error before this call leaves the original table
+/// identity and startup marker intact for retry.
+fn apply_lookup_table_id_transitions(
+    lookup_table_ids: &mut BTreeMap<String, String>,
+    lookup_current_on_open: &mut BTreeSet<String>,
+    transitions: &[LookupTableIdTransition],
+) {
+    for transition in transitions {
+        lookup_table_ids.insert(transition.name.clone(), transition.table_id.clone());
+        lookup_current_on_open.remove(&transition.name);
+    }
+}
 
 /// Is this a merge worth trying again against a freshly opened target?
 ///
@@ -1206,4 +1284,82 @@ fn attach_partition_columns(
 
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| Error::Schema(format!("could not attach partition columns: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::{
+        apply_lookup_table_id_transitions, lookup_table_id_changed, LookupTableIdTransition,
+    };
+
+    #[test]
+    fn failed_current_fallback_stays_pending_until_the_target_commit() {
+        // A runtime replacement: the selected historical snapshot is still from `old`, while
+        // the open head is `new`. A failed batch must leave that identity expectation intact,
+        // or a retry would see `new` as ordinary timestamp-pinned provenance.
+        let mut ids = BTreeMap::from([("fx".to_string(), "old".to_string())]);
+        let mut current_on_open = BTreeSet::new();
+        let pending = vec![LookupTableIdTransition {
+            name: "fx".into(),
+            table_id: "new".into(),
+        }];
+
+        assert!(lookup_table_id_changed(
+            ids.get("fx").unwrap(),
+            "old",
+            "new",
+            current_on_open.contains("fx")
+        ));
+
+        // Simulate a target-write failure: the transition is deliberately not acknowledged.
+        assert_eq!(ids.get("fx").unwrap(), "old");
+        assert!(lookup_table_id_changed(
+            ids.get("fx").unwrap(),
+            "old",
+            "new",
+            current_on_open.contains("fx")
+        ));
+
+        apply_lookup_table_id_transitions(&mut ids, &mut current_on_open, &pending);
+        assert_eq!(ids.get("fx").unwrap(), "new");
+        assert!(!lookup_table_id_changed(
+            ids.get("fx").unwrap(),
+            "new",
+            "new",
+            current_on_open.contains("fx")
+        ));
+    }
+
+    #[test]
+    fn failed_startup_mismatch_keeps_the_current_marker_for_retry() {
+        // On restart, validation has already opened the new table id, so the marker (rather
+        // than the IDs) is what requires the first committed batch to record `.current`.
+        let mut ids = BTreeMap::from([("fx".to_string(), "new".to_string())]);
+        let mut current_on_open = BTreeSet::from(["fx".to_string()]);
+        let pending = vec![LookupTableIdTransition {
+            name: "fx".into(),
+            table_id: "new".into(),
+        }];
+
+        assert!(lookup_table_id_changed(
+            ids.get("fx").unwrap(),
+            "new",
+            "new",
+            current_on_open.contains("fx")
+        ));
+
+        // A failed batch does not remove the marker, so retrying still writes `.current`.
+        assert!(current_on_open.contains("fx"));
+        assert!(lookup_table_id_changed(
+            ids.get("fx").unwrap(),
+            "new",
+            "new",
+            current_on_open.contains("fx")
+        ));
+
+        apply_lookup_table_id_transitions(&mut ids, &mut current_on_open, &pending);
+        assert!(!current_on_open.contains("fx"));
+    }
 }

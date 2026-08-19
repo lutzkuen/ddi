@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, Utc};
 use deltalake::logstore::commit_uri_from_version;
-use deltalake::logstore::object_store::ObjectStoreExt;
+use deltalake::logstore::object_store::{Error as ObjectStoreError, ObjectStoreExt};
 use deltalake::DeltaTable;
 use serde::{Deserialize, Serialize};
 
@@ -20,16 +20,17 @@ use crate::storage::Storage;
 ///
 /// The default keeps lookup provenance reproducible: a source batch is enriched from the
 /// snapshot that existed before that source commit, and a changed table id is an error. The
-/// opt-in mode deliberately trades provenance across a replacement for availability: normal
-/// same-id updates remain timestamp-pinned, but a snapshot from a different table lineage is
-/// replaced with the current table head.
+/// opt-in mode deliberately trades provenance across a replacement or unavailable retained
+/// history for availability: normal same-id updates remain timestamp-pinned, but an ambiguous
+/// or unavailable historic snapshot is replaced with the current table head.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LookupTableIdChangePolicy {
     /// Reject a different Delta table id. This is the safe default.
     #[default]
     Strict,
-    /// Use the lookup's current/head snapshot after a table replacement.
+    /// Use the lookup's current/head snapshot after a table replacement or when its required
+    /// timestamp-pinned history is no longer retained.
     UseCurrent,
 }
 
@@ -50,10 +51,11 @@ pub struct LookupConfig {
     /// lookup snapshot to an initial source backfill.
     #[serde(default)]
     pub pre_history_version: Option<Version>,
-    /// What to do when a table at this URI has a different Delta table id.
+    /// What to do when a table at this URI has a different Delta table id or its historical
+    /// snapshot is no longer retained.
     ///
     /// `strict` is the default. `use_current` is an explicit availability-over-replay
-    /// choice for a replacement; ordinary updates remain timestamp-pinned.
+    /// choice for a replacement or vacuumed history; ordinary updates remain timestamp-pinned.
     #[serde(default)]
     pub table_id_change_policy: LookupTableIdChangePolicy,
 }
@@ -82,10 +84,64 @@ impl ResolvedLookup {
         storage: &Storage,
         as_of: DateTime<Utc>,
     ) -> Result<LookupSnapshots> {
-        let head_table = storage
-            .open(&self.uri)
-            .await
-            .map_err(|e| Error::Config(format!("lookup {:?} at {:?}: {e}", self.name, self.uri)))?;
+        // Opening a Delta URI twice is not atomic. CREATE OR REPLACE in particular keeps
+        // historic log versions but gives the current table a new id. Retry until the table
+        // identity used for timestamp selection still matches the head at the end, so callers
+        // cannot receive a selected snapshot from one lineage and a head from another.
+        // Ordinary same-id writes deliberately do not retry: their selected snapshot remains
+        // timestamp-pinned and the verified head below becomes the current fallback snapshot.
+        for _ in 0..LOOKUP_SNAPSHOT_STABILITY_ATTEMPTS {
+            let mut snapshots = match self.snapshots_once(storage, as_of).await {
+                Ok(snapshots) => snapshots,
+                Err(SnapshotSelectionError::HistoryUnavailable(_reason))
+                    if self.table_id_change_policy == LookupTableIdChangePolicy::UseCurrent =>
+                {
+                    return self.current_snapshots(storage);
+                }
+                Err(SnapshotSelectionError::HistoryUnavailable(reason)) => {
+                    return Err(Error::Config(format!(
+                        "lookup {:?} cannot load a retained timestamp-pinned snapshot for source commit time {as_of}: {reason}. \
+                         Its historical Delta log or files were likely vacuumed; restore the history, use an approved \
+                         pre_history_version, or explicitly set table_id_change_policy = \"use_current\" to trade replay \
+                         determinism for availability.",
+                        self.name
+                    )));
+                }
+                Err(SnapshotSelectionError::Other(error)) => return Err(error),
+            };
+            let verified_head = self.open_head(storage).await?;
+            let verified_version = verified_head.version().ok_or_else(|| {
+                Error::Config(format!(
+                    "lookup {:?} at {:?} has no Delta version",
+                    self.name, self.uri
+                ))
+            })?;
+            let verified_table_id = table_id(&verified_head);
+            if snapshots.head.table_id == verified_table_id {
+                snapshots.head = LookupSnapshot {
+                    name: self.name.clone(),
+                    version: verified_version,
+                    table_id: verified_table_id,
+                    used_pre_history: false,
+                    used_current: false,
+                    table: verified_head,
+                };
+                return Ok(snapshots);
+            }
+        }
+
+        Err(Error::Config(format!(
+            "lookup {:?} at {:?} changed while resolving the snapshot for source commit time {as_of}; retry after its writer settles",
+            self.name, self.uri
+        )))
+    }
+
+    async fn snapshots_once(
+        &self,
+        storage: &Storage,
+        as_of: DateTime<Utc>,
+    ) -> std::result::Result<LookupSnapshots, SnapshotSelectionError> {
+        let head_table = self.open_head(storage).await?;
         let head = head_table.version().ok_or_else(|| {
             Error::Config(format!(
                 "lookup {:?} at {:?} has no Delta version",
@@ -102,7 +158,7 @@ impl ResolvedLookup {
         let selected = storage
             .open_at_datetime(&self.uri, cutoff)
             .await
-            .map_err(|e| Error::Config(format!("lookup {:?} at {:?}: {e}", self.name, self.uri)))?;
+            .map_err(|e| historical_snapshot_load_error(self, "timestamp selection", e))?;
         let mut version = selected.version().ok_or_else(|| {
             Error::Config(format!(
                 "lookup {:?} at {:?} has no Delta version after loading its snapshot",
@@ -111,7 +167,8 @@ impl ResolvedLookup {
         })?;
 
         let selected_millis = lookup_log_timestamp(&head_table, version)
-            .await?
+            .await
+            .map_err(|e| historical_log_timestamp_error(self, version, e))?
             .timestamp_millis();
         let used_pre_history = if selected_millis >= source_millis {
             let baseline = self.pre_history_version.ok_or_else(|| {
@@ -127,7 +184,8 @@ impl ResolvedLookup {
                 return Err(Error::Config(format!(
                     "lookup {:?} configures pre_history_version {baseline}, but its current head is {head}",
                     self.name
-                )));
+                ))
+                .into());
             }
             version = baseline;
             true
@@ -138,7 +196,8 @@ impl ResolvedLookup {
             while version < head {
                 let next = version + 1;
                 if lookup_log_timestamp(&head_table, next)
-                    .await?
+                    .await
+                    .map_err(|e| historical_log_timestamp_error(self, next, e))?
                     .timestamp_millis()
                     >= source_millis
                 {
@@ -151,7 +210,7 @@ impl ResolvedLookup {
         let table = storage
             .open_at_version(&self.uri, version)
             .await
-            .map_err(|e| Error::Config(format!("lookup {:?} at {:?}: {e}", self.name, self.uri)))?;
+            .map_err(|e| historical_snapshot_load_error(self, "version selection", e))?;
         Ok(LookupSnapshots {
             selected: LookupSnapshot {
                 name: self.name.clone(),
@@ -171,22 +230,132 @@ impl ResolvedLookup {
             },
         })
     }
+
+    async fn open_head(&self, storage: &Storage) -> Result<DeltaTable> {
+        storage
+            .open(&self.uri)
+            .await
+            .map_err(|e| Error::Config(format!("lookup {:?} at {:?}: {e}", self.name, self.uri)))
+    }
+
+    /// Return the lookup's current snapshot when the configured availability policy explicitly
+    /// accepts that timestamp-selected history has been vacuumed. The clone is a single loaded
+    /// Delta state, so selected and head remain coherent even while a replacement races us.
+    async fn current_snapshots(&self, storage: &Storage) -> Result<LookupSnapshots> {
+        let table = self.open_head(storage).await?;
+        let version = table.version().ok_or_else(|| {
+            Error::Config(format!(
+                "lookup {:?} at {:?} has no Delta version",
+                self.name, self.uri
+            ))
+        })?;
+        let id = table_id(&table);
+        Ok(LookupSnapshots {
+            selected: LookupSnapshot {
+                name: self.name.clone(),
+                version,
+                table_id: id.clone(),
+                used_pre_history: false,
+                used_current: true,
+                table: table.clone(),
+            },
+            head: LookupSnapshot {
+                name: self.name.clone(),
+                version,
+                table_id: id,
+                used_pre_history: false,
+                used_current: false,
+                table,
+            },
+        })
+    }
+}
+
+/// Repeated table replacement should make the pipeline retry rather than mix two lineages.
+const LOOKUP_SNAPSHOT_STABILITY_ATTEMPTS: u8 = 3;
+
+/// Errors from timestamp selection that have a precise, safe availability fallback: the current
+/// head opened successfully, but a historic commit/snapshot no longer exists. Everything else
+/// (URI, credentials, corrupt logs, schema failures) remains an error even under `use_current`.
+enum SnapshotSelectionError {
+    Other(Error),
+    HistoryUnavailable(String),
+}
+
+impl From<Error> for SnapshotSelectionError {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+fn historical_snapshot_load_error(
+    lookup: &ResolvedLookup,
+    stage: &str,
+    error: Error,
+) -> SnapshotSelectionError {
+    if missing_historical_snapshot(&error) {
+        SnapshotSelectionError::HistoryUnavailable(format!(
+            "{stage} could not load lookup {:?} at {:?}: {error}",
+            lookup.name, lookup.uri
+        ))
+    } else {
+        SnapshotSelectionError::Other(Error::Config(format!(
+            "lookup {:?} at {:?}: {error}",
+            lookup.name, lookup.uri
+        )))
+    }
+}
+
+fn historical_log_timestamp_error(
+    lookup: &ResolvedLookup,
+    version: Version,
+    error: ObjectStoreError,
+) -> SnapshotSelectionError {
+    if matches!(&error, ObjectStoreError::NotFound { .. }) {
+        SnapshotSelectionError::HistoryUnavailable(format!(
+            "the Delta log entry for lookup {:?} version {version} is no longer retained: {error}",
+            lookup.name
+        ))
+    } else {
+        SnapshotSelectionError::Other(Error::Other(format!(
+            "cannot read Delta-log timestamp for lookup {:?} commit {version}: {error}",
+            lookup.name
+        )))
+    }
+}
+
+fn missing_historical_snapshot(error: &Error) -> bool {
+    match error {
+        Error::Delta(
+            deltalake::DeltaTableError::InvalidVersion(_)
+            | deltalake::DeltaTableError::NotATable(_),
+        ) => true,
+        Error::Delta(deltalake::DeltaTableError::ObjectStore { source }) => {
+            matches!(source, ObjectStoreError::NotFound { .. })
+        }
+        // Storage's checkpoint-replay fallback names this exact condition after it proves that
+        // replaying from the surviving log would be incomplete. It is log retention, not a URI
+        // or credential problem, and the current head had already opened before time travel.
+        Error::Config(message) => {
+            message.contains("cannot load lookup")
+                && message.contains("the log no longer reaches back to version 0")
+        }
+        _ => false,
+    }
 }
 
 /// Read a lookup commit's timestamp from the same object-store metadata Delta's own time travel
 /// uses. A writer-provided `commitInfo.timestamp` is intentionally not part of lookup selection.
-async fn lookup_log_timestamp(table: &DeltaTable, version: Version) -> Result<DateTime<Utc>> {
+async fn lookup_log_timestamp(
+    table: &DeltaTable,
+    version: Version,
+) -> std::result::Result<DateTime<Utc>, ObjectStoreError> {
     table
         .log_store()
         .object_store(None)
         .head(&commit_uri_from_version(Some(version)))
         .await
         .map(|object| object.last_modified)
-        .map_err(|e| {
-            Error::Other(format!(
-                "cannot read Delta-log timestamp for lookup commit {version}: {e}"
-            ))
-        })
 }
 
 /// One concrete Delta snapshot used to enrich one source batch.
@@ -202,15 +371,16 @@ pub struct LookupSnapshot {
     /// lookup table. It is recorded in target commit metadata for auditability.
     pub used_pre_history: bool,
     /// True when the configured table-id policy deliberately used the lookup head rather
-    /// than selecting a source-timestamp-pinned snapshot. It is recorded in target commit
-    /// metadata so that the loss of replay determinism is visible after the fact.
+    /// than selecting a source-timestamp-pinned snapshot, either after a replacement or
+    /// because the required historical snapshot was vacuumed. It is recorded in target
+    /// commit metadata so the loss of replay determinism is visible after the fact.
     pub used_current: bool,
     pub table: DeltaTable,
 }
 
-/// The source-timestamp-pinned lookup snapshot and the current head opened from one lookup
-/// URI. Keeping both makes a lineage change detectable without opening a potentially different
-/// head a second time between comparison and use.
+/// The source-timestamp-pinned lookup snapshot and a coherently verified current head. Keeping
+/// both makes a lineage change detectable, while `snapshots` retries if a replacement races the
+/// opens used to form this pair.
 pub struct LookupSnapshots {
     pub selected: LookupSnapshot,
     pub head: LookupSnapshot,

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use common::pipeline_cfg;
-use delta_delta_ingest::lookup::{resolve, LookupConfig, LookupTableIdChangePolicy};
+use delta_delta_ingest::lookup::{resolve, table_id, LookupConfig, LookupTableIdChangePolicy};
 use delta_delta_ingest::pipeline::Pipeline;
 use deltalake::arrow::array::{
     Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
@@ -147,6 +147,61 @@ async fn write_lookup(path: &str, rate: f64) {
     .await;
 }
 
+async fn overwrite_lookup(path: &str, rate: f64) {
+    open_table(ensure_table_uri(path).unwrap())
+        .await
+        .unwrap()
+        .write(vec![RecordBatch::try_new(
+            lookup_schema(),
+            vec![
+                Arc::new(StringArray::from(vec!["USD"])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![rate])) as ArrayRef,
+            ],
+        )
+        .unwrap()])
+        .with_save_mode(SaveMode::Overwrite)
+        .await
+        .unwrap();
+}
+
+/// Delta's CREATE OR REPLACE keeps the old log history at the URI but writes a new metadata
+/// action (and therefore table id). It is the real production shape in which time travel can
+/// select an old-id snapshot while the URI's head has the replacement id.
+async fn create_or_replace_lookup(path: &str, rate: f64) {
+    let columns: StructType = lookup_schema().as_ref().try_into_kernel().unwrap();
+    DeltaTable::try_from_url(ensure_table_uri(path).unwrap())
+        .await
+        .unwrap()
+        .create()
+        .with_columns(columns.fields().cloned().collect::<Vec<_>>())
+        .with_save_mode(SaveMode::Overwrite)
+        .await
+        .unwrap();
+    write_lookup(path, rate).await;
+}
+
+async fn lookup_id(path: &str) -> String {
+    table_id(&open_table(ensure_table_uri(path).unwrap()).await.unwrap())
+        .expect("lookup table has an id")
+}
+
+/// Model log-retention VACUUM: a current checkpoint keeps the head readable after the historical
+/// JSON entries are gone, while attempting to open the approved historical baseline must fail.
+async fn checkpoint_then_remove_lookup_history(path: &str, before_version: u64) {
+    let table = open_table(ensure_table_uri(path).unwrap()).await.unwrap();
+    deltalake::protocol::checkpoints::create_checkpoint(&table, None)
+        .await
+        .unwrap();
+    for version in 0..before_version {
+        std::fs::remove_file(
+            Path::new(path)
+                .join("_delta_log")
+                .join(format!("{version:020}.json")),
+        )
+        .unwrap();
+    }
+}
+
 async fn write_source(path: &str, order_id: i64) {
     append(
         path,
@@ -248,6 +303,190 @@ async fn a_pinned_fx_lookup_left_join_enriches_the_source_batch() {
         .expect("lookup join executes");
 
     assert_eq!(target_rows(&target).await, vec![(42, Some(1.2345))]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn use_current_keeps_timestamp_pinning_when_the_lookup_id_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let source = root.join("source").to_str().unwrap().to_string();
+    let lookup = root.join("fx_rates").to_str().unwrap().to_string();
+    let target = root.join("target").to_str().unwrap().to_string();
+
+    create_table(&source, source_schema()).await;
+    create_table(&lookup, lookup_schema()).await;
+    create_table(&target, target_schema()).await;
+    write_lookup(&lookup, 1.0).await;
+    let before_update = lookup_id(&lookup).await;
+    write_source(&source, 42).await;
+    // This is an ordinary newer Delta version, not a new table lineage. The head has rate 2.0,
+    // but the source commit predates it and must continue to see the historical rate 1.0.
+    overwrite_lookup(&lookup, 2.0).await;
+    assert_eq!(lookup_id(&lookup).await, before_update);
+
+    set_log_mtime(&lookup, 0, 1_700_000_000);
+    set_log_mtime(&lookup, 1, 1_700_000_001);
+    set_log_mtime(&source, 0, 1_700_000_002);
+    set_log_mtime(&source, 1, 1_700_000_003);
+    set_log_mtime(&lookup, 2, 1_700_000_004);
+
+    let mut pipeline = Pipeline::open(fx_pipeline(
+        &source,
+        &lookup,
+        &target,
+        LookupTableIdChangePolicy::UseCurrent,
+    ))
+    .await
+    .expect("pipeline opens against the newer same-id lookup head");
+    pipeline
+        .run_until_caught_up()
+        .await
+        .expect("same-id lookup update remains timestamp-pinned");
+
+    assert_eq!(target_rows(&target).await, vec![(42, Some(1.0))]);
+    assert!(
+        !latest_target_commit(&target)
+            .await
+            .contains(r#""ddi.lookup.fx_rates.current":true"#),
+        "an ordinary same-id update must not be marked as a current-head fallback"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn use_current_uses_the_head_when_vacuumed_lookup_history_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let source = root.join("source").to_str().unwrap().to_string();
+    let lookup = root.join("fx_rates").to_str().unwrap().to_string();
+    let target = root.join("target").to_str().unwrap().to_string();
+    let strict_target = root.join("strict_target").to_str().unwrap().to_string();
+
+    create_table(&source, source_schema()).await;
+    create_table(&lookup, lookup_schema()).await;
+    create_table(&target, target_schema()).await;
+    create_table(&strict_target, target_schema()).await;
+    write_lookup(&lookup, 1.0).await;
+    write_source(&source, 42).await;
+    overwrite_lookup(&lookup, 2.0).await;
+    // A checkpoint makes v2/current readable; VACUUM-like retention removes v0-v1, including
+    // the explicitly configured pre-history baseline for the older source commit.
+    checkpoint_then_remove_lookup_history(&lookup, 2).await;
+    set_log_mtime(&source, 0, 1_700_000_002);
+    set_log_mtime(&source, 1, 1_700_000_003);
+    set_log_mtime(&lookup, 2, 1_700_000_004);
+
+    let mut strict = Pipeline::open(fx_pipeline(
+        &source,
+        &lookup,
+        &strict_target,
+        LookupTableIdChangePolicy::Strict,
+    ))
+    .await
+    .expect("strict pipeline can still inspect the current lookup head");
+    let error = strict
+        .run_until_caught_up()
+        .await
+        .expect_err("strict policy must retain its historical-snapshot requirement");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot load a retained timestamp-pinned snapshot"),
+        "got: {error}"
+    );
+
+    let mut pipeline = Pipeline::open(fx_pipeline(
+        &source,
+        &lookup,
+        &target,
+        LookupTableIdChangePolicy::UseCurrent,
+    ))
+    .await
+    .expect("current lookup head remains readable after history retention");
+    pipeline
+        .run_until_caught_up()
+        .await
+        .expect("explicit availability policy falls back rather than pausing");
+
+    assert_eq!(target_rows(&target).await, vec![(42, Some(2.0))]);
+    assert!(
+        latest_target_commit(&target)
+            .await
+            .contains(r#""ddi.lookup.fx_rates.current":true"#),
+        "vacuumed-history fallback must be visible in target provenance"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn use_current_handles_create_or_replace_historic_selection_at_the_same_uri() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let source = root.join("source").to_str().unwrap().to_string();
+    let lookup = root.join("fx_rates").to_str().unwrap().to_string();
+    let target = root.join("target").to_str().unwrap().to_string();
+
+    create_table(&source, source_schema()).await;
+    create_table(&lookup, lookup_schema()).await;
+    create_table(&target, target_schema()).await;
+    write_lookup(&lookup, 1.0).await;
+    let old_id = lookup_id(&lookup).await;
+    write_source(&source, 42).await;
+    create_or_replace_lookup(&lookup, 2.0).await;
+    let new_id = lookup_id(&lookup).await;
+    assert_ne!(
+        old_id, new_id,
+        "CREATE OR REPLACE must create a new Delta id"
+    );
+
+    // Source v1 is after old lookup v1 but before CREATE OR REPLACE v2. The retained history
+    // therefore selects the old id, while the URI's current head is the replacement id.
+    set_log_mtime(&lookup, 0, 1_700_000_000);
+    set_log_mtime(&lookup, 1, 1_700_000_001);
+    set_log_mtime(&source, 0, 1_700_000_002);
+    set_log_mtime(&source, 1, 1_700_000_003);
+    set_log_mtime(&lookup, 2, 1_700_000_004);
+    set_log_mtime(&lookup, 3, 1_700_000_005);
+
+    let resolved = resolve(&LookupConfig {
+        name: "fx_rates".into(),
+        uri: lookup.clone(),
+        relation: None,
+        pre_history_version: Some(0),
+        table_id_change_policy: LookupTableIdChangePolicy::UseCurrent,
+    })
+    .unwrap();
+    let snapshots = resolved
+        .snapshots(
+            &delta_delta_ingest::storage::Storage::default(),
+            chrono::DateTime::from_timestamp(1_700_000_003, 0).unwrap(),
+        )
+        .await
+        .expect("historical lookup snapshot resolves");
+    assert_eq!(
+        snapshots.selected.table_id.as_deref(),
+        Some(old_id.as_str())
+    );
+    assert_eq!(snapshots.head.table_id.as_deref(), Some(new_id.as_str()));
+
+    let mut pipeline = Pipeline::open(fx_pipeline(
+        &source,
+        &lookup,
+        &target,
+        LookupTableIdChangePolicy::UseCurrent,
+    ))
+    .await
+    .expect("pipeline opens against replacement head");
+    pipeline
+        .run_until_caught_up()
+        .await
+        .expect("opt-in uses coherent current head for the replacement");
+
+    assert_eq!(target_rows(&target).await, vec![(42, Some(2.0))]);
+    assert!(
+        latest_target_commit(&target)
+            .await
+            .contains(r#""ddi.lookup.fx_rates.current":true"#),
+        "the replacement-head decision must be recorded in target provenance"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
