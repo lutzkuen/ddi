@@ -12,8 +12,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use deltalake::kernel::{Action, Add, Remove, StructType};
-use deltalake::logstore::{get_actions, LogStore};
+use deltalake::logstore::object_store::ObjectStoreExt;
+use deltalake::logstore::{commit_uri_from_version, get_actions, LogStore};
 use deltalake::{DeltaTable, DeltaTableConfig};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -74,6 +76,10 @@ pub struct LogBatch {
     pub schema: Arc<StructType>,
     /// Highest source version fully represented in `files`.
     pub through_version: Version,
+    /// Last-modified timestamp of `through_version`'s Delta log object, when a pipeline needs
+    /// deterministic lookup snapshots. It deliberately uses the same storage clock as Delta
+    /// time travel, not an optional writer-provided `commitInfo.timestamp`.
+    pub through_log_timestamp: Option<DateTime<Utc>>,
 }
 
 impl LogBatch {
@@ -105,12 +111,21 @@ pub struct LogStreamBuilder {
     max_bytes_per_batch: u64,
     policy: ChangePolicy,
     allow_commit_splitting: bool,
+    /// Lookup pipelines intentionally take one data commit per batch. That gives every source
+    /// version one deterministic lookup timestamp irrespective of byte/file batch settings.
+    pin_lookup_snapshots: bool,
     /// Schema cache keyed by the version it was read at, so a batch that spans many
     /// commits with no schema change costs one snapshot load, not one per commit.
     schema_cache: HashMap<Version, Arc<StructType>>,
     /// Source head as of the last `next_batch` poll. `None` before the first poll.
     /// Recorded rather than re-fetched: `next_batch` already pays for this read.
     head: Option<Version>,
+    /// What decoding this source's files has cost, per byte the log said they were.
+    ///
+    /// Shared with the pipeline, which updates it after every read. It is the only thing
+    /// that connects `max_bytes_per_batch` — a count of *compressed* bytes — to the memory
+    /// the batch will actually occupy.
+    amplification: Arc<crate::budget::Amplification>,
 }
 
 impl LogStreamBuilder {
@@ -122,8 +137,34 @@ impl LogStreamBuilder {
             max_bytes_per_batch: 256 * 1024 * 1024,
             policy: ChangePolicy::default(),
             allow_commit_splitting: false,
+            pin_lookup_snapshots: false,
             schema_cache: HashMap::new(),
             head: None,
+            amplification: Arc::new(crate::budget::Amplification::default()),
+        }
+    }
+
+    /// The running estimate this stream sizes its batches by, for the reader to update.
+    pub fn amplification(&self) -> Arc<crate::budget::Amplification> {
+        self.amplification.clone()
+    }
+
+    /// The most bytes this batch may *combine*, as opposed to the most one commit may be.
+    ///
+    /// Two limits, and the distinction is the whole of the design. `max_bytes_per_batch` is
+    /// a contract: a commit that fits it has always been delivered, and a memory budget
+    /// must not turn a pipeline that worked yesterday into one that errors today. The
+    /// budget's limit is advice about how much to put together at once, so it only ever
+    /// stops accumulation early — the first commit of a batch is admitted against the
+    /// configured limit however tight memory is.
+    ///
+    /// That is enough, because the shape that kills the process is not one enormous commit.
+    /// It is a cold pipeline filling 256 MB of *compressed* budget with many files, all
+    /// decoded at once into five or six times that.
+    fn combined_ceiling(&self) -> u64 {
+        match crate::budget::current().bytes_per_batch(self.amplification.get()) {
+            Some(b) => self.max_bytes_per_batch.min(b),
+            None => self.max_bytes_per_batch,
         }
     }
 
@@ -161,6 +202,16 @@ impl LogStreamBuilder {
         self
     }
 
+    /// Process one source data commit at a time and pin lookup selection to its Delta-log
+    /// object timestamp.
+    ///
+    /// A lookup is selected as-of that timestamp. Taking one data commit avoids making the
+    /// snapshot depend on how several source commits happened to fit under a batch cap.
+    pub fn with_pinned_lookup_snapshots(mut self, yes: bool) -> Self {
+        self.pin_lookup_snapshots = yes;
+        self
+    }
+
     pub fn cursor(&self) -> StreamCursor {
         self.cursor
     }
@@ -171,8 +222,9 @@ impl LogStreamBuilder {
         ts: chrono::DateTime<chrono::Utc>,
     ) -> Result<Self> {
         // Reuse the log store rather than rebuilding one from the URL: it already
-        // carries the object-store credentials, and a rebuilt one would not.
-        let mut table = DeltaTable::new(self.log_store.clone(), DeltaTableConfig::default());
+        // carries the object-store credentials, and a rebuilt one would not. Without
+        // files, for the reasons in `schema_at`: the answer is a version number.
+        let mut table = DeltaTable::new(self.log_store.clone(), without_files());
         table.load_with_datetime(ts).await.map_err(Error::Delta)?;
         let v = table.version().unwrap_or(0);
         self.cursor = StreamCursor::at_version(v);
@@ -213,6 +265,7 @@ impl LogStreamBuilder {
         let mut bytes: u64 = 0;
         let mut cursor = self.cursor;
         let mut through: Option<Version> = None;
+        let mut through_log_timestamp: Option<DateTime<Utc>> = None;
 
         while cursor.version <= latest {
             let version = cursor.version;
@@ -274,13 +327,27 @@ impl LogStreamBuilder {
 
             let commit_bytes: u64 = remaining.iter().map(|a| a.size.max(0) as u64).sum();
             let fits_files = files.len() + remaining.len() <= self.max_files_per_batch;
-            let fits_bytes = bytes + commit_bytes <= self.max_bytes_per_batch;
+            // Nothing accumulated yet, so this commit is measured against the configured
+            // limit alone — see `combined_ceiling`. Only a batch that is already carrying
+            // something is asked to stop early for memory.
+            let ceiling = if files.is_empty() {
+                self.max_bytes_per_batch
+            } else {
+                self.combined_ceiling()
+            };
+            let fits_bytes = bytes + commit_bytes <= ceiling;
 
             if fits_files && fits_bytes {
                 files.extend(remaining.iter().map(|a| (version, a.clone())));
                 bytes += commit_bytes;
                 through = Some(version);
+                if self.pin_lookup_snapshots {
+                    through_log_timestamp = Some(self.commit_log_timestamp(version).await?);
+                }
                 cursor = cursor.next_version();
+                if self.pin_lookup_snapshots {
+                    break;
+                }
                 continue;
             }
 
@@ -320,6 +387,9 @@ impl LogStreamBuilder {
             // (bytes not re-read: we break out of the loop immediately below)
             cursor = cursor.advanced_by(take);
             through = Some(version);
+            if self.pin_lookup_snapshots {
+                through_log_timestamp = Some(self.commit_log_timestamp(version).await?);
+            }
             break;
         }
 
@@ -342,15 +412,46 @@ impl LogStreamBuilder {
             file_versions,
             schema,
             through_version,
+            through_log_timestamp,
         }))
     }
 
+    /// The timestamp Delta time travel itself uses for this commit: the log JSON object's
+    /// storage metadata. `commitInfo.timestamp` is supplied by writers and can be absent,
+    /// skewed, or rewritten independently of the object-store clock used by lookups.
+    async fn commit_log_timestamp(&self, version: Version) -> Result<DateTime<Utc>> {
+        let object = self
+            .log_store
+            .object_store(None)
+            .head(&commit_uri_from_version(Some(version)))
+            .await
+            .map_err(|e| {
+                Error::Other(format!(
+                    "cannot read Delta-log timestamp for source commit {version}: {e}"
+                ))
+            })?;
+        Ok(object.last_modified)
+    }
+
     /// Schema as of `version`, cached.
+    ///
+    /// Loaded **without files**, and that is not only an optimisation. The schema lives in
+    /// the `metaData` action, so the list of live files is answering a question nobody
+    /// asked — on a large source it is the whole file set of the table, rebuilt whenever a
+    /// batch reaches a version this has not seen.
+    ///
+    /// It is also what keeps this readable on a lakehouse other engines compact. Delta-rs
+    /// replays protocol and metadata from the commits alone and only reads a checkpoint's
+    /// *file* actions when files are required — so a checkpoint another engine wrote at a
+    /// precision the protocol does not have is never parsed here. Without this, a table
+    /// whose newest checkpoint is fine still fails the moment a batch asks for the schema
+    /// at a version an older, foreign checkpoint covers: `open` steps over such a
+    /// checkpoint, but only for the version it opens at.
     async fn schema_at(&mut self, version: Version) -> Result<Arc<StructType>> {
         if let Some(s) = self.schema_cache.get(&version) {
             return Ok(s.clone());
         }
-        let mut table = DeltaTable::new(self.log_store.clone(), DeltaTableConfig::default());
+        let mut table = DeltaTable::new(self.log_store.clone(), without_files());
         table.load_version(version).await.map_err(Error::Delta)?;
         let snapshot = table.snapshot().map_err(Error::Delta)?;
         let schema = snapshot.schema();
@@ -361,6 +462,19 @@ impl LogStreamBuilder {
         }
         self.schema_cache.insert(version, schema.clone());
         Ok(schema)
+    }
+}
+
+/// Load the log, but not the list of files it leaves live.
+///
+/// Both uses here ask the log a question about *itself* — what the schema was, which
+/// version a timestamp lands on — and neither needs to know which files survived. Saying so
+/// is what stops delta-rs materialising them, which costs a full replay of the file set and,
+/// on a table another engine has compacted, means parsing that engine's checkpoint.
+fn without_files() -> DeltaTableConfig {
+    DeltaTableConfig {
+        require_files: false,
+        ..Default::default()
     }
 }
 

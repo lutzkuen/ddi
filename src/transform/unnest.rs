@@ -46,8 +46,8 @@
 
 use deltalake::datafusion::sql::parser::DFParser;
 use deltalake::datafusion::sql::sqlparser::ast::{
-    DataType, Expr, Query, Select, SelectItem, SetExpr, Statement as SqlStatement, TableFactor,
-    TableWithJoins, VisitMut, VisitorMut,
+    DataType, Expr, Join, Query, Select, SelectItem, SetExpr, Statement as SqlStatement,
+    TableFactor, TableWithJoins, VisitMut, VisitorMut,
 };
 use std::ops::ControlFlow;
 
@@ -188,8 +188,24 @@ fn rewrite_select(select: &mut Select) -> Result<()> {
         column = found.column,
     );
     let from = format!("({inner}) AS {alias}");
+    let mut rewritten = parse_from(&from)?;
 
-    select.from = parse_from(&from)?;
+    // Whatever else was joined here still has to be joined to the fan-out. The `UNNEST` has
+    // moved inside the derived table, so the surviving joins reattach to that, in the order
+    // they were written -- a pinned lookup's `LEFT JOIN ... ON` reads the expanded rows and
+    // is indifferent to the expansion, because it adds columns rather than rows. Whether such
+    // a join is permitted at all is still the validator's question; this only preserves it
+    // intact for the validator to ask.
+    let carried: Vec<Join> = std::mem::take(&mut select.from)
+        .into_iter()
+        .flat_map(|twj| twj.joins)
+        .filter(|join| !matches!(join.relation, TableFactor::UNNEST { .. }))
+        .collect();
+    if let Some(base) = rewritten.first_mut() {
+        base.joins = carried;
+    }
+
+    select.from = rewritten;
     Ok(())
 }
 
@@ -224,8 +240,16 @@ fn find(select: &Select) -> Result<Option<Found>> {
     if unnests.is_empty() {
         return Ok(None);
     }
-    // Anything alongside the UNNEST is a real join, and stays rejected by the validator.
-    if factors.len() != unnests.len() {
+    // A comma-separated factor is an implicit cross join, and rewriting the `FROM` at all
+    // means dropping it, so anything sitting there that is not the fan-out is left alone for
+    // the validator to reject. An explicit join is different: `rewrite_select` carries it
+    // over verbatim, so a declared lookup's `LEFT JOIN ... ON` may accompany a fan-out.
+    if select
+        .from
+        .iter()
+        .skip(1)
+        .any(|twj| !matches!(twj.relation, TableFactor::UNNEST { .. }))
+    {
         return Ok(None);
     }
     if unnests.len() > 1 {

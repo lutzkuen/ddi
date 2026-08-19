@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use delta_delta_ingest::config::{Config, ResolvedPipeline};
+use delta_delta_ingest::gate;
 use delta_delta_ingest::locate::{self, Locator};
 use delta_delta_ingest::metrics::Metrics;
 use delta_delta_ingest::pipeline::{Pipeline, StepOutcome};
@@ -168,12 +169,39 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
     for r in &rejected {
         error!(pipeline = %r.name, "held back: {}", r.reason);
     }
+    // Divided by what will actually run, not by what was written down: a held-back pipeline
+    // allocates nothing, and counting it would make everyone else's share too small.
+    let budget = cfg.budget(pipelines.len())?;
+    budget.clone().install();
+
+    // The count limit and the memory limit answer different questions and are deliberately
+    // not derived from one another: the budget bounds what one pipeline holds, the gate
+    // bounds how many of them are reading a target at the same instant. See `crate::gate`.
+    gate::install(gate::Gate::new(
+        cfg.runtime.max_concurrent_upsert_merges,
+        cfg.runtime.max_concurrent_upsert_preflights,
+    ));
+
     info!(
         config = %cli.config.display(),
         pipelines = pipelines.len(),
         rejected = rejected.len(),
+        memory_per_pipeline = ?budget.per_pipeline(),
         "config loaded"
     );
+    match budget.per_pipeline() {
+        Some(b) => info!(
+            bytes = b,
+            "each pipeline may use about {} — DataFusion spills at it, and batches are sized \
+             so what they decode to fits inside it",
+            bytesize::ByteSize(b)
+        ),
+        None => info!(
+            "no memory budget: neither [runtime] max_memory nor a container limit. Nothing \
+             here is bounded by size, which is fine on a workstation and worth setting in a \
+             container."
+        ),
+    }
     let command = cli.command.unwrap_or(Command::Run);
     // `validate` still has something to say when nothing can run — that *is* its report.
     if pipelines.is_empty() && !matches!(command, Command::Validate) {
@@ -197,6 +225,9 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
                 // — both of which would otherwise surface on the first batch.
                 p.storage.check(&p.source_uri)?;
                 p.storage.check(&p.target_uri)?;
+                for lookup in &p.lookups {
+                    p.storage.check(&lookup.uri)?;
+                }
                 // write_mode is shown because it changes what the target *is*, not just how
                 // fast it fills: an upserted table holds one row per key and can only be
                 // read downstream by another upserting pipeline.
@@ -269,20 +300,18 @@ fn non_delta_catalog(
     delta: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
     let target = manifest.node(&s.unique_id)?;
-    let source = target
-        .depends_on
-        .nodes
-        .first()
-        .and_then(|id| manifest.node(id));
+    let source = manifest.node(&s.source_unique_id);
 
-    [
-        target.database.as_deref(),
-        source.and_then(|n| n.database.as_deref()),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|c| !delta.contains(*c))
-    .map(str::to_string)
+    std::iter::once(target.database.as_deref())
+        .chain(std::iter::once(source.and_then(|n| n.database.as_deref())))
+        .chain(s.lookups.iter().map(|lookup| {
+            manifest
+                .node(&lookup.unique_id)
+                .and_then(|node| node.database.as_deref())
+        }))
+        .flatten()
+        .find(|c| !delta.contains(*c))
+        .map(str::to_string)
 }
 
 /// The first clause of a rejection, for grouping. The rest is the explanation.
@@ -803,6 +832,10 @@ async fn attempt(
                     if u.window_clamped {
                         m.upsert_window_clamped.fetch_add(1, Ordering::Relaxed);
                     }
+                    m.merges.fetch_add(1, Ordering::Relaxed);
+                    m.merge_millis.fetch_add(u.merge_millis, Ordering::Relaxed);
+                    m.merge_queue_millis
+                        .fetch_add(u.queue_millis, Ordering::Relaxed);
                 }
             }
             Ok(StepOutcome::Skipped {

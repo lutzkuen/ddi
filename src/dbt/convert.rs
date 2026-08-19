@@ -11,6 +11,7 @@ use crate::dbt::analyze::{analyze_all, Verdict};
 use crate::dbt::{Manifest, Node, UriTemplate};
 use crate::dedup::DEFAULT_TIMESTAMP_COLUMN;
 use crate::error::{Error, Result};
+use crate::lookup::LookupConfig;
 
 /// Prefix for generated `app_id`s. The offset key must be stable forever, so it is
 /// derived from the model name and nothing that moves (not the schema, not the path).
@@ -49,9 +50,7 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
         let Verdict::Streamable(s) = v else { continue };
 
         let target_node = manifest.node(&s.unique_id);
-        let source_node = target_node
-            .and_then(|n| n.depends_on.nodes.first())
-            .and_then(|id| manifest.node(id));
+        let source_node = manifest.node(&s.source_unique_id);
         let (Some(src), Some(tgt)) = (source_node, target_node) else {
             return Err(Error::Config(format!(
                 "model {:?}: could not resolve its relations from the manifest",
@@ -73,11 +72,37 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
             )));
         };
 
+        let mut lookups = Vec::with_capacity(s.lookups.len());
+        for lookup in &s.lookups {
+            let Some(node) = manifest.node(&lookup.unique_id) else {
+                return Err(Error::Config(format!(
+                    "model {:?}: lookup {:?} disappeared from the manifest",
+                    s.name, lookup.name
+                )));
+            };
+            let Some(uri) = location(node, template.as_ref()) else {
+                return Err(Error::Config(format!(
+                    "model {:?}: the manifest does not say where lookup {} lives, and no \
+                     [storage].uri_template is set. Give the source a Delta location or add \
+                     a template.",
+                    s.name,
+                    node.qualified()
+                )));
+            };
+            lookups.push(LookupConfig {
+                name: lookup.name.clone(),
+                uri,
+                relation: node.fully_qualified(),
+                pre_history_version: lookup.pre_history_version,
+            });
+        }
+
         out.push(PipelineConfig {
             name: s.name.clone(),
             app_id: app_id_for(&s.name),
             source_uri,
             target_uri,
+            lookups,
             starting_version: 0,
             change_policy: Default::default(),
             transform_sql: s.transform_sql.clone(),
@@ -99,9 +124,30 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
             // this daemon happens to be deployed.
             write_mode: match tgt.meta_str("ddi_write_mode") {
                 Some("upsert") => crate::config::WriteMode::Upsert,
+                Some("staged_upsert") => crate::config::WriteMode::StagedUpsert,
                 _ => crate::config::WriteMode::Append,
             },
+            // Derived from the target, and deliberately not declarable in dbt: the stage is
+            // this tool's own working table, not part of the model the warehouse shares.
+            stage_uri: None,
+            // Set by the expansion, never by the manifest.
+            stage_for: None,
+            apply_max_bytes: tgt.meta_str("ddi_apply_max_bytes").map(str::to_string),
+            apply_max_latency_secs: tgt
+                .meta_value("ddi_apply_max_latency_secs")
+                .and_then(|v| v.as_u64()),
             upsert_key: tgt.meta_str("ddi_upsert_key").map(str::to_string),
+            // `meta: {ddi_tiebreak: [kafka_partition, kafka_offset]}`. A single string is
+            // accepted too, because one tie-breaker is the common case and writing it as a
+            // list of one is the kind of thing nobody remembers to do.
+            upsert_tiebreak: match tgt.meta_value("ddi_tiebreak") {
+                Some(serde_json::Value::Array(a)) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                Some(serde_json::Value::String(one)) => vec![one.clone()],
+                _ => Vec::new(),
+            },
             // Defaults to <target>__ddi_dq; declared only when it lives somewhere else.
             dq_uri: tgt.meta_str("ddi_dq").map(str::to_string),
             upsert_lookback: tgt.meta_str("ddi_upsert_lookback").map(str::to_string),

@@ -1,13 +1,14 @@
 //! Configuration: N pipelines in one process.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::lookup::{LookupConfig, ResolvedLookup};
 use crate::source::{ChangePolicy, Version};
-use crate::transform::validate::normalise_sql;
+use crate::transform::validate::normalise_sql_with_lookups;
 
 fn default_allowed_latency() -> u64 {
     30
@@ -40,6 +41,42 @@ pub struct Defaults {
     pub max_files_per_batch: usize,
     #[serde(default = "default_max_output_rows")]
     pub max_output_rows_per_batch: usize,
+
+    /// How much memory the whole process may use, divided across the pipelines in it.
+    ///
+    /// Unset means "whatever the container says", and if the container says nothing either
+    /// then nothing is bounded — which is the behaviour there has always been, and the
+    /// right one for a local run. Set it to take a tighter bound than the cgroup's, or to
+    /// get one at all outside a container.
+    ///
+    /// It is a *process* number rather than a per-pipeline one on purpose: pipelines all
+    /// start at once, and it is that simultaneity which turns a survivable allocation into
+    /// an OOM. See [`crate::budget`].
+    #[serde(default)]
+    pub max_memory: Option<String>,
+
+    /// How many merges may run at once across the whole process.
+    ///
+    /// A merge reads back a slice of the target it writes, so its cost is set by the target
+    /// rather than by the batch — which means `max_bytes_per_batch` and `max_memory` do not
+    /// bound it, and neither does dividing them further. Hundreds of pipelines starting
+    /// together scan hundreds of targets together, and that simultaneity is what turns a
+    /// survivable merge into an OOM. See [`crate::gate`].
+    ///
+    /// Unset means unbounded, which is the behaviour there has always been and the right one
+    /// for a local run. Watch `ddi_merge_queue_seconds_total` after setting it: a rate that
+    /// climbs towards 1 per merge slot means the limit, not the storage, is the throughput.
+    #[serde(default)]
+    pub max_concurrent_upsert_merges: Option<usize>,
+
+    /// How many startup uniqueness checks may run at once.
+    ///
+    /// Separate from the merge limit because the two overlap in time but not in kind: every
+    /// upsert pipeline preflights once, at startup, all at the same moment, and each one
+    /// reads its whole target. One limit covering both would have to be set for that burst
+    /// and would then throttle steady state for the rest of the run.
+    #[serde(default)]
+    pub max_concurrent_upsert_preflights: Option<usize>,
 }
 
 impl Default for Defaults {
@@ -50,6 +87,9 @@ impl Default for Defaults {
             target_file_size: default_target_file_size(),
             max_files_per_batch: default_max_files(),
             max_output_rows_per_batch: default_max_output_rows(),
+            max_memory: None,
+            max_concurrent_upsert_merges: None,
+            max_concurrent_upsert_preflights: None,
         }
     }
 }
@@ -69,11 +109,34 @@ pub enum WriteMode {
     /// holds one row per key, at the cost of reading part of it on every batch. See
     /// [`crate::upsert`].
     Upsert,
+    /// The same end state as [`Self::Upsert`], reached by merging many source commits at
+    /// once instead of each one on its own.
+    ///
+    /// One configured pipeline in this mode becomes two running ones — see [`crate::stage`]
+    /// — so this variant never survives [`Config::resolve_all`]. Anything asking a
+    /// *resolved* pipeline for its mode is therefore asking about one of the two halves,
+    /// and gets `Append` or `Upsert`, which is what keeps the runtime unaware that staging
+    /// exists at all.
+    StagedUpsert,
 }
 
 impl WriteMode {
+    /// True when this pipeline merges into its target rather than appending.
+    ///
+    /// Deliberately false for [`Self::StagedUpsert`]: a staged pipeline writes nothing
+    /// itself, and the half of it that merges says so on its own.
     pub fn is_upsert(self) -> bool {
         matches!(self, WriteMode::Upsert)
+    }
+
+    pub fn is_staged(self) -> bool {
+        matches!(self, WriteMode::StagedUpsert)
+    }
+
+    /// True when the target ends up holding one row per key, however it gets there. The
+    /// question config validation asks, because both modes need a key and a timestamp.
+    pub fn keeps_one_row_per_key(self) -> bool {
+        matches!(self, WriteMode::Upsert | WriteMode::StagedUpsert)
     }
 }
 
@@ -88,6 +151,10 @@ pub struct PipelineConfig {
 
     pub source_uri: String,
     pub target_uri: String,
+
+    /// Small Delta tables joined as pinned snapshots while processing a source batch.
+    #[serde(default)]
+    pub lookups: Vec<LookupConfig>,
 
     #[serde(default)]
     pub starting_version: Version,
@@ -161,6 +228,54 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub upsert_lookback: Option<String>,
 
+    /// Columns that decide which row wins when two share a `dedup_timestamp`.
+    ///
+    /// Compared left to right after the timestamp, so `["kafka_partition", "kafka_offset"]`
+    /// reads as "later offset within the same partition wins". Every column must be in the
+    /// target, because the comparison is made against the row already stored as well as
+    /// between rows in hand.
+    ///
+    /// Without this, a tie is broken by position in the batch — which is only stable while
+    /// batch boundaries are, and they are not: a retry regroups commits, and
+    /// `write_mode = "staged_upsert"` regroups them by design. See [`crate::upsert`].
+    #[serde(default)]
+    pub upsert_tiebreak: Vec<String>,
+
+    /// Where `write_mode = "staged_upsert"` parks rows between its two halves.
+    ///
+    /// Defaults to `<target_uri>__ddi_stage`, which is what almost every pipeline should
+    /// use: it puts the stage beside the table it feeds, so a target that relocates takes
+    /// its stage along. Set it only when the stage has to live somewhere else.
+    #[serde(default)]
+    pub stage_uri: Option<String>,
+
+    /// How much staged data the apply half accumulates before merging.
+    ///
+    /// This is the knob the whole mode exists for: one merge per this many bytes instead of
+    /// one merge per source commit, paid for in how stale the target may be. Defaults to
+    /// `max_bytes_per_batch` — the conservative reading, "accumulate no more per merge than
+    /// a direct upsert would have handled", and almost certainly too small to be worth
+    /// staging for.
+    #[serde(default)]
+    pub apply_max_bytes: Option<String>,
+
+    /// How long the apply half waits before merging what it has, however little that is.
+    ///
+    /// The ceiling on how stale the target may be, and therefore the number to publish to
+    /// whoever reads it. Defaults to `allowed_latency_secs`.
+    #[serde(default)]
+    pub apply_max_latency_secs: Option<u64>,
+
+    /// The real target this pipeline's stage stands in for, set only on the ingest half of a
+    /// split `staged_upsert` and never written by hand.
+    ///
+    /// It carries two things the ingest half cannot otherwise know. The stage's schema is
+    /// this table's schema, so it says what to create; and the full-row rule is stated
+    /// against this table, so it says what the transform must produce. Both follow from the
+    /// same fact — that the stage is a stand-in for a table it never writes to.
+    #[serde(skip)]
+    pub stage_for: Option<String>,
+
     /// Fully qualified catalog names, so a location can be re-resolved while running.
     /// Filled in from the dbt manifest.
     #[serde(default)]
@@ -202,6 +317,8 @@ pub struct ResolvedPipeline {
     pub app_id: String,
     pub source_uri: String,
     pub target_uri: String,
+    /// Pinned Delta lookup relations available to `transform_sql`.
+    pub lookups: Vec<ResolvedLookup>,
     pub starting_version: Version,
     pub change_policy: ChangePolicy,
     pub transform_sql: Option<String>,
@@ -224,6 +341,17 @@ pub struct ResolvedPipeline {
     /// How far back the merge window may reach. `None` means "as far as the target's
     /// statistics require".
     pub upsert_lookback: Option<crate::upsert::Lookback>,
+    /// Columns compared after `dedup_timestamp` to settle a tie, left to right. Empty means
+    /// position in the batch decides, which is stable only while batches are.
+    pub upsert_tiebreak: Vec<String>,
+    /// Set only on the ingest half of a staged upsert: the real target its stage feeds.
+    ///
+    /// Two things follow from it, and both are why the field exists rather than a pair of
+    /// booleans. The stage is created with this table's schema if it is not there; and the
+    /// transform is held to producing *every* column of it, because a staged row is written
+    /// once and merged later, by which time "the transform said nothing about this column"
+    /// is indistinguishable from "this column is null". See [`crate::stage`].
+    pub stage_for: Option<String>,
     /// An explicit data-quality table, when the derived one will not do. Kept unresolved
     /// so that a target which moves takes its rejects with it — see [`Self::dq_uri`].
     pub dq_uri: Option<String>,
@@ -312,6 +440,194 @@ impl Resolved {
 /// Only the last combination works, so it is the only one allowed to pass quietly. The other
 /// two are a configuration mistake that no amount of runtime care can repair, which puts the
 /// check here.
+/// Why this staged pipeline cannot be split, if it cannot.
+///
+/// Checked before expansion so the complaint names the pipeline the operator wrote rather
+/// than a half this code invented. A staged pipeline that fails here is left unexpanded and
+/// rejected by the resolver under its own name.
+fn staged_problem(p: &PipelineConfig) -> Option<String> {
+    if p.upsert_key.is_none() && p.dedup_key.is_none() {
+        return Some(
+            "write_mode = \"staged_upsert\" needs upsert_key (or dedup_key, which it falls \
+             back to) — the apply half merges on it. Without it staging would only be a \
+             slower append."
+                .into(),
+        );
+    }
+    if p.dedup_timestamp.is_none() {
+        return Some(
+            "write_mode = \"staged_upsert\" needs dedup_timestamp — it decides which of the \
+             rows accumulated for one key is the one to keep. In dbt: \
+             `meta: {ddi_timestamp: _timestamp}`."
+                .into(),
+        );
+    }
+    // A stage that is its own source or target is a loop, and the derived name cannot
+    // collide, so reaching this means somebody set `stage_uri` by hand.
+    let stage = p
+        .stage_uri
+        .clone()
+        .unwrap_or_else(|| crate::stage::uri_for(&p.target_uri));
+    if stage == p.target_uri || stage == p.source_uri {
+        return Some(format!(
+            "stage_uri {stage:?} is the same table as this pipeline's own source or target, \
+             which would feed it its own output."
+        ));
+    }
+    if !crate::stage::is_stage_uri(&stage) {
+        return Some(format!(
+            "stage_uri {stage:?} does not end in {:?}. The suffix is what tells every other \
+             pipeline that the table is private to this one — without it, nothing stops a \
+             second pipeline reading rows that are about to be consumed.",
+            crate::stage::SUFFIX
+        ));
+    }
+    None
+}
+
+/// Turn every `staged_upsert` entry into the two ordinary pipelines that implement it.
+///
+/// Runs before validation and before [`cascade_conflicts`], so everything downstream — the
+/// resolver, the runtime, the metrics, the cascade check itself — sees only `Append` and
+/// `Upsert` and needs to know nothing about staging. See [`crate::stage`] for why the
+/// feature is shaped this way.
+///
+/// The split is not a copy. Each half keeps only what it is responsible for, and getting
+/// that wrong is how a staged pipeline would quietly do a thing twice:
+///
+/// - The **transform, lookups and data-quality handling** belong to the ingest half alone.
+///   A pinned lookup in particular *must* resolve there, against the raw source commit, or
+///   the FX rate applied to a row would depend on when the apply half happened to run.
+/// - The **merge key, timestamp and tie-breaker** belong to the apply half, which is the
+///   only one that merges.
+/// - The **rebuild watermark** belongs to the ingest half. Rows a dbt rebuild already covers
+///   are dropped before they are staged, so applying it again downstream would be asking a
+///   question already answered.
+fn expand_staged(pipelines: &[PipelineConfig]) -> Vec<PipelineConfig> {
+    let mut out = Vec::with_capacity(pipelines.len());
+    for p in pipelines {
+        // Left whole when it could not be correct, so the resolver reports the reason
+        // against the operator's own name. See `staged_problem`.
+        if !p.write_mode.is_staged() || staged_problem(p).is_some() {
+            out.push(p.clone());
+            continue;
+        }
+        let stage_uri = p
+            .stage_uri
+            .clone()
+            .unwrap_or_else(|| crate::stage::uri_for(&p.target_uri));
+
+        let mut ingest = p.clone();
+        ingest.name = crate::stage::ingest_name(&p.name);
+        ingest.app_id = crate::stage::ingest_app_id(&p.app_id);
+        ingest.target_uri = stage_uri.clone();
+        // The stage is not in anybody's catalog, and claiming it is would send the locator
+        // looking for a table nothing has declared.
+        ingest.target_relation = None;
+        ingest.write_mode = WriteMode::Append;
+        // Appending is all this half does; the merge settings are the other half's.
+        ingest.upsert_key = None;
+        ingest.upsert_lookback = None;
+        ingest.upsert_tiebreak = Vec::new();
+        // Rejects belong beside the real target, not beside the stage. Pinned explicitly
+        // because the default derives from `target_uri`, which for this half is the stage.
+        ingest.dq_uri = Some(
+            p.dq_uri
+                .clone()
+                .unwrap_or_else(|| crate::dq::uri_for(&p.target_uri)),
+        );
+        ingest.stage_uri = None;
+        ingest.apply_max_bytes = None;
+        ingest.apply_max_latency_secs = None;
+        ingest.stage_for = Some(p.target_uri.clone());
+
+        let mut apply = p.clone();
+        apply.name = crate::stage::apply_name(&p.name);
+        apply.app_id = crate::stage::apply_app_id(&p.app_id);
+        apply.source_uri = stage_uri;
+        apply.source_relation = None;
+        apply.write_mode = WriteMode::Upsert;
+        // Already applied on the way in. Running the transform twice would apply it to its
+        // own output, and re-resolving a lookup here would pin it to the wrong instant.
+        apply.transform_sql = None;
+        apply.lookups = Vec::new();
+        apply.watermark_uri = None;
+        // The stage begins empty and is read from its first commit; the raw source's
+        // starting version has nothing to say about it.
+        apply.starting_version = 0;
+        // The stage is ddi's own append-only table. A `dataChange: false` compaction of it
+        // is skipped by the reader that skips them anyway, so what `fail` actually catches
+        // is a genuine rewrite of staged rows — which no correct process performs, and
+        // which would silently drop pending state if it were tolerated.
+        apply.change_policy = ChangePolicy::Fail;
+        apply.stage_uri = None;
+        apply.apply_max_bytes = None;
+        apply.apply_max_latency_secs = None;
+        apply.stage_for = None;
+        // The whole point of the mode: accumulate, then pay for the target once.
+        if let Some(b) = &p.apply_max_bytes {
+            apply.max_bytes_per_batch = Some(b.clone());
+        }
+        if let Some(l) = p.apply_max_latency_secs {
+            apply.allowed_latency_secs = Some(l);
+        }
+
+        out.push(ingest);
+        out.push(apply);
+    }
+    out
+}
+
+/// Pipelines that would read or write a stage table they do not own.
+///
+/// A stage is an implementation detail of the pipeline that owns it, and it is append-only
+/// on the strength of that: the apply half assumes nothing else writes there, and drops its
+/// rows once merged. Another pipeline writing to one would have its rows applied to a target
+/// it never named; another pipeline reading one would be reading rows that are about to be
+/// consumed, and would see each of them once or twice depending on a race.
+///
+/// Checked against the *expanded* list, so the two halves' own use of the stage is already
+/// accounted for and only a third party trips it.
+fn stage_conflicts(pipelines: &[PipelineConfig]) -> Vec<(String, String)> {
+    use std::collections::BTreeMap;
+
+    // Which pipeline legitimately owns each stage, by the naming rule that created it.
+    let mut owners: BTreeMap<&str, &str> = BTreeMap::new();
+    for p in pipelines {
+        if crate::stage::is_stage_uri(&p.target_uri) {
+            owners.insert(p.target_uri.as_str(), p.name.as_str());
+        }
+    }
+
+    let mut out = Vec::new();
+    for p in pipelines {
+        for (uri, which) in [(&p.source_uri, "reads"), (&p.target_uri, "writes to")] {
+            if !crate::stage::is_stage_uri(uri) {
+                continue;
+            }
+            // Its own stage, or the stage of the pipeline it was split from.
+            let owner = owners.get(uri.as_str()).copied().unwrap_or("");
+            let mine = p.name == owner
+                || crate::stage::apply_name(owner.trim_end_matches("__ingest")) == p.name;
+            if mine {
+                continue;
+            }
+            out.push((
+                p.name.clone(),
+                format!(
+                    "{which} {uri:?}, which is the staging table of a staged_upsert pipeline. \
+                     A stage is private to the pair that owns it: its rows are appended by one \
+                     half and consumed by the other, so a third pipeline reading it would see \
+                     each row once or twice depending on a race, and one writing to it would \
+                     have its rows merged into a target it never named. Point this pipeline at \
+                     the real table instead."
+                ),
+            ));
+        }
+    }
+    out
+}
+
 fn cascade_conflicts(pipelines: &[PipelineConfig]) -> Vec<(String, String)> {
     use crate::source::ChangePolicy;
 
@@ -359,6 +675,21 @@ fn parse_size(s: &str, field: &str) -> Result<u64> {
 }
 
 impl Config {
+    /// The process's memory budget, resolved against the config and the container.
+    ///
+    /// Called once at startup, with the pipelines that are actually going to run — not the
+    /// ones written down, since a rejected pipeline allocates nothing and dividing by it
+    /// would make everyone else's share too small.
+    pub fn budget(&self, running: usize) -> Result<crate::budget::Budget> {
+        let configured = self
+            .runtime
+            .max_memory
+            .as_deref()
+            .map(|s| parse_size(s, "runtime.max_memory"))
+            .transpose()?;
+        Ok(crate::budget::Budget::resolve(configured, running))
+    }
+
     pub fn from_toml_str(s: &str) -> Result<Self> {
         toml::from_str(s).map_err(|e| Error::Config(format!("invalid config: {e}")))
     }
@@ -402,6 +733,13 @@ impl Config {
                     .into(),
             ));
         }
+
+        // A `staged_upsert` entry is two pipelines wearing one name. Expanding first means
+        // every check below — duplicate app_ids, cascades, the resolver itself — sees the
+        // two halves as the ordinary pipelines they are, and none of them has to know that
+        // staging exists. See `crate::stage`.
+        let expanded = expand_staged(pipelines);
+        let pipelines: &[PipelineConfig] = &expanded;
 
         let mut rejected: Vec<Rejection> = Vec::new();
         let mut reject = |name: &str, reason: String| {
@@ -452,6 +790,12 @@ impl Config {
         }
         let cascades = cascade_conflicts(pipelines);
         for (name, reason) in &cascades {
+            condemned
+                .entry(name.as_str())
+                .or_insert_with(|| reason.clone());
+        }
+        let stages = stage_conflicts(pipelines);
+        for (name, reason) in &stages {
             condemned
                 .entry(name.as_str())
                 .or_insert_with(|| reason.clone());
@@ -519,20 +863,62 @@ impl Config {
         // `CROSS JOIN UNNEST` — is rewritten here, once, so the pipeline executes the same
         // query the validator approved. The model's own text stays in `PipelineConfig`, so
         // `ddi dbt convert` still pins what dbt wrote.
-        let transform_sql = match &p.transform_sql {
-            Some(sql) => Some(normalise_sql(sql).map_err(|e| match e {
-                Error::Config(m) => Error::Config(m),
-                other => Error::Config(other.to_string()),
-            })?),
-            None => None,
-        };
-
         if p.source_uri == p.target_uri {
             return Err(Error::Config(
                 "source_uri and target_uri are the same table; that would feed the pipeline \
                  its own output"
                     .into(),
             ));
+        }
+
+        let mut lookup_names = BTreeSet::new();
+        let mut lookups = Vec::with_capacity(p.lookups.len());
+        for lookup in &p.lookups {
+            let lookup = crate::lookup::resolve(lookup)?;
+            if !lookup_names.insert(lookup.name.clone()) {
+                return Err(Error::Config(format!(
+                    "lookup {:?} is declared more than once",
+                    lookup.name
+                )));
+            }
+            if lookup.uri == p.source_uri || lookup.uri == p.target_uri {
+                return Err(Error::Config(format!(
+                    "lookup {:?} points at a streaming source or target; a lookup must be a \
+                     separate, read-only Delta table",
+                    lookup.name
+                )));
+            }
+            lookups.push(lookup);
+        }
+
+        // Declared lookups are the only additional relations a transform may join. The
+        // normaliser validates their narrow join shape and rewrites dialect spellings such as
+        // Trino's CROSS JOIN UNNEST once, so the pipeline executes exactly what it approved.
+        let transform_sql = match &p.transform_sql {
+            Some(sql) => Some(normalise_sql_with_lookups(sql, &lookup_names).map_err(
+                |e| match e {
+                    Error::Config(m) => Error::Config(m),
+                    other => Error::Config(other.to_string()),
+                },
+            )?),
+            None => None,
+        };
+
+        if !lookups.is_empty() && transform_sql.is_none() {
+            return Err(Error::Config(
+                "lookups are declared but transform_sql is empty; a lookup must be joined by \
+                 a SELECT transformation"
+                    .into(),
+            ));
+        }
+
+        // Only reachable when `expand_staged` declined to split this pipeline, which it does
+        // exactly when it could not be correct. Reported here so the reason lands against
+        // the name in the config file rather than against a generated half.
+        if p.write_mode.is_staged() {
+            return Err(Error::Config(staged_problem(p).unwrap_or_else(|| {
+                "internal: a staged pipeline reached the resolver unsplit".into()
+            })));
         }
 
         // The merge needs a key to merge on and a value to decide "newer" by. Neither can be
@@ -558,12 +944,42 @@ impl Config {
                         .into(),
                 ));
             }
-        } else if p.upsert_key.is_some() || p.upsert_lookback.is_some() {
+        } else if p.upsert_key.is_some()
+            || p.upsert_lookback.is_some()
+            || !p.upsert_tiebreak.is_empty()
+        {
             return Err(Error::Config(
-                "upsert_key/upsert_lookback are set but write_mode is \"append\", so they do \
-                 nothing. Set write_mode = \"upsert\", or remove them."
+                "upsert_key/upsert_lookback/upsert_tiebreak are set but write_mode is \
+                 \"append\", so they do nothing. Set write_mode = \"upsert\", or remove them."
                     .into(),
             ));
+        }
+
+        // A tie-breaker that repeats a column, or names the timestamp it is meant to break a
+        // tie *on*, cannot order anything the timestamp did not already order. Silently
+        // ignoring it would leave the pipeline believing it had a stable order.
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            for c in &p.upsert_tiebreak {
+                if c.trim().is_empty() {
+                    return Err(Error::Config(
+                        "upsert_tiebreak contains an empty column name".into(),
+                    ));
+                }
+                if Some(c) == p.dedup_timestamp.as_ref() {
+                    return Err(Error::Config(format!(
+                        "upsert_tiebreak lists {c:?}, which is already dedup_timestamp. A \
+                         column cannot break a tie against itself — the tie is that the two \
+                         rows agree on it."
+                    )));
+                }
+                if !seen.insert(c) {
+                    return Err(Error::Config(format!(
+                        "upsert_tiebreak lists {c:?} twice; the second comparison can never \
+                         decide anything the first did not."
+                    )));
+                }
+            }
         }
         let upsert_lookback = p
             .upsert_lookback
@@ -591,6 +1007,7 @@ impl Config {
             app_id: p.app_id.clone(),
             source_uri: p.source_uri.clone(),
             target_uri: p.target_uri.clone(),
+            lookups,
             starting_version: p.starting_version,
             change_policy: p.change_policy,
             transform_sql,
@@ -610,6 +1027,8 @@ impl Config {
             write_mode: p.write_mode,
             upsert_key,
             upsert_lookback,
+            upsert_tiebreak: p.upsert_tiebreak.clone(),
+            stage_for: p.stage_for.clone(),
             dq_uri: p.dq_uri.clone(),
             storage: crate::storage::Storage::new(self.storage.options.clone()),
             source_relation: p.source_relation.clone(),
@@ -787,6 +1206,168 @@ write_mode = "upsert"
 dedup_timestamp = "_timestamp"
 dedup_key = "order_id"
 "#;
+
+    const STAGED: &str = r#"
+[[pipeline]]
+name = "style"
+app_id = "ddi.style"
+source_uri = "/tmp/bronze/style"
+target_uri = "/tmp/silver/style"
+write_mode = "staged_upsert"
+dedup_timestamp = "_timestamp"
+upsert_key = "style_id"
+transform_sql = "SELECT style_id, _timestamp FROM source"
+apply_max_bytes = "512MB"
+apply_max_latency_secs = 900
+"#;
+
+    fn staged() -> Vec<ResolvedPipeline> {
+        Config::from_toml_str(STAGED).unwrap().resolve().unwrap()
+    }
+
+    #[test]
+    fn a_staged_pipeline_becomes_an_ingest_and_an_apply() {
+        let r = staged();
+        assert_eq!(r.len(), 2, "one written down, two running");
+
+        let ingest = &r[0];
+        let apply = &r[1];
+        assert_eq!(ingest.name, "style__ingest");
+        assert_eq!(apply.name, "style__apply");
+
+        // The stage is between them, and is the only table they share.
+        assert_eq!(ingest.target_uri, "/tmp/silver/style__ddi_stage");
+        assert_eq!(apply.source_uri, "/tmp/silver/style__ddi_stage");
+        assert_eq!(ingest.source_uri, "/tmp/bronze/style");
+        assert_eq!(apply.target_uri, "/tmp/silver/style");
+
+        // Append in, merge out. Nothing downstream needs to know staging happened.
+        assert_eq!(ingest.write_mode, WriteMode::Append);
+        assert_eq!(apply.write_mode, WriteMode::Upsert);
+        assert!(!r.iter().any(|p| p.write_mode.is_staged()));
+    }
+
+    #[test]
+    fn the_two_halves_never_share_an_offset() {
+        // The exactly-once story rests on this: one `txn` key advanced by both would let
+        // either resume from a version the other had reached.
+        let r = staged();
+        assert_ne!(r[0].app_id, r[1].app_id);
+        assert_eq!(r[0].app_id, "ddi.style.ingest");
+        assert_eq!(r[1].app_id, "ddi.style.apply");
+    }
+
+    #[test]
+    fn the_transform_and_its_lookups_belong_to_the_ingest_half_alone() {
+        // Running the transform again downstream would apply it to its own output, and
+        // re-resolving a pinned lookup there would pin it to the instant the apply worker
+        // happened to run rather than to the source commit.
+        let r = staged();
+        assert!(r[0].transform_sql.is_some());
+        assert!(r[1].transform_sql.is_none());
+        assert!(r[1].lookups.is_empty());
+    }
+
+    #[test]
+    fn the_accumulation_limits_land_on_the_half_that_merges() {
+        let r = staged();
+        assert_eq!(r[1].max_bytes_per_batch, 512 * 1000 * 1000);
+        assert_eq!(r[1].allowed_latency_secs, 900);
+        // The ingest half keeps the ordinary defaults: its whole purpose is to stay cheap
+        // and current, and accumulating there would only delay the stage.
+        assert_ne!(r[0].max_bytes_per_batch, r[1].max_bytes_per_batch);
+    }
+
+    #[test]
+    fn rejects_go_beside_the_real_target_not_beside_the_stage() {
+        // The default derives from `target_uri`, which for the ingest half is the stage —
+        // so without pinning it, a fleet's rejects would scatter into staging tables.
+        let r = staged();
+        assert_eq!(r[0].dq_uri(), "/tmp/silver/style__ddi_dq");
+    }
+
+    #[test]
+    fn only_the_ingest_half_is_held_to_producing_every_column() {
+        let r = staged();
+        assert_eq!(r[0].stage_for.as_deref(), Some("/tmp/silver/style"));
+        assert!(r[1].stage_for.is_none());
+    }
+
+    #[test]
+    fn a_staged_pipeline_without_a_key_is_named_as_the_operator_wrote_it() {
+        // Not as "style__apply", which is a name they never chose and cannot search for.
+        let toml = STAGED.replace("upsert_key = \"style_id\"\n", "");
+        let e = Config::from_toml_str(&toml)
+            .unwrap()
+            .resolve()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("\"style\""), "names the written pipeline: {e}");
+        assert!(!e.contains("__apply"), "not a generated half: {e}");
+        assert!(e.contains("upsert_key"), "and what is missing: {e}");
+    }
+
+    #[test]
+    fn a_third_pipeline_may_not_touch_somebody_elses_stage() {
+        // The stage is append-only on the strength of nobody else writing it, and its rows
+        // are consumed once. A reader would race the apply half for them.
+        let toml = format!(
+            "{STAGED}\n\
+             [[pipeline]]\n\
+             name = \"nosy\"\n\
+             app_id = \"ddi.nosy\"\n\
+             source_uri = \"/tmp/silver/style__ddi_stage\"\n\
+             target_uri = \"/tmp/silver/copy\"\n"
+        );
+        let r = Config::from_toml_str(&toml).unwrap().resolve_all().unwrap();
+        let held = r
+            .rejected
+            .iter()
+            .find(|x| x.name == "nosy")
+            .expect("the interloper is held back");
+        assert!(held.reason.contains("staging table"), "{}", held.reason);
+
+        // And the pair that owns it still runs.
+        assert_eq!(r.pipelines.len(), 2);
+    }
+
+    #[test]
+    fn the_two_halves_are_not_mistaken_for_a_cascade() {
+        // `cascade_conflicts` holds back a pipeline that reads a table another *upserts*
+        // into. The ingest half only appends, which is exactly why the stage is append-only
+        // — so the apply half reading it must pass cleanly.
+        let r = Config::from_toml_str(STAGED)
+            .unwrap()
+            .resolve_all()
+            .unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+    }
+
+    #[test]
+    fn a_hand_written_stage_uri_must_still_look_like_a_stage() {
+        // The suffix is what every other pipeline uses to recognise one; without it the
+        // privacy guard above has nothing to go on.
+        let toml = STAGED.replace(
+            "apply_max_bytes = \"512MB\"",
+            "stage_uri = \"/tmp/silver/somewhere_else\"",
+        );
+        let e = Config::from_toml_str(&toml)
+            .unwrap()
+            .resolve()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("__ddi_stage"), "names the rule: {e}");
+    }
+
+    #[test]
+    fn direct_upsert_is_untouched_by_any_of_this() {
+        let r = Config::from_toml_str(UPSERT).unwrap().resolve().unwrap();
+        assert_eq!(r.len(), 1, "an upsert pipeline is still one pipeline");
+        assert_eq!(r[0].name, "orders");
+        assert_eq!(r[0].app_id, "ddi.orders");
+        assert_eq!(r[0].write_mode, WriteMode::Upsert);
+        assert!(r[0].stage_for.is_none());
+    }
 
     /// A config where the second of three pipelines cannot possibly work.
     fn one_bad_of_three() -> Config {

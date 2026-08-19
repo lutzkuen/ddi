@@ -176,6 +176,7 @@ fn pipeline(source: &str, target: &str) -> ResolvedPipeline {
         app_id: format!("ddi.it.{}", target.rsplit('/').next().unwrap()),
         source_uri: source.into(),
         target_uri: target.into(),
+        lookups: vec![],
         starting_version: 0,
         change_policy: ChangePolicy::Fail,
         // Parses JSON and casts, so the batch really has to read the parquet -- which is
@@ -199,6 +200,8 @@ fn pipeline(source: &str, target: &str) -> ResolvedPipeline {
         write_mode: Default::default(),
         upsert_key: None,
         upsert_lookback: None,
+        upsert_tiebreak: Vec::new(),
+        stage_for: None,
         dq_uri: None,
         storage: Storage::new(storage_options()),
         source_relation: None,

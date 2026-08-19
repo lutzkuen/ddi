@@ -44,6 +44,19 @@ pub struct PipelineMetrics {
     /// **Each one may have inserted a key alongside an older row instead of replacing it**,
     /// so this is the metric to alert on.
     pub upsert_window_clamped: AtomicU64,
+    /// Total milliseconds spent inside merges, permit already in hand.
+    ///
+    /// A counter rather than an average, so the reader picks the window. Divided by
+    /// `ddi_merges_total` it is the mean merge; its *rate* is merge-seconds per second,
+    /// which is how many merges this pipeline keeps permanently busy.
+    pub merge_millis: AtomicU64,
+    /// Total milliseconds spent waiting for a merge permit, before the merge began.
+    ///
+    /// Kept apart from `merge_millis` because the two have different cures: time inside a
+    /// merge is the target's size, time before one is `max_concurrent_upsert_merges`.
+    pub merge_queue_millis: AtomicU64,
+    /// Merges started. The denominator for both millisecond counters.
+    pub merges: AtomicU64,
 
     /// 1 while this pipeline is streaming, 0 while it is backing off after a failure.
     ///
@@ -186,7 +199,7 @@ impl Metrics {
         let map = self.pipelines.read().unwrap();
         let mut s = String::new();
 
-        let metrics: [MetricSpec; 20] = [
+        let metrics: [MetricSpec; 23] = [
             (
                 "ddi_batches_committed_total",
                 "counter",
@@ -311,6 +324,26 @@ impl Metrics {
                  required; each may have inserted a key alongside an older row.",
                 |m| m.upsert_window_clamped.load(Ordering::Relaxed) as i64,
             ),
+            (
+                "ddi_merges_total",
+                "counter",
+                "Merges started. The denominator for the two millisecond counters below.",
+                |m| m.merges.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_merge_milliseconds_total",
+                "counter",
+                "Time spent inside merges, permit already in hand. Rising against a flat \
+                 ddi_merges_total means the target, not the queue.",
+                |m| m.merge_millis.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_merge_queue_milliseconds_total",
+                "counter",
+                "Time spent waiting for a merge permit. Rising means \
+                 max_concurrent_upsert_merges is the throughput, not the storage.",
+                |m| m.merge_queue_millis.load(Ordering::Relaxed) as i64,
+            ),
         ];
 
         for (name, kind, help, get) in metrics {
@@ -319,6 +352,21 @@ impl Metrics {
                 s.push_str(&format!("{name}{{pipeline=\"{pipeline}\"}} {}\n", get(m)));
             }
         }
+
+        // Process-wide, and therefore unlabelled: the limits in `crate::gate` are shared by
+        // every pipeline, so attributing a queue to one of them would be a fiction. These
+        // are what say whether the fleet is waiting on itself.
+        let gate = crate::gate::current();
+        s.push_str(&format!(
+            "# HELP ddi_merges_in_flight Merges running right now, process-wide.\n\
+             # TYPE ddi_merges_in_flight gauge\n\
+             ddi_merges_in_flight {}\n\
+             # HELP ddi_preflights_in_flight Startup uniqueness checks running right now.\n\
+             # TYPE ddi_preflights_in_flight gauge\n\
+             ddi_preflights_in_flight {}\n",
+            gate.merges_in_flight(),
+            gate.preflights_in_flight(),
+        ));
         s
     }
 }

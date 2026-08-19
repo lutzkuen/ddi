@@ -116,6 +116,7 @@ fn pipeline(declared_source: &str, declared_target: &str) -> ResolvedPipeline {
         app_id: "ddi.orders_stg".into(),
         source_uri: declared_source.into(),
         target_uri: declared_target.into(),
+        lookups: vec![],
         source_relation: Some("hive.bronze.orders_raw".into()),
         target_relation: Some("hive.silver.orders_stg".into()),
         starting_version: 0,
@@ -132,6 +133,8 @@ fn pipeline(declared_source: &str, declared_target: &str) -> ResolvedPipeline {
         write_mode: Default::default(),
         upsert_key: None,
         upsert_lookback: None,
+        upsert_tiebreak: Vec::new(),
+        stage_for: None,
         dq_uri: None,
         storage: Default::default(),
     }

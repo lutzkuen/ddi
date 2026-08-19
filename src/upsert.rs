@@ -354,8 +354,9 @@ impl Window {
 pub struct MergePlan {
     /// The `ON` clause: key equality, bounded by the window.
     pub predicate: Expr,
-    /// `source.<sequence> > target.<sequence>`, the rule that makes a re-delivery of older
-    /// data a no-op rather than a rollback.
+    /// The rule that makes a re-delivery of older data a no-op rather than a rollback:
+    /// `source` is newer than what is stored, compared over the sequence and then each
+    /// tie-breaker. See [`newer_than_stored`].
     pub newer_than_stored: Expr,
     /// Columns a matched row may have overwritten — only those the transform produced. The
     /// rest are the coercer's nulls, and writing them would erase a co-writer's work; see
@@ -368,6 +369,48 @@ pub struct MergePlan {
     pub window: Window,
 }
 
+/// "Newer than the row already stored", over the sequence and then each tie-breaker.
+///
+/// With no tie-breaker this is the original `source.<seq> > target.<seq>`. With them it is
+/// the lexicographic form, which has to be spelled out rather than expressed as a row
+/// comparison because the two sides are different tables:
+///
+/// ```sql
+/// s.seq > t.seq
+///   OR (s.seq = t.seq AND s.a > t.a)
+///   OR (s.seq = t.seq AND s.a = t.a AND s.b > t.b)
+/// ```
+///
+/// The equality prefixes are what make it an ordering rather than three independent tests:
+/// without them a row with an older `seq` but a larger `b` would count as newer and roll the
+/// target back, which is the exact failure this predicate exists to prevent.
+///
+/// This is the half of the tie-breaker that `collapse` cannot do. Collapsing settles ties
+/// *within* one batch; a tie between an arriving row and one already committed is only
+/// visible here, and it is the one that regrouping commits creates.
+fn newer_than_stored(sequence_column: &str, tiebreak: &[String]) -> Expr {
+    let s = |c: &str| col(format!("{SOURCE_ALIAS}.{}", quote(c)));
+    let t = |c: &str| col(format!("{TARGET_ALIAS}.{}", quote(c)));
+
+    let columns: Vec<&str> = std::iter::once(sequence_column)
+        .chain(tiebreak.iter().map(String::as_str))
+        .collect();
+
+    let mut out: Option<Expr> = None;
+    for (i, c) in columns.iter().enumerate() {
+        // Everything before this column decided nothing, so it must be equal for this
+        // column to be the one that decides.
+        let term = columns[..i].iter().fold(s(c).gt(t(c)), |acc, earlier| {
+            s(earlier).eq(t(earlier)).and(acc)
+        });
+        out = Some(match out {
+            Some(prev) => prev.or(term),
+            None => term,
+        });
+    }
+    out.expect("there is always at least the sequence column")
+}
+
 impl MergePlan {
     /// Resolve the plan for one collapsed batch.
     pub fn resolve(
@@ -377,6 +420,7 @@ impl MergePlan {
         sequence_column: &str,
         lookback: Option<Lookback>,
         update_columns: Vec<String>,
+        tiebreak: &[String],
     ) -> Result<Self> {
         let sequence_type = batch
             .schema()
@@ -405,8 +449,7 @@ impl MergePlan {
 
         Ok(Self {
             predicate: window.predicate(key_column, sequence_column, &sequence_type)?,
-            newer_than_stored: col(format!("{SOURCE_ALIAS}.{}", quote(sequence_column)))
-                .gt(col(format!("{TARGET_ALIAS}.{}", quote(sequence_column)))),
+            newer_than_stored: newer_than_stored(sequence_column, tiebreak),
             update_columns,
             insert_columns: batch
                 .schema()
@@ -539,12 +582,16 @@ fn scalar_of_bound(bound: &Bound, dtype: &DataType) -> Option<ScalarValue> {
 /// contains a correction *and* the row it corrects behave the same as the two arriving in
 /// separate batches.
 ///
-/// Ties on the sequence value are broken by position: later in the batch is later in the
-/// source, so it wins.
+/// Ties on the sequence value are broken by `tiebreak`, compared left to right. With no
+/// tie-breaker configured they fall back to position: later in the batch is later in the
+/// source, so it wins. That fallback is correct only while batch boundaries are stable, and
+/// they are not — a retry regroups commits, and `staged_upsert` regroups them by design.
+/// See [`crate::config::PipelineConfig::upsert_tiebreak`].
 pub fn collapse(
     batches: &[RecordBatch],
     key_column: &str,
     sequence_column: &str,
+    tiebreak: &[String],
 ) -> Result<RecordBatch> {
     use deltalake::arrow::array::{StringArray, UInt64Array};
     use deltalake::arrow::compute::{concat_batches, take_record_batch};
@@ -582,24 +629,48 @@ pub fn collapse(
         .map_err(|e| Error::Schema(format!("upsert key {key_column:?} is not comparable: {e}")))?;
     let text = text.as_any().downcast_ref::<StringArray>().expect("utf8");
 
-    // A byte-comparable encoding of the sequence column, so any Delta type orders correctly
-    // without a match arm per type.
-    let converter =
-        RowConverter::new(vec![SortField::new(sequence.data_type().clone())]).map_err(|e| {
-            Error::Schema(format!(
-                "upsert sequence column {sequence_column:?} cannot be ordered: {e}"
-            ))
-        })?;
+    // The sequence first, then each tie-breaker in the order it was declared. A row
+    // encoding compares lexicographically, so this *is* the ordering rule — no per-type
+    // match arm, and no separate code path for the tie.
+    let mut order = vec![sequence.clone()];
+    for c in tiebreak {
+        let v = column(&all, c)?;
+        if v.null_count() > 0 {
+            return Err(Error::Schema(format!(
+                "upsert tie-breaker {c:?} contains {} null(s). It decides which of two rows \
+                 sharing a {sequence_column:?} is the later one, and a null cannot be \
+                 compared — the rows would fall back to whichever the batch happened to \
+                 carry last, which is the instability the tie-breaker exists to remove.",
+                v.null_count()
+            )));
+        }
+        order.push(v);
+    }
+
+    // A byte-comparable encoding, so any Delta type orders correctly without a match arm
+    // per type.
+    let converter = RowConverter::new(
+        order
+            .iter()
+            .map(|c| SortField::new(c.data_type().clone()))
+            .collect(),
+    )
+    .map_err(|e| {
+        Error::Schema(format!(
+            "upsert sequence column {sequence_column:?} cannot be ordered: {e}"
+        ))
+    })?;
     let rows = converter
-        .convert_columns(std::slice::from_ref(&sequence))
+        .convert_columns(&order)
         .map_err(|e| Error::Other(format!("upsert: cannot order the batch: {e}")))?;
 
     let mut newest: HashMap<&str, usize> = HashMap::with_capacity(all.num_rows());
     for i in 0..all.num_rows() {
         let k = text.value(i);
         match newest.get(k) {
-            // `>=`: a tie means two rows share an instant, and the later one in the batch
-            // is the later one in the source.
+            // `>=`: a tie survives every configured tie-breaker, so the two rows are
+            // indistinguishable by any persisted value and the later one in the batch is
+            // taken as the later one in the source.
             Some(&best) if rows.row(i) < rows.row(best) => {}
             _ => {
                 newest.insert(k, i);
@@ -629,6 +700,7 @@ pub async fn preflight(
     key_column: &str,
     sequence_column: &str,
     lookback: Option<Lookback>,
+    tiebreak: &[String],
 ) -> Result<()> {
     let named = |c: &str| -> Result<&DataType> {
         target_schema
@@ -648,6 +720,14 @@ pub async fn preflight(
     };
     named(key_column)?;
     let sequence_type = named(sequence_column)?.clone();
+
+    // The tie-breaker is compared against the *stored* row, not only between rows in hand,
+    // so a column that is not in the target cannot settle anything. Caught here rather than
+    // in the merge, where it would surface as a planner error on the first contested key —
+    // which may be days after the pipeline started.
+    for c in tiebreak {
+        named(c)?;
+    }
 
     // A duration against a counter, or a bare number against a clock, has no defined
     // meaning. Guessing one would silently draw the window at the wrong scale — a
@@ -718,62 +798,74 @@ pub async fn preflight(
 /// than per batch. See [`crate::dedup::Dedup::read`] for the same reasoning applied to the
 /// watermark.
 async fn assert_one_row_per_key(target: &DeltaTable, key_column: &str) -> Result<()> {
-    use deltalake::arrow::array::{Array, StringArray};
-    use futures::TryStreamExt;
-    use std::collections::{HashMap, HashSet};
+    use deltalake::arrow::array::{Array, AsArray, Int64Array};
+    use deltalake::datafusion::prelude::SessionContext;
 
     /// Enough to show the operator the shape of the problem without gathering all of it.
     const EXAMPLES: usize = 3;
 
-    let (_t, mut stream) = target
-        .clone()
-        .scan_table()
-        .with_columns([key_column])
+    // Asked as an aggregate rather than answered by hand, and the reason is memory. The
+    // obvious implementation — stream the key column and keep a `HashSet` of what has been
+    // seen — is O(distinct keys) resident, on every start, for the life of the check. At
+    // ~74 bytes per key that is a third of a gigabyte on a six-million-row target, held by
+    // every upsert pipeline at once, at exactly the moment every other pipeline is also
+    // starting. It is the same shape [`crate::dedup::Dedup::read`] used to have.
+    //
+    // DataFusion's grouped aggregate answers the identical question, exits on the same
+    // three examples, and lives inside the session's memory pool — so it spills rather than
+    // grows, and it is bounded by [`crate::config::Runtime::max_memory`] like everything
+    // else rather than being a special case that budget has to know about.
+    let provider = target
+        .table_provider()
         .await
-        .map_err(Error::Delta)?;
+        .map_err(|e| Error::Other(format!("upsert: cannot read the target's grain: {e}")))?;
 
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut repeated: HashMap<String, usize> = HashMap::new();
-    let mut rows_scanned = 0usize;
+    let ctx = SessionContext::new_with_state(crate::budget::session(target)?);
+    ctx.register_table("target", provider)
+        .map_err(|e| Error::Other(format!("upsert: cannot register the target: {e}")))?;
 
-    'scan: while let Some(batch) = stream.try_next().await.map_err(|e| {
-        Error::Other(format!(
-            "upsert: cannot scan the target to check its grain: {e}"
-        ))
-    })? {
-        rows_scanned += batch.num_rows();
-        let col = column(&batch, key_column)?;
-        let text = cast(&col, &DataType::Utf8).map_err(|e| {
+    let key = quote(key_column);
+    let sql = format!(
+        "SELECT {key} AS k, count(*) AS n FROM target GROUP BY {key} \
+         HAVING count(*) > 1 LIMIT {EXAMPLES}"
+    );
+    let found = ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| Error::Config(format!("upsert key {key_column:?} cannot be grouped: {e}")))?
+        .collect()
+        .await
+        .map_err(|e| {
+            Error::Other(format!(
+                "upsert: cannot scan the target to check its grain: {e}"
+            ))
+        })?;
+
+    let mut examples: Vec<String> = Vec::new();
+    for b in &found {
+        let keys = cast(b.column(0), &DataType::Utf8).map_err(|e| {
             Error::Config(format!("upsert key {key_column:?} is not comparable: {e}"))
         })?;
-        let text = text.as_any().downcast_ref::<StringArray>().expect("utf8");
-
-        for i in 0..batch.num_rows() {
-            let key = if text.is_null(i) {
+        let keys = keys.as_string::<i32>();
+        let counts = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count(*) is int64");
+        for i in 0..b.num_rows() {
+            let k = if keys.is_null(i) {
                 "NULL"
             } else {
-                text.value(i)
+                keys.value(i)
             };
-            if !seen.insert(key.to_string()) {
-                let n = repeated.entry(key.to_string()).or_insert(1);
-                *n += 1;
-                if repeated.len() >= EXAMPLES {
-                    // The answer is already "no"; counting the rest only costs time.
-                    break 'scan;
-                }
-            }
+            examples.push(format!("{k:?} ({} rows)", counts.value(i)));
         }
     }
 
-    if repeated.is_empty() {
-        tracing::debug!(key_column, rows_scanned, "the target holds one row per key");
+    if examples.is_empty() {
+        tracing::debug!(key_column, "the target holds one row per key");
         return Ok(());
     }
-
-    let mut examples: Vec<String> = repeated
-        .into_iter()
-        .map(|(k, n)| format!("{k:?} ({n}+ rows)"))
-        .collect();
     examples.sort();
 
     Err(Error::Config(format!(
@@ -812,6 +904,17 @@ fn quote(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-tie-breaker signature. Most of these tests are about collapsing itself and
+    /// say nothing about ties, so they keep reading as they did; the tie-breaker gets its
+    /// own tests below. An explicit item shadows the glob import above.
+    fn collapse(
+        batches: &[RecordBatch],
+        key_column: &str,
+        sequence_column: &str,
+    ) -> Result<RecordBatch> {
+        super::collapse(batches, key_column, sequence_column, &[])
+    }
     use deltalake::arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
     use deltalake::arrow::datatypes::{Field, Schema, TimeUnit};
     use std::sync::Arc;
@@ -903,6 +1006,199 @@ mod tests {
         assert!(e.contains("48h"), "should show the spelling: {e}");
         assert!(e.contains("10000"), "and the numeric one: {e}");
         assert!(Lookback::parse("-1h").is_err(), "negative is meaningless");
+    }
+
+    /// `order_id, _timestamp, status, kafka_offset` — the shape a tie-breaker needs, which
+    /// the three-column fixture above deliberately does not have.
+    fn batch_with_offset(rows: &[(&str, i64, &str, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Utf8, false),
+            Field::new(
+                "_timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("status", DataType::Utf8, false),
+            Field::new("kafka_offset", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(deltalake::arrow::array::Int64Array::from(
+                    rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn statuses(b: &RecordBatch) -> Vec<String> {
+        let s = b.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        (0..b.num_rows()).map(|i| s.value(i).to_string()).collect()
+    }
+
+    #[test]
+    fn a_tie_is_settled_by_the_tie_breaker_rather_than_by_batch_position() {
+        let tiebreak = vec!["kafka_offset".to_string()];
+
+        // Same instant, and the winner is written *first* — so position would pick the
+        // wrong one. Only the offset can tell them apart.
+        let out = super::collapse(
+            &[batch_with_offset(&[
+                ("a", 10, "shipped", 99),
+                ("a", 10, "placed", 7),
+            ])],
+            "order_id",
+            "_timestamp",
+            &tiebreak,
+        )
+        .unwrap();
+        assert_eq!(statuses(&out), vec!["shipped".to_string()]);
+
+        // Reverse the rows: the answer must not move.
+        let out = super::collapse(
+            &[batch_with_offset(&[
+                ("a", 10, "placed", 7),
+                ("a", 10, "shipped", 99),
+            ])],
+            "order_id",
+            "_timestamp",
+            &tiebreak,
+        )
+        .unwrap();
+        assert_eq!(
+            statuses(&out),
+            vec!["shipped".to_string()],
+            "the winner is a property of the rows, not of the order they arrived in"
+        );
+    }
+
+    #[test]
+    fn without_a_tie_breaker_position_still_decides() {
+        // The pre-existing rule, kept: an unconfigured pipeline behaves exactly as before.
+        let out = super::collapse(
+            &[batch_with_offset(&[
+                ("a", 10, "shipped", 99),
+                ("a", 10, "placed", 7),
+            ])],
+            "order_id",
+            "_timestamp",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(statuses(&out), vec!["placed".to_string()], "last in wins");
+    }
+
+    #[test]
+    fn regrouping_the_same_rows_cannot_change_the_winner() {
+        // The property `staged_upsert` needs and batch position cannot give: an apply worker
+        // accumulates a different number of commits each time it runs, so a winner that
+        // depends on where the batch boundary fell is a winner that changes on replay.
+        let tiebreak = vec!["kafka_offset".to_string()];
+        let rows = [
+            ("a", 10, "one", 5),
+            ("a", 10, "two", 9),
+            ("a", 10, "three", 3),
+        ];
+
+        let whole = super::collapse(
+            &[batch_with_offset(&rows)],
+            "order_id",
+            "_timestamp",
+            &tiebreak,
+        )
+        .unwrap();
+
+        // The same rows, delivered as three separate commits the apply worker grouped.
+        let split = super::collapse(
+            &[
+                batch_with_offset(&rows[0..1]),
+                batch_with_offset(&rows[1..2]),
+                batch_with_offset(&rows[2..3]),
+            ],
+            "order_id",
+            "_timestamp",
+            &tiebreak,
+        )
+        .unwrap();
+
+        assert_eq!(statuses(&whole), vec!["two".to_string()]);
+        assert_eq!(
+            statuses(&split),
+            statuses(&whole),
+            "grouping is not evidence"
+        );
+    }
+
+    #[test]
+    fn a_null_tie_breaker_is_an_error_rather_than_a_silent_fallback() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Utf8, false),
+            Field::new(
+                "_timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("kafka_offset", DataType::Int64, true),
+        ]));
+        let b = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a"])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![10, 10])) as ArrayRef,
+                Arc::new(deltalake::arrow::array::Int64Array::from(vec![
+                    Some(1),
+                    None,
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let e = super::collapse(
+            &[b],
+            "order_id",
+            "_timestamp",
+            &["kafka_offset".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("kafka_offset"), "names the column: {e}");
+        assert!(e.contains("null"), "and what was wrong with it: {e}");
+    }
+
+    #[test]
+    fn the_merge_predicate_compares_lexicographically() {
+        // Collapsing settles ties inside one batch. This is the other half: a tie between an
+        // arriving row and one already committed, which is the case regrouping creates and
+        // which no amount of collapsing can see.
+        let plain = newer_than_stored("_timestamp", &[]).to_string();
+        assert!(
+            !plain.contains("OR"),
+            "with no tie-breaker it stays the original single comparison: {plain}"
+        );
+
+        let lex = newer_than_stored(
+            "_timestamp",
+            &["kafka_partition".to_string(), "kafka_offset".to_string()],
+        )
+        .to_string();
+        assert!(lex.contains("kafka_partition"), "{lex}");
+        assert!(lex.contains("kafka_offset"), "{lex}");
+        // The equality prefixes are what make it an ordering rather than three independent
+        // tests: without them an older row with a larger offset would count as newer.
+        assert!(
+            lex.matches("= t.").count() >= 3,
+            "each term must require every earlier column to be equal: {lex}"
+        );
     }
 
     #[test]

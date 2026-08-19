@@ -303,6 +303,231 @@ impl Rejected {
     }
 }
 
+// ------------------------------------------------------- reading somebody else's files
+
+/// Read a batch as the table says it should be read.
+///
+/// The Delta protocol defines `timestamp` as microseconds, but not every engine writes it
+/// that way: Trino writes milliseconds, into both its checkpoints and the files its
+/// `OPTIMIZE` rewrites. Those files are legal parquet, they are already in the lakehouse in
+/// volume, and the information needed to read them correctly is unambiguous — the table's
+/// own schema says what the column is, and a millisecond value widens to microseconds
+/// without loss. So a physical column that differs from the declared one **in precision
+/// alone** is coerced here rather than refused.
+///
+/// This is not a licence to accept anything, and it is deliberately not a new gate either.
+/// Only a **widening** between two timestamps is touched. Every other difference — a
+/// narrowing, a different logical type, anything at all — is left exactly as it arrived and
+/// handed to the code that handled it before this function existed, so it succeeds or fails
+/// there in the words it always did: a `string` where the table says `timestamp` still
+/// fails, and says so the same way.
+///
+/// # Timezones
+///
+/// Trino's column is `timestamp[ms]` with **no** timezone where delta-rs writes
+/// `timestamp[us, tz=UTC]`. Delta's `timestamp` is UTC-adjusted by definition, so an absent
+/// timezone on a physical column is read as UTC, never as local — Arrow's cast agrees,
+/// treating both as the same count from the epoch and changing only the unit.
+/// `timestamp_ntz` is untouched by this and continues to mean what it means.
+///
+/// Returns the batch unchanged, without copying a single buffer, when the file already
+/// agrees with the table — which is the common case and has to stay free.
+pub fn read_as_declared(batch: RecordBatch, declared: &Schema) -> Result<RecordBatch> {
+    let file = batch.schema();
+    let Some(target) = aligned_schema(declared, &file)? else {
+        return Ok(batch);
+    };
+
+    // safe: false => this must be exact. It is a widening by construction, so nothing can
+    // fail to fit; the flag is here so that if that ever stops being true, it stops loudly.
+    let opts = CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(target.fields())
+        .map(|(col, field)| {
+            if col.data_type() == field.data_type() {
+                Ok(col.clone())
+            } else {
+                cast_with_options(col, field.data_type(), &opts).map_err(|e| {
+                    Error::Schema(format!(
+                        "column {:?}: the file holds {} where the table's schema declares \
+                         {}, and reading it as declared failed: {e}",
+                        field.name(),
+                        col.data_type(),
+                        field.data_type()
+                    ))
+                })
+            }
+        })
+        .collect::<Result<Vec<ArrayRef>>>()?;
+
+    RecordBatch::try_new(target, columns).map_err(|e| {
+        Error::Schema(format!(
+            "could not read the file at the table's declared precision: {e}"
+        ))
+    })
+}
+
+/// The schema `file` must be read as, or `None` when it already agrees with `declared`.
+///
+/// Named columns only: a column the table does not declare keeps whatever the file gave it,
+/// and a column the file does not carry is not invented here.
+fn aligned_schema(declared: &Schema, file: &Schema) -> Result<Option<SchemaRef>> {
+    let mut fields: Vec<Arc<Field>> = Vec::with_capacity(file.fields().len());
+    let mut changed = false;
+
+    for f in file.fields() {
+        let Ok(want) = declared.field_with_name(f.name()) else {
+            fields.push(f.clone());
+            continue;
+        };
+        match widened(want.data_type(), f.data_type())
+            .map_err(|why| Error::Schema(format!("column {:?}: {why}", f.name())))?
+        {
+            Some(dt) => {
+                changed = true;
+                fields.push(Arc::new(f.as_ref().clone().with_data_type(dt)));
+            }
+            None => fields.push(f.clone()),
+        }
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(Schema::new_with_metadata(
+        fields,
+        file.metadata().clone(),
+    ))))
+}
+
+/// The type `have` should be read as to become `want`, or `None` to leave it alone.
+///
+/// `Err` is reserved for the pairs where reading as declared would change what the value
+/// *means* rather than merely how precisely it is written — a timezone that would be
+/// applied or dropped rather than relabelled.
+fn widened(want: &DataType, have: &DataType) -> std::result::Result<Option<DataType>, String> {
+    use DataType::*;
+
+    if want == have {
+        return Ok(None);
+    }
+    match (want, have) {
+        (Timestamp(wu, wtz), Timestamp(hu, htz)) => {
+            // A file finer than the table is not this function's to touch, and refusing it
+            // would be a regression rather than a safeguard. Spark writes Delta timestamps
+            // as INT96, which the parquet reader decodes as `Timestamp(ns)` whatever the
+            // table declares — so on a Spark-written lakehouse this is not the exception,
+            // it is every file. Those values are microsecond-resolution by construction,
+            // they have always been read by casting down to the target, and they still are:
+            // leaving them alone hands them to exactly the code that handled them before.
+            //
+            // Widening is the whole of the argument for coercing here ("a millisecond value
+            // widens to microseconds without loss"), and it does not extend to this.
+            if rank(hu) > rank(wu) {
+                return Ok(None);
+            }
+            match (wtz.as_deref(), htz.as_deref()) {
+                // Declared UTC-adjusted and the file is too, whatever it calls its zone: an
+                // Arrow timezone is a display label on a count from the epoch, so this
+                // changes the unit and nothing else.
+                (Some(_), Some(_)) => Ok(Some(want.clone())),
+                // Declared UTC-adjusted, file naive. This is the Trino case, and reading
+                // the absent zone as UTC is not a guess: Delta's `timestamp` is
+                // UTC-adjusted by definition, so UTC is the only thing it can mean.
+                //
+                // Guarded on the declared zone actually being UTC, because Arrow's cast
+                // from a naive timestamp to a zoned one preserves the *wall clock* rather
+                // than the instant — it subtracts that zone's offset. Against UTC that is
+                // arithmetically nothing; against anything else it would move every value
+                // by hours, silently. Delta never declares another zone, so this arm is
+                // unreachable in practice and exists to keep it that way.
+                (Some(tz), None) if is_utc(tz) => Ok(Some(want.clone())),
+                (Some(tz), None) => Err(format!(
+                    "the file holds {have} with no timezone and the table's schema declares \
+                     {want}. Reading it at the declared type would shift every value by \
+                     {tz:?}'s offset to keep the wall clock, which is not what Delta's \
+                     UTC-adjusted `timestamp` means, so it is refused rather than guessed."
+                )),
+                // Declared `timestamp_ntz`, and the file agrees. Widen the unit only.
+                (None, None) => Ok(Some(want.clone())),
+                // Declared `timestamp_ntz`, file zoned. Dropping a UTC label leaves the same
+                // number and the same meaning. Dropping any other one turns an instant into
+                // a wall clock in a zone nobody named, which is a change of meaning even
+                // though no digit moves — so it stops here.
+                (None, Some(tz)) if is_utc(tz) => Ok(Some(want.clone())),
+                (None, Some(tz)) => Err(format!(
+                    "the file holds {have} but the table's schema declares {want}, which is \
+                     a wall clock. Reading a {tz:?} instant as one would change what the \
+                     value means, so it is refused rather than guessed."
+                )),
+            }
+        }
+        (Struct(want_fields), Struct(have_fields)) => {
+            let mut fields: Vec<Arc<Field>> = Vec::with_capacity(have_fields.len());
+            let mut changed = false;
+            for h in have_fields {
+                let w = want_fields.iter().find(|w| w.name() == h.name());
+                match w
+                    .map(|w| widened(w.data_type(), h.data_type()))
+                    .transpose()?
+                {
+                    Some(Some(dt)) => {
+                        changed = true;
+                        fields.push(Arc::new(h.as_ref().clone().with_data_type(dt)));
+                    }
+                    _ => fields.push(h.clone()),
+                }
+            }
+            Ok(changed.then(|| Struct(fields.into())))
+        }
+        (List(w), List(h)) => Ok(widened_item(w, h)?.map(List)),
+        (LargeList(w), LargeList(h)) => Ok(widened_item(w, h)?.map(LargeList)),
+        (ListView(w), ListView(h)) => Ok(widened_item(w, h)?.map(ListView)),
+        (LargeListView(w), LargeListView(h)) => Ok(widened_item(w, h)?.map(LargeListView)),
+        (FixedSizeList(w, _), FixedSizeList(h, n)) => {
+            Ok(widened_item(w, h)?.map(|f| FixedSizeList(f, *n)))
+        }
+        (Map(w, _), Map(h, sorted)) => Ok(widened_item(w, h)?.map(|f| Map(f, *sorted))),
+        // Everything else is left as it arrived, so a genuine mismatch is reported by
+        // whoever would have reported it before this function existed, in the same words.
+        _ => Ok(None),
+    }
+}
+
+fn widened_item(
+    want: &Arc<Field>,
+    have: &Arc<Field>,
+) -> std::result::Result<Option<Arc<Field>>, String> {
+    Ok(widened(want.data_type(), have.data_type())?
+        .map(|dt| Arc::new(have.as_ref().clone().with_data_type(dt))))
+}
+
+/// How much a unit resolves, so "coarser" and "finer" can be compared.
+fn rank(u: &deltalake::arrow::datatypes::TimeUnit) -> u8 {
+    use deltalake::arrow::datatypes::TimeUnit::*;
+    match u {
+        Second => 0,
+        Millisecond => 1,
+        Microsecond => 2,
+        Nanosecond => 3,
+    }
+}
+
+/// The spellings of UTC that Arrow and the engines writing these files actually use.
+fn is_utc(tz: &str) -> bool {
+    tz.eq_ignore_ascii_case("utc")
+        || tz.eq_ignore_ascii_case("z")
+        || tz == "+00:00"
+        || tz == "-00:00"
+        || tz == "00:00"
+        || tz.eq_ignore_ascii_case("etc/utc")
+}
+
 /// Drop metadata so two schemas compare on structure alone.
 pub fn bare_schema(s: &Schema) -> Schema {
     Schema::new(
@@ -475,6 +700,289 @@ mod quarantine_tests {
         assert!(
             e.contains("without loss"),
             "and uses the strict wording, because that is what happened: {e}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_as_declared_tests {
+    use super::*;
+    use deltalake::arrow::datatypes::TimeUnit;
+
+    fn ts(unit: TimeUnit, tz: Option<&str>) -> DataType {
+        DataType::Timestamp(unit, tz.map(Into::into))
+    }
+
+    /// Delta's `timestamp`, as the kernel spells it in Arrow.
+    fn declared() -> DataType {
+        ts(TimeUnit::Microsecond, Some("UTC"))
+    }
+
+    #[test]
+    fn a_coarser_unit_is_widened_to_the_declared_one() {
+        use TimeUnit::*;
+        // What Trino writes: milliseconds, and no timezone at all.
+        for have in [
+            ts(Millisecond, None),
+            ts(Second, None),
+            ts(Millisecond, Some("UTC")),
+            // An Arrow timezone labels a count from the epoch, so relabelling it moves
+            // nothing — only the unit changes.
+            ts(Millisecond, Some("Europe/Berlin")),
+        ] {
+            assert_eq!(
+                widened(&declared(), &have),
+                Ok(Some(declared())),
+                "{have} should widen"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agreeing_column_asks_for_no_work_at_all() {
+        assert_eq!(widened(&declared(), &declared()), Ok(None));
+        assert_eq!(widened(&DataType::Int64, &DataType::Int64), Ok(None));
+    }
+
+    #[test]
+    fn a_finer_unit_is_left_alone_rather_than_narrowed_here() {
+        // Not a refusal — a hand-off. Spark writes Delta timestamps as INT96, which the
+        // parquet reader decodes as `Timestamp(ns)` however the table is declared, so on a
+        // Spark-written lakehouse this is every file rather than an oddity. Widening is the
+        // only thing this function claims; a narrowing goes to the coercer that has always
+        // done it, and refusing it here would stall those pipelines outright.
+        assert_eq!(
+            widened(&declared(), &ts(TimeUnit::Nanosecond, None)),
+            Ok(None)
+        );
+        assert_eq!(
+            widened(
+                &ts(TimeUnit::Millisecond, None),
+                &ts(TimeUnit::Microsecond, None)
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_declared_zone_that_is_not_utc_never_shifts_a_naive_value() {
+        // Arrow's cast from naive to zoned keeps the *wall clock*, subtracting the zone's
+        // offset — so allowing this would move every value by hours without a word. Delta
+        // never declares such a column; this is the guard that keeps it that way.
+        let e = widened(
+            &ts(TimeUnit::Microsecond, Some("Europe/Berlin")),
+            &ts(TimeUnit::Millisecond, None),
+        )
+        .unwrap_err();
+        assert!(e.contains("shift"), "got: {e}");
+    }
+
+    #[test]
+    fn timestamp_ntz_keeps_meaning_what_it_means() {
+        let ntz = ts(TimeUnit::Microsecond, None);
+        // A naive file widens into a naive column.
+        assert_eq!(
+            widened(&ntz, &ts(TimeUnit::Millisecond, None)),
+            Ok(Some(ntz.clone()))
+        );
+        // A UTC instant read as a wall clock is the same number and the same meaning.
+        assert_eq!(
+            widened(&ntz, &ts(TimeUnit::Millisecond, Some("UTC"))),
+            Ok(Some(ntz.clone()))
+        );
+        // Any other zone is a change of meaning, digits or no digits.
+        let e = widened(&ntz, &ts(TimeUnit::Millisecond, Some("Asia/Tokyo"))).unwrap_err();
+        assert!(e.contains("what the value means"), "got: {e}");
+    }
+
+    #[test]
+    fn anything_that_is_not_two_timestamps_is_left_exactly_as_it_arrived() {
+        // Not this function's to refuse: leaving it alone is what makes the failure land
+        // downstream, in the words it has always been reported in.
+        assert_eq!(widened(&declared(), &DataType::Utf8), Ok(None));
+        assert_eq!(widened(&DataType::Int64, &DataType::Utf8), Ok(None));
+        assert_eq!(widened(&DataType::Int64, &DataType::Int32), Ok(None));
+    }
+
+    #[test]
+    fn a_timestamp_nested_in_a_struct_is_widened_too() {
+        // An OPTIMIZE rewrites every column of the file, including the ones inside a struct.
+        let inner = |unit| {
+            DataType::Struct(
+                vec![
+                    Field::new("at", ts(unit, None), true),
+                    Field::new("who", DataType::Utf8, true),
+                ]
+                .into(),
+            )
+        };
+        let want = DataType::Struct(
+            vec![
+                Field::new("at", declared(), true),
+                Field::new("who", DataType::Utf8, true),
+            ]
+            .into(),
+        );
+        assert_eq!(
+            widened(&want, &inner(TimeUnit::Millisecond)),
+            Ok(Some(DataType::Struct(
+                vec![
+                    Field::new("at", declared(), true),
+                    Field::new("who", DataType::Utf8, true),
+                ]
+                .into()
+            )))
+        );
+    }
+
+    #[test]
+    fn a_timestamp_inside_any_of_the_collection_types_is_widened_too() {
+        // One arm each, because an `OPTIMIZE` rewrites whatever the column happens to be
+        // and a missing arm would silently leave that shape at the wrong precision.
+        let item = |unit, tz| Arc::new(Field::new("element", ts(unit, tz), true));
+        let want = item(TimeUnit::Microsecond, Some("UTC"));
+        let have = item(TimeUnit::Millisecond, None);
+
+        let shapes: Vec<(DataType, DataType)> = vec![
+            (DataType::List(want.clone()), DataType::List(have.clone())),
+            (
+                DataType::LargeList(want.clone()),
+                DataType::LargeList(have.clone()),
+            ),
+            (
+                DataType::ListView(want.clone()),
+                DataType::ListView(have.clone()),
+            ),
+            (
+                DataType::LargeListView(want.clone()),
+                DataType::LargeListView(have.clone()),
+            ),
+            (
+                DataType::FixedSizeList(want.clone(), 2),
+                DataType::FixedSizeList(have.clone(), 2),
+            ),
+        ];
+        for (want, have) in shapes {
+            assert_eq!(
+                widened(&want, &have),
+                Ok(Some(want.clone())),
+                "{have} should widen to {want}"
+            );
+        }
+
+        // A map's timestamp lives in the value half of its entries struct.
+        let entries = |unit, tz| {
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", ts(unit, tz), true),
+                    ]
+                    .into(),
+                ),
+                false,
+            ))
+        };
+        assert_eq!(
+            widened(
+                &DataType::Map(entries(TimeUnit::Microsecond, Some("UTC")), false),
+                &DataType::Map(entries(TimeUnit::Millisecond, None), false),
+            ),
+            Ok(Some(DataType::Map(
+                entries(TimeUnit::Microsecond, Some("UTC")),
+                false
+            )))
+        );
+    }
+
+    #[test]
+    fn a_column_the_table_does_not_declare_is_not_touched() {
+        // A projection hands back a subset, and a file may carry a column the schema has
+        // since dropped. Neither is this function's business.
+        let file = Schema::new(vec![
+            Field::new("kept", ts(TimeUnit::Millisecond, None), true),
+            Field::new("stranger", ts(TimeUnit::Millisecond, None), true),
+        ]);
+        let table = Schema::new(vec![Field::new("kept", declared(), true)]);
+        let got = aligned_schema(&table, &file)
+            .unwrap()
+            .expect("kept changes");
+        assert_eq!(got.field(0).data_type(), &declared());
+        assert_eq!(
+            got.field(1).data_type(),
+            &ts(TimeUnit::Millisecond, None),
+            "a column nobody declared keeps whatever the file gave it"
+        );
+    }
+
+    #[test]
+    fn a_nested_timestamp_widens_its_values_too_not_just_its_type() {
+        // Computing the right nested type is only half of it: Arrow has to be willing to
+        // push the cast down into a struct's children and come back with the values moved.
+        // If it ever stops doing that, the schema tests above would still pass and the data
+        // would be wrong, so this asserts the numbers.
+        use deltalake::arrow::array::{AsArray, StructArray, TimestampMillisecondArray};
+        use deltalake::arrow::datatypes::{Fields, TimestampMicrosecondType};
+
+        let ms = 1_770_000_000_000i64;
+        let child: Fields = vec![Field::new("at", ts(TimeUnit::Millisecond, None), true)].into();
+        let event = StructArray::new(
+            child.clone(),
+            vec![Arc::new(TimestampMillisecondArray::from(vec![ms])) as ArrayRef],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "event",
+                DataType::Struct(child),
+                true,
+            )])),
+            vec![Arc::new(event) as ArrayRef],
+        )
+        .unwrap();
+
+        let table = Schema::new(vec![Field::new(
+            "event",
+            DataType::Struct(vec![Field::new("at", declared(), true)].into()),
+            true,
+        )]);
+        let out = read_as_declared(batch, &table).unwrap();
+        let at = out.column(0).as_struct().column(0);
+        assert_eq!(at.data_type(), &declared());
+        assert_eq!(
+            at.as_primitive::<TimestampMicrosecondType>().value(0),
+            ms * 1000
+        );
+    }
+
+    #[test]
+    fn the_values_widen_by_exactly_a_thousand_and_do_not_move() {
+        use deltalake::arrow::array::{AsArray, TimestampMillisecondArray};
+        use deltalake::arrow::datatypes::TimestampMicrosecondType;
+
+        // 2026-02-02T02:40:00Z, far enough from the epoch that a factor-of-1000 slip lands
+        // in 1970 rather than merely a little early.
+        let ms = 1_770_000_000_000i64;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "at",
+                ts(TimeUnit::Millisecond, None),
+                true,
+            )])),
+            vec![Arc::new(TimestampMillisecondArray::from(vec![ms])) as ArrayRef],
+        )
+        .unwrap();
+
+        let table = Schema::new(vec![Field::new("at", declared(), true)]);
+        let out = read_as_declared(batch, &table).unwrap();
+        assert_eq!(out.column(0).data_type(), &declared());
+        assert_eq!(
+            out.column(0)
+                .as_primitive::<TimestampMicrosecondType>()
+                .value(0),
+            ms * 1000,
+            "the absent timezone means UTC, so the value widens and stays put"
         );
     }
 }

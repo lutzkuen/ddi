@@ -20,6 +20,7 @@ use deltalake::DeltaTable;
 use tracing::debug;
 
 use crate::error::{Error, Result};
+use crate::lookup::LookupSnapshot;
 use crate::upsert::MergePlan;
 
 pub struct Sink {
@@ -29,6 +30,16 @@ pub struct Sink {
     /// still the same one. A dropped-and-recreated source keeps its path but gets a new
     /// id, and nothing else in the log records that.
     source_table_id: Option<String>,
+    /// The exact lookup snapshots that enriched the source batch currently being committed.
+    lookup_snapshots: Vec<LookupCommit>,
+}
+
+#[derive(Clone, Debug)]
+struct LookupCommit {
+    name: String,
+    version: i64,
+    table_id: Option<String>,
+    used_pre_history: bool,
 }
 
 impl Sink {
@@ -37,6 +48,7 @@ impl Sink {
             app_id: app_id.into(),
             target_file_size: NonZeroU64::new(target_file_size),
             source_table_id: None,
+            lookup_snapshots: Vec::new(),
         }
     }
 
@@ -45,31 +57,66 @@ impl Sink {
         self
     }
 
+    /// Replace the provenance recorded with the next target commit.
+    ///
+    /// This is set immediately after snapshots are selected and before any work that could
+    /// write the target. A retry repeats selection from the same source commit timestamp, so
+    /// the metadata also tells an operator exactly which FX version produced a row.
+    pub fn set_lookup_snapshots(&mut self, snapshots: &[LookupSnapshot]) {
+        self.lookup_snapshots = snapshots
+            .iter()
+            .map(|snapshot| LookupCommit {
+                name: snapshot.name.clone(),
+                version: snapshot.version as i64,
+                table_id: snapshot.table_id.clone(),
+                used_pre_history: snapshot.used_pre_history,
+            })
+            .collect();
+    }
+
     /// The commit properties every write of ours carries, whatever its shape.
     fn properties(&self, source_version: i64) -> CommitProperties {
+        let mut metadata = vec![
+            (
+                "ddi.sourceVersion".to_string(),
+                serde_json::Value::from(source_version),
+            ),
+            (
+                "ddi.appId".to_string(),
+                serde_json::Value::from(self.app_id.clone()),
+            ),
+        ];
+        if let Some(id) = &self.source_table_id {
+            metadata.push((
+                "ddi.sourceTableId".to_string(),
+                serde_json::Value::from(id.clone()),
+            ));
+        }
+        for lookup in &self.lookup_snapshots {
+            let prefix = format!("ddi.lookup.{}", lookup.name);
+            metadata.push((
+                format!("{prefix}.version"),
+                serde_json::Value::from(lookup.version),
+            ));
+            if let Some(id) = &lookup.table_id {
+                metadata.push((
+                    format!("{prefix}.tableId"),
+                    serde_json::Value::from(id.clone()),
+                ));
+            }
+            if lookup.used_pre_history {
+                metadata.push((
+                    format!("{prefix}.preHistory"),
+                    serde_json::Value::from(true),
+                ));
+            }
+        }
+
         CommitProperties::default()
             .with_application_transaction(Transaction::new(&self.app_id, source_version))
             // Recorded for operators and for v2's mid-commit cursor work. Purely
             // informational today: the txn action above is the authority.
-            .with_metadata(
-                [
-                    (
-                        "ddi.sourceVersion".to_string(),
-                        serde_json::Value::from(source_version),
-                    ),
-                    (
-                        "ddi.appId".to_string(),
-                        serde_json::Value::from(self.app_id.clone()),
-                    ),
-                ]
-                .into_iter()
-                .chain(self.source_table_id.iter().map(|id| {
-                    (
-                        "ddi.sourceTableId".to_string(),
-                        serde_json::Value::from(id.clone()),
-                    )
-                })),
-            )
+            .with_metadata(metadata)
     }
 
     /// Append `batches` and record `source_version` in a `txn` action, atomically.
@@ -144,7 +191,8 @@ impl Sink {
         let rows = batch.num_rows();
         let target_schema = batch.schema();
 
-        let ctx = SessionContext::new();
+        let session = std::sync::Arc::new(crate::budget::session(&table)?);
+        let ctx = SessionContext::new_with_state((*session).clone());
         let source = ctx
             .read_batch(batch)
             .map_err(|e| Error::Other(format!("upsert: cannot register the batch: {e}")))?;
@@ -168,6 +216,10 @@ impl Sink {
             // `t.key = s.key` into a static key range and skip target files by it. The
             // batch is an in-memory table, so re-planning it is cheap.
             .with_streaming(false)
+            // The merge reads the target and joins it against the batch, and both of those
+            // are DataFusion's to hold. Giving it the pipeline's share is what makes a
+            // merge window that turned out wider than expected spill instead of OOM.
+            .with_session_state(session)
             .with_commit_properties(self.properties(source_version));
 
         merge = merge
@@ -198,6 +250,10 @@ impl Sink {
             committed: table.version() != before,
             window_bounded: plan.window.is_bounded(),
             window_clamped: plan.window.clamped,
+            // The caller owns both: the wait happened before this sink was entered, and the
+            // retry loop that may run this method more than once is out there too.
+            queue_millis: 0,
+            merge_millis: 0,
         };
 
         if stats.committed {
@@ -246,6 +302,15 @@ pub struct UpsertStats {
     /// True when `upsert_lookback` held the window above what completeness asked for, so a
     /// key may have been inserted alongside an older row instead of replacing it.
     pub window_clamped: bool,
+    /// Milliseconds spent waiting for a merge permit, before any work began.
+    ///
+    /// Filled in by the caller rather than here: the wait happens outside this sink, and a
+    /// sink that timed its own queue would be reporting a wait it never did.
+    pub queue_millis: u64,
+    /// Milliseconds spent merging, permit in hand, including any replanned attempts. Those
+    /// attempts really were spent, so counting only the last one would understate what the
+    /// target cost.
+    pub merge_millis: u64,
 }
 
 impl UpsertStats {

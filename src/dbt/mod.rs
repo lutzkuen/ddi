@@ -121,11 +121,12 @@ impl Node {
     ///       ddi_timestamp: event_ts
     ///       ddi_key: order_id
     /// ```
+    pub fn meta_value(&self, key: &str) -> Option<&serde_json::Value> {
+        self.meta.get(key).or_else(|| self.config.meta.get(key))
+    }
+
     pub fn meta_str(&self, key: &str) -> Option<&str> {
-        self.meta
-            .get(key)
-            .or_else(|| self.config.meta.get(key))
-            .and_then(|v| v.as_str())
+        self.meta_value(key).and_then(|v| v.as_str())
     }
 }
 

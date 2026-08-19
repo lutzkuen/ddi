@@ -138,7 +138,7 @@ directory*. Every accepted feature preserves it.
 | unnest / explode | no | yes | **supported**, in Trino's spelling or DataFusion's |
 | intra-row array agg | no | yes | **supported** (`array_sum` etc.) |
 | upsert on a key | no (the *target* holds it) | no | **supported**, opt-in — see [Upserting](#upserting) |
-| lookup join vs. pinned snapshot | no | yes | v2 |
+| pinned Delta lookup via `LEFT JOIN` | no | yes | **supported**, declared and version-pinned per source commit |
 | `GROUP BY` aggregation | **yes** | **no** | **rejected — different product** |
 
 `GROUP BY` is rejected at config-load time, not at runtime, and the error names the
@@ -186,7 +186,8 @@ FROM (SELECT order_id, unnest(line_items) AS li FROM source)
 The rewrite runs **before** validation, so the two forms cannot diverge: whatever
 `ddi validate` accepts is what executes. `UNNEST` of a column of the same row is not a join —
 there is no second table, nothing to pin and no cross-row state — so it is not caught by the
-join rejection. A join against another table still is.
+join rejection. An arbitrary join against another table still is; the constrained pinned-lookup
+exception is documented below.
 
 #### When the array is inside a JSON blob
 
@@ -236,40 +237,55 @@ FROM source
 Also `array_min` and `array_avg`. For real Rust, implement the `Transform` trait — an escape
 hatch that does not require forking.
 
-### Lookups against a second table
+### Pinned Delta lookups
 
-Not in v1. A transform may read exactly one table — the batch it was handed, registered as
-`source` — and anything else is rejected at config load:
+A transformation still has exactly one streaming input, registered as `source`. It may also
+enrich that batch from a small, declared Delta lookup using only a direct `LEFT JOIN … ON`:
 
+```toml
+[[pipeline]]
+name = "order_items"
+source_uri = "abfss://lake@acct/.../order_created"
+target_uri = "abfss://lake@acct/.../order_items"
+transform_sql = """
+SELECT o.order_id, o.currency, fx_rates.exchange_rate
+FROM source AS o
+LEFT JOIN fx_rates
+  ON fx_rates.currency = o.currency
+ AND fx_rates.starting_date = o.order_date
+"""
+
+[[pipeline.lookups]]
+name = "fx_rates"                         # SQL relation name
+uri = "abfss://lake@acct/.../fx_rates"
 ```
-the table "products" is not supported: a transform may only read the batch it was given,
-which is registered as "source". Reading a second table means joining against something
-that can change between batches, which makes the output non-reproducible. Instead:
-denormalise upstream, or enrich downstream; pinned-snapshot lookup joins are planned for v2.
-```
 
-This covers `JOIN`, a comma-separated `FROM` list, a second table inside a derived table,
-and a second table inside a `WHERE ... IN (SELECT ...)` subquery.
+This is deliberately not a general second-source join. Inner/right/full/cross joins,
+comma joins, lookup subqueries (`IN`, `EXISTS`, scalar subqueries), a lookup as the primary
+`FROM`, and unbounded `ON true` predicates are rejected. The predicate must contain an equality
+between a lookup-qualified field and a source- or source-derived-CTE field. The lookup itself
+must have a uniqueness/non-overlap data contract for its key; SQL alone cannot prove that a
+join is one-to-one.
 
-The problem is not the join, it is the *pinning*. This tool's entire restart story is that a
-source version number reproduces a batch exactly. Join to `products` unpinned and the same
-source version yields different output depending on when it is replayed, so a restart stops
-being a no-op and exactly-once quietly becomes exactly-once-modulo-the-dimension.
+Before processing a source data commit, ddi selects the newest lookup Delta version whose log
+object timestamp is **strictly before** the source log object's millisecond. It records the
+selected lookup version and Delta table id in the same target commit as the source `txn` offset.
+The strict boundary means that a lookup commit appearing later in the same millisecond cannot
+change a failed batch's retry. If raw source history predates a lookup table, a
+`pre_history_version` must be explicitly approved and configured; ddi otherwise stops rather
+than silently applying a future lookup snapshot. Source and lookup log objects must use a
+comparable, stable object-store `last_modified` clock (normally the same lake/account), which is
+the clock Delta itself uses for timestamp travel.
 
-Until v2, three options that keep the property:
+The table id is checked at startup and again for every selected snapshot. Dropping/recreating
+or relocating a lookup at the same URI is therefore a hard error: choose a new app id and
+rebuild the target rather than mixing two dimensions in one stream. Keep both the lookup's log
+and data files through the maximum source replay horizon. A lookup correction only affects
+newly processed source commits; replay/rebuild is the explicit way to re-enrich old output.
 
-- **Denormalise upstream** — resolve the product attributes in whatever writes bronze. Best
-  when the attributes are part of the event's meaning at the time it happened (the price
-  actually charged).
-- **Enrich downstream** — let `ddi` land silver at source grain, and join to the dimension in
-  a downstream view or job. Best when you want current attributes, not historical ones.
-- **Inline it** — for a genuinely static handful of values, a `CASE` expression in the
-  transform is stateless and reproducible.
-
-v2's shape is to pin the dimension at a specific version and record that version in the
-commit alongside the source offset, so a replay resolves the same rows it did the first
-time. The `txn` action already carries the source offset; a pinned lookup needs the same
-treatment for every table it reads.
+Use this for compact, keyed relations such as daily FX rates. It is not a substitute for
+joining a many-gigabyte historical RRP/COGS table into every 5,000-row source batch; materialize
+a compact lookup with a documented key first, or enrich downstream.
 
 ## Running alongside dbt
 
@@ -735,6 +751,77 @@ SELECT * FROM silver.orders
 QUALIFY row_number() OVER (PARTITION BY order_id ORDER BY _timestamp DESC) = 1
 ```
 
+### Staged upserts
+
+A direct upsert pays for the target on every batch. That is the right trade when a batch
+touches a few files and the wrong one for a high-cardinality current-state stream: 5,000 rows
+carrying random keys touch *every* file, so the merge rewrites the whole state to apply a
+handful of changes. Nothing about the batch makes that cheaper — not better statistics, not
+sorting, not `upsert_lookback`, and not a smaller batch, which only multiplies a fixed cost
+by more batches.
+
+The cost is per *merge*, so the fix is fewer merges:
+
+```
+source ──▶ ingest ──▶ silver.style__ddi_stage ──▶ apply ──▶ silver.style
+           append,                                merge,
+           per commit                             per accumulation
+```
+
+```toml
+write_mode             = "staged_upsert"
+dedup_timestamp        = "_timestamp"
+upsert_key             = "style_id"
+apply_max_bytes        = "512MB"   # merge once per this much staged data
+apply_max_latency_secs = 900       # ...or this often, whichever comes first
+```
+
+or in dbt, `meta: {ddi_write_mode: staged_upsert, ddi_apply_max_bytes: 512MB}`.
+
+One configured pipeline becomes **two running ones**, `style__ingest` and `style__apply`,
+each with its own `txn` offset, its own metrics and its own backoff. That is the whole
+implementation: everything the two halves need — exactly-once, cursor resume, the merge
+window, the data-quality table — already worked for one source and one target, and splitting
+at config time means none of it had to change. The staging table is created from the target's
+schema if it is not there; it is the only table `ddi` ever creates, because it is the only one
+that is its own.
+
+Read the two halves' lag separately: `ddi_source_lag_versions{pipeline="style__ingest"}` is
+how far behind the raw stream is, and `{pipeline="style__apply"}` is how much has been staged
+but not yet merged.
+
+#### What it costs
+
+**The target is eventually consistent**, by up to `apply_max_latency_secs`. That is the
+bargain rather than a defect, and it is the number to publish to whoever reads the table.
+
+**The transform must produce every target column.** A staged row is written now and merged
+later, and by then a null cannot be told apart from a column the transform never mentioned —
+so merging it would erase whatever the target already held there. Plain `upsert` carries that
+distinction with the batch and can leave such columns alone; staging cannot, so it refuses
+rather than guessing. If something else owns a column of your target, use `upsert`.
+
+**Ties need a tie-breaker.** The apply half accumulates a different number of commits each
+time it runs, so "later in the batch" stops being a stable rule — see
+[`upsert_tiebreak`](#upsert_tiebreak).
+
+The staging table is private to the pair that owns it: its rows are appended by one half and
+consumed by the other, so `ddi validate` holds back any third pipeline that reads or writes
+one.
+
+### `upsert_tiebreak`
+
+Which row wins when two share a `dedup_timestamp`. Compared after the timestamp, left to
+right, against rows in hand *and* against the row already stored:
+
+```toml
+upsert_tiebreak = ["kafka_partition", "kafka_offset"]
+```
+
+Unset, a tie is settled by position in the batch — later in the batch is later in the source.
+That is true exactly as long as batch boundaries are, which under `staged_upsert` they are
+not. Every column named must be in the target, and none of them may be null.
+
 ### JSON payloads
 
 Bronze often carries a payload as text, so Trino's JSON functions are implemented here
@@ -781,6 +868,79 @@ whereas a gap is silent and permanent.
 
 `OPTIMIZE` on the target is not mistaken for a rebuild: its `Remove` actions carry
 `dataChange: false`.
+
+## Memory
+
+```toml
+[runtime]
+max_memory = "6GB"      # optional; the container's own limit is used when unset
+```
+
+One number for the process, divided by the pipelines running in it — because they all start
+at once, and it is that simultaneity which turns a survivable allocation into an OOM. When
+`max_memory` is unset the cgroup's limit is read and three quarters of it used; when there is
+no limit either, nothing is bounded, which is the right answer on a workstation.
+
+It covers two things, and they are not the same mechanism:
+
+- **DataFusion**, through the memory pool every session `ddi` builds — the SQL transform, the
+  merge, the target scans, the upsert's grain check. Those consumers spill rather than grow.
+- **The batch**, which matters more. `max_bytes_per_batch` counts *compressed parquet bytes*,
+  and what the process holds is that decoded into Arrow for every file at once. Measured on a
+  realistic table the gap is about 5×, so a 256 MB setting can be 1.4 GB resident — per
+  pipeline, on the first batch after a cold start, when every pipeline is furthest behind and
+  asking for the most.
+
+  So a batch stops accumulating when what it has *already decoded* would fill its share. The
+  ratio is measured after every batch rather than assumed, because a constant chosen here is
+  a constant to get wrong later.
+
+Measured, on 90 MiB of parquet in 8 files:
+
+| `max_memory` | batches | peak RSS |
+|---|---|---|
+| unset | 1 | +413 MiB |
+| 512 MiB | 4 | +119 MiB |
+| 256 MiB | 8 | +89 MiB |
+
+The floor is one commit: a commit that fits `max_bytes_per_batch` is always delivered, however
+tight the budget. A budget makes batches smaller and more numerous; it never refuses one, and
+it never stalls a pipeline that worked before it was set.
+
+### What memory cannot bound
+
+`max_memory` bounds what one pipeline holds. It is the right bound for the work a pipeline
+does to *itself* and the wrong one for the work it does to a **target**, because the target
+work is where pipelines stop being independent: a merge reads back a slice of the table it
+writes, and the startup uniqueness check reads all of it. Neither is proportional to the
+batch, so neither gets smaller when batches do — and dividing the budget more finely only
+makes each pipeline spill sooner while the same number of scans run at once.
+
+```toml
+[runtime]
+max_concurrent_upsert_merges     = 4   # optional; unset means unbounded
+max_concurrent_upsert_preflights = 8
+```
+
+Both are unset by default, which is the behaviour there has always been: a limit chosen here
+would be a limit chosen without knowing the fleet. They are separate because they overlap in
+time but not in kind — every upsert pipeline preflights once, at startup, all at the same
+instant, while merges happen forever at whatever rate commits arrive. One limit covering both
+would have to be set for the startup burst and would throttle steady state for the rest of
+the run.
+
+Waiting is measured, because from outside a queue and a stall look identical. Watch
+`ddi_merge_queue_milliseconds_total` against `ddi_merge_milliseconds_total`: queue time rising
+while merge time stays flat means the limit, not the storage, is the throughput.
+
+`tests/memory_shape.rs` is the probe those numbers come from. It is `#[ignore]`d because it
+builds multi-million-row tables, and it is in the repository because every memory incident
+here was first diagnosed by correlation from outside the process, and twice that was wrong:
+
+```bash
+cargo test --profile release-lean --test memory_shape -- --ignored --nocapture --test-threads=1
+ROWS=6000000 BUDGET_MB=512 cargo test --profile release-lean --test memory_shape -- --ignored --nocapture
+```
 
 ## Storage
 
@@ -838,6 +998,73 @@ the source replays the whole table downstream.
 - `fail` (default) — error on any `dataChange` `Remove`.
 - `skip_change_commits` — skip those commits entirely.
 - `ignore_changes` — emit their `Add`s; rewritten rows are duplicated downstream.
+
+## Tables other engines also write
+
+`ddi`'s premise is that it can be pointed at a lakehouse other tools write, so it has to
+read what those tools leave behind. The one that shows up in practice is precision.
+
+The Delta protocol defines `timestamp` as **microseconds**. Trino writes **milliseconds** —
+into the data files its `OPTIMIZE` rewrites, and into the `stats_parsed` of the checkpoints
+it leaves behind. Nothing else in a typical estate objects: an append-only writer never
+reads the data back, and Trino reads what Trino wrote. A spec-enforcing reader is the first
+thing to notice, and without care it is the only thing that stops.
+
+So `ddi` is liberal in what it accepts, along one axis only:
+
+> **The table's Delta schema is authoritative. A physical column that differs from it in
+> precision alone is coerced on read.**
+
+- A `timestamp[ms]` data file is read as the declared `timestamp[us, tz=UTC]`. A column
+  written with no timezone at all is read as UTC, because that is what Delta's
+  UTC-adjusted `timestamp` means — never as local. `timestamp_ntz` keeps meaning what it
+  means.
+- A checkpoint whose `stats_parsed` carries types the protocol does not have no longer
+  decides whether the table opens. `ddi` replays the commit log instead and says so once,
+  naming the engine that wrote it:
+
+  ```text
+  WARN "abfss://…/erp_variant_article_changed" carries a checkpoint written by
+       parquet-mr-trino version 480-e.5 whose stats_parsed types do not match the table
+       schema; replaying the log instead. This is usually an OPTIMIZE from another engine.
+  ```
+
+  Opening is slower — every commit since version 0 is read — and the snapshot is identical.
+  Nothing is lost: a checkpoint's only exclusive content is `stats_parsed`, a pre-decoded
+  copy of statistics `ddi` never reads. [`src/stats.rs`](src/stats.rs) parses the `stats`
+  JSON string, which the commits carry verbatim.
+
+  Only the checkpoints that were *already there* are stepped over. A table opened this way
+  stays fully writable, and the checkpoint delta-rs writes on its way through is well-typed
+  and visible — so the table heals itself, and the slow open stops being needed. Where log
+  retention has already removed the commits the bad checkpoint stands in for, there is
+  nothing left to replay; `ddi` says exactly that rather than failing obscurely.
+
+  A table compacted more than once has *older* checkpoints too, and the newest being
+  readable says nothing about them. `ddi` never parses those, because the only questions it
+  asks about an earlier version — what the schema was, which version a timestamp lands on —
+  are answered from the commits alone, and it asks them without requesting the file list
+  that would make delta-rs read a checkpoint. That is also why it is fast: those calls used
+  to rebuild the source's entire file set once per version.
+
+  A compaction can also land *while a merge is running*. It commits and checkpoints
+  together, so an upsert that loses the race meets that checkpoint during conflict
+  resolution — above the version its handle was opened at, and so read rather than skipped.
+  Nothing is committed when that happens, so it is replanned against a freshly opened target
+  exactly like the commit conflict it is. None of this depends on the target's own files:
+  it happens with every one of them at the declared precision.
+
+Only a **widening** between two timestamps is performed, and nothing else is newly refused
+either. A file *finer* than the schema — Spark writes Delta timestamps as INT96, which
+decodes as nanoseconds however the table is declared — is passed through to the coercer that
+has always narrowed it. A `string` where the schema says `timestamp` is not a precision
+difference at all, and fails exactly as it always has. The point of the rule is to narrow
+what is refused, not to refuse more.
+
+If you hit the checkpoint failure on a build that predates this, deleting the offending
+`*.checkpoint.parquet` and `_last_checkpoint` forces the same log replay by hand, and is
+safe while the JSON commits are still inside log retention. It does not help where
+`OPTIMIZE` also rewrote data files — but it tells the two failures apart quickly.
 
 ## Fan-out
 
@@ -945,6 +1172,11 @@ reading: it never updates a row and never reads the target back.
 | `ddi_upsert_rows_updated_total` | counter | Stored rows replaced by a newer delivery of the same key. |
 | `ddi_upsert_rows_inserted_total` | counter | Rows inserted for a key the target did not hold. |
 | `ddi_upsert_target_files_scanned_total` | counter | Target files a merge had to open. |
+| `ddi_merges_total` | counter | Merges started. The denominator for the two below. |
+| `ddi_merge_milliseconds_total` | counter | Time inside merges, permit in hand. |
+| `ddi_merge_queue_milliseconds_total` | counter | Time waiting for a merge permit — rising means `max_concurrent_upsert_merges` is the throughput, not the storage. |
+| `ddi_merges_in_flight` | gauge | Merges running right now, process-wide (no `pipeline` label). |
+| `ddi_preflights_in_flight` | gauge | Startup uniqueness checks running right now, process-wide. |
 | `ddi_upsert_window_unbounded_total` | counter | Merges that read the whole target because its statistics could not bound the window. |
 | `ddi_upsert_window_clamped_total` | counter | Merges where `upsert_lookback` held the window above what completeness required. |
 
