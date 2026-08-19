@@ -508,9 +508,27 @@ impl Pipeline {
             .to_vec();
 
         let mut out = Vec::new();
-        for add in &batch.files {
+        for (i, add) in batch.files.iter().enumerate() {
             let path = StorePath::parse(&add.path)
                 .map_err(|e| Error::Other(format!("bad file path {:?}: {e}", add.path)))?;
+            // Two of the three calls below reach storage — the metadata load and the row
+            // group fetches; `build` only reshapes what the first already read — and both
+            // fail in one of two ways that need opposite answers: something transient,
+            // which the supervisor's backoff clears, or a file the store does not have,
+            // which no amount of waiting brings back. The second used to arrive here as a
+            // generic transform error and retry until somebody read the logs. `build` goes
+            // through the same classifier for uniformity; its NotFound arm never fires.
+            let unreadable = |verb: &str, e: deltalake::parquet::errors::ParquetError| {
+                if is_not_found(&e) {
+                    Error::SourceFileVacuumed {
+                        source_uri: self.cfg.source_uri.clone(),
+                        version: batch.version_of(i),
+                        path: add.path.clone(),
+                    }
+                } else {
+                    Error::Transform(format!("{verb} {:?}: {e}", add.path))
+                }
+            };
             // Supply the size from the Add action rather than letting the reader probe
             // for it. The probe is a suffix range request ("last N bytes"), which Azure
             // Blob Storage does not implement — on local disk it works, so this only
@@ -519,14 +537,17 @@ impl Pipeline {
                 .with_file_size(add.size.max(0) as u64);
             let stream = ParquetRecordBatchStreamBuilder::new(reader)
                 .await
-                .map_err(|e| Error::Transform(format!("cannot open {:?}: {e}", add.path)))?
+                .map_err(|e| unreadable("cannot open", e))?
                 .build()
-                .map_err(|e| Error::Transform(format!("cannot read {:?}: {e}", add.path)))?;
+                .map_err(|e| unreadable("cannot read", e))?;
 
+            // Deleted between the footer read and here, or deleted while a later row group
+            // was still outstanding: the store re-opens the object per range request, so a
+            // vacuum landing mid-file surfaces at this call rather than the one above.
             let batches: Vec<RecordBatch> = stream
                 .try_collect()
                 .await
-                .map_err(|e| Error::Transform(format!("read failed for {:?}: {e}", add.path)))?;
+                .map_err(|e| unreadable("read failed for", e))?;
 
             for b in batches {
                 out.push(if partition_cols.is_empty() {
@@ -574,6 +595,29 @@ fn is_commit_conflict(e: &Error) -> bool {
                 | TransactionError::MaxCommitAttempts(_),
         })
     )
+}
+
+/// Did this fail because the object store does not have the file?
+///
+/// The typed cause survives the read: `object_store` is what every backend funnels its
+/// misses through — `LocalFileSystem` maps `ErrorKind::NotFound`, and the Azure client maps
+/// a `404 BlobNotFound` — and the parquet reader boxes that error whole into
+/// `ParquetError::External` rather than stringifying it. So walking `source()` and asking
+/// each link whether it is an `object_store::Error::NotFound` reads the real answer instead
+/// of grepping a message for "not found", which would be a different sentence per cloud and
+/// would quietly start matching row-group text the day one of them changed.
+///
+/// The walk, rather than one `downcast_ref`, because a backend is free to wrap its miss in
+/// `Generic { source }` on the way out.
+fn is_not_found(e: &(dyn std::error::Error + 'static)) -> bool {
+    use deltalake::logstore::object_store::Error as ObjectStoreError;
+
+    std::iter::successors(Some(e), |e| e.source()).any(|e| {
+        matches!(
+            e.downcast_ref::<ObjectStoreError>(),
+            Some(ObjectStoreError::NotFound { .. })
+        )
+    })
 }
 
 /// A Delta table's own identity, which survives nothing but the table itself.

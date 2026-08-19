@@ -309,6 +309,11 @@ history.
 - **Two processes with the same `app_id` on one target** is a config error, not a
   supported mode. Delta's optimistic concurrency keeps it correct, but it wastes work.
 - **Deletion vectors in the source** are an explicit error, never a silent wrong result.
+- **`delta.deletedFileRetentionDuration` on each source must exceed your worst backlog.**
+  `OPTIMIZE` retires a file and `VACUUM` deletes it; a pipeline still behind the commit that
+  added it then has a commit it cannot read, and no way to rebuild that batch from the
+  compacted replacements. The default is seven days, and a pipeline you excluded on purpose
+  counts as behind. See below.
 
 ### Bad rows, and streams that break
 
@@ -337,6 +342,29 @@ peers keep running, and `ddi_pipeline_up` says which of them are healthy. That m
 worth turning on: `--metrics-addr 127.0.0.1:9100`, then alert on `ddi_pipeline_up == 0 for
 10m` and `increase(ddi_batches_fully_rejected_total[15m]) > 0` — the second catches an
 upstream type change, where every row is quarantined and the target silently stops growing.
+
+### A source file that was vacuumed before you read it
+
+The one failure backing off does not fix. `ddi` names the relation, the version and the
+file, and raises `ddi_source_file_vacuumed` — alert on `== 1`. Unlike `ddi_pipeline_up`,
+it is cleared only by a step that succeeds, so it does not flap and an alert on it does not
+reset when the stream fails a second way.
+
+It keeps retrying, which is deliberate: restoring the object is a real fix and the pipeline
+resumes by itself once you do. ADLS soft delete and S3 versioning are both opt-in and
+neither is retroactive, so whether that option exists was decided before the `VACUUM` ran.
+If it does, hold `VACUUM` off the source until the backlog is gone, and expect to restore
+every retired file the pipeline still has to read — it names them one per attempt.
+
+The alternative is to rebuild the target from a current snapshot of the source, and it
+takes more than an overwrite: `starting_version` is only consulted when the target holds no
+`txn` action for this `app_id`, and a `txn` action survives an overwrite. Recreate the
+table, or use a new `app_id`. `ddi` will not choose for you — an append target and an
+upsert target need different rebuilds, and something downstream may have read the old one.
+
+What it will not do is skip the commit or read the compacted replacements instead. Those
+files hold the missing rows, but they hold already-consumed rows too, and nothing in a
+compaction says which are which. Prevention is the source's retention setting, above.
 
 ### Deletes and updates upstream
 
@@ -403,6 +431,8 @@ column in silver, an upsert will not blank it.
 | `the target already holds ... more than once` | Switching to `upsert` on a table that accumulated duplicates while append-only; collapse it to one row per key first |
 | `upserts into ... which pipeline ... reads as its source` | A downstream pipeline cannot read an upserted target unless it also upserts on the same key with `ignore_changes` |
 | `write_mode = "upsert" needs upsert_key` | Set `ddi_key` on the model (or `upsert_key` in the TOML) |
+| `adds ... and the object store no longer has that file` | The source vacuumed a file this pipeline had not read yet; restore the file, or rebuild the target and resume past that version |
+| `cannot resume from ...` | The source's *log* no longer reaches that version — `delta.logRetentionDuration` (30 days by default), not the file retention above; recreate the target or use a new `app_id`, with `starting_version` past it |
 
 Logs are quiet by default. `RUST_LOG=debug,delta_delta_ingest=trace` for detail.
 

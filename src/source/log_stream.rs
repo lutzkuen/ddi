@@ -63,6 +63,13 @@ pub struct LogBatch {
     pub end: StreamCursor,
     /// The `dataChange: true` `Add` actions to read, in commit then log order.
     pub files: Vec<Add>,
+    /// The source version that added each entry of `files`, positionally.
+    ///
+    /// Built with `files` in one `unzip`, so the two cannot drift apart. A batch spans as
+    /// many commits as its byte and file limits allow, so this is the only thing that can
+    /// say which commit a given file came from — `through_version` is the last of them,
+    /// not the one that matters when a single file turns out to be unreadable.
+    pub file_versions: Vec<Version>,
     /// Schema as of `end`'s last consumed version.
     pub schema: Arc<StructType>,
     /// Highest source version fully represented in `files`.
@@ -72,6 +79,17 @@ pub struct LogBatch {
 impl LogBatch {
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
+    }
+
+    /// The source version that added `files[index]`.
+    ///
+    /// Falls back to `through_version` rather than panicking: this exists to make an error
+    /// message specific, and an error about an error is the worst way to learn that.
+    pub fn version_of(&self, index: usize) -> Version {
+        self.file_versions
+            .get(index)
+            .copied()
+            .unwrap_or(self.through_version)
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -189,7 +207,9 @@ impl LogStreamBuilder {
         }
 
         let start = self.cursor;
-        let mut files: Vec<Add> = Vec::new();
+        // Each file is carried with the version that added it, so a batch spanning several
+        // commits can still say which one any single file came from.
+        let mut files: Vec<(Version, Add)> = Vec::new();
         let mut bytes: u64 = 0;
         let mut cursor = self.cursor;
         let mut through: Option<Version> = None;
@@ -257,7 +277,7 @@ impl LogStreamBuilder {
             let fits_bytes = bytes + commit_bytes <= self.max_bytes_per_batch;
 
             if fits_files && fits_bytes {
-                files.extend_from_slice(remaining);
+                files.extend(remaining.iter().map(|a| (version, a.clone())));
                 bytes += commit_bytes;
                 through = Some(version);
                 cursor = cursor.next_version();
@@ -296,7 +316,7 @@ impl LogStreamBuilder {
                 take += 1;
             }
             let take = take.max(1).min(remaining.len());
-            files.extend_from_slice(&remaining[..take]);
+            files.extend(remaining[..take].iter().map(|a| (version, a.clone())));
             // (bytes not re-read: we break out of the loop immediately below)
             cursor = cursor.advanced_by(take);
             through = Some(version);
@@ -310,6 +330,7 @@ impl LogStreamBuilder {
             return Ok(None);
         }
 
+        let (file_versions, files): (Vec<Version>, Vec<Add>) = files.into_iter().unzip();
         let through_version = through.unwrap_or(start.version);
         let schema = self.schema_at(through_version).await?;
         self.cursor = cursor;
@@ -318,6 +339,7 @@ impl LogStreamBuilder {
             start,
             end: cursor,
             files,
+            file_versions,
             schema,
             through_version,
         }))

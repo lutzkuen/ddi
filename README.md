@@ -551,15 +551,79 @@ Because the process no longer exits when a stream dies, metrics stop being optio
 | `ddi_pipeline_config_valid` | 0 for a pipeline held back at load. `up = 0` is a stream that stopped; this is one that never started. |
 | `ddi_pipeline_seconds_since_progress` | Staleness. Still moves when a pipeline fails while *opening*, which lag does not. |
 | `ddi_pipeline_restarts_total` | Reopens after a failure. Climbing steadily = stuck on something a human must fix. |
+| `ddi_source_file_vacuumed` | 1 while a stream is stuck on a source file that no longer exists. The one failure waiting does not fix. |
 | `ddi_rows_rejected_total` | Rows sent to the data-quality table. |
 | `ddi_batches_fully_rejected_total` | Batches where *every* row was rejected. |
 
-Alert on `ddi_pipeline_up == 0 for 10m` and on
-`increase(ddi_batches_fully_rejected_total[15m]) > 0`. The second one matters more than it
+Alert on `ddi_pipeline_up == 0 for 10m`, on `ddi_source_file_vacuumed == 1`, and on
+`increase(ddi_batches_fully_rejected_total[15m]) > 0`. The last one matters more than it
 looks: there is no bad-row threshold, so an upstream type change quarantines the whole batch
 and the target simply stops growing — no error, no lag, nothing else to notice it by.
 `ddi_errors_total` is now a *rate* of retried attempts, not a page: a pipeline that lost one
 commit race and recovered a second later increments it.
+
+### A source file that is no longer there
+
+Backing off and reopening is the right answer to almost everything, because almost
+everything clears: a storage blip, a commit race, a schema somebody is in the middle of
+fixing. One failure never clears, and stopping stays the right answer to it — so it gets a
+signal of its own rather than a place in the queue of things that recover.
+
+Delta's `OPTIMIZE` retires a data file with `dataChange: false` and writes compacted
+replacements. `VACUUM` later deletes the retired object for real. Both are routine, and
+neither is a problem — until a consumer is still behind the commit that added the retired
+file. Then the commit is in the log, the file it names is not in storage, and the batch that
+commit represents cannot be built at all. Not "with difficulty": at all. The rows survive
+inside the compacted files, but so do rows from commits already consumed, and there is
+nothing in a compaction that says which were which. Replaying it would be a guess, and this
+tool stops rather than guessing. Where a `DELETE` retired the file instead, the rows are
+simply gone — same symptom, different answer, and worth telling the two apart before
+deciding what to do about either.
+
+So `ddi` stops on that pipeline, names the relation, the version and the file, and raises
+`ddi_source_file_vacuumed`. It keeps retrying — restoring the file is a real recovery, and a
+stream that gave up would need the process bounced to notice — but the gauge is what tells
+the two kinds of retry apart:
+
+```
+ddi_source_file_vacuumed{pipeline="catalog_description_changed"} 1
+```
+
+Alert on it directly. `ddi_source_file_vacuumed == 1` needs no `for` clause and tolerates
+one: it is raised by the failure and cleared only by a step that succeeds, so a second,
+unrelated failure part-way through the outage cannot drop it and reset a pending alert.
+That is the difference from `ddi_pipeline_up == 0`, which flaps by design because almost
+every failure it covers does recover.
+
+**The contract this rests on is the source's, not `ddi`'s.**
+`delta.deletedFileRetentionDuration` on every source table must exceed the longest a
+pipeline reading it may be behind — including one that is *deliberately* excluded, which is
+the case people forget, because an excluded pipeline looks like a decision rather than a
+backlog. The default is seven days. A pipeline paused over a long weekend and a public
+holiday is inside that; one excluded pending a schema review is not.
+
+Two recoveries are safe, and which one applies is a question about your storage, not about
+`ddi`:
+
+- **Restore the file.** ADLS soft delete, S3 versioning, a backup — anything that puts the
+  named object back where the log says it is. The pipeline picks up on its next retry, and
+  this is the better option whenever it exists, because it is the only one that preserves
+  exactly-once. Two things it is easy to get wrong: both storage mechanisms are opt-in and
+  neither is retroactive, so whether the option exists at all was decided before the
+  `VACUUM` ran; and a stream far enough behind will name the *next* missing file on its
+  next retry, so restore the whole retired set for the versions still to be read, and hold
+  `VACUUM` off the source until the backlog is gone or the next run undoes the work.
+- **Rebuild the target deliberately**, from a current snapshot of the source. Note what
+  that takes, because the obvious version does not work: `starting_version` is consulted
+  only when the target holds no `txn` action for the pipeline's `app_id`, and a `txn`
+  action survives an overwrite — so an in-place rebuild resumes at the lost version again.
+  Recreate the table, or give the pipeline a new `app_id`. Which rebuild is right is not
+  something `ddi` will decide: an append target and an upsert target need different ones,
+  the target may have been read downstream already, and only you know which.
+
+What `ddi` will *not* do is skip the commit, or quietly treat the compaction's output as an
+equivalent batch. Both would produce a target that is wrong in a way nothing downstream
+could detect.
 
 ## Upserting
 
@@ -868,6 +932,7 @@ correctness still holds (the `txn` action prevents double-apply) — it just was
 | `ddi_pipeline_up` | gauge | 1 while streaming, 0 while backing off after a failure. |
 | `ddi_pipeline_config_valid` | gauge | 1 when the configuration was accepted, 0 when the pipeline was held back at load and never started. |
 | `ddi_pipeline_seconds_since_progress` | gauge | Since the last completed step; -1 before the first. |
+| `ddi_source_file_vacuumed` | gauge | 1 while the pipeline is stopped on a source data file the object store no longer has. |
 | `ddi_pipeline_restarts_total` | counter | Reopens after a failure. |
 | `ddi_rows_rejected_total` | counter | Rows written to the data-quality table. |
 | `ddi_batches_fully_rejected_total` | counter | Batches where every row was rejected. |
@@ -899,6 +964,8 @@ the number to look at when reasoning about *restart* behaviour — it is what a 
 from.
 
 Alert on **`ddi_pipeline_up == 0 for 10m`** for a stream that is down, on
+**`ddi_source_file_vacuumed == 1`** for one that will not come back without a human (see
+[A source file that is no longer there](#a-source-file-that-is-no-longer-there)), on
 **`increase(ddi_batches_fully_rejected_total[15m]) > 0`** for a target that has silently
 stopped growing, and on `ddi_source_lag_versions` for backlog. Use
 `ddi_pipeline_seconds_since_progress` rather than lag where the failure might be in startup:
