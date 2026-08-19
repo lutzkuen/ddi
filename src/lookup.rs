@@ -39,6 +39,10 @@ pub enum LookupTableIdChangePolicy {
 /// `name` is both the safe SQL relation a model joins and the name registered in the
 /// DataFusion session. `relation` is optional only for hand-written configs; dbt-derived
 /// pipelines carry it so the deployment wrapper can ask Starburst to describe the model.
+///
+/// The serde default keeps existing TOML valid. Rust callers that construct this public struct
+/// with an exhaustive literal must add `table_id_change_policy: LookupTableIdChangePolicy::Strict`
+/// to retain the previous behaviour.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LookupConfig {
