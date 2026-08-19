@@ -45,7 +45,8 @@ pub struct StreamableLookup {
     pub relation: String,
     /// Optional explicit lookup snapshot for source commits older than the lookup table.
     pub pre_history_version: Option<u64>,
-    /// Whether a replacement at the same lookup URI is a hard error or uses its current head.
+    /// Whether a replacement or unavailable historical snapshot is a hard error or uses the
+    /// lookup's current head.
     pub table_id_change_policy: LookupTableIdChangePolicy,
 }
 
