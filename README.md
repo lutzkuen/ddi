@@ -277,11 +277,30 @@ than silently applying a future lookup snapshot. Source and lookup log objects m
 comparable, stable object-store `last_modified` clock (normally the same lake/account), which is
 the clock Delta itself uses for timestamp travel.
 
-The table id is checked at startup and again for every selected snapshot. Dropping/recreating
-or relocating a lookup at the same URI is therefore a hard error: choose a new app id and
-rebuild the target rather than mixing two dimensions in one stream. Keep both the lookup's log
-and data files through the maximum source replay horizon. A lookup correction only affects
-newly processed source commits; replay/rebuild is the explicit way to re-enrich old output.
+By default, the table id is checked at startup and again for every selected snapshot.
+Dropping/recreating or relocating a lookup at the same URI is therefore a hard error: choose a
+new app id and rebuild the target rather than mixing two dimensions in one stream. Keep both the
+lookup's log and data files through the maximum source replay horizon. A lookup correction only
+affects newly processed source commits; replay/rebuild is the explicit way to re-enrich old
+output.
+
+For an explicitly availability-first lookup, opt in per relation instead:
+
+```toml
+[[pipeline.lookups]]
+name = "fx_rates"
+uri = "abfss://lake@acct/.../fx_rates"
+table_id_change_policy = "use_current"
+```
+
+This does **not** make routine updates non-deterministic: as long as the timestamp-selected
+snapshot and current head have the same Delta table id, ddi still uses that timestamp-pinned
+snapshot. If the table id changes, ddi warns and substitutes the current head for that batch,
+then records `ddi.lookup.fx_rates.current = true` alongside the lookup version and id in the
+target commit. It is an intentional trade: data spanning the replacement can no longer be
+replayed against its original lookup lineage. In dbt-derived config, declare the equivalent on
+the lookup source as `meta: {ddi_lookup: fx_rates,
+ddi_lookup_table_id_change_policy: use_current}`. `strict` remains the default.
 
 Use this for compact, keyed relations such as daily FX rates. It is not a substitute for
 joining a many-gigabyte historical RRP/COGS table into every 5,000-row source batch; materialize

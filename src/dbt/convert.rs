@@ -94,6 +94,7 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
                 uri,
                 relation: node.fully_qualified(),
                 pre_history_version: lookup.pre_history_version,
+                table_id_change_policy: lookup.table_id_change_policy,
             });
         }
 
@@ -297,6 +298,41 @@ mod tests {
         }
     }
 
+    fn fixture_with_current_lookup_policy() -> Manifest {
+        let mut manifest = fixture();
+        let model = manifest.nodes.get_mut("model.p.orders_stg").unwrap();
+        model.compiled_code = Some(
+            "SELECT o.order_id, fx.exchange_rate, o._timestamp \
+             FROM bronze.orders_raw AS o \
+             LEFT JOIN bronze.exchange_rates AS fx ON fx.currency = o.currency"
+                .into(),
+        );
+        model
+            .depends_on
+            .nodes
+            .push("source.p.bronze.exchange_rates".into());
+        manifest.sources.insert(
+            "source.p.bronze.exchange_rates".into(),
+            Node {
+                name: "exchange_rates".into(),
+                resource_type: "source".into(),
+                schema: "bronze".into(),
+                meta: HashMap::from([
+                    (
+                        "ddi_lookup".into(),
+                        serde_json::Value::String("fx_rates".into()),
+                    ),
+                    (
+                        "ddi_lookup_table_id_change_policy".into(),
+                        serde_json::Value::String("use_current".into()),
+                    ),
+                ]),
+                ..Default::default()
+            },
+        );
+        manifest
+    }
+
     #[test]
     fn a_streamable_model_becomes_a_complete_pipeline() {
         let ps = pipelines(&fixture(), &storage()).unwrap();
@@ -351,6 +387,28 @@ mod tests {
         let p = &pipelines(&m, &storage()).unwrap()[0];
         assert_eq!(p.dedup_timestamp.as_deref(), Some("event_ts"));
         assert_eq!(p.dedup_key.as_deref(), Some("order_id"));
+    }
+
+    #[test]
+    fn dbt_lookup_policy_is_emitted_into_pinned_toml() {
+        let manifest = fixture_with_current_lookup_policy();
+        let derived = pipelines(&manifest, &storage()).unwrap();
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].lookups.len(), 1);
+        assert_eq!(
+            derived[0].lookups[0].table_id_change_policy,
+            crate::lookup::LookupTableIdChangePolicy::UseCurrent
+        );
+
+        let cfg = Config {
+            storage: storage(),
+            ..Default::default()
+        };
+        let toml = to_toml(&manifest, &cfg).unwrap();
+        assert!(
+            toml.contains("table_id_change_policy = \"use_current\""),
+            "the dbt metadata must survive conversion: {toml}"
+        );
     }
 
     #[test]

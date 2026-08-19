@@ -15,6 +15,7 @@ use deltalake::datafusion::sql::sqlparser::ast::{
 };
 
 use crate::dbt::{Manifest, Node};
+use crate::lookup::LookupTableIdChangePolicy;
 use crate::transform::sql::SOURCE_TABLE;
 use crate::transform::validate::validate_sql_with_lookups;
 
@@ -44,6 +45,8 @@ pub struct StreamableLookup {
     pub relation: String,
     /// Optional explicit lookup snapshot for source commits older than the lookup table.
     pub pre_history_version: Option<u64>,
+    /// Whether a replacement at the same lookup URI is a hard error or uses its current head.
+    pub table_id_change_policy: LookupTableIdChangePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,11 +216,28 @@ pub fn analyze(manifest: &Manifest, unique_id: &str) -> Verdict {
                 }
             },
         };
+        let table_id_change_policy = match lookup.meta_value("ddi_lookup_table_id_change_policy") {
+            None => LookupTableIdChangePolicy::Strict,
+            Some(value) => match value.as_str() {
+                Some("strict") => LookupTableIdChangePolicy::Strict,
+                Some("use_current") => LookupTableIdChangePolicy::UseCurrent,
+                _ => {
+                    return reject(
+                            &name,
+                            format!(
+                                "lookup source {} declares ddi_lookup_table_id_change_policy={value}; it must be \"strict\" or \"use_current\"",
+                                lookup.qualified()
+                            ),
+                        );
+                }
+            },
+        };
         streamable_lookups.push(StreamableLookup {
             unique_id: unique_id.to_string(),
             name: lookup_name,
             relation: lookup.qualified(),
             pre_history_version,
+            table_id_change_policy,
         });
     }
 

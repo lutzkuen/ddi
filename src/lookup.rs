@@ -16,6 +16,23 @@ use crate::error::{Error, Result};
 use crate::source::Version;
 use crate::storage::Storage;
 
+/// How a lookup responds when the Delta table at its configured URI is replaced.
+///
+/// The default keeps lookup provenance reproducible: a source batch is enriched from the
+/// snapshot that existed before that source commit, and a changed table id is an error. The
+/// opt-in mode deliberately trades provenance across a replacement for availability: normal
+/// same-id updates remain timestamp-pinned, but a snapshot from a different table lineage is
+/// replaced with the current table head.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LookupTableIdChangePolicy {
+    /// Reject a different Delta table id. This is the safe default.
+    #[default]
+    Strict,
+    /// Use the lookup's current/head snapshot after a table replacement.
+    UseCurrent,
+}
+
 /// A lookup as it appears in a hand-written or dbt-derived pipeline config.
 ///
 /// `name` is both the safe SQL relation a model joins and the name registered in the
@@ -33,6 +50,12 @@ pub struct LookupConfig {
     /// lookup snapshot to an initial source backfill.
     #[serde(default)]
     pub pre_history_version: Option<Version>,
+    /// What to do when a table at this URI has a different Delta table id.
+    ///
+    /// `strict` is the default. `use_current` is an explicit availability-over-replay
+    /// choice for a replacement; ordinary updates remain timestamp-pinned.
+    #[serde(default)]
+    pub table_id_change_policy: LookupTableIdChangePolicy,
 }
 
 /// A lookup with its location resolved and its name validated.
@@ -42,21 +65,23 @@ pub struct ResolvedLookup {
     pub uri: String,
     pub relation: Option<String>,
     pub pre_history_version: Option<Version>,
+    pub table_id_change_policy: LookupTableIdChangePolicy,
 }
 
 impl ResolvedLookup {
-    /// Load the newest version strictly before the source Delta-log object's millisecond.
+    /// Load the newest version strictly before the source Delta-log object's millisecond,
+    /// together with the lookup's current head.
     ///
     /// Delta time travel is millisecond-granular. Excluding the whole source millisecond means a
     /// lookup commit that appears later in that same millisecond cannot change a failed batch's
     /// retry. We then advance through every earlier equal-timestamp lookup version, making the
     /// rule an explicit upper bound rather than accepting the binary search's arbitrary equality
     /// match. That is the deterministic mapping that makes a failed batch reproducible.
-    pub async fn snapshot(
+    pub async fn snapshots(
         &self,
         storage: &Storage,
         as_of: DateTime<Utc>,
-    ) -> Result<LookupSnapshot> {
+    ) -> Result<LookupSnapshots> {
         let head_table = storage
             .open(&self.uri)
             .await
@@ -127,12 +152,23 @@ impl ResolvedLookup {
             .open_at_version(&self.uri, version)
             .await
             .map_err(|e| Error::Config(format!("lookup {:?} at {:?}: {e}", self.name, self.uri)))?;
-        Ok(LookupSnapshot {
-            name: self.name.clone(),
-            version,
-            table_id: table_id(&table),
-            used_pre_history,
-            table,
+        Ok(LookupSnapshots {
+            selected: LookupSnapshot {
+                name: self.name.clone(),
+                version,
+                table_id: table_id(&table),
+                used_pre_history,
+                used_current: false,
+                table,
+            },
+            head: LookupSnapshot {
+                name: self.name.clone(),
+                version: head,
+                table_id: table_id(&head_table),
+                used_pre_history: false,
+                used_current: false,
+                table: head_table,
+            },
         })
     }
 }
@@ -165,7 +201,19 @@ pub struct LookupSnapshot {
     /// True only when an explicitly configured baseline serves source history that predates the
     /// lookup table. It is recorded in target commit metadata for auditability.
     pub used_pre_history: bool,
+    /// True when the configured table-id policy deliberately used the lookup head rather
+    /// than selecting a source-timestamp-pinned snapshot. It is recorded in target commit
+    /// metadata so that the loss of replay determinism is visible after the fact.
+    pub used_current: bool,
     pub table: DeltaTable,
+}
+
+/// The source-timestamp-pinned lookup snapshot and the current head opened from one lookup
+/// URI. Keeping both makes a lineage change detectable without opening a potentially different
+/// head a second time between comparison and use.
+pub struct LookupSnapshots {
+    pub selected: LookupSnapshot,
+    pub head: LookupSnapshot,
 }
 
 /// Refuse names that would be ambiguous in a model or collide with the streaming input.
@@ -185,6 +233,7 @@ pub fn resolve(config: &LookupConfig) -> Result<ResolvedLookup> {
         uri: config.uri.clone(),
         relation: config.relation.clone(),
         pre_history_version: config.pre_history_version,
+        table_id_change_policy: config.table_id_change_policy,
     })
 }
 
@@ -220,6 +269,7 @@ mod tests {
             uri: "/tmp/fx".into(),
             relation: None,
             pre_history_version: None,
+            table_id_change_policy: Default::default(),
         })
         .is_ok());
         for name in ["", "source", "FX", "fx-rates", "1fx"] {
@@ -229,6 +279,7 @@ mod tests {
                     uri: "/tmp/fx".into(),
                     relation: None,
                     pre_history_version: None,
+                    table_id_change_policy: Default::default(),
                 })
                 .is_err(),
                 "{name:?} must be rejected"

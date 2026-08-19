@@ -40,6 +40,7 @@ struct LookupCommit {
     version: i64,
     table_id: Option<String>,
     used_pre_history: bool,
+    used_current: bool,
 }
 
 impl Sink {
@@ -70,6 +71,7 @@ impl Sink {
                 version: snapshot.version as i64,
                 table_id: snapshot.table_id.clone(),
                 used_pre_history: snapshot.used_pre_history,
+                used_current: snapshot.used_current,
             })
             .collect();
     }
@@ -109,6 +111,9 @@ impl Sink {
                     format!("{prefix}.preHistory"),
                     serde_json::Value::from(true),
                 ));
+            }
+            if lookup.used_current {
+                metadata.push((format!("{prefix}.current"), serde_json::Value::from(true)));
             }
         }
 
