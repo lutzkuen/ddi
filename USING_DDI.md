@@ -294,7 +294,154 @@ history.
 
 ---
 
-## 8. Operating notes
+## 8. Publishing to a live dashboard
+
+Optional, and off unless you ask for it. After a batch commits to Delta, `ddi` can push a
+compact payload derived from that same batch to a fan-out service, so a browser gets the
+update without polling Delta and without a second real-time platform in the stack.
+
+Delta stays authoritative. This is a best-effort fast path: at-most-once, no retry, no
+queue. A publish that fails, times out, or never happens because the process died **cannot**
+affect the commit — the commit is durable and the offset moved with it before anything is
+sent. That is the whole safety argument, and it is why the send returns statistics rather
+than an error: there is no failure here for the pipeline to act on.
+
+### What you write
+
+The payload is a dbt model, so the complete live-dashboard logic is SQL an analyst can read
+and `dbt test`:
+
+```sql
+-- models/orders_live.sql
+{{ config(materialized='view') }}
+
+select
+    status,
+    count(*)    as orders_delta,
+    sum(amount) as amount_delta
+
+from {{ ref('orders_stg') }}
+
+group by status
+```
+
+```yaml
+# models/schema.yml
+models:
+  - name: orders_live
+    meta:
+      ddi_publish: webpubsub    # opt in, and which backend
+      ddi_publish_group: orders # the channel a browser subscribes to
+```
+
+That is the whole model-side surface. `ddi` never writes this table — there is no table —
+and it is not a pipeline. It rides on the commits of the model it `ref()`s.
+
+**A view, not a table**, and the reason matters. Over the whole table that SQL is the
+running total per status. Over one committed batch — which is what `ddi` runs it against,
+in memory, immediately after that batch commits — it is the delta to add to it. The same SQL
+means both, which is what lets a browser read the view once as a baseline and then apply
+deltas on top.
+
+That duality only holds for aggregates that combine across batches, so those are the only
+ones allowed: `sum`, `count`, `min`, `max`. `avg` is refused, and the error says why — the
+average of two batches is not the average of their averages, so publishing one as a delta
+would be silently wrong on every dashboard that applied it. Publish `sum(x)` and `count(*)`
+and divide in the view.
+
+**Append-only.** A merge replaces the row already stored under a key, so the committed batch
+does not say what the dashboard delta was: the value it replaced is not in it, and adding
+the new row would double-count. `ddi_publish` on an upserting model is refused.
+
+### What you configure
+
+Where it goes is a deployment fact, so it lives in `ddi`'s own config beside `[storage]` —
+never in dbt, and never in what `ddi dbt convert` writes, because it holds a credential:
+
+```toml
+[publish]
+type = "webpubsub"
+connection_string_env = "DDI_WEBPUBSUB_CONNECTION"
+hub = "ddi"
+message_ttl_secs = 60      # 0..=300; a stale live delta is worse than none
+```
+
+Leave the whole table out and nothing publishes, whatever the models ask for. That is a
+supported state, not a mistake — it is what a dev deployment looks like — and `ddi` says so
+per pipeline at startup rather than failing. The same is true of every other way this can be
+wrong: a bad hub, a missing environment variable, a publish model whose SQL does not
+validate. Each one logs what it found and leaves the pipeline streaming. `--no-publish`
+turns it off for a whole process.
+
+### What a browser receives
+
+```json
+{
+  "ddi": 1,
+  "pipeline": "orders_stg",
+  "app_id": "ddi.orders_stg",
+  "model": "orders_live",
+  "group": "orders",
+  "prev_source_version": 120,
+  "from_source_version": 121,
+  "source_version": 123,
+  "target_version": 456,
+  "committed_at": "2026-08-20T09:31:02.481Z",
+  "complete": true,
+  "row_count": 2,
+  "rows": [{"status": "paid", "orders_delta": 2, "amount_delta": 40}]
+}
+```
+
+Because delivery is best-effort, every message says where it sits in the sequence so a
+client can tell when it has missed one:
+
+```text
+B    := read the baseline (the publish model, as a view), noting its target version
+last := null
+
+on message m:
+  if m.ddi != 1 or m.pipeline != mine                        -> reload
+  if m.target_version is not null and m.target_version <= B  -> ignore (already in baseline)
+  if last is not null and m.source_version <= last           -> ignore (replay)
+  if last is not null and m.prev_source_version != last      -> reload, reset
+  if not m.complete                                          -> reload; last := m.source_version
+  apply m.rows; last := m.source_version
+```
+
+The gap test is `prev_source_version`, not the source versions themselves. Those are **not**
+consecutive and were never meant to be: a compaction on the source, a `dataChange: false`
+rewrite, or a change commit under `skip_change_commits` all advance the cursor without
+producing a batch. A client testing for consecutive source versions would reload its
+baseline every time somebody ran `OPTIMIZE` on a bronze table.
+
+`complete: false` means the payload was larger than the service will carry, so `rows` is
+empty and `row_count` says what you missed — reload rather than assume nothing happened.
+
+### What `ddi` does not do
+
+It does not hold browser connections, mint client access tokens, or serve a negotiate
+endpoint. Its only HTTP surface is `/metrics`. Minting client tokens would mean
+authenticating dashboard users, which `ddi` has no notion of, and would turn a compromise of
+the daemon into a token-minting oracle — that belongs in the dashboard's own web app. Grant
+those clients `webpubsub.joinLeaveGroup.<group>` and never `sendToGroup`, or a browser could
+forge deltas into the feed with version numbers of its choosing.
+
+### Watching it
+
+`ddi_publish_configured` is 1 when a pipeline has a publisher, which is the only way to tell
+"not configured" from "configured and silent". `ddi_publish_sent_total` counts what left this
+process — **not** deliveries: a group nobody has joined accepts a message and discards it.
+`ddi_publish_failed_total` and `ddi_publish_skipped_total` are separate because a run of
+failures becomes a run of skips once the breaker opens and stops attempting them.
+
+None of them moves `ddi_pipeline_up`. A pipeline whose every publish is failing is streaming
+to Delta exactly as it should, and paging somebody about it would be paging them about a
+dashboard.
+
+---
+
+## 9. Operating notes
 
 - **Decimals, not doubles.** If bronze declares prices as `double`, precision was already
   lost before `ddi` saw the row. Use `decimal(18,4)` at bronze.
@@ -417,7 +564,7 @@ column in silver, an upsert will not blank it.
 
 ---
 
-## 9. When something goes wrong
+## 10. When something goes wrong
 
 | Message | Meaning |
 |---|---|
@@ -438,7 +585,7 @@ Logs are quiet by default. `RUST_LOG=debug,delta_delta_ingest=trace` for detail.
 
 ---
 
-## 10. Try it without any of your own infrastructure
+## 11. Try it without any of your own infrastructure
 
 The repository contains a runnable version of all of the above — vanilla jaffle shop
 against local Delta tables, including a simulated batch rebuild and a compaction:

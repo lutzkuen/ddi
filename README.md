@@ -1134,6 +1134,84 @@ exactly-once but not mutually atomic** — two tables cannot share one Delta com
 `app_id` uniqueness is validated at startup: duplicates silently corrupt offsets, so they are
 a hard error.
 
+## Live dashboards
+
+Optional, off by default, and a *leaf* of the pipeline rather than a stage in it. After a
+target commit lands, `ddi` can push a compact payload derived from that same batch to a
+fan-out service — Azure Web PubSub today — so a browser gets the update over a socket it
+already holds, without polling Delta and without a second real-time platform in the stack.
+
+```text
+Delta source
+    |
+    v
+   ddi
+    |
+    +-----------------> Delta target
+    |                     commit succeeds
+    |
+    +-- post-commit ---> publisher ---> Web PubSub ---> browsers
+```
+
+What to push is a dbt model, so there is no second aggregation hidden in Rust or in
+frontend code:
+
+```sql
+-- models/orders_live.sql
+{{ config(materialized='view') }}
+
+select status, count(*) as orders_delta, sum(amount) as amount_delta
+from {{ ref('orders_stg') }}
+group by status
+```
+
+```yaml
+models:
+  - name: orders_live
+    meta:
+      ddi_publish: webpubsub
+      ddi_publish_group: orders
+```
+
+**This is the one place `GROUP BY` is allowed, and the exception proves the rule.** A
+transform's rows are appended to a table that outlives their batch, so a group spanning
+batches would store a partial sum forever — which is why `GROUP BY` is this tool's headline
+rejection. A publication's rows are a *message* describing one committed batch and are never
+stored, so a partial sum is exactly what it is for. The validator takes the grain as a
+parameter rather than forking, so every other rule — one source relation, no window frames,
+no foreign tables — stays shared between the two.
+
+The aggregates are narrowed further, to the ones a client can apply as a delta: `sum`,
+`count`, `min`, `max`. `avg` is refused because the average of two batches is not the average
+of their averages. That narrowing is also what keeps the useful duality: over one batch the
+model is the delta, over the whole table it is the running total, so **the same view is the
+baseline a client reloads after a gap**.
+
+Delta stays authoritative and the realtime path cannot touch it:
+
+- The payload is built **before** the commit, from the already-coerced batch, and sent
+  **after** it. A build failure yields no payload; it never fails a batch.
+- The send returns statistics, not a `Result`. "A publisher cannot fail a commit" is a
+  property of the signature rather than a convention at the call site.
+- At-most-once, deliberately. No retry, no queue, no outbox — the batch cannot be replayed
+  once the offset has moved, and an outbox would be state in a daemon whose premise is that
+  it has none.
+
+What makes that honest is the cursor in every message. Each carries `prev_source_version`,
+so a client that misses one notices and reloads the baseline view. That field is a fact about
+the *publication* sequence, not about the source table: source versions are not consecutive
+and never were, because compaction and `dataChange: false` commits advance the cursor without
+producing a batch.
+
+Append-only in v1. A merge replaces the row stored under a key, so the committed batch does
+not contain the value it replaced and a delta cannot be derived from it; `ddi_publish` on an
+upserting model is refused.
+
+`ddi` does not hold browser connections, mint client access tokens, or serve a negotiate
+endpoint — its only HTTP surface is `/metrics`, and token-minting would mean authenticating
+dashboard users, which it has no notion of. See [USING_DDI.md](USING_DDI.md) §8 for the
+configuration, the payload schema, and the client contract.
+
 ## Concurrency
 
 One tokio task per pipeline. No coordination between pipelines, none between processes.
@@ -1257,6 +1335,11 @@ momentary blip look identical in the counter and quite different in `ddi_pipelin
   KDI's `allowed_latency` — makes this a non-issue.
 - Mid-stream schema changes surface as a batch whose schema differs from the previous one;
   the target schema is the contract and a mismatch is an error.
+- **Realtime publication is append-only, at-most-once, and one payload per pipeline.** A
+  merge does not say what a dashboard delta was; a message lost to a crash between commit and
+  send is recovered by the client's own baseline reload rather than by an outbox; and two
+  payloads describing the same batch would be indistinguishable to a client, so a second
+  `ddi_publish` model for one host rejects both.
 
 ## Layout
 
@@ -1270,6 +1353,9 @@ src/
 ├── transform/       # DataFusion SQL, validation, intra-row UDFs
 ├── schema.rs        # target-schema cast, hard-fail on mismatch
 ├── pipeline.rs      # the step loop
+├── publish/         # optional post-commit fan-out; a leaf, never a stage
+│   ├── jwt.rs       #   HS256 bearer token for the data plane
+│   └── webpubsub.rs #   the one REST call, spoken directly
 └── metrics.rs       # prometheus
 ```
 
