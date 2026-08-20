@@ -37,6 +37,11 @@ pub enum StepOutcome {
         upsert: Option<UpsertStats>,
         /// Rows the target would not take, written to the data-quality table instead.
         rejected: usize,
+        /// What the realtime publisher did, when this pipeline has one. `None` otherwise.
+        ///
+        /// Reported rather than acted on: by the time this is set the commit is durable, so
+        /// nothing here can change the outcome — it exists so the supervisor can count it.
+        published: Option<crate::publish::PublishStats>,
     },
 
     /// Source commits existed but produced no rows for the target — every row was filtered
@@ -47,6 +52,10 @@ pub enum StepOutcome {
         /// Rows the target would not take. Non-zero here is the loud case: the batch had
         /// rows and *none* of them made it, which is usually a schema change upstream.
         rejected: usize,
+        /// What the realtime publisher did. A zero-row batch still publishes: the offset
+        /// moved, and staying silent would make the next message look like one the client
+        /// lost.
+        published: Option<crate::publish::PublishStats>,
     },
 }
 
@@ -93,6 +102,18 @@ pub struct Pipeline {
     /// cross the same replacement in many batches; it should be observable without flooding
     /// the log once per source commit.
     warned_lookup_table_id_changes: BTreeSet<(String, String, String)>,
+    /// What to push after each commit. `None` unless a dbt model asked for it, this
+    /// deployment configured somewhere to push it, and this pipeline is append-only.
+    publisher: Option<crate::publish::Publisher>,
+    /// The `through_version` of the last batch this process published.
+    ///
+    /// The client's gap detector, and the reason it is held here rather than read off the
+    /// batch: skipped source commits advance the cursor without producing a batch at all
+    /// (see `LogStream::next_batch`), so consecutive source versions are not a property of
+    /// the reader. A fact about the publication sequence is, and this is it. `None` until
+    /// the first publication of the process, which is itself a signal — a restart is a gap,
+    /// because whatever was in flight when the process died was not sent.
+    prev_published_through: Option<Version>,
 }
 
 impl Pipeline {
@@ -226,6 +247,25 @@ impl Pipeline {
             ),
         }
 
+        // Same reasoning as the data-quality line above: which mode this pipeline is in is
+        // said once at startup rather than discovered during an incident. Every way a
+        // publisher can be absent is a normal state, so all three are logged at info.
+        let publisher = crate::publish::Publisher::open(&cfg);
+        match (&publisher, &cfg.publish) {
+            (Some(p), _) => info!(
+                pipeline = %cfg.name,
+                publish = %p.describe(),
+                "each committed batch will also be published"
+            ),
+            (None, Some(m)) => info!(
+                pipeline = %cfg.name,
+                model = %m.model,
+                "this model declares ddi_publish, but nothing is configured to publish to. \
+                 The Delta stream is unaffected."
+            ),
+            (None, None) => {}
+        }
+
         Ok(Self {
             cfg,
             source,
@@ -241,6 +281,8 @@ impl Pipeline {
             lookup_table_ids: lookup_validation.table_ids,
             lookup_current_on_open: lookup_validation.use_current_on_open,
             warned_lookup_table_id_changes: BTreeSet::new(),
+            publisher,
+            prev_published_through: None,
         })
     }
 
@@ -412,6 +454,31 @@ impl Pipeline {
             );
         }
 
+        // The publish payload is built here, before the commit, and sent after it.
+        //
+        // Building it now costs a `Vec<RecordBatch>` clone, which is a handful of `Arc`
+        // refcount bumps and no data — `upsert` already relies on that below — and the clone
+        // is dropped before the write plan is built. Keeping `coerced` alive *past* the
+        // commit instead would hold up to `max_bytes_per_batch` across the one operation
+        // this tool is most careful about, to produce a few aggregate rows. Publication
+        // itself still happens strictly after the commit; only the arithmetic is early.
+        //
+        // Contrast `write_rejects` above, which deliberately fails the batch. The offset
+        // depends on the rejects landing. It does not depend on this.
+        let pending = match &self.publisher {
+            // A paused publisher means the sink has been failing. Running an aggregation to
+            // build a message that will not be sent is pure waste on the durable path.
+            Some(p) if !p.is_paused() => {
+                let batches = if coerced.is_empty() {
+                    vec![RecordBatch::new_empty(self.coercer.target())]
+                } else {
+                    coerced.clone()
+                };
+                p.render(self.coercer.target(), batches).await
+            }
+            _ => None,
+        };
+
         if coerced.is_empty() {
             // Nothing to write, but the source version was still consumed, so the offset
             // must advance or these commits would be re-read forever. A zero-row batch in
@@ -424,9 +491,16 @@ impl Pipeline {
             let empty = RecordBatch::new_empty(self.coercer.target());
             self.commit(vec![empty], txn_version).await?;
             self.acknowledge_lookup_table_id_transitions(&lookup_batch.transitions);
+            // This commit moved the offset too, so it gets a message like any other. Staying
+            // silent on a fully-filtered batch would leave a hole in the version chain and
+            // make the *next* real message look like one the client had lost.
+            let published = self
+                .publish(pending, batch.start.version, through, self.target.version())
+                .await;
             return Ok(StepOutcome::Skipped {
                 through_version: through,
                 rejected: rejected_rows,
+                published,
             });
         }
 
@@ -452,6 +526,14 @@ impl Pipeline {
             "committed"
         );
 
+        // After the commit, and after the log line, so a failed publish is always
+        // correlatable with the batch it belongs to. Returns stats and never an error — see
+        // `crate::publish` for why that is a property of the signature rather than a
+        // convention here.
+        let published = self
+            .publish(pending, batch.start.version, through, target_version)
+            .await;
+
         Ok(StepOutcome::Progressed {
             through_version: through,
             files,
@@ -459,6 +541,7 @@ impl Pipeline {
             target_version,
             upsert,
             rejected: rejected_rows,
+            published,
         })
     }
 
@@ -733,6 +816,41 @@ impl Pipeline {
                  out. Correct, but the cost grows with the table."
             );
         }
+    }
+
+    /// Send what `render` produced, now that the commit is durable.
+    ///
+    /// Takes `&mut self` only to advance the publication cursor. It returns stats and never
+    /// an error, and that is load-bearing rather than lax: every caller sits between a
+    /// successful Delta commit and its `StepOutcome`, so a `?` here would discard an outcome
+    /// describing a batch that *did* commit — under-counting it, dropping the pipeline's
+    /// liveness gauge to zero, and making `--once` exit non-zero for a run that succeeded.
+    /// The commit cannot be undone by then, so there is nothing to propagate to. See
+    /// [`crate::publish`].
+    async fn publish(
+        &mut self,
+        pending: Option<crate::publish::Rendered>,
+        from_version: Version,
+        through: Version,
+        target_version: Option<Version>,
+    ) -> Option<crate::publish::PublishStats> {
+        let publisher = self.publisher.as_ref()?;
+        let stats = publisher
+            .send(
+                pending,
+                self.prev_published_through,
+                from_version,
+                through,
+                target_version,
+            )
+            .await;
+        // Advanced only on a message that actually left, so a client is never told that the
+        // batch before the one it is holding was the one we failed to send. A failure
+        // therefore reads to the client as exactly what it is: a gap, healed by reloading.
+        if stats.sent {
+            self.prev_published_through = Some(through);
+        }
+        Some(stats)
     }
 
     async fn commit(&mut self, batches: Vec<RecordBatch>, txn_version: i64) -> Result<()> {

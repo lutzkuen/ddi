@@ -863,6 +863,7 @@ async fn attempt(
             Ok(StepOutcome::Skipped {
                 through_version,
                 rejected,
+                ..
             }) => {
                 progressed.store(true, Ordering::Relaxed);
                 m.mark_progress();

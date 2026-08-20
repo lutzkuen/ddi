@@ -111,7 +111,7 @@ pub struct Envelope {
     /// Last source version this batch drew from. The dedup key.
     pub source_version: Version,
     /// Delta version of the target commit these rows are already in.
-    pub target_version: Option<i64>,
+    pub target_version: Option<Version>,
     pub committed_at: String,
     /// `false` when the payload was too large to send: `rows` is then empty and the client
     /// should reload a baseline rather than assume nothing happened.
@@ -478,7 +478,7 @@ impl Publisher {
         prev_source_version: Option<Version>,
         from_source_version: Version,
         source_version: Version,
-        target_version: Option<i64>,
+        target_version: Option<Version>,
     ) -> PublishStats {
         let elapsed = self.origin.elapsed();
 
