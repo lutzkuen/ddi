@@ -155,6 +155,9 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
             // Carried so a running pipeline can re-ask the catalog where these live.
             source_relation: src.fully_qualified(),
             target_relation: tgt.fully_qualified(),
+            // Filled in from the `ddi_publish` models in a second pass over the same
+            // verdicts; nothing publishes until that lands.
+            publish: None,
         });
     }
     Ok(out)

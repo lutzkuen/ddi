@@ -153,6 +153,8 @@ mod tests {
             lookups: vec![],
             source_relation: Some("hive.bronze.orders".into()),
             target_relation: Some("hive.silver.orders".into()),
+            publish: None,
+            publish_to: None,
             starting_version: 0,
             change_policy: Default::default(),
             transform_sql: None,

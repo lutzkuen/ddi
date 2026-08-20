@@ -77,3 +77,38 @@ transform_sql = """
 SELECT order_id, li.sku, li.qty, CAST(li.price AS DECIMAL(18,4)) AS price
 FROM (SELECT order_id, unnest(line_items) AS li FROM source)
 """
+
+# ---------------------------------------------------------------------------
+# Realtime publication (optional).
+#
+# After a target commit lands, ddi can push a compact payload derived from that
+# same batch to a fan-out service, so a dashboard gets updates without polling
+# Delta. Delta stays authoritative; this is a best-effort fast path and is
+# at-most-once. A publish that fails, times out, or never happens because the
+# process died cannot affect the commit — the offset has already moved with it.
+#
+# What to publish is a dbt question, and is declared there:
+#
+#   models:
+#     - name: orders_live          # a view over the streamed model
+#       meta:
+#         ddi_publish: webpubsub
+#         ddi_publish_group: sales
+#
+# What is left here is the part dbt cannot know: where to send it, and how to
+# authenticate. Omit this table entirely and nothing publishes, whatever the
+# models ask for — which is the normal state of a dev deployment, not an error.
+# Append-only pipelines only: a merge replaces the row stored under a key, so
+# the committed batch does not say what the dashboard delta was.
+#
+# [publish]
+# type = "webpubsub"
+# # Name of the environment variable holding the connection string, in the form
+# # Endpoint=https://<name>.webpubsub.azure.com;AccessKey=<key>;Version=1.0;
+# connection_string_env = "DDI_WEBPUBSUB_CONNECTION"
+# hub = "ddi"
+# message_ttl_secs   = 60      # 0..=300; a stale live delta is worse than none
+# timeout_secs       = 5       # a slow publish is already useless to a dashboard
+# failure_threshold  = 5       # consecutive failures before the breaker opens
+# breaker_cooldown_secs = 30
+# max_message_bytes  = "900KB" # the service's frame limit is 1 MB

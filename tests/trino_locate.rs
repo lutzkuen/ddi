@@ -119,6 +119,8 @@ fn pipeline(declared_source: &str, declared_target: &str) -> ResolvedPipeline {
         lookups: vec![],
         source_relation: Some("hive.bronze.orders_raw".into()),
         target_relation: Some("hive.silver.orders_stg".into()),
+        publish: None,
+        publish_to: None,
         starting_version: 0,
         change_policy: Default::default(),
         transform_sql: None,

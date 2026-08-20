@@ -80,6 +80,14 @@ struct Cli {
     #[arg(long, global = true, value_name = "DIR", env = "DBT_PROFILES_DIR")]
     profiles_dir: Option<PathBuf>,
 
+    /// Do not publish realtime payloads, whatever the dbt models and `[publish]` say.
+    ///
+    /// The Delta stream is identical either way — publication is a leaf — so this is the
+    /// switch for running a copy of production against the same config without a second
+    /// writer pushing to the same dashboard group.
+    #[arg(long, global = true, env = "DDI_NO_PUBLISH")]
+    no_publish: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -148,7 +156,10 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
-    let cfg = Config::from_path(&cli.config)?;
+    let mut cfg = Config::from_path(&cli.config)?;
+    // Applied to the config rather than checked at each call site, so there is one place
+    // where publication can be off and nothing downstream has to remember to ask.
+    cfg.publish_disabled = cli.no_publish;
 
     // The dbt subcommands read a manifest, not the pipeline list, so they must work
     // before any pipelines exist — that is the point at which you are deciding what to
@@ -239,6 +250,17 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
                     "{:<24} {} -> {}  (app_id={}, change_policy={:?}, write_mode={mode})",
                     p.name, p.source_uri, p.target_uri, p.app_id, p.change_policy
                 );
+                // Shown only when it is on, because silence has to mean "not publishing" —
+                // and every way this can be off already said so as a warning at load.
+                if let Some(publish) = &p.publish {
+                    println!(
+                        "{:<24}   publishes {} -> {} group {:?}",
+                        "",
+                        publish.model,
+                        publish.kind.as_str(),
+                        publish.group
+                    );
+                }
             }
             println!("\n{} pipeline(s) valid.", pipelines.len());
             if !rejected.is_empty() {

@@ -206,6 +206,8 @@ fn pipeline(source: &str, target: &str) -> ResolvedPipeline {
         storage: Storage::new(storage_options()),
         source_relation: None,
         target_relation: None,
+        publish: None,
+        publish_to: None,
     }
 }
 
