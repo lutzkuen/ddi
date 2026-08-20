@@ -257,11 +257,16 @@ impl Pipeline {
                 publish = %p.describe(),
                 "each committed batch will also be published"
             ),
+            // Reached when the resolver approved a sink and `Publisher::open` then declined
+            // it — an unparseable connection string, an unset environment variable, a write
+            // mode that merges. Each of those has already warned with the actual reason, so
+            // this says where to look rather than guessing at it again. (A model that asked
+            // to publish into a deployment with no `[publish]` never gets here: the resolver
+            // clears both fields together, so this arm cannot mean that.)
             (None, Some(m)) => info!(
                 pipeline = %cfg.name,
                 model = %m.model,
-                "this model declares ddi_publish, but nothing is configured to publish to. \
-                 The Delta stream is unaffected."
+                "not publishing — see the warning above. The Delta stream is unaffected."
             ),
             (None, None) => {}
         }
@@ -844,12 +849,20 @@ impl Pipeline {
                 target_version,
             )
             .await;
-        // Advanced only on a message that actually left, so a client is never told that the
-        // batch before the one it is holding was the one we failed to send. A failure
-        // therefore reads to the client as exactly what it is: a gap, healed by reloading.
-        if stats.sent {
-            self.prev_published_through = Some(through);
-        }
+        // Advanced whatever happened, and that is the whole point of the field.
+        //
+        // It names the previous *batch*, not the previous successful send, because what the
+        // client tests is the continuity of the chain. Holding it back on a failure would
+        // renumber the chain over the hole: batch 11 fails to send, batch 12 then claims to
+        // follow batch 10, the client's `prev_source_version == last` test passes, and 11's
+        // delta is lost with no signal at all — silently, and for a whole cooldown at a time
+        // once the breaker is open. Advancing unconditionally makes 12 say it follows 11,
+        // which the client has never seen, so it re-baselines. That is the correct outcome
+        // and the one the at-most-once bargain depends on being reachable.
+        //
+        // It is also right in the ambiguous case: a request that timed out after the service
+        // accepted it leaves the client holding 11, and 12 still says it follows 11.
+        self.prev_published_through = Some(through);
         Some(stats)
     }
 

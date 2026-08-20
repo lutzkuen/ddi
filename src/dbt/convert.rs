@@ -168,8 +168,8 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
             source_relation: src.fully_qualified(),
             target_relation: tgt.fully_qualified(),
             // The live payload, declared on its own dbt model and resolved onto the
-            // pipeline whose commits carry it. `group` was defaulted at analyze time, so
-            // what is pinned here is what runs.
+            // pipeline whose commits carry it. `group` was defaulted at analyze time, so what
+            // is pinned here is what runs.
             publish: publications
                 .get(s.unique_id.as_str())
                 .map(|p| crate::config::PublishModel {
@@ -649,10 +649,10 @@ mod tests {
 
     #[test]
     fn a_pinned_publication_round_trips_through_toml() {
-        // `publish` has to be the last field of PipelineConfig: toml emits a table's scalars
-        // before its sub-tables, so a struct field among the scalars fails to serialise.
-        // This is what catches that, and it is the convert path — not the run path — that
-        // would break.
+        // The convert path, not the run path, is what a new sub-table field can break:
+        // `ddi run` derives a PipelineConfig and uses it, while `ddi dbt convert` has to
+        // render one as TOML and read it back. This asserts the round trip rather than any
+        // particular field order, which under toml 0.8 is not a constraint.
         let cfg = Config {
             storage: storage(),
             ..Default::default()

@@ -149,11 +149,13 @@ impl WebPubSubPublisher {
     /// restricts a group to `[A-Za-z0-9._:-]` — so nothing here needs escaping, and this
     /// asserts that rather than assuming it.
     fn send_url(&self, group: &str) -> Result<String> {
-        fn safe(s: &str) -> bool {
-            !s.is_empty()
-                && s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'))
-        }
+        // The same predicate the dbt gate and the config resolver apply, deliberately shared
+        // rather than restated. A second, looser copy lived here and accepted `..` — and
+        // `reqwest` parses this string with `Url::parse` before sending, which collapses dot
+        // segments, so `/api/hubs/{hub}/groups/../:send` becomes `/api/hubs/{hub}/:send`:
+        // send-to-**all**, not send-to-group. It failed only because the token was signed
+        // over the uncollapsed text, which is luck rather than a control.
+        let safe = crate::dbt::analyze::valid_group;
         if !safe(&self.hub) {
             return Err(Error::Config(format!(
                 "[publish].hub {:?} has characters that would have to be escaped into the \

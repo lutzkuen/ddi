@@ -1183,7 +1183,8 @@ no foreign tables — stays shared between the two.
 
 The aggregates are narrowed further, to the ones a client can apply as a delta: `sum`,
 `count`, `min`, `max`. `avg` is refused because the average of two batches is not the average
-of their averages. That narrowing is also what keeps the useful duality: over one batch the
+of their averages — and the refused set is asked of the query engine's own registry rather
+than written out by hand, so an alias like `mean` cannot slip past it. That narrowing is also what keeps the useful duality: over one batch the
 model is the delta, over the whole table it is the running total, so **the same view is the
 baseline a client reloads after a gap**.
 
@@ -1197,10 +1198,12 @@ Delta stays authoritative and the realtime path cannot touch it:
   once the offset has moved, and an outbox would be state in a daemon whose premise is that
   it has none.
 
-What makes that honest is the cursor in every message. Each carries `prev_source_version`,
-so a client that misses one notices and reloads the baseline view. That field is a fact about
-the *publication* sequence, not about the source table: source versions are not consecutive
-and never were, because compaction and `dataChange: false` commits advance the cursor without
+What makes that honest is the cursor in every message. Each carries `prev_source_version` —
+the previous *batch*, whether or not its own message got through — so a batch that was lost
+still occupies its place in the chain and the next message says it follows one the client
+never saw. That is what makes a loss detectable rather than silent. The field is a fact about
+the publication sequence, not about the source table: source versions are not consecutive and
+never were, because compaction and `dataChange: false` commits advance the cursor without
 producing a batch.
 
 Append-only in v1. A merge replaces the row stored under a key, so the committed batch does

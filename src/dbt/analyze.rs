@@ -174,7 +174,7 @@ pub fn analyze(manifest: &Manifest, unique_id: &str) -> Verdict {
     // bare `continue`. The result of a one-line YAML edit would be a production pipeline that
     // silently stopped being derived. So a streamable model carrying the key is refused
     // loudly instead, naming both facts.
-    if node.meta_str("ddi_publish").is_some() {
+    if node.meta_value("ddi_publish").is_some() {
         if STREAMABLE_MATERIALIZATIONS.contains(&mat) {
             return reject(
                 &name,
@@ -359,7 +359,7 @@ const PUBLISHABLE_MATERIALIZATIONS: &[&str] = &["view", "ephemeral"];
 /// A group name goes into a request path and into a browser's subscription, so it is kept to
 /// characters that need no escaping in either. The service permits far more; we do not, so
 /// that nothing between here and the wire has to encode or decode it.
-fn valid_group(name: &str) -> bool {
+pub(crate) fn valid_group(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && name.starts_with(|c: char| c.is_ascii_alphanumeric())
@@ -374,7 +374,24 @@ fn valid_group(name: &str) -> bool {
 /// `source`, holding one committed batch, and nothing else in memory to read. What differs is
 /// only the grain — see [`crate::transform::validate::Grain`].
 fn analyze_publish(manifest: &Manifest, unique_id: &str, node: &Node, name: &str) -> Verdict {
-    let declared = node.meta_str("ddi_publish").unwrap_or_default();
+    // Read through `meta_value` rather than `meta_str`, because the two disagree in exactly
+    // the case that matters. `meta_str` yields `None` for a non-string, so `ddi_publish:
+    // {type: webpubsub}` — the natural flattening of the nested spelling issue #6 sketched —
+    // would not have registered as a publish declaration at all: the model would simply never
+    // appear, with no rejection line and nothing in `ddi dbt check` to explain it. The routing
+    // above uses the same accessor, which is what keeps the recursion bound honest.
+    let Some(declared) = node.meta_value("ddi_publish").and_then(|v| v.as_str()) else {
+        return reject(
+            name,
+            format!(
+                "declares meta.ddi_publish={}, and it must be a plain string naming a \
+                 publisher: `ddi_publish: webpubsub`. Every ddi_* key is a flat scalar.",
+                node.meta_value("ddi_publish")
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "nothing".into())
+            ),
+        );
+    };
     let Some(kind) = crate::config::PublisherKind::parse(declared) else {
         return reject(
             name,
@@ -440,7 +457,7 @@ fn analyze_publish(manifest: &Manifest, unique_id: &str, node: &Node, name: &str
     // has to come out as a reason rather than as a crash. With this here the recursion is
     // depth-1 by construction: the host is never a publish model, and analysing a streamable
     // one does not recurse at all.
-    if host.meta_str("ddi_publish").is_some() {
+    if host.meta_value("ddi_publish").is_some() {
         return reject(
             name,
             format!(
@@ -491,10 +508,23 @@ fn analyze_publish(manifest: &Manifest, unique_id: &str, node: &Node, name: &str
         );
     }
 
-    let group = node
-        .meta_str("ddi_publish_group")
-        .unwrap_or(name)
-        .to_string();
+    // Same reasoning as `ddi_publish` above: a non-string here would silently fall back to
+    // the model's own name, so a browser would subscribe to a group nothing publishes to.
+    let group = match node.meta_value("ddi_publish_group") {
+        None => name.to_string(),
+        Some(v) => match v.as_str() {
+            Some(g) => g.to_string(),
+            None => {
+                return reject(
+                    name,
+                    format!(
+                        "declares meta.ddi_publish_group={v}, and it must be a plain string. \
+                         Omit the key to use the model's own name."
+                    ),
+                )
+            }
+        },
+    };
     if !valid_group(&group) {
         return reject(
             name,
@@ -569,11 +599,15 @@ pub fn analyze_all(manifest: &Manifest) -> Vec<Verdict> {
 /// reason a duplicate `app_id` condemns every sharer: there is no innocent party, and
 /// choosing silently would be worse than saying so.
 fn reject_duplicate_publications(verdicts: &mut [Verdict]) {
+    // Keyed on the manifest id, not on `schema.table`: dbt only forbids a duplicate
+    // `database.schema.alias`, so two models in different databases can share a qualified
+    // relation, and keying on that would condemn two publications that never collided.
+    // `host_unique_id` is also exactly the key `convert::pipelines` attaches by.
     let mut by_host: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for v in verdicts.iter() {
         if let Verdict::Publishes(p) = v {
             by_host
-                .entry(p.host_relation.clone())
+                .entry(p.host_unique_id.clone())
                 .or_default()
                 .push(p.name.clone());
         }
@@ -585,7 +619,7 @@ fn reject_duplicate_publications(verdicts: &mut [Verdict]) {
     }
     for v in verdicts.iter_mut() {
         let Verdict::Publishes(p) = v else { continue };
-        let Some(others) = contested.get(&p.host_relation) else {
+        let Some(others) = contested.get(&p.host_unique_id) else {
             continue;
         };
         let reason = format!(
@@ -633,8 +667,11 @@ fn rewrite_relations(
     // use Trino's `ARRAY(JSON)` spelling before the unnest normaliser turns it into the
     // DataFusion form. Treating that model as "unknown" here would make `ddi dbt check`
     // disagree with the daemon that actually runs it.
-    let mut statements = crate::transform::validate::parse_permissively(sql)
-        .map_err(|e| format!("could not parse the compiled SQL: {e}"))?;
+    // The subject is passed down rather than wrapped on the way back, which also collapses
+    // what used to read "could not parse the compiled SQL: config error: could not parse
+    // transform_sql: ..." into one sentence naming the thing the analyst wrote.
+    let mut statements = crate::transform::validate::parse_permissively(sql, "the compiled SQL")
+        .map_err(|e| e.to_string())?;
 
     if statements.len() > 1 {
         return Err(format!(

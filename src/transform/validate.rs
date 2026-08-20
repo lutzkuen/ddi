@@ -110,7 +110,10 @@ fn reparse_natively(statement: &SqlStatement, grain: Grain) -> Result<SqlStateme
 ///
 /// The fallback is only ever consulted when this engine's parser has already refused, so a
 /// query it can read is never interpreted by the other one.
-pub(crate) fn parse_permissively(sql: &str) -> Result<std::collections::VecDeque<Statement>> {
+pub(crate) fn parse_permissively(
+    sql: &str,
+    subject: &str,
+) -> Result<std::collections::VecDeque<Statement>> {
     use deltalake::datafusion::sql::sqlparser::dialect::ClickHouseDialect;
 
     match DFParser::parse_sql(sql) {
@@ -119,7 +122,7 @@ pub(crate) fn parse_permissively(sql: &str) -> Result<std::collections::VecDeque
             // Report the native error: it is the one that describes the engine the query
             // will actually run on, and the fallback's complaint about a different grammar
             // would only mislead.
-            .map_err(|_| Error::Config(format!("could not parse transform_sql: {native}"))),
+            .map_err(|_| Error::Config(format!("could not parse {subject}: {native}"))),
     }
 }
 
@@ -164,7 +167,7 @@ fn validate_sql_with_grain(
     grain: Grain,
 ) -> Result<Statement> {
     let subject = grain.subject();
-    let mut statements = parse_permissively(sql)?;
+    let mut statements = parse_permissively(sql, subject)?;
 
     if statements.is_empty() {
         return Err(Error::Config(format!("{subject} is empty")));
@@ -823,31 +826,96 @@ struct StatefulConstructVisitor {
     grain: Grain,
 }
 
-/// Aggregates a client can apply as a delta on top of a baseline.
+/// Aggregates a client may apply as a delta on top of a baseline.
 ///
-/// Strictly narrower than [`AGGREGATES`], and the narrowing is the whole safety argument for
-/// letting a publication aggregate at all. A published row is combined with what the client
-/// already holds — `+sales_delta`, `count + orders_delta` — so only functions that are
-/// monoids under that combination can be correct. `avg` is the canonical counter-example:
-/// the average of two batches is not the average of their averages, so a per-batch `avg`
-/// published as a delta is silently wrong on every dashboard that applies it. Same for
-/// `median`, `mode`, `stddev*`, `var*`, `string_agg` and `listagg`.
+/// An allowlist rather than a denylist, and deliberately much narrower than the set of
+/// aggregates this engine can run. A published row is combined with what a client already
+/// holds — `+sales_delta`, `count + orders_delta` — so a function qualifies only if the
+/// value for two batches is a function of the value for each.
 ///
-/// It is also what keeps the useful duality: the same model is a delta over one batch and a
-/// running total over the whole table, which is why a client can reload it as the baseline
-/// after a gap. That stops being true the moment a non-combinable aggregate is allowed.
+/// Two different disqualifications, worth keeping apart because only the first is about
+/// arithmetic:
+///
+///  * **Not combinable at all.** `avg` is the canonical case: the average of two batches is
+///    not the average of their averages, so a per-batch `avg` published as a delta is
+///    silently wrong on every dashboard that applies it. `median`, `mode`, `stddev*`, `var*`,
+///    the `regr_*` family and `count(DISTINCT ..)` are the same shape of wrong.
+///  * **Combinable, but not something to push.** `string_agg`, `listagg`, `array_agg`,
+///    `bool_and/or` and `bit_and/or/xor` *do* compose associatively — concatenating two
+///    batches' lists is the list of both. They are refused anyway: a list aggregate's payload
+///    grows without bound as batches accumulate, and its order is the batch's file order,
+///    which is an accident rather than a fact about the data.
+///
+/// The allowlist is also what keeps the duality the design rests on: the same model is a
+/// delta over one batch and a running total over the whole table, which is why a client can
+/// reload it as the baseline after a gap. That stops being true the moment a non-combinable
+/// aggregate is allowed.
 const COMBINABLE_AGGREGATES: &[&str] = &["sum", "count", "min", "max"];
 
-/// Aggregate function names that imply cross-row state.
+/// Every aggregate and window function name this engine actually resolves.
 ///
-/// `array_*` UDFs are intentionally absent: they aggregate *within* a row and cannot
-/// reach across rows.
-const AGGREGATES: &[&str] = &[
-    "sum",
-    "avg",
-    "min",
-    "max",
-    "count",
+/// Derived from DataFusion's own registry rather than written out by hand, and that is a
+/// correctness property rather than tidiness. A hand-maintained list is a list of the names
+/// somebody thought of: it had `avg` and not `mean`, which DataFusion registers as an alias
+/// of it — so `SELECT mean(x) FROM source` passed a gate whose entire purpose is to refuse
+/// exactly that, and would have gone on doing so for every alias added upstream. Asking the
+/// engine which names it will resolve cannot drift from what it then resolves.
+///
+/// `array_*` UDFs are intentionally absent, and stay absent for free: they are ours, not
+/// DataFusion's, and they aggregate *within* a row rather than across rows.
+///
+/// The registry is unioned with [`FOREIGN_AGGREGATE_SPELLINGS`] rather than replacing it,
+/// because the two cover different mistakes and neither subsumes the other.
+fn aggregates() -> &'static BTreeSet<String> {
+    static AGGREGATES: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+    AGGREGATES.get_or_init(|| {
+        use deltalake::datafusion::functions_aggregate::all_default_aggregate_functions;
+        use deltalake::datafusion::functions_window::all_default_window_functions;
+
+        let mut names: BTreeSet<String> = FOREIGN_AGGREGATE_SPELLINGS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for f in all_default_aggregate_functions() {
+            names.insert(f.name().to_ascii_lowercase());
+            names.extend(f.aliases().iter().map(|a| a.to_ascii_lowercase()));
+        }
+        // A window function is cross-row whether or not it is written with OVER, and the
+        // `OVER` check alone would miss `rank()` used bare.
+        for f in all_default_window_functions() {
+            names.insert(f.name().to_ascii_lowercase());
+            names.extend(f.aliases().iter().map(|a| a.to_ascii_lowercase()));
+        }
+        names
+    })
+}
+
+/// Cross-row functions other warehouses have and this engine does not.
+///
+/// A dbt model is written for the warehouse first, so it can name a function DataFusion
+/// cannot resolve at all — Trino's `mode`, `approx_distinct`, `corr`. Leaving those to the
+/// registry would mean they were refused by a *planning* failure on the first batch in
+/// production rather than by this module at load, which is the exact outcome the file exists
+/// to prevent. So they are named here, and the registry supplies everything this engine will
+/// actually run, including the aliases nobody thinks of.
+const FOREIGN_AGGREGATE_SPELLINGS: &[&str] = &[
+    "mode",
+    "listagg",
+    "approx_distinct",
+    "approx_median",
+    "approx_percentile_cont",
+    "percentile_cont",
+    "percentile_disc",
+    "corr",
+    "covar",
+    "covar_pop",
+    "covar_samp",
+    "every",
+    "bool_and",
+    "bool_or",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
     "stddev",
     "stddev_pop",
     "stddev_samp",
@@ -855,37 +923,9 @@ const AGGREGATES: &[&str] = &[
     "var_pop",
     "var_samp",
     "median",
-    "mode",
-    "array_agg",
     "string_agg",
-    "listagg",
-    "bit_and",
-    "bit_or",
-    "bit_xor",
-    "bool_and",
-    "bool_or",
-    "every",
-    "corr",
-    "covar",
-    "covar_pop",
-    "covar_samp",
-    "approx_distinct",
-    "approx_median",
-    "approx_percentile_cont",
-    "percentile_cont",
-    "percentile_disc",
+    "array_agg",
     "grouping",
-    "first_value",
-    "last_value",
-    "nth_value",
-    "row_number",
-    "rank",
-    "dense_rank",
-    "percent_rank",
-    "cume_dist",
-    "ntile",
-    "lag",
-    "lead",
 ];
 
 impl VisitorMut for StatefulConstructVisitor {
@@ -955,7 +995,7 @@ impl VisitorMut for StatefulConstructVisitor {
             }
             let name = f.name.to_string().to_ascii_lowercase();
             let bare = name.rsplit('.').next().unwrap_or(&name).to_string();
-            if AGGREGATES.contains(&bare.as_str()) {
+            if aggregates().contains(&bare) {
                 if !self.grain.aggregation_allowed() {
                     self.found = Some(reject(
                         &format!("the aggregate function {bare}()"),
@@ -973,8 +1013,10 @@ impl VisitorMut for StatefulConstructVisitor {
                     self.found = Some(reject(
                         &format!("the aggregate function {bare}()"),
                         "a published row is a delta the client adds to a baseline it already \
-                         has, and this function does not combine that way: the value for two \
-                         batches is not a function of the value for each.",
+                         has, and only sum, count, min and max combine that way — either \
+                         because the value for two batches is not a function of the value for \
+                         each, or because it accumulates a list whose size and order are not \
+                         something to push.",
                         "publish sum() and count() and derive it in the model, so the same \
                          SQL is a delta over one batch and the baseline over the whole table.",
                     ));
@@ -1497,11 +1539,16 @@ mod tests {
             "mode(amount)",
             "string_agg(name, ',')",
             "array_agg(name)",
+            // An alias of avg that a hand-written denylist did not have — which is why the
+            // set is now asked of the engine rather than written out here.
+            "mean(amount)",
+            "var_sample(amount)",
+            "regr_slope(amount, amount)",
         ] {
             let sql = format!("SELECT country, {f} AS x FROM source GROUP BY country");
             let e = publish_err_of(&sql);
             assert!(
-                e.contains("does not combine that way"),
+                e.contains("only sum, count, min and max combine that way"),
                 "expected {f} to be refused as non-combinable, got: {e}"
             );
         }
@@ -1542,12 +1589,30 @@ mod tests {
     #[test]
     fn a_publish_model_still_reads_only_the_source_batch() {
         // The rules that are not about aggregation must be identical, because the batch is
-        // still the only thing in memory when the payload is built.
-        let e = publish_err_of(
-            "SELECT c.name, sum(s.amount) AS x FROM source s, countries c \
-                                GROUP BY c.name",
-        );
-        assert!(e.contains("not supported"), "got: {e}");
+        // still the only thing in memory when the payload is built. Asserted against a
+        // single foreign relation: the comma-FROM spelling is refused by the implicit-cross-
+        // join rule before the relation check is reached, so it would pass while proving
+        // nothing about foreign tables. `not supported` would have matched either.
+        let e = publish_err_of("SELECT sum(amount) AS x FROM countries");
+        assert!(e.contains("countries"), "must name the relation: {e}");
+    }
+
+    #[test]
+    fn the_aggregate_names_come_from_the_engine_that_will_run_them() {
+        // The property that closes the alias hole: anything DataFusion resolves as an
+        // aggregate is known here without somebody having to remember to add it.
+        let names = aggregates();
+        for expected in ["avg", "mean", "sum", "count", "median", "row_number", "lag"] {
+            assert!(names.contains(expected), "{expected} missing");
+        }
+    }
+
+    #[test]
+    fn an_alias_of_a_cross_row_aggregate_is_refused_as_a_transform_too() {
+        // Not only a publish-grain concern. `mean` slipping the denylist made it a grain
+        // violation in an ordinary transform: a per-batch average, stored forever.
+        let e = err_of("SELECT mean(amount) AS a FROM source");
+        assert!(e.contains("mean()"), "got: {e}");
     }
 
     #[test]

@@ -101,10 +101,14 @@ pub struct Envelope {
     pub app_id: String,
     /// The dbt model whose SQL produced `rows`.
     pub model: String,
-    /// The group this was sent to, echoed so a client on several routes without reading
-    /// socket metadata.
+    /// The group this was sent to, echoed so a client subscribed to several can route on the
+    /// message alone rather than on socket metadata.
     pub group: String,
-    /// The previous publication's `source_version`, or `null` for the first since start.
+    /// The previous *batch's* `source_version`, or `null` for the first since start.
+    ///
+    /// The previous batch, not the previous successful send: a batch whose message never
+    /// arrived must still occupy a place in the chain, or the client cannot tell that it
+    /// missed one. See `Pipeline::publish`.
     pub prev_source_version: Option<Version>,
     /// First source version this batch drew from. Display only — see the type docs.
     pub from_source_version: Version,
@@ -113,8 +117,9 @@ pub struct Envelope {
     /// Delta version of the target commit these rows are already in.
     pub target_version: Option<Version>,
     pub committed_at: String,
-    /// `false` when the payload was too large to send: `rows` is then empty and the client
-    /// should reload a baseline rather than assume nothing happened.
+    /// `false` when the rows could not be carried — over the size cap, or unserialisable.
+    /// `rows` is then empty and the client should reload a baseline rather than assume
+    /// nothing happened. `row_count` still says how many there were.
     pub complete: bool,
     /// How many rows the transform produced, which is meaningful even when `rows` is empty.
     pub row_count: usize,
@@ -227,7 +232,10 @@ impl Breaker {
     fn record_failure(&self, elapsed: Duration) -> bool {
         let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
         if self.threshold > 0 && n >= self.threshold {
-            let until = elapsed.as_millis() as u64 + self.cooldown.as_millis() as u64;
+            // Saturating: this runs between a durable commit and its StepOutcome, and an
+            // absurd configured cooldown must not panic a debug build there.
+            let until =
+                (elapsed.as_millis() as u64).saturating_add(self.cooldown.as_millis() as u64);
             self.open_until_millis.store(until, Ordering::Relaxed);
             return true;
         }
@@ -338,8 +346,8 @@ impl Publisher {
         }
     }
 
-    /// Build a publisher around an arbitrary sink. For tests, and for a library caller
-    /// wiring in a backend of their own.
+    /// Build a publisher around an arbitrary sink. For tests: `Pipeline::open` builds its
+    /// own, and nothing in `Pipeline`'s public surface takes one.
     pub fn with_sink(
         cfg: &ResolvedPipeline,
         model: &PublishModel,
@@ -396,6 +404,19 @@ impl Publisher {
         let out = match self.transform.run(schema, batches).await {
             Ok(out) => out,
             Err(e) => {
+                // Counted into the same breaker as a failing sink, for the same reason it
+                // exists: a model whose SQL can never plan — a stale manifest naming a
+                // column the target no longer has — would otherwise pay a fresh
+                // SessionContext, a UDF registration pass and a planning attempt on the
+                // *pre-commit* path of every batch forever, which is exactly the cost the
+                // breaker is here to stop paying.
+                if self.breaker.record_failure(self.origin.elapsed()) {
+                    info!(
+                        pipeline = %self.pipeline,
+                        "pausing realtime publication after repeated failures; the Delta \
+                         stream continues and publication resumes on its own"
+                    );
+                }
                 warn!(
                     pipeline = %self.pipeline,
                     model = %self.model,
@@ -415,7 +436,12 @@ impl Publisher {
             Err(e) => {
                 // Over the cap, or unserialisable. Either way the client is told to reload
                 // rather than left believing nothing happened.
-                debug!(pipeline = %self.pipeline, "publishing an incomplete payload: {e}");
+                warn!(
+                    pipeline = %self.pipeline,
+                    model = %self.model,
+                    "{e}; publishing an empty payload so the client reloads a baseline \
+                     instead of assuming nothing happened"
+                );
                 Some(Rendered {
                     rows: serde_json::Value::Array(Vec::new()),
                     row_count,
@@ -547,7 +573,11 @@ impl Publisher {
                     source_version,
                     "publishing failed; the Delta commit is unaffected: {e}"
                 );
-                if self.breaker.record_failure(elapsed) {
+                // Measured now rather than from `elapsed`, which was captured before the
+                // request: a hung endpoint burns the whole timeout first, and with
+                // `timeout_secs >= breaker_cooldown_secs` the breaker would open already
+                // expired and never skip anything.
+                if self.breaker.record_failure(self.origin.elapsed()) {
                     info!(
                         pipeline = %self.pipeline,
                         "pausing realtime publication after repeated failures; the Delta \
@@ -834,5 +864,56 @@ mod tests {
             max_message_bytes: "900KB".into(),
         });
         assert!(Publisher::open(&cfg).is_none());
+    }
+
+    #[test]
+    fn the_breaker_closes_again_once_its_cooldown_has_passed() {
+        // The reason `is_open` takes the clock as a parameter at all. Nothing exercised the
+        // expiry, so a breaker that latched open forever would have passed the suite.
+        let b = Breaker::new(1, Duration::from_secs(30));
+        assert!(!b.is_open(Duration::from_secs(0)));
+
+        assert!(
+            b.record_failure(Duration::from_secs(10)),
+            "threshold 1 opens at once"
+        );
+        assert!(
+            b.is_open(Duration::from_secs(11)),
+            "still inside the cooldown"
+        );
+        assert!(b.is_open(Duration::from_secs(39)));
+        assert!(
+            !b.is_open(Duration::from_secs(41)),
+            "and it expires on its own"
+        );
+    }
+
+    #[test]
+    fn an_absurd_cooldown_does_not_panic_between_a_commit_and_its_outcome() {
+        let b = Breaker::new(1, Duration::from_secs(u64::MAX / 1000));
+        b.record_failure(Duration::from_secs(1));
+        assert!(b.is_open(Duration::from_secs(2)));
+    }
+
+    #[tokio::test]
+    async fn a_render_failure_counts_toward_the_breaker() {
+        // A publish model that can never plan would otherwise re-plan on the pre-commit path
+        // of every batch forever, which is the cost the breaker exists to stop paying.
+        let sink = Recorder::new(false);
+        let p = Publisher::with_sink(
+            &pipeline_cfg(),
+            &model("SELECT no_such_column FROM source"),
+            sink.clone(),
+            900_000,
+            2,
+            Duration::from_secs(30),
+        );
+        for _ in 0..2 {
+            assert!(p
+                .render(schema(), vec![batch(&["NL"], &[1])])
+                .await
+                .is_none());
+        }
+        assert!(p.is_paused(), "two unplannable renders pause it");
     }
 }

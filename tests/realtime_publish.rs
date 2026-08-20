@@ -30,8 +30,12 @@ enum HubBehaviour {
     Hang,
 }
 
-/// One captured request: its start line, and its body.
-type Captured = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+/// One captured request: its full head, its body, and the status we answered with.
+///
+/// The whole head is kept, not just the start line: the Authorization header is the one part
+/// of this request that no other test can observe, and without it here the header could be
+/// deleted outright with the suite still green.
+type Captured = Arc<Mutex<Vec<(String, Vec<u8>, u16)>>>;
 
 /// A stand-in for the Web PubSub data plane.
 ///
@@ -42,6 +46,24 @@ struct FakeHub {
     pub addr: String,
     pub requests: Captured,
     pub hits: Arc<AtomicU64>,
+    behaviour: Arc<AtomicU64>,
+}
+
+impl HubBehaviour {
+    fn code(self) -> u64 {
+        match self {
+            HubBehaviour::Accept => 0,
+            HubBehaviour::Fail => 1,
+            HubBehaviour::Hang => 2,
+        }
+    }
+    fn from_code(c: u64) -> Self {
+        match c {
+            1 => HubBehaviour::Fail,
+            2 => HubBehaviour::Hang,
+            _ => HubBehaviour::Accept,
+        }
+    }
 }
 
 impl FakeHub {
@@ -50,9 +72,11 @@ impl FakeHub {
         let addr = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let hits = Arc::new(AtomicU64::new(0));
+        let behaviour = Arc::new(AtomicU64::new(behaviour.code()));
 
         let sink = requests.clone();
         let counter = hits.clone();
+        let mode = behaviour.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -60,6 +84,7 @@ impl FakeHub {
                 };
                 let sink = sink.clone();
                 let counter = counter.clone();
+                let mode = mode.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -97,10 +122,17 @@ impl FakeHub {
                     }
 
                     counter.fetch_add(1, Ordering::SeqCst);
-                    let target = head.lines().next().unwrap_or_default().to_string();
+                    let behaviour = HubBehaviour::from_code(mode.load(Ordering::SeqCst));
+                    let status = match behaviour {
+                        HubBehaviour::Accept => 202,
+                        HubBehaviour::Fail => 500,
+                        HubBehaviour::Hang => 0,
+                    };
+                    // Recorded before the response is written, so a test inspecting the
+                    // capture after the client returned always sees it.
                     sink.lock()
                         .unwrap()
-                        .push((target, buf[header_end..].to_vec()));
+                        .push((head.clone(), buf[header_end..].to_vec(), status));
 
                     match behaviour {
                         HubBehaviour::Accept => {
@@ -129,15 +161,32 @@ impl FakeHub {
             addr,
             requests,
             hits,
+            behaviour,
         }
     }
 
+    /// Change what the far end does from here on, so one test can lose exactly one message.
+    fn set(&self, behaviour: HubBehaviour) {
+        self.behaviour.store(behaviour.code(), Ordering::SeqCst);
+    }
+
+    /// Every envelope that arrived, whether or not it was accepted.
     fn envelopes(&self) -> Vec<Envelope> {
+        self.parse(|_| true)
+    }
+
+    /// Only the envelopes a client would actually have received.
+    fn delivered(&self) -> Vec<Envelope> {
+        self.parse(|status| status == 202)
+    }
+
+    fn parse(&self, keep: impl Fn(u16) -> bool) -> Vec<Envelope> {
         self.requests
             .lock()
             .unwrap()
             .iter()
-            .map(|(_, body)| {
+            .filter(|(_, _, status)| keep(*status))
+            .map(|(_, body, _)| {
                 serde_json::from_slice(body).unwrap_or_else(|e| {
                     panic!(
                         "body was not a ddi envelope ({e}): {}",
@@ -148,12 +197,19 @@ impl FakeHub {
             .collect()
     }
 
-    fn request_lines(&self) -> Vec<String> {
+    fn heads(&self) -> Vec<String> {
         self.requests
             .lock()
             .unwrap()
             .iter()
-            .map(|(line, _)| line.clone())
+            .map(|(head, _, _)| head.clone())
+            .collect()
+    }
+
+    fn request_lines(&self) -> Vec<String> {
+        self.heads()
+            .iter()
+            .map(|h| h.lines().next().unwrap_or_default().to_string())
             .collect()
     }
 }
@@ -265,6 +321,20 @@ async fn nothing_is_published_when_the_target_commit_fails() {
         hub.hits.load(Ordering::SeqCst),
         0,
         "a payload was published for a commit that never landed"
+    );
+
+    // Positive control. Without it this test passes for any failure at all, including one
+    // early enough that the publisher was never going to run — which would make it prove
+    // nothing about ordering. Put the target back and the same pipeline publishes.
+    create_table(&f.target).await;
+    let mut p = Pipeline::open(publishing_cfg(&f, "copy", &hub, 5))
+        .await
+        .unwrap();
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(
+        hub.hits.load(Ordering::SeqCst),
+        1,
+        "so the zero above was the commit gate, not an earlier failure"
     );
 }
 
@@ -548,4 +618,176 @@ async fn an_upsert_pipeline_does_not_publish_even_when_asked_directly() {
         0,
         "but publishes nothing at all"
     );
+}
+
+#[tokio::test]
+async fn a_message_that_never_arrives_shows_up_as_a_gap_in_the_next_one() {
+    // The test the whole at-most-once bargain rests on. Publication is allowed to lose a
+    // message; what is not allowed is losing one *silently*, because a client that cannot
+    // tell has quietly wrong numbers forever rather than a stale baseline it reloads.
+    let f = Fixture::new().await;
+    append(&f.source, &[1]).await;
+
+    let hub = FakeHub::start(HubBehaviour::Accept).await;
+    let mut p = Pipeline::open(publishing_cfg(&f, "copy", &hub, 5))
+        .await
+        .unwrap();
+    p.run_until_caught_up().await.unwrap();
+    let first = hub.envelopes()[0].clone();
+
+    // Second batch: the hub refuses it, so its message never reaches a client.
+    hub.set(HubBehaviour::Fail);
+    append(&f.source, &[2]).await;
+    p.run_until_caught_up().await.unwrap();
+
+    // Third batch: accepted again.
+    hub.set(HubBehaviour::Accept);
+    append(&f.source, &[3]).await;
+    p.run_until_caught_up().await.unwrap();
+
+    let delivered: Vec<Envelope> = hub.delivered();
+    assert_eq!(
+        delivered.len(),
+        2,
+        "the middle one was refused: {delivered:?}"
+    );
+    let third = delivered.last().unwrap();
+
+    // A client holding the first message applies the client contract to the third.
+    assert_ne!(
+        third.prev_source_version,
+        Some(first.source_version),
+        "the third message must NOT claim to follow the first — that is what makes the \
+         lost second one invisible"
+    );
+    assert!(
+        third.prev_source_version > Some(first.source_version),
+        "it names the batch that was actually before it: {:?} after {:?}",
+        third.prev_source_version,
+        first.source_version
+    );
+    assert_eq!(
+        read_ids(&f.target).await,
+        vec![1, 2, 3],
+        "and all three committed"
+    );
+}
+
+#[tokio::test]
+async fn an_open_breaker_stops_attempting_and_says_so() {
+    // The breaker's only production enforcement point is the caller's is_paused() check, so
+    // it needs a test that goes through the real path rather than through Breaker directly.
+    let f = Fixture::new().await;
+    append(&f.source, &[1]).await;
+
+    let hub = FakeHub::start(HubBehaviour::Fail).await;
+    let mut cfg = publishing_cfg(&f, "copy", &hub, 5);
+    cfg.publish_to.as_mut().unwrap().failure_threshold = 1;
+    cfg.publish_to.as_mut().unwrap().breaker_cooldown_secs = 3_600;
+    let mut p = Pipeline::open(cfg).await.unwrap();
+
+    let outcome = p.step().await.unwrap();
+    let StepOutcome::Progressed { published, .. } = outcome else {
+        panic!("expected a commit");
+    };
+    assert!(
+        published.unwrap().failed,
+        "the first attempt fails and opens the breaker"
+    );
+
+    append(&f.source, &[2]).await;
+    let outcome = p.step().await.unwrap();
+    let StepOutcome::Progressed { published, .. } = outcome else {
+        panic!("expected a commit");
+    };
+    let stats = published.unwrap();
+    assert!(
+        stats.skipped && !stats.failed,
+        "second batch is skipped, not retried: {stats:?}"
+    );
+    assert_eq!(
+        hub.hits.load(Ordering::SeqCst),
+        1,
+        "and nothing was sent the second time"
+    );
+    assert_eq!(
+        read_ids(&f.target).await,
+        vec![1, 2],
+        "both committed regardless"
+    );
+}
+
+#[tokio::test]
+async fn the_request_carries_a_bearer_token_whose_audience_is_the_request_url() {
+    // Without this, deleting the Authorization header entirely leaves the suite green.
+    let f = Fixture::new().await;
+    append(&f.source, &[1]).await;
+
+    let hub = FakeHub::start(HubBehaviour::Accept).await;
+    let mut p = Pipeline::open(publishing_cfg(&f, "copy", &hub, 5))
+        .await
+        .unwrap();
+    p.run_until_caught_up().await.unwrap();
+
+    let head = &hub.heads()[0];
+    let auth = head
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("authorization: ")
+                .or(l.strip_prefix("Authorization: "))
+        })
+        .unwrap_or_else(|| panic!("no Authorization header in:\n{head}"));
+    let token = auth
+        .strip_prefix("Bearer ")
+        .unwrap_or_else(|| panic!("not a bearer token: {auth}"));
+    let parts: Vec<&str> = token.split('.').collect();
+    assert_eq!(parts.len(), 3, "header.payload.signature: {token}");
+
+    let payload: serde_json::Value =
+        serde_json::from_slice(&base64_url_nopad(parts[1]).expect("payload is base64url"))
+            .expect("payload is JSON");
+
+    // The rule that is invisible until a real service 401s: aud is the whole request URL,
+    // query string included.
+    let request_line = head.lines().next().unwrap();
+    let path = request_line.split(' ').nth(1).expect("METHOD PATH VERSION");
+    let expected = format!("{}{}", hub.addr, path);
+    assert_eq!(
+        payload["aud"], expected,
+        "aud must be the request URL: {payload}"
+    );
+    assert!(
+        payload["aud"].as_str().unwrap().contains("api-version"),
+        "including its query string: {payload}"
+    );
+
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: application/json"),
+        "the service needs the content type to frame the message:\n{head}"
+    );
+}
+
+/// base64url without padding, as JWS uses.
+fn base64_url_nopad(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }

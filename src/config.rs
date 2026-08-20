@@ -287,10 +287,11 @@ pub struct PipelineConfig {
 
     /// The live payload this pipeline's commits carry, when a dbt model declared one.
     ///
-    /// Must stay the **last** field: `toml::to_string` emits a table's scalars before its
-    /// sub-tables, and a struct field sitting among the scalars fails to serialise with
-    /// "values must be emitted before tables". `ddi dbt convert` writes this file, so that
-    /// would break the convert path rather than anything at run time.
+    /// Last by preference rather than by constraint. `toml 0.8` reorders a table's scalars
+    /// ahead of its sub-tables when serialising, so field order here is free — `lookups` is a
+    /// `Vec<LookupConfig>` sitting at field four with two dozen scalars after it, and round
+    /// trips. It reads best last, and `a_pinned_publication_round_trips_through_toml` is what
+    /// actually holds the convert path to working.
     #[serde(default)]
     pub publish: Option<PublishModel>,
 }
@@ -573,8 +574,25 @@ impl PublisherConfig {
             }
             _ => {}
         }
-        if self.hub.trim().is_empty() {
-            return Err("[publish].hub must not be empty".into());
+        if !crate::dbt::analyze::valid_group(&self.hub) {
+            return Err(format!(
+                "[publish].hub is {:?}. It goes into a request path, so it must be 1-128 \
+                 characters of A-Z a-z 0-9 . _ : - starting with a letter or digit.",
+                self.hub
+            ));
+        }
+        if self.timeout_secs == 0 || self.timeout_secs > 300 {
+            return Err(format!(
+                "[publish].timeout_secs is {}; a publish that slow is already useless to a \
+                 dashboard and is holding up the next batch. Use 1..=300.",
+                self.timeout_secs
+            ));
+        }
+        if self.breaker_cooldown_secs > 86_400 {
+            return Err(format!(
+                "[publish].breaker_cooldown_secs is {}, which is longer than a day",
+                self.breaker_cooldown_secs
+            ));
         }
         // The service's own bound. Sending outside it is a 400 at the far end, which is a
         // worse way to find out than a line at startup.
@@ -635,10 +653,13 @@ pub struct PublishModel {
 
 /// Why this pipeline must not publish, if it must not.
 ///
-/// Asked of the *configured* pipeline, before `expand_staged` rewrites a `staged_upsert`
-/// into an appending half and a merging half. After that rewrite the ingest half claims
-/// `write_mode = Append` while writing to a private staging table, so asking afterwards
-/// would let exactly the case this rejects through wearing the wrong answer.
+/// Reached from `resolve_publish`, which runs on the *expanded* list — so by the time this
+/// sees a staged upsert it has already become an appending half and a merging half, and the
+/// appending half would answer "no problem" about rows going into a private staging table.
+///
+/// That case is therefore not this function's to catch, and is not left to it: `expand_staged`
+/// clears `publish` on both halves unconditionally as it builds them. **Do not delete those
+/// two lines on the strength of this check** — it cannot see what they prevent.
 fn publish_problem(p: &PipelineConfig) -> Option<String> {
     p.publish.as_ref()?;
     if p.write_mode.keeps_one_row_per_key() {
@@ -1082,13 +1103,20 @@ impl Config {
         // merely ignores the foreign ones; one that does not re-baselines forever. Either way
         // it is a mistake, and unlike a duplicate app_id it costs nothing to keep streaming
         // through — so the *publication* is dropped from every sharer and the pipelines run.
+        // Only pipelines that could actually publish contest a group. An upsert entry, or one
+        // whose publication is refused for any other reason, will never send anything — so
+        // letting it collide would take a healthy neighbour's dashboard down for company.
         let mut group_users: HashMap<&str, Vec<&str>> = HashMap::new();
-        for p in pipelines {
-            if let Some(m) = &p.publish {
-                group_users
-                    .entry(m.group.as_str())
-                    .or_default()
-                    .push(&p.name);
+        if !self.publish_disabled && self.publish.is_some() {
+            for p in pipelines {
+                if let Some(m) = &p.publish {
+                    if publish_problem(p).is_none() {
+                        group_users
+                            .entry(m.group.as_str())
+                            .or_default()
+                            .push(&p.name);
+                    }
+                }
             }
         }
         let contested_groups: BTreeSet<&str> = group_users
@@ -1227,6 +1255,21 @@ impl Config {
                 model.model,
                 model.kind.as_str(),
                 sink.kind.as_str()
+            );
+            return (None, None);
+        }
+
+        // Judged here rather than left to the first request. The dbt gate already applies
+        // this, but a pinned config is meant to be read and edited by hand, and a group that
+        // would have to be escaped would otherwise pass load, log "each committed batch will
+        // also be published", and then fail on every batch until the breaker opened.
+        if !crate::dbt::analyze::valid_group(&model.group) {
+            tracing::warn!(
+                pipeline = %p.name,
+                "not publishing: group {:?} goes into a request path and into a browser's \
+                 subscription, so it must be 1-128 characters of A-Z a-z 0-9 . _ : - \
+                 starting with a letter or digit. The Delta stream is unaffected.",
+                model.group
             );
             return (None, None);
         }
@@ -2195,6 +2238,28 @@ hub = "ddi"
             "but it still streams: {:?}",
             r.rejected
         );
+    }
+
+    #[test]
+    fn publish_problem_refuses_a_staged_upsert_before_it_is_split() {
+        // The half of this that `publish_problem` actually owns. Asked of the operator's own
+        // entry, which is the only form in which a staged upsert still says it merges — after
+        // the split the ingest half claims write_mode = Append. The test below covers the
+        // other half of the defence, and would pass even if this check were deleted.
+        let mut p: PipelineConfig = toml::from_str(
+            "name = \"style\"\napp_id = \"ddi.style\"\nsource_uri = \"/a\"\n\
+             target_uri = \"/b\"\nwrite_mode = \"staged_upsert\"\n",
+        )
+        .unwrap();
+        p.publish = Some(PublishModel {
+            model: "style_live".into(),
+            kind: PublisherKind::Webpubsub,
+            group: "style".into(),
+            publish_sql: "SELECT count(*) AS c FROM source".into(),
+        });
+        let reason = publish_problem(&p).expect("a staged upsert must not publish");
+        assert!(reason.contains("staged_upsert"), "got: {reason}");
+        assert!(reason.contains("double-count"), "says why: {reason}");
     }
 
     #[test]

@@ -388,7 +388,7 @@ turns it off for a whole process.
   "target_version": 456,
   "committed_at": "2026-08-20T09:31:02.481Z",
   "complete": true,
-  "row_count": 2,
+  "row_count": 1,
   "rows": [{"status": "paid", "orders_delta": 2, "amount_delta": 40}]
 }
 ```
@@ -401,7 +401,7 @@ B    := read the baseline (the publish model, as a view), noting its target vers
 last := null
 
 on message m:
-  if m.pipeline != mine or m.app_id != mine                   -> ignore (not my stream)
+  if m.pipeline != mine or m.app_id != mine                  -> ignore (not my stream)
   if m.ddi != 1                                              -> reload
   if m.target_version is not null and m.target_version <= B  -> ignore (already in baseline)
   if last is not null and m.source_version <= last           -> ignore (replay)
@@ -416,14 +416,22 @@ pipeline reloaded its baseline on every message that pipeline sent, forever. `dd
 refuses to let two pipelines publish to one group, so this should not arise — but the client
 rule has to be right on its own.
 
+`prev_source_version` names the **previous batch**, not the previous message that got
+through. That is what makes a lost message detectable at all: a batch whose publish failed
+still occupies its place in the chain, so the next message says it follows one the client
+never saw, and the client reloads. Holding it back on a failure would renumber the chain over
+the hole and the loss would be silent — which is the one thing a best-effort transport must
+not be.
+
 The gap test is `prev_source_version`, not the source versions themselves. Those are **not**
 consecutive and were never meant to be: a compaction on the source, a `dataChange: false`
 rewrite, or a change commit under `skip_change_commits` all advance the cursor without
 producing a batch. A client testing for consecutive source versions would reload its
 baseline every time somebody ran `OPTIMIZE` on a bronze table.
 
-`complete: false` means the payload was larger than the service will carry, so `rows` is
-empty and `row_count` says what you missed — reload rather than assume nothing happened.
+`complete: false` means the rows could not be carried — larger than the service will take,
+or not serialisable — so `rows` is empty and `row_count` says how many there were. Reload
+rather than assume nothing happened.
 
 ### What `ddi` does not do
 
