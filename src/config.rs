@@ -5,6 +5,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use tracing::warn;
+
 use crate::error::{Error, Result};
 use crate::lookup::{LookupConfig, ResolvedLookup};
 use crate::source::{ChangePolicy, Version};
@@ -1075,6 +1077,38 @@ impl Config {
             }
         }
 
+        // Two pipelines pushing to one group interleave their messages on a socket a browser
+        // cannot demultiplex by anything but the envelope. A client that filters correctly
+        // merely ignores the foreign ones; one that does not re-baselines forever. Either way
+        // it is a mistake, and unlike a duplicate app_id it costs nothing to keep streaming
+        // through — so the *publication* is dropped from every sharer and the pipelines run.
+        let mut group_users: HashMap<&str, Vec<&str>> = HashMap::new();
+        for p in pipelines {
+            if let Some(m) = &p.publish {
+                group_users
+                    .entry(m.group.as_str())
+                    .or_default()
+                    .push(&p.name);
+            }
+        }
+        let contested_groups: BTreeSet<&str> = group_users
+            .iter()
+            .filter(|(_, users)| users.len() > 1)
+            .flat_map(|(group, users)| {
+                warn!(
+                    "pipelines {} all publish to group {group:?}. One group is one stream to a \
+                     browser, so their messages would interleave with nothing to tell them \
+                     apart. None of them will publish; all of them keep streaming to Delta.",
+                    users
+                        .iter()
+                        .map(|n| format!("{n:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                users.iter().copied()
+            })
+            .collect();
+
         let d = &self.runtime;
         let mut ok = Vec::new();
         for p in pipelines {
@@ -1083,7 +1117,13 @@ impl Config {
                 continue;
             }
             match self.resolve_one(p, d) {
-                Ok(r) => ok.push(r),
+                Ok(mut r) => {
+                    if contested_groups.contains(p.name.as_str()) {
+                        r.publish = None;
+                        r.publish_to = None;
+                    }
+                    ok.push(r)
+                }
                 Err(e) => reject(
                     &p.name,
                     match e {
@@ -2204,5 +2244,53 @@ hub = "ddi"
             "a Config is logged at startup: {rendered}"
         );
         assert!(rendered.contains("redacted"), "got: {rendered}");
+    }
+
+    #[test]
+    fn two_pipelines_publishing_to_one_group_both_stop_publishing_and_keep_streaming() {
+        // One group is one stream to a browser. Two producers on it interleave with nothing
+        // in the envelope to tell a client which is which — a correct client ignores the
+        // foreign ones, an incorrect one re-baselines forever. Neither is worth shipping, and
+        // neither is worth stopping ingestion over.
+        let toml = format!(
+            "{PUBLISH_SINK}\n[[pipeline]]\nname = \"a\"\napp_id = \"ddi.a\"\n\
+             source_uri = \"/tmp/bronze/a\"\ntarget_uri = \"/tmp/silver/a\"\n\
+             [pipeline.publish]\nmodel = \"a_live\"\nkind = \"webpubsub\"\ngroup = \"sales\"\n\
+             publish_sql = \"SELECT count(*) AS c FROM source\"\n\
+             \n[[pipeline]]\nname = \"b\"\napp_id = \"ddi.b\"\n\
+             source_uri = \"/tmp/bronze/b\"\ntarget_uri = \"/tmp/silver/b\"\n\
+             [pipeline.publish]\nmodel = \"b_live\"\nkind = \"webpubsub\"\ngroup = \"sales\"\n\
+             publish_sql = \"SELECT count(*) AS c FROM source\"\n"
+        );
+        let r = Config::from_toml_str(&toml).unwrap().resolve_all().unwrap();
+        assert_eq!(r.pipelines.len(), 2, "both still run: {:?}", r.rejected);
+        assert!(
+            r.rejected.is_empty(),
+            "and neither is held back: {:?}",
+            r.rejected
+        );
+        for p in &r.pipelines {
+            assert!(p.publish.is_none(), "{:?} must not publish", p.name);
+            assert!(p.publish_to.is_none());
+        }
+    }
+
+    #[test]
+    fn distinct_groups_are_left_alone() {
+        let toml = format!(
+            "{PUBLISH_SINK}\n[[pipeline]]\nname = \"a\"\napp_id = \"ddi.a\"\n\
+             source_uri = \"/tmp/bronze/a\"\ntarget_uri = \"/tmp/silver/a\"\n\
+             [pipeline.publish]\nmodel = \"a_live\"\nkind = \"webpubsub\"\ngroup = \"sales\"\n\
+             publish_sql = \"SELECT count(*) AS c FROM source\"\n\
+             \n[[pipeline]]\nname = \"b\"\napp_id = \"ddi.b\"\n\
+             source_uri = \"/tmp/bronze/b\"\ntarget_uri = \"/tmp/silver/b\"\n\
+             [pipeline.publish]\nmodel = \"b_live\"\nkind = \"webpubsub\"\ngroup = \"orders\"\n\
+             publish_sql = \"SELECT count(*) AS c FROM source\"\n"
+        );
+        let r = Config::from_toml_str(&toml).unwrap().resolve_all().unwrap();
+        assert_eq!(r.pipelines.len(), 2);
+        for p in &r.pipelines {
+            assert!(p.publish.is_some(), "{:?} should publish", p.name);
+        }
     }
 }

@@ -432,6 +432,26 @@ fn analyze_publish(manifest: &Manifest, unique_id: &str, node: &Node, name: &str
         );
     };
 
+    // Refused before the recursion below, and that ordering is what bounds it. A publish
+    // model whose host also carries `ddi_publish` would send `analyze` back into
+    // `analyze_publish`, and two of them pointing at each other — or one pointing at itself —
+    // would recurse until the stack ran out. dbt will not emit a cycle, but the manifest is
+    // an input to this program rather than something it produced, and "cannot be correct"
+    // has to come out as a reason rather than as a crash. With this here the recursion is
+    // depth-1 by construction: the host is never a publish model, and analysing a streamable
+    // one does not recurse at all.
+    if host.meta_str("ddi_publish").is_some() {
+        return reject(
+            name,
+            format!(
+                "publishes for {:?}, which is itself a publish model. A publication describes \
+                 one committed batch of a *streamed* model, and a publish model commits \
+                 nothing — point this at the ddi model whose batches you want to describe.",
+                host.name
+            ),
+        );
+    }
+
     // A publication rides on a pipeline's commits, and there are none without one. Asked of
     // the host's own verdict so the reason quoted is the one the analyst will see against
     // that model too, rather than a second opinion that could drift from it.
@@ -1340,5 +1360,92 @@ mod tests {
         }
         // And the host is untouched: a contested dashboard must not stop ingestion.
         assert!(verdicts.iter().any(|v| v.is_streamable()));
+    }
+
+    #[test]
+    fn a_publish_model_pointing_at_another_publish_model_is_rejected_not_recursed() {
+        // Two of these pointing at each other used to recurse until the stack ran out.
+        // dbt will not emit a cycle, but the manifest is an input to this program rather
+        // than something it produced, so "cannot be correct" has to come out as a reason.
+        let mut m = publish_manifest(&[("ddi_publish", "webpubsub")], AGG, "view");
+        let mut meta = HashMap::new();
+        meta.insert("ddi_publish".into(), serde_json::Value::from("webpubsub"));
+        m.nodes.insert(
+            "model.p.orders_live_2".to_string(),
+            Node {
+                name: "orders_live_2".into(),
+                resource_type: "model".into(),
+                schema: "silver".into(),
+                compiled_code: Some("SELECT count(*) AS c FROM silver.orders_live".into()),
+                depends_on: DependsOn {
+                    nodes: vec!["model.p.orders_live".to_string()],
+                },
+                config: NodeConfig {
+                    materialized: Some("view".into()),
+                    ..Default::default()
+                },
+                meta,
+                ..Default::default()
+            },
+        );
+
+        let v = analyze(&m, "model.p.orders_live_2");
+        let Verdict::Rejected { reason, .. } = v else {
+            panic!("expected a rejection, got {v:?}");
+        };
+        assert!(reason.contains("itself a publish model"), "got: {reason}");
+    }
+
+    #[test]
+    fn two_publish_models_referring_to_each_other_terminate() {
+        // The cycle proper. Reaching an assertion at all is the point of this test: before
+        // the guard, analyze_all would overflow the stack here.
+        let mut m = publish_manifest(&[("ddi_publish", "webpubsub")], AGG, "view");
+        m.nodes
+            .get_mut("model.p.orders_live")
+            .unwrap()
+            .depends_on
+            .nodes = vec!["model.p.orders_live_2".to_string()];
+        let mut meta = HashMap::new();
+        meta.insert("ddi_publish".into(), serde_json::Value::from("webpubsub"));
+        m.nodes.insert(
+            "model.p.orders_live_2".to_string(),
+            Node {
+                name: "orders_live_2".into(),
+                resource_type: "model".into(),
+                schema: "silver".into(),
+                compiled_code: Some("SELECT count(*) AS c FROM silver.orders_live".into()),
+                depends_on: DependsOn {
+                    nodes: vec!["model.p.orders_live".to_string()],
+                },
+                config: NodeConfig {
+                    materialized: Some("view".into()),
+                    ..Default::default()
+                },
+                meta,
+                ..Default::default()
+            },
+        );
+
+        let verdicts = analyze_all(&m);
+        assert!(
+            verdicts.iter().filter(|v| v.is_publication()).count() == 0,
+            "neither may publish: {verdicts:?}"
+        );
+    }
+
+    #[test]
+    fn a_publish_model_that_depends_on_itself_is_rejected() {
+        let mut m = publish_manifest(&[("ddi_publish", "webpubsub")], AGG, "view");
+        m.nodes
+            .get_mut("model.p.orders_live")
+            .unwrap()
+            .depends_on
+            .nodes = vec!["model.p.orders_live".to_string()];
+        let v = analyze(&m, "model.p.orders_live");
+        let Verdict::Rejected { reason, .. } = v else {
+            panic!("expected a rejection, got {v:?}");
+        };
+        assert!(reason.contains("itself a publish model"), "got: {reason}");
     }
 }

@@ -401,13 +401,20 @@ B    := read the baseline (the publish model, as a view), noting its target vers
 last := null
 
 on message m:
-  if m.ddi != 1 or m.pipeline != mine                        -> reload
+  if m.pipeline != mine or m.app_id != mine                   -> ignore (not my stream)
+  if m.ddi != 1                                              -> reload
   if m.target_version is not null and m.target_version <= B  -> ignore (already in baseline)
   if last is not null and m.source_version <= last           -> ignore (replay)
   if last is not null and m.prev_source_version != last      -> reload, reset
   if not m.complete                                          -> reload; last := m.source_version
   apply m.rows; last := m.source_version
 ```
+
+A message from another stream is **ignored, not reloaded**. It is not a hole in this
+client's chain, and treating it as one would mean a client sharing a group with a second
+pipeline reloaded its baseline on every message that pipeline sent, forever. `ddi` also
+refuses to let two pipelines publish to one group, so this should not arise — but the client
+rule has to be right on its own.
 
 The gap test is `prev_source_version`, not the source versions themselves. Those are **not**
 consecutive and were never meant to be: a compaction on the source, a `dataChange: false`
