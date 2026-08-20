@@ -415,7 +415,7 @@ async fn dbt_command(sub: &DbtCommand, cfg: &Config, cli: &Cli) -> delta_delta_i
                 }
             }
 
-            let (mut ok, mut no, mut unknown) = (0usize, 0usize, 0usize);
+            let (mut ok, mut no, mut unknown, mut publishes) = (0usize, 0usize, 0usize, 0usize);
             let mut why: std::collections::BTreeMap<String, usize> = Default::default();
 
             for v in &verdicts {
@@ -426,6 +426,22 @@ async fn dbt_command(sub: &DbtCommand, cfg: &Config, cli: &Cli) -> delta_delta_i
                             println!(
                                 "streamable  {:<28} {} -> {}",
                                 s.name, s.source_relation, s.target_relation
+                            );
+                        }
+                    }
+                    // Listed on its own line rather than folded into the streamable count,
+                    // because it is not a pipeline: it is a payload another model's commits
+                    // carry. Without this line a typo in `ddi_publish` would be invisible —
+                    // the model simply would not appear anywhere.
+                    Verdict::Publishes(p) => {
+                        publishes += 1;
+                        if !rejected_only {
+                            println!(
+                                "publishes   {:<28} -> {}  ({}, group={})",
+                                p.name,
+                                p.host_relation,
+                                p.kind.as_str(),
+                                p.group
                             );
                         }
                     }
@@ -443,8 +459,8 @@ async fn dbt_command(sub: &DbtCommand, cfg: &Config, cli: &Cli) -> delta_delta_i
             }
 
             println!(
-                "\n{ok} streamable, {no} not streamable, {unknown} could not be judged, \
-                 of {} model(s).",
+                "\n{ok} streamable, {publishes} publishes, {no} not streamable, {unknown} \
+                 could not be judged, of {} model(s).",
                 verdicts.len()
             );
             if unknown > 0 {

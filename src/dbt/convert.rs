@@ -46,7 +46,19 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
     let template = storage.uri_template.as_deref().map(UriTemplate::new);
     let mut out = Vec::new();
 
-    for v in analyze_all(manifest) {
+    // One analysis, read twice. A publish model is not a pipeline — it is a property of the
+    // one it `ref()`s — so the publications are indexed by host first and attached below.
+    let verdicts = analyze_all(manifest);
+    let publications: std::collections::BTreeMap<&str, &crate::dbt::analyze::Publication> =
+        verdicts
+            .iter()
+            .filter_map(|v| match v {
+                Verdict::Publishes(p) => Some((p.host_unique_id.as_str(), p.as_ref())),
+                _ => None,
+            })
+            .collect();
+
+    for v in &verdicts {
         let Verdict::Streamable(s) = v else { continue };
 
         let target_node = manifest.node(&s.unique_id);
@@ -155,9 +167,17 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
             // Carried so a running pipeline can re-ask the catalog where these live.
             source_relation: src.fully_qualified(),
             target_relation: tgt.fully_qualified(),
-            // Filled in from the `ddi_publish` models in a second pass over the same
-            // verdicts; nothing publishes until that lands.
-            publish: None,
+            // The live payload, declared on its own dbt model and resolved onto the
+            // pipeline whose commits carry it. `group` was defaulted at analyze time, so
+            // what is pinned here is what runs.
+            publish: publications
+                .get(s.unique_id.as_str())
+                .map(|p| crate::config::PublishModel {
+                    model: p.name.clone(),
+                    kind: p.kind,
+                    group: p.group.clone(),
+                    publish_sql: p.sql.clone(),
+                }),
         });
     }
     Ok(out)
@@ -218,6 +238,23 @@ pub fn to_toml(manifest: &Manifest, cfg: &Config) -> Result<String> {
             }
         }
     }
+    let publishing: Vec<&Verdict> = all.iter().filter(|v| v.is_publication()).collect();
+    if !publishing.is_empty() {
+        out.push_str("# ---------------------------------------------------------------\n");
+        out.push_str("# Realtime payloads (not pipelines; attached to the model they ref):\n");
+        for v in publishing {
+            if let Verdict::Publishes(p) = v {
+                out.push_str(&format!(
+                    "#   {}: {} -> {} group {:?}\n",
+                    p.name,
+                    p.host_relation,
+                    p.kind.as_str(),
+                    p.group
+                ));
+            }
+        }
+    }
+
     let unknown: Vec<&Verdict> = all.iter().filter(|v| v.is_unknown()).collect();
     if !unknown.is_empty() {
         out.push_str("# ---------------------------------------------------------------\n");
@@ -531,5 +568,105 @@ mod tests {
             "a pinned upsert pipeline must still upsert"
         );
         assert_eq!(pinned[0].upsert_key.as_deref(), Some("order_id"));
+    }
+
+    /// The fixture plus a publish model over `orders_stg`.
+    fn fixture_with_publication() -> Manifest {
+        let mut m = fixture();
+        let mut meta = HashMap::new();
+        meta.insert("ddi_publish".into(), serde_json::Value::from("webpubsub"));
+        meta.insert("ddi_publish_group".into(), serde_json::Value::from("sales"));
+        m.nodes.insert(
+            "model.p.orders_live".to_string(),
+            Node {
+                name: "orders_live".into(),
+                resource_type: "model".into(),
+                schema: "silver".into(),
+                compiled_code: Some(
+                    "SELECT status, count(*) AS orders_delta FROM silver.orders_stg \
+                     GROUP BY status"
+                        .into(),
+                ),
+                depends_on: DependsOn {
+                    nodes: vec!["model.p.orders_stg".into()],
+                },
+                config: NodeConfig {
+                    materialized: Some("view".into()),
+                    ..Default::default()
+                },
+                meta,
+                ..Default::default()
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn a_publication_is_attached_to_the_pipeline_it_refs_and_is_not_one_itself() {
+        let derived = pipelines(&fixture_with_publication(), &storage()).unwrap();
+
+        assert!(
+            !derived.iter().any(|p| p.name == "orders_live"),
+            "a publish model is a payload, not a pipeline: {:?}",
+            derived.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+
+        let host = derived
+            .iter()
+            .find(|p| p.name == "orders_stg")
+            .expect("the host still streams");
+        let publish = host.publish.as_ref().expect("the publication rode along");
+        assert_eq!(publish.model, "orders_live");
+        assert_eq!(publish.group, "sales");
+        assert_eq!(publish.kind, crate::config::PublisherKind::Webpubsub);
+        // Rewritten onto the in-memory batch, with no warehouse name left in it.
+        assert!(publish.publish_sql.contains("source"), "{publish:?}");
+        assert!(!publish.publish_sql.contains("silver"), "{publish:?}");
+
+        // And no other pipeline picked it up.
+        for p in derived.iter().filter(|p| p.name != "orders_stg") {
+            assert!(p.publish.is_none(), "{:?} should not publish", p.name);
+        }
+    }
+
+    #[test]
+    fn a_pipeline_with_no_publish_model_carries_none() {
+        let derived = pipelines(&fixture(), &storage()).unwrap();
+        assert!(derived.iter().all(|p| p.publish.is_none()));
+    }
+
+    #[test]
+    fn the_pinned_toml_lists_publications_so_a_typo_is_never_silent() {
+        let cfg = Config {
+            storage: storage(),
+            ..Default::default()
+        };
+        let rendered = to_toml(&fixture_with_publication(), &cfg).unwrap();
+        assert!(rendered.contains("Realtime payloads"), "got:\n{rendered}");
+        assert!(rendered.contains("orders_live"), "got:\n{rendered}");
+        assert!(rendered.contains("group \"sales\""), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn a_pinned_publication_round_trips_through_toml() {
+        // `publish` has to be the last field of PipelineConfig: toml emits a table's scalars
+        // before its sub-tables, so a struct field among the scalars fails to serialise.
+        // This is what catches that, and it is the convert path — not the run path — that
+        // would break.
+        let cfg = Config {
+            storage: storage(),
+            ..Default::default()
+        };
+        let rendered = to_toml(&fixture_with_publication(), &cfg).unwrap();
+        let reparsed = Config::from_toml_str(&rendered).unwrap();
+        let host = reparsed
+            .pipelines
+            .iter()
+            .find(|p| p.name == "orders_stg")
+            .expect("round-tripped");
+        assert_eq!(
+            host.publish.as_ref().map(|p| p.group.as_str()),
+            Some("sales")
+        );
     }
 }
