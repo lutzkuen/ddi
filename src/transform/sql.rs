@@ -54,6 +54,20 @@ impl SqlTransform {
         Self { sql }
     }
 
+    /// Build the transform behind a `ddi_publish` model.
+    ///
+    /// Differs from [`SqlTransform::new`] only in which validator normalised the text: a
+    /// publication may aggregate, because its rows describe one committed batch and are sent
+    /// rather than stored. See [`crate::transform::validate::Grain`]. Execution is identical —
+    /// the batch is registered as `source` and nothing else exists to read, which is what
+    /// makes running this over the *committed* rows the same operation as running the
+    /// model over the target table.
+    pub fn new_per_batch(sql: impl Into<String>) -> Self {
+        let sql = sql.into();
+        let sql = crate::transform::validate::normalise_publish_sql(&sql).unwrap_or(sql);
+        Self { sql }
+    }
+
     pub fn sql(&self) -> &str {
         &self.sql
     }
