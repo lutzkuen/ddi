@@ -15,6 +15,7 @@ pub mod lookup;
 pub mod metrics;
 pub mod offset;
 pub mod pipeline;
+pub mod publish;
 pub mod schema;
 pub mod sink;
 pub mod source;
