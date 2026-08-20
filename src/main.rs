@@ -534,10 +534,15 @@ async fn run_all(
             .store(0, Ordering::Relaxed);
     }
     for p in &pipelines {
-        metrics
-            .pipeline(&p.name)
-            .config_valid
-            .store(1, Ordering::Relaxed);
+        let m = metrics.pipeline(&p.name);
+        m.config_valid.store(1, Ordering::Relaxed);
+        // Set here rather than on the first publish, because the question it answers is
+        // "should this dashboard be getting anything at all?" — and a pipeline that has no
+        // publisher and one whose publishes are all failing both leave the counters at zero.
+        m.publish_configured.store(
+            i64::from(p.publish.is_some() && p.publish_to.is_some()),
+            Ordering::Relaxed,
+        );
     }
 
     if let Some(addr) = metrics_addr {
@@ -824,6 +829,7 @@ async fn attempt(
                 rows,
                 upsert,
                 rejected,
+                published,
                 ..
             }) => {
                 // A step that got this far means the pipeline is working, whatever happened
@@ -859,10 +865,14 @@ async fn attempt(
                     m.merge_queue_millis
                         .fetch_add(u.queue_millis, Ordering::Relaxed);
                 }
+                if let Some(p) = published {
+                    m.observe_publish(&p);
+                }
             }
             Ok(StepOutcome::Skipped {
                 through_version,
                 rejected,
+                published,
                 ..
             }) => {
                 progressed.store(true, Ordering::Relaxed);
@@ -878,6 +888,9 @@ async fn attempt(
                 m.commits_skipped.fetch_add(1, Ordering::Relaxed);
                 m.last_source_version
                     .store(through_version as i64, Ordering::Relaxed);
+                if let Some(p) = published {
+                    m.observe_publish(&p);
+                }
             }
             Err(e) => {
                 // Hand it to the supervisor above, which backs off and reopens. Not counted
