@@ -9,12 +9,19 @@
 //! order_id` where every group provably fits in one batch would be fine; accepting it
 //! invites `GROUP BY customer_id`, which silently emits partial sums per batch. So all
 //! `GROUP BY` is rejected, and the error names the alternative.
+//!
+//! That argument is about rows that get *stored*. A `ddi_publish` model's rows are a message
+//! describing one committed batch, and a partial sum is precisely what it is for — so the
+//! same rules are applied at a second [`Grain`], under which aggregation is allowed and the
+//! aggregate functions narrow to the ones a client can apply as a delta. Everything else —
+//! one source relation, no window frames, no foreign tables — is shared, so the two cannot
+//! drift into disagreeing about what a batch is.
 
 use deltalake::datafusion::sql::parser::{DFParser, Statement};
 use deltalake::datafusion::sql::sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Join,
-    JoinConstraint, JoinOperator, ObjectName, Query, Select, SetExpr, Statement as SqlStatement,
-    TableFactor, Value, VisitMut, VisitorMut,
+    BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    Ident, Join, JoinConstraint, JoinOperator, ObjectName, Query, Select, SetExpr,
+    Statement as SqlStatement, TableFactor, Value, VisitMut, VisitorMut,
 };
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -35,23 +42,59 @@ fn reject(what: &str, why: &str, instead: &str) -> Error {
     Error::Config(format!("{what} is not supported: {why} Instead: {instead}"))
 }
 
+/// What a query's rows *mean*, which is what decides whether aggregation is legal.
+///
+/// [`Grain::Preserved`] is a transform: its rows are appended to a table that outlives their
+/// batch, so a per-batch `sum` would be a partial sum stored forever — the reason `GROUP BY`
+/// is the headline rejection in this module.
+///
+/// [`Grain::PerBatch`] is a *publication*: a message that names the closed source-version
+/// range it covers and is never stored. A partial sum is exactly what it is for. That single
+/// difference is the whole reason this parameter exists, and it is why the two grains may
+/// share every other rule — one source relation, no window frames, no foreign tables — while
+/// disagreeing about `GROUP BY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Grain {
+    /// One row in, one row out. Rows are appended to a Delta table.
+    #[default]
+    Preserved,
+    /// Rows describe one committed batch and are sent, not stored.
+    PerBatch,
+}
+
+impl Grain {
+    /// What to call the SQL in an error message, so an analyst is told which of their two
+    /// kinds of model is wrong.
+    fn subject(self) -> &'static str {
+        match self {
+            Grain::Preserved => "transform_sql",
+            Grain::PerBatch => "publish SQL",
+        }
+    }
+
+    fn aggregation_allowed(self) -> bool {
+        matches!(self, Grain::PerBatch)
+    }
+}
+
 /// Render a statement and read it back with this engine's own parser.
 ///
 /// Used to hand the query from the permissive parser to the native one once the syntax that
 /// needed the former has been rewritten away. It is not a formality: the two parsers
 /// disagree about the shape of what they read, not just about what they accept.
-fn reparse_natively(statement: &SqlStatement) -> Result<SqlStatement> {
+fn reparse_natively(statement: &SqlStatement, grain: Grain) -> Result<SqlStatement> {
     let text = statement.to_string();
+    let subject = grain.subject();
     let mut parsed = DFParser::parse_sql(&text).map_err(|e| {
         Error::Config(format!(
-            "transform_sql uses a dialect this engine cannot run, and rewriting did not \
+            "{subject} uses a dialect this engine cannot run, and rewriting did not \
              resolve it ({e}). After rewriting it read: {text}"
         ))
     })?;
     match parsed.pop_front() {
         Some(Statement::Statement(inner)) => Ok(*inner),
         _ => Err(Error::Config(format!(
-            "could not re-read transform_sql after rewriting it: {text}"
+            "could not re-read {subject} after rewriting it: {text}"
         ))),
     }
 }
@@ -67,7 +110,10 @@ fn reparse_natively(statement: &SqlStatement) -> Result<SqlStatement> {
 ///
 /// The fallback is only ever consulted when this engine's parser has already refused, so a
 /// query it can read is never interpreted by the other one.
-pub(crate) fn parse_permissively(sql: &str) -> Result<std::collections::VecDeque<Statement>> {
+pub(crate) fn parse_permissively(
+    sql: &str,
+    subject: &str,
+) -> Result<std::collections::VecDeque<Statement>> {
     use deltalake::datafusion::sql::sqlparser::dialect::ClickHouseDialect;
 
     match DFParser::parse_sql(sql) {
@@ -76,7 +122,7 @@ pub(crate) fn parse_permissively(sql: &str) -> Result<std::collections::VecDeque
             // Report the native error: it is the one that describes the engine the query
             // will actually run on, and the fallback's complaint about a different grammar
             // would only mislead.
-            .map_err(|_| Error::Config(format!("could not parse transform_sql: {native}"))),
+            .map_err(|_| Error::Config(format!("could not parse {subject}: {native}"))),
     }
 }
 
@@ -93,10 +139,38 @@ pub fn validate_sql(sql: &str) -> Result<Statement> {
 /// lookup is a Delta snapshot registered for that batch. The caller supplies only the aliases
 /// that were declared in dbt; any other relation remains a configuration error.
 pub fn validate_sql_with_lookups(sql: &str, lookups: &BTreeSet<String>) -> Result<Statement> {
-    let mut statements = parse_permissively(sql)?;
+    validate_sql_with_grain(sql, lookups, Grain::Preserved)
+}
+
+/// Parse and validate the SQL behind a `ddi_publish` model.
+///
+/// Same rules as a transform in every respect but one: aggregation is the point rather than
+/// the headline rejection, because these rows are a message about one committed batch rather
+/// than rows appended to a table. Lookups are deliberately not offered — a lookup snapshot is
+/// pinned to the *source* commit's timestamp, and re-resolving one when the payload is built
+/// would pin it to a different instant. Enrichment belongs in the model being published for.
+pub fn validate_publish_sql(sql: &str) -> Result<Statement> {
+    validate_sql_with_grain(sql, &BTreeSet::new(), Grain::PerBatch)
+}
+
+/// Validate publish SQL and return the text the engine should actually run.
+pub fn normalise_publish_sql(sql: &str) -> Result<String> {
+    match validate_publish_sql(sql)? {
+        Statement::Statement(inner) => Ok(inner.to_string()),
+        other => Ok(other.to_string()),
+    }
+}
+
+fn validate_sql_with_grain(
+    sql: &str,
+    lookups: &BTreeSet<String>,
+    grain: Grain,
+) -> Result<Statement> {
+    let subject = grain.subject();
+    let mut statements = parse_permissively(sql, subject)?;
 
     if statements.is_empty() {
-        return Err(Error::Config("transform_sql is empty".into()));
+        return Err(Error::Config(format!("{subject} is empty")));
     }
     if statements.len() > 1 {
         return Err(reject(
@@ -140,13 +214,13 @@ pub fn validate_sql_with_lookups(sql: &str, lookups: &BTreeSet<String>) -> Resul
     // point therefore works on one parser's AST, whichever one let the text in.
     crate::transform::unnest::rewrite_json_array_casts(&mut query)?;
     rewrite_trino_from_unixtime(&mut query)?;
-    if let SqlStatement::Query(q) = reparse_natively(&SqlStatement::Query(query.clone()))? {
+    if let SqlStatement::Query(q) = reparse_natively(&SqlStatement::Query(query.clone()), grain)? {
         query = q;
     }
 
     crate::transform::unnest::rewrite(&mut query)?;
 
-    check_query(&query, &BTreeSet::new(), lookups)?;
+    check_query(&query, &BTreeSet::new(), lookups, grain)?;
 
     let rewritten = Statement::Statement(Box::new(SqlStatement::Query(query)));
 
@@ -157,7 +231,7 @@ pub fn validate_sql_with_lookups(sql: &str, lookups: &BTreeSet<String>) -> Resul
     let text = rewritten.to_string();
     DFParser::parse_sql(&text).map_err(|e| {
         Error::Config(format!(
-            "transform_sql uses a dialect this engine cannot run, and rewriting did not \
+            "{subject} uses a dialect this engine cannot run, and rewriting did not \
              resolve it ({e}). After rewriting it read: {text}"
         ))
     })?;
@@ -304,7 +378,12 @@ fn timezone_literal(value: &str) -> Expr {
 /// `scope` matters because the checks recurse: a CTE body is examined on its own, and it
 /// may legitimately refer to a CTE its parent declared. Without inheriting those names,
 /// `WITH a AS (...), b AS (SELECT * FROM a) ...` would report `a` as a foreign table.
-fn check_query(query: &Query, scope: &BTreeSet<String>, lookups: &BTreeSet<String>) -> Result<()> {
+fn check_query(
+    query: &Query,
+    scope: &BTreeSet<String>,
+    lookups: &BTreeSet<String>,
+    grain: Grain,
+) -> Result<()> {
     // Names this query adds, visible to its own CTE bodies and to its body.
     let mut inner = scope.clone();
     inner.extend(cte_names(query));
@@ -327,9 +406,9 @@ fn check_query(query: &Query, scope: &BTreeSet<String>, lookups: &BTreeSet<Strin
     // live on the Select node rather than in an expression. So `WITH base AS (SELECT
     // DISTINCT ...) SELECT * FROM base` slipped through until this recursed.
     for cte in query.with.iter().flat_map(|w| w.cte_tables.iter()) {
-        check_query(&cte.query, &inner, lookups)?;
+        check_query(&cte.query, &inner, lookups, grain)?;
     }
-    check_set_expr(&query.body, &inner, lookups)?;
+    check_set_expr(&query.body, &inner, lookups, grain)?;
 
     // Window functions and relation references can appear in ORDER BY / expressions anywhere.
     // Count the lookup references that are valid direct LEFT JOINs before the general visitor
@@ -339,6 +418,7 @@ fn check_query(query: &Query, scope: &BTreeSet<String>, lookups: &BTreeSet<Strin
     let mut v = StatefulConstructVisitor {
         ctes: inner,
         lookups: lookups.clone(),
+        grain,
         ..Default::default()
     };
     let mut q = query.clone();
@@ -361,13 +441,14 @@ fn check_set_expr(
     body: &SetExpr,
     scope: &BTreeSet<String>,
     lookups: &BTreeSet<String>,
+    grain: Grain,
 ) -> Result<()> {
     match body {
-        SetExpr::Select(select) => check_select(select, scope, lookups),
-        SetExpr::Query(q) => check_query(q, scope, lookups),
+        SetExpr::Select(select) => check_select(select, scope, lookups, grain),
+        SetExpr::Query(q) => check_query(q, scope, lookups, grain),
         SetExpr::SetOperation { left, right, .. } => {
-            check_set_expr(left, scope, lookups)?;
-            check_set_expr(right, scope, lookups)
+            check_set_expr(left, scope, lookups, grain)?;
+            check_set_expr(right, scope, lookups, grain)
         }
         SetExpr::Values(_) => Err(reject(
             "VALUES",
@@ -386,15 +467,19 @@ fn check_select(
     select: &Select,
     scope: &BTreeSet<String>,
     lookups: &BTreeSet<String>,
+    grain: Grain,
 ) -> Result<()> {
-    // GROUP BY — the headline rejection.
+    // GROUP BY — the headline rejection for a transform, and the entire point of a
+    // publication. A published row describes one committed batch and is never stored, so a
+    // partial sum is what the client is asking for; it applies the delta on top of a baseline
+    // it read from the same model. See [`Grain`].
     let grouped = match &select.group_by {
         deltalake::datafusion::sql::sqlparser::ast::GroupByExpr::All(_) => true,
         deltalake::datafusion::sql::sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
             !exprs.is_empty()
         }
     };
-    if grouped {
+    if grouped && !grain.aggregation_allowed() {
         return Err(reject(
             "GROUP BY",
             "this tool preserves grain: a group that spans batches would emit partial \
@@ -404,7 +489,7 @@ fn check_select(
         ));
     }
 
-    if select.having.is_some() {
+    if select.having.is_some() && !grain.aggregation_allowed() {
         return Err(reject(
             "HAVING",
             "it only exists alongside aggregation.",
@@ -412,7 +497,9 @@ fn check_select(
         ));
     }
 
-    if select.distinct.is_some() {
+    // DISTINCT is GROUP BY over every selected column, so refusing it while allowing the
+    // spelling that means the same thing would only teach analysts to write the other one.
+    if select.distinct.is_some() && !grain.aggregation_allowed() {
         return Err(reject(
             "DISTINCT",
             "deduplication is cross-row state: rows in an earlier batch are already \
@@ -448,7 +535,7 @@ fn check_select(
     }
 
     for twj in &select.from {
-        check_base_table_factor(&twj.relation, scope, lookups)?;
+        check_base_table_factor(&twj.relation, scope, lookups, grain)?;
         for join in &twj.joins {
             check_lookup_join(join, lookups)?;
         }
@@ -461,6 +548,7 @@ fn check_base_table_factor(
     tf: &TableFactor,
     scope: &BTreeSet<String>,
     lookups: &BTreeSet<String>,
+    grain: Grain,
 ) -> Result<()> {
     match tf {
         TableFactor::Table { .. } if !is_plain_table_relation(tf) => Err(reject(
@@ -476,7 +564,7 @@ fn check_base_table_factor(
             "start from source (or a source-derived CTE) and LEFT JOIN the lookup.",
         )),
         TableFactor::Table { .. } => Ok(()),
-        TableFactor::Derived { subquery, .. } => check_query(subquery, scope, lookups),
+        TableFactor::Derived { subquery, .. } => check_query(subquery, scope, lookups, grain),
         TableFactor::UNNEST { .. } => Ok(()),
         TableFactor::NestedJoin { .. } => Err(reject(
             "JOIN",
@@ -735,18 +823,99 @@ struct StatefulConstructVisitor {
     ctes: BTreeSet<String>,
     lookups: BTreeSet<String>,
     lookup_refs: usize,
+    grain: Grain,
 }
 
-/// Aggregate function names that imply cross-row state.
+/// Aggregates a client may apply as a delta on top of a baseline.
 ///
-/// `array_*` UDFs are intentionally absent: they aggregate *within* a row and cannot
-/// reach across rows.
-const AGGREGATES: &[&str] = &[
-    "sum",
-    "avg",
-    "min",
-    "max",
-    "count",
+/// An allowlist rather than a denylist, and deliberately much narrower than the set of
+/// aggregates this engine can run. A published row is combined with what a client already
+/// holds — `+sales_delta`, `count + orders_delta` — so a function qualifies only if the
+/// value for two batches is a function of the value for each.
+///
+/// Two different disqualifications, worth keeping apart because only the first is about
+/// arithmetic:
+///
+///  * **Not combinable at all.** `avg` is the canonical case: the average of two batches is
+///    not the average of their averages, so a per-batch `avg` published as a delta is
+///    silently wrong on every dashboard that applies it. `median`, `mode`, `stddev*`, `var*`,
+///    the `regr_*` family and `count(DISTINCT ..)` are the same shape of wrong.
+///  * **Combinable, but not something to push.** `string_agg`, `listagg`, `array_agg`,
+///    `bool_and/or` and `bit_and/or/xor` *do* compose associatively — concatenating two
+///    batches' lists is the list of both. They are refused anyway: a list aggregate's payload
+///    grows without bound as batches accumulate, and its order is the batch's file order,
+///    which is an accident rather than a fact about the data.
+///
+/// The allowlist is also what keeps the duality the design rests on: the same model is a
+/// delta over one batch and a running total over the whole table, which is why a client can
+/// reload it as the baseline after a gap. That stops being true the moment a non-combinable
+/// aggregate is allowed.
+const COMBINABLE_AGGREGATES: &[&str] = &["sum", "count", "min", "max"];
+
+/// Every aggregate and window function name this engine actually resolves.
+///
+/// Derived from DataFusion's own registry rather than written out by hand, and that is a
+/// correctness property rather than tidiness. A hand-maintained list is a list of the names
+/// somebody thought of: it had `avg` and not `mean`, which DataFusion registers as an alias
+/// of it — so `SELECT mean(x) FROM source` passed a gate whose entire purpose is to refuse
+/// exactly that, and would have gone on doing so for every alias added upstream. Asking the
+/// engine which names it will resolve cannot drift from what it then resolves.
+///
+/// `array_*` UDFs are intentionally absent, and stay absent for free: they are ours, not
+/// DataFusion's, and they aggregate *within* a row rather than across rows.
+///
+/// The registry is unioned with [`FOREIGN_AGGREGATE_SPELLINGS`] rather than replacing it,
+/// because the two cover different mistakes and neither subsumes the other.
+fn aggregates() -> &'static BTreeSet<String> {
+    static AGGREGATES: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+    AGGREGATES.get_or_init(|| {
+        use deltalake::datafusion::functions_aggregate::all_default_aggregate_functions;
+        use deltalake::datafusion::functions_window::all_default_window_functions;
+
+        let mut names: BTreeSet<String> = FOREIGN_AGGREGATE_SPELLINGS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for f in all_default_aggregate_functions() {
+            names.insert(f.name().to_ascii_lowercase());
+            names.extend(f.aliases().iter().map(|a| a.to_ascii_lowercase()));
+        }
+        // A window function is cross-row whether or not it is written with OVER, and the
+        // `OVER` check alone would miss `rank()` used bare.
+        for f in all_default_window_functions() {
+            names.insert(f.name().to_ascii_lowercase());
+            names.extend(f.aliases().iter().map(|a| a.to_ascii_lowercase()));
+        }
+        names
+    })
+}
+
+/// Cross-row functions other warehouses have and this engine does not.
+///
+/// A dbt model is written for the warehouse first, so it can name a function DataFusion
+/// cannot resolve at all — Trino's `mode`, `approx_distinct`, `corr`. Leaving those to the
+/// registry would mean they were refused by a *planning* failure on the first batch in
+/// production rather than by this module at load, which is the exact outcome the file exists
+/// to prevent. So they are named here, and the registry supplies everything this engine will
+/// actually run, including the aliases nobody thinks of.
+const FOREIGN_AGGREGATE_SPELLINGS: &[&str] = &[
+    "mode",
+    "listagg",
+    "approx_distinct",
+    "approx_median",
+    "approx_percentile_cont",
+    "percentile_cont",
+    "percentile_disc",
+    "corr",
+    "covar",
+    "covar_pop",
+    "covar_samp",
+    "every",
+    "bool_and",
+    "bool_or",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
     "stddev",
     "stddev_pop",
     "stddev_samp",
@@ -754,37 +923,9 @@ const AGGREGATES: &[&str] = &[
     "var_pop",
     "var_samp",
     "median",
-    "mode",
-    "array_agg",
     "string_agg",
-    "listagg",
-    "bit_and",
-    "bit_or",
-    "bit_xor",
-    "bool_and",
-    "bool_or",
-    "every",
-    "corr",
-    "covar",
-    "covar_pop",
-    "covar_samp",
-    "approx_distinct",
-    "approx_median",
-    "approx_percentile_cont",
-    "percentile_cont",
-    "percentile_disc",
+    "array_agg",
     "grouping",
-    "first_value",
-    "last_value",
-    "nth_value",
-    "row_number",
-    "rank",
-    "dense_rank",
-    "percent_rank",
-    "cume_dist",
-    "ntile",
-    "lag",
-    "lead",
 ];
 
 impl VisitorMut for StatefulConstructVisitor {
@@ -854,15 +995,48 @@ impl VisitorMut for StatefulConstructVisitor {
             }
             let name = f.name.to_string().to_ascii_lowercase();
             let bare = name.rsplit('.').next().unwrap_or(&name).to_string();
-            if AGGREGATES.contains(&bare.as_str()) {
-                self.found = Some(reject(
-                    &format!("the aggregate function {bare}()"),
-                    "it combines values across rows, which cannot be correct when rows \
-                     arrive in independent batches.",
-                    "use array_sum / array_min / array_max / array_avg / array_length for \
-                     intra-row aggregation over an array column, or aggregate downstream.",
-                ));
-                return ControlFlow::Break(());
+            if aggregates().contains(&bare) {
+                if !self.grain.aggregation_allowed() {
+                    self.found = Some(reject(
+                        &format!("the aggregate function {bare}()"),
+                        "it combines values across rows, which cannot be correct when rows \
+                         arrive in independent batches.",
+                        "use array_sum / array_min / array_max / array_avg / array_length for \
+                         intra-row aggregation over an array column, or aggregate downstream.",
+                    ));
+                    return ControlFlow::Break(());
+                }
+                // Aggregation is legal here, but only for functions whose per-batch result
+                // can be combined with what a client already holds. See
+                // [`COMBINABLE_AGGREGATES`].
+                if !COMBINABLE_AGGREGATES.contains(&bare.as_str()) {
+                    self.found = Some(reject(
+                        &format!("the aggregate function {bare}()"),
+                        "a published row is a delta the client adds to a baseline it already \
+                         has, and only sum, count, min and max combine that way — either \
+                         because the value for two batches is not a function of the value for \
+                         each, or because it accumulates a list whose size and order are not \
+                         something to push.",
+                        "publish sum() and count() and derive it in the model, so the same \
+                         SQL is a delta over one batch and the baseline over the whole table.",
+                    ));
+                    return ControlFlow::Break(());
+                }
+                // `count(DISTINCT x)` is the same problem wearing the name of one that is
+                // fine: this batch cannot know which values the last one already counted.
+                if let FunctionArguments::List(list) = &f.args {
+                    if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+                        self.found = Some(reject(
+                            &format!("{bare}(DISTINCT ...)"),
+                            "distinctness cannot be combined across batches: this batch does \
+                             not know which values an earlier one already counted, so the \
+                             delta would double-count every value that repeats.",
+                            "publish the distinct keys themselves and let the client count \
+                             them, or count without DISTINCT.",
+                        ));
+                        return ControlFlow::Break(());
+                    }
+                }
             }
         }
         ControlFlow::Continue(())
@@ -1325,5 +1499,132 @@ mod tests {
     #[test]
     fn empty_sql_is_rejected() {
         assert!(validate_sql("   ").is_err());
+    }
+
+    // ---- Grain::PerBatch — publish SQL ----
+    //
+    // The rule these all circle is that a publication is a message about one committed
+    // batch, so aggregating is the point; but a client applies it as a delta, so only
+    // aggregates that combine that way can be allowed.
+
+    fn publish_err_of(sql: &str) -> String {
+        validate_publish_sql(sql)
+            .err()
+            .unwrap_or_else(|| panic!("expected publish SQL {sql:?} to be rejected"))
+            .to_string()
+    }
+
+    #[test]
+    fn group_by_is_allowed_per_batch_and_still_rejected_for_a_transform() {
+        let sql = "SELECT country, sum(amount) AS sales_delta, count(*) AS orders_delta \
+                   FROM source GROUP BY country";
+        validate_publish_sql(sql).expect("a per-batch aggregation is what a publication is");
+        let e = err_of(sql);
+        assert!(e.contains("GROUP BY is not supported"), "got: {e}");
+    }
+
+    #[test]
+    fn avg_is_rejected_per_batch_and_names_sum_and_count() {
+        let e = publish_err_of("SELECT country, avg(amount) AS a FROM source GROUP BY country");
+        assert!(e.contains("avg()"), "got: {e}");
+        assert!(e.contains("sum() and count()"), "got: {e}");
+    }
+
+    #[test]
+    fn the_other_non_combinable_aggregates_are_rejected_per_batch() {
+        for f in [
+            "median(amount)",
+            "stddev(amount)",
+            "var_pop(amount)",
+            "mode(amount)",
+            "string_agg(name, ',')",
+            "array_agg(name)",
+            // An alias of avg that a hand-written denylist did not have — which is why the
+            // set is now asked of the engine rather than written out here.
+            "mean(amount)",
+            "var_sample(amount)",
+            "regr_slope(amount, amount)",
+        ] {
+            let sql = format!("SELECT country, {f} AS x FROM source GROUP BY country");
+            let e = publish_err_of(&sql);
+            assert!(
+                e.contains("only sum, count, min and max combine that way"),
+                "expected {f} to be refused as non-combinable, got: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_combinable_aggregates_are_allowed_per_batch() {
+        validate_publish_sql(
+            "SELECT country, sum(amount) AS s, count(*) AS c, min(amount) AS lo, \
+             max(amount) AS hi FROM source GROUP BY country",
+        )
+        .expect("sum/count/min/max are exactly the ones a client can apply as a delta");
+    }
+
+    #[test]
+    fn count_distinct_is_rejected_per_batch() {
+        let e = publish_err_of(
+            "SELECT country, count(DISTINCT customer_id) AS c FROM source GROUP BY country",
+        );
+        assert!(e.contains("DISTINCT"), "got: {e}");
+        assert!(e.contains("double-count"), "got: {e}");
+    }
+
+    #[test]
+    fn a_bare_aggregate_with_no_group_by_is_a_valid_publication() {
+        // One row describing the whole batch is a legitimate dashboard payload, and is the
+        // shape a single-number tile wants.
+        validate_publish_sql("SELECT sum(amount) AS total, count(*) AS n FROM source").unwrap();
+    }
+
+    #[test]
+    fn window_functions_stay_rejected_per_batch() {
+        // Row order within a batch is an accident of file order, not a fact about the data.
+        let e = publish_err_of("SELECT row_number() OVER (ORDER BY x) AS r FROM source");
+        assert!(e.contains("window functions (OVER)"), "got: {e}");
+    }
+
+    #[test]
+    fn a_publish_model_still_reads_only_the_source_batch() {
+        // The rules that are not about aggregation must be identical, because the batch is
+        // still the only thing in memory when the payload is built. Asserted against a
+        // single foreign relation: the comma-FROM spelling is refused by the implicit-cross-
+        // join rule before the relation check is reached, so it would pass while proving
+        // nothing about foreign tables. `not supported` would have matched either.
+        let e = publish_err_of("SELECT sum(amount) AS x FROM countries");
+        assert!(e.contains("countries"), "must name the relation: {e}");
+    }
+
+    #[test]
+    fn the_aggregate_names_come_from_the_engine_that_will_run_them() {
+        // The property that closes the alias hole: anything DataFusion resolves as an
+        // aggregate is known here without somebody having to remember to add it.
+        let names = aggregates();
+        for expected in ["avg", "mean", "sum", "count", "median", "row_number", "lag"] {
+            assert!(names.contains(expected), "{expected} missing");
+        }
+    }
+
+    #[test]
+    fn an_alias_of_a_cross_row_aggregate_is_refused_as_a_transform_too() {
+        // Not only a publish-grain concern. `mean` slipping the denylist made it a grain
+        // violation in an ordinary transform: a per-batch average, stored forever.
+        let e = err_of("SELECT mean(amount) AS a FROM source");
+        assert!(e.contains("mean()"), "got: {e}");
+    }
+
+    #[test]
+    fn publish_errors_name_publish_sql_rather_than_transform_sql() {
+        let e = validate_publish_sql("   ").unwrap_err().to_string();
+        assert!(e.contains("publish SQL is empty"), "got: {e}");
+    }
+
+    #[test]
+    fn distinct_is_allowed_per_batch_because_group_by_over_the_same_columns_is() {
+        validate_publish_sql("SELECT DISTINCT country FROM source").unwrap();
+        let e = err_of("SELECT DISTINCT country FROM source");
+        assert!(e.contains("DISTINCT is not supported"), "got: {e}");
     }
 }

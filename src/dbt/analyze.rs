@@ -50,9 +50,36 @@ pub struct StreamableLookup {
     pub table_id_change_policy: LookupTableIdChangePolicy,
 }
 
+/// A dbt model that says what to push when *another* model's batch commits.
+///
+/// Never a pipeline of its own: no Delta target, no `txn` action, no offset, and no part in
+/// [`crate::dbt::watermark`]'s handover. It is a property of the model it rides on, resolved
+/// onto that model's `PipelineConfig` in [`crate::dbt::convert::pipelines`].
+///
+/// It is also, deliberately, an ordinary dbt model — a view over the streamed one. That is
+/// what makes the live path testable by an analyst rather than a second aggregation hidden
+/// in Rust: `dbt test` runs against it, and because the aggregation is a monoid over an
+/// append-only stream, the same SQL is a delta over one committed batch and the running
+/// total over the whole table. Which is exactly the baseline a client reloads after a gap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Publication {
+    pub unique_id: String,
+    pub name: String,
+    /// The streamed model whose commits trigger this: its single dependency.
+    pub host_unique_id: String,
+    pub host_relation: String,
+    pub kind: crate::config::PublisherKind,
+    /// The channel browsers subscribe to. Defaults to the model's own name.
+    pub group: String,
+    /// Compiled SQL rewritten to read `source` — at run time, the committed batch.
+    pub sql: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Streamable(Box<Streamable>),
+    /// A realtime payload for another model, not a table to write.
+    Publishes(Box<Publication>),
     /// The model was understood, and it cannot be streamed.
     Rejected {
         name: String,
@@ -74,6 +101,7 @@ impl Verdict {
     pub fn name(&self) -> &str {
         match self {
             Verdict::Streamable(s) => &s.name,
+            Verdict::Publishes(p) => &p.name,
             Verdict::Rejected { name, .. } | Verdict::Unknown { name, .. } => name,
         }
     }
@@ -82,13 +110,17 @@ impl Verdict {
         matches!(self, Verdict::Streamable(_))
     }
 
+    pub fn is_publication(&self) -> bool {
+        matches!(self, Verdict::Publishes(_))
+    }
+
     pub fn is_unknown(&self) -> bool {
         matches!(self, Verdict::Unknown { .. })
     }
 
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Verdict::Streamable(_) => None,
+            Verdict::Streamable(_) | Verdict::Publishes(_) => None,
             Verdict::Rejected { reason, .. } | Verdict::Unknown { reason, .. } => Some(reason),
         }
     }
@@ -131,6 +163,32 @@ pub fn analyze(manifest: &Manifest, unique_id: &str) -> Verdict {
     }
 
     let mat = node.materialized();
+
+    // A publish model is a different question, and the streaming gates would always answer
+    // "no" to it: it aggregates, and it has no storage. Both are the point of it.
+    //
+    // The materialization is checked *first*, not after, and that ordering is the whole
+    // safety of this branch. Routing on the key alone would mean a `ddi_publish` pasted onto
+    // a running `materialized: table` model — the natural copy-paste — took the publish path,
+    // failed its gates, and returned a rejection that `convert::pipelines` discards with a
+    // bare `continue`. The result of a one-line YAML edit would be a production pipeline that
+    // silently stopped being derived. So a streamable model carrying the key is refused
+    // loudly instead, naming both facts.
+    if node.meta_value("ddi_publish").is_some() {
+        if STREAMABLE_MATERIALIZATIONS.contains(&mat) {
+            return reject(
+                &name,
+                format!(
+                    "materialized as {mat:?} and carrying meta.ddi_publish. A publish model \
+                     describes what to push when *another* model commits, so it belongs on a \
+                     separate view model that ref()s this one — as written, this model would \
+                     stop being streamed."
+                ),
+            );
+        }
+        return analyze_publish(manifest, unique_id, node, &name);
+    }
+
     if !STREAMABLE_MATERIALIZATIONS.contains(&mat) {
         return reject(
             &name,
@@ -290,13 +348,293 @@ pub fn analyze(manifest: &Manifest, unique_id: &str) -> Verdict {
     }))
 }
 
+/// Materializations a publish model may have: ones with no storage of their own.
+///
+/// The complement of [`STREAMABLE_MATERIALIZATIONS`], and the reason is the same fact read
+/// the other way. What this SQL selects is a *delta* — the rows one committed batch produced
+/// — not a state. A table of those would mean something different from what dbt builds
+/// nightly under the same name, so the two would silently disagree.
+const PUBLISHABLE_MATERIALIZATIONS: &[&str] = &["view", "ephemeral"];
+
+/// A group name goes into a request path and into a browser's subscription, so it is kept to
+/// characters that need no escaping in either. The service permits far more; we do not, so
+/// that nothing between here and the wire has to encode or decode it.
+pub(crate) fn valid_group(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'))
+}
+
+/// Decide whether a `ddi_publish` model describes a payload ddi can build.
+///
+/// The gates mirror `analyze`'s, because the runtime is the same: one relation registered as
+/// `source`, holding one committed batch, and nothing else in memory to read. What differs is
+/// only the grain — see [`crate::transform::validate::Grain`].
+fn analyze_publish(manifest: &Manifest, unique_id: &str, node: &Node, name: &str) -> Verdict {
+    // Read through `meta_value` rather than `meta_str`, because the two disagree in exactly
+    // the case that matters. `meta_str` yields `None` for a non-string, so `ddi_publish:
+    // {type: webpubsub}` — the natural flattening of the nested spelling issue #6 sketched —
+    // would not have registered as a publish declaration at all: the model would simply never
+    // appear, with no rejection line and nothing in `ddi dbt check` to explain it. The routing
+    // above uses the same accessor, which is what keeps the recursion bound honest.
+    let Some(declared) = node.meta_value("ddi_publish").and_then(|v| v.as_str()) else {
+        return reject(
+            name,
+            format!(
+                "declares meta.ddi_publish={}, and it must be a plain string naming a \
+                 publisher: `ddi_publish: webpubsub`. Every ddi_* key is a flat scalar.",
+                node.meta_value("ddi_publish")
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "nothing".into())
+            ),
+        );
+    };
+    let Some(kind) = crate::config::PublisherKind::parse(declared) else {
+        return reject(
+            name,
+            format!(
+                "declares meta.ddi_publish={declared:?}, which is not a publisher this build \
+                 knows. Use one of: {}.",
+                crate::config::PublisherKind::known()
+            ),
+        );
+    };
+
+    let mat = node.materialized();
+    if !PUBLISHABLE_MATERIALIZATIONS.contains(&mat) {
+        return reject(
+            name,
+            format!(
+                "is materialized as {mat:?}, and a publish model must not have storage. What \
+                 it selects is a delta — the rows one committed batch produced — not a state, \
+                 so a table of them would mean something different from what dbt builds \
+                 nightly under the same name. Materialize it as one of: {}.",
+                PUBLISHABLE_MATERIALIZATIONS.join(", ")
+            ),
+        );
+    }
+
+    let Some(sql) = node.compiled_code.as_deref() else {
+        return reject(
+            name,
+            "no compiled_code in the manifest — run `dbt compile` (or `dbt run`) so the \
+             manifest carries the resolved SQL",
+        );
+    };
+
+    // Exactly one upstream, and it is the pipeline whose commits carry this. There is no
+    // lookup equivalent here on purpose: a lookup snapshot is pinned to the *source*
+    // commit's timestamp, and re-resolving one when the payload is built would pin it to a
+    // different instant. Enrichment belongs in the model being published for.
+    if node.depends_on.nodes.len() != 1 {
+        return reject(
+            name,
+            format!(
+                "depends on {} relations; a publish model reads exactly one — the ddi model \
+                 whose committed batches it describes. Everything it needs must already be in \
+                 that model's rows: the batch is the only thing in memory when the payload is \
+                 built, and a join here would read a table that has moved on since the commit.",
+                node.depends_on.nodes.len()
+            ),
+        );
+    }
+    let host_id = &node.depends_on.nodes[0];
+    let Some(host) = manifest.node(host_id) else {
+        return reject(
+            name,
+            format!("publishes for {host_id:?}, which is absent from the manifest"),
+        );
+    };
+
+    // Refused before the recursion below, and that ordering is what bounds it. A publish
+    // model whose host also carries `ddi_publish` would send `analyze` back into
+    // `analyze_publish`, and two of them pointing at each other — or one pointing at itself —
+    // would recurse until the stack ran out. dbt will not emit a cycle, but the manifest is
+    // an input to this program rather than something it produced, and "cannot be correct"
+    // has to come out as a reason rather than as a crash. With this here the recursion is
+    // depth-1 by construction: the host is never a publish model, and analysing a streamable
+    // one does not recurse at all.
+    if host.meta_value("ddi_publish").is_some() {
+        return reject(
+            name,
+            format!(
+                "publishes for {:?}, which is itself a publish model. A publication describes \
+                 one committed batch of a *streamed* model, and a publish model commits \
+                 nothing — point this at the ddi model whose batches you want to describe.",
+                host.name
+            ),
+        );
+    }
+
+    // A publication rides on a pipeline's commits, and there are none without one. Asked of
+    // the host's own verdict so the reason quoted is the one the analyst will see against
+    // that model too, rather than a second opinion that could drift from it.
+    match analyze(manifest, host_id) {
+        Verdict::Streamable(_) => {}
+        other => {
+            let detail = other.reason().unwrap_or("it is not streamable").to_string();
+            return reject(
+                name,
+                format!(
+                    "publishes for {:?}, which ddi cannot stream itself: {detail} Fix that \
+                     model first — a publish model rides on a pipeline's commits.",
+                    host.name
+                ),
+            );
+        }
+    }
+
+    // Append-only in v1, refused here as well as at config load. A merge replaces the row
+    // already stored under a key, so the committed batch does not say what the dashboard
+    // delta is: the value it replaced is not in it, and adding the new row would double-count.
+    if matches!(
+        host.meta_str("ddi_write_mode"),
+        Some("upsert") | Some("staged_upsert")
+    ) {
+        return reject(
+            name,
+            format!(
+                "publishes for {:?}, which is meta.ddi_write_mode = {:?}. Realtime publication \
+                 is append-only: a merge replaces the row already stored under a key, so the \
+                 committed batch alone does not say what the dashboard delta is — the value it \
+                 replaced is not in it, and adding the new row would double-count. Publish from \
+                 an append-only model and aggregate current state downstream.",
+                host.name,
+                host.meta_str("ddi_write_mode").unwrap_or_default()
+            ),
+        );
+    }
+
+    // Same reasoning as `ddi_publish` above: a non-string here would silently fall back to
+    // the model's own name, so a browser would subscribe to a group nothing publishes to.
+    let group = match node.meta_value("ddi_publish_group") {
+        None => name.to_string(),
+        Some(v) => match v.as_str() {
+            Some(g) => g.to_string(),
+            None => {
+                return reject(
+                    name,
+                    format!(
+                        "declares meta.ddi_publish_group={v}, and it must be a plain string. \
+                         Omit the key to use the model's own name."
+                    ),
+                )
+            }
+        },
+    };
+    if !valid_group(&group) {
+        return reject(
+            name,
+            format!(
+                "declares meta.ddi_publish_group={group:?}. A group name is a channel a \
+                 browser subscribes to and goes into a URL, so it must be 1-128 characters of \
+                 A-Z a-z 0-9 . _ : - starting with a letter or digit. Omit the key to use the \
+                 model's own name."
+            ),
+        );
+    }
+
+    // The same rewrite the streaming path uses, so the host relation becomes `source` — which
+    // at run time is the committed batch. No new rewriting code: `add_relation_replacements`
+    // registers both `schema.table` and `catalog.schema.table`, and the rewriter is CTE-aware.
+    let mut replacements = BTreeMap::new();
+    add_relation_replacements(&mut replacements, host, SOURCE_TABLE);
+    let rewrite = match rewrite_relations(sql, &replacements) {
+        Ok(v) => v,
+        // Not a rejection: this parser did not understand the SQL, which says nothing about
+        // whether the payload is publishable.
+        Err(e) => return unknown(name, e),
+    };
+    if !rewrite.unknown.is_empty() {
+        return reject(
+            name,
+            format!(
+                "reads relation(s) that are neither the model it publishes for nor anything \
+                 ddi can register: {}. The publish transform runs over one batch held in \
+                 memory, and nothing else exists to read.",
+                rewrite.unknown.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        );
+    }
+
+    // The real gate, at the per-batch grain: aggregation is allowed, and narrowed to the
+    // functions a client can apply as a delta.
+    if let Err(e) = crate::transform::validate::validate_publish_sql(&rewrite.sql) {
+        let detail = match e {
+            crate::Error::Config(m) => m,
+            other => other.to_string(),
+        };
+        return reject(name, detail);
+    }
+
+    Verdict::Publishes(Box::new(Publication {
+        unique_id: unique_id.to_string(),
+        name: name.to_string(),
+        host_unique_id: host_id.to_string(),
+        host_relation: host.qualified(),
+        kind,
+        group,
+        sql: rewrite.sql,
+    }))
+}
+
 /// Every model in the manifest, in stable order.
 pub fn analyze_all(manifest: &Manifest) -> Vec<Verdict> {
-    manifest
+    let mut verdicts: Vec<Verdict> = manifest
         .model_ids()
         .iter()
         .map(|id| analyze(manifest, id))
-        .collect()
+        .collect();
+    reject_duplicate_publications(&mut verdicts);
+    verdicts
+}
+
+/// Two publish models for one host reject **both**, each naming the other.
+///
+/// One pipeline pushes one payload per commit, so two would describe the same batch and a
+/// client could not tell them apart. Both are refused rather than one picked, for the same
+/// reason a duplicate `app_id` condemns every sharer: there is no innocent party, and
+/// choosing silently would be worse than saying so.
+fn reject_duplicate_publications(verdicts: &mut [Verdict]) {
+    // Keyed on the manifest id, not on `schema.table`: dbt only forbids a duplicate
+    // `database.schema.alias`, so two models in different databases can share a qualified
+    // relation, and keying on that would condemn two publications that never collided.
+    // `host_unique_id` is also exactly the key `convert::pipelines` attaches by.
+    let mut by_host: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for v in verdicts.iter() {
+        if let Verdict::Publishes(p) = v {
+            by_host
+                .entry(p.host_unique_id.clone())
+                .or_default()
+                .push(p.name.clone());
+        }
+    }
+    let contested: BTreeMap<&String, &Vec<String>> =
+        by_host.iter().filter(|(_, v)| v.len() > 1).collect();
+    if contested.is_empty() {
+        return;
+    }
+    for v in verdicts.iter_mut() {
+        let Verdict::Publishes(p) = v else { continue };
+        let Some(others) = contested.get(&p.host_unique_id) else {
+            continue;
+        };
+        let reason = format!(
+            "models {} all declare ddi_publish for {:?}. One pipeline pushes one payload per \
+             commit: two would each describe the same batch and a client could not tell them \
+             apart.",
+            others
+                .iter()
+                .map(|n| format!("{n:?}"))
+                .collect::<Vec<_>>()
+                .join(" and "),
+            p.host_relation
+        );
+        *v = reject(&p.name, reason);
+    }
 }
 
 /// A compiled model after physical dbt relation names became session-local aliases.
@@ -329,8 +667,11 @@ fn rewrite_relations(
     // use Trino's `ARRAY(JSON)` spelling before the unnest normaliser turns it into the
     // DataFusion form. Treating that model as "unknown" here would make `ddi dbt check`
     // disagree with the daemon that actually runs it.
-    let mut statements = crate::transform::validate::parse_permissively(sql)
-        .map_err(|e| format!("could not parse the compiled SQL: {e}"))?;
+    // The subject is passed down rather than wrapped on the way back, which also collapses
+    // what used to read "could not parse the compiled SQL: config error: could not parse
+    // transform_sql: ..." into one sentence naming the thing the analyst wrote.
+    let mut statements = crate::transform::validate::parse_permissively(sql, "the compiled SQL")
+        .map_err(|e| e.to_string())?;
 
     if statements.len() > 1 {
         return Err(format!(
@@ -745,5 +1086,403 @@ mod tests {
         assert_eq!(all.len(), 2, "both models are classified");
         let names: Vec<&str> = all.iter().map(|v| v.name()).collect();
         assert_eq!(names, vec!["orders_header", "other"]);
+    }
+
+    // ---- ddi_publish models ----
+    //
+    // The shape under test throughout: a `view` model that ref()s the streamed model, whose
+    // aggregation is a delta over one committed batch and the running total over the whole
+    // table. It is never a pipeline of its own.
+
+    /// A manifest with a streamable host and one publish model over it.
+    fn publish_manifest(publish_meta: &[(&str, &str)], publish_sql: &str, mat: &str) -> Manifest {
+        let mut m = manifest("SELECT order_id, amount FROM bronze.orders", &[]);
+        let mut meta = HashMap::new();
+        for (k, v) in publish_meta {
+            meta.insert(k.to_string(), serde_json::Value::from(*v));
+        }
+        m.nodes.insert(
+            "model.p.orders_live".to_string(),
+            Node {
+                name: "orders_live".into(),
+                resource_type: "model".into(),
+                schema: "silver".into(),
+                compiled_code: Some(publish_sql.into()),
+                depends_on: DependsOn {
+                    nodes: vec!["model.p.orders_header".to_string()],
+                },
+                config: NodeConfig {
+                    materialized: Some(mat.into()),
+                    ..Default::default()
+                },
+                meta,
+                ..Default::default()
+            },
+        );
+        m
+    }
+
+    const AGG: &str =
+        "SELECT country, sum(amount) AS sales_delta FROM silver.orders_header GROUP BY country";
+
+    fn publish_verdict(meta: &[(&str, &str)], sql: &str, mat: &str) -> Verdict {
+        analyze(&publish_manifest(meta, sql, mat), "model.p.orders_live")
+    }
+
+    fn publish_reason(meta: &[(&str, &str)], sql: &str, mat: &str) -> String {
+        match publish_verdict(meta, sql, mat) {
+            Verdict::Rejected { reason, .. } => reason,
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_aggregating_view_that_refs_a_streamed_model_publishes() {
+        let v = publish_verdict(&[("ddi_publish", "webpubsub")], AGG, "view");
+        let Verdict::Publishes(p) = v else {
+            panic!("expected a publication, got {v:?}");
+        };
+        assert_eq!(p.host_relation, "silver.orders_header");
+        assert_eq!(p.host_unique_id, "model.p.orders_header");
+        assert_eq!(p.kind, crate::config::PublisherKind::Webpubsub);
+        assert_eq!(p.group, "orders_live", "defaults to the model's own name");
+        // Rewritten onto the in-memory batch by exactly the machinery the streaming path
+        // uses — the same reason a transform never sees a warehouse name either.
+        assert!(p.sql.contains("source"), "got: {}", p.sql);
+        assert!(!p.sql.contains("silver"), "got: {}", p.sql);
+        assert!(
+            p.sql.contains("GROUP BY"),
+            "the aggregation survives: {}",
+            p.sql
+        );
+    }
+
+    #[test]
+    fn an_explicit_group_overrides_the_model_name() {
+        let v = publish_verdict(
+            &[("ddi_publish", "webpubsub"), ("ddi_publish_group", "sales")],
+            AGG,
+            "view",
+        );
+        let Verdict::Publishes(p) = v else {
+            panic!("expected a publication, got {v:?}");
+        };
+        assert_eq!(p.group, "sales");
+    }
+
+    #[test]
+    fn a_publish_model_is_not_a_pipeline() {
+        // It has no Delta target and must never be derived into one.
+        let m = publish_manifest(&[("ddi_publish", "webpubsub")], AGG, "view");
+        let verdicts = analyze_all(&m);
+        assert_eq!(
+            verdicts.iter().filter(|v| v.is_streamable()).count(),
+            1,
+            "only the host streams: {verdicts:?}"
+        );
+        assert_eq!(verdicts.iter().filter(|v| v.is_publication()).count(), 1);
+    }
+
+    #[test]
+    fn ddi_publish_on_a_streamable_model_is_rejected_loudly() {
+        // The failure this guard exists for. Routing on the key alone would send a running
+        // `materialized: table` model down the publish path, where it fails a gate and is
+        // discarded by `convert::pipelines` with a bare `continue` — so a one-line YAML
+        // paste would silently stop a production pipeline being derived.
+        let mut m = manifest("SELECT order_id FROM bronze.orders", &[]);
+        m.nodes
+            .get_mut("model.p.orders_header")
+            .unwrap()
+            .meta
+            .insert("ddi_publish".into(), serde_json::Value::from("webpubsub"));
+
+        let v = analyze(&m, "model.p.orders_header");
+        let Verdict::Rejected { reason, .. } = v else {
+            panic!("a streamable model carrying ddi_publish must be refused, got {v:?}");
+        };
+        assert!(reason.contains("ddi_publish"), "got: {reason}");
+        assert!(
+            reason.contains("would stop being streamed"),
+            "got: {reason}"
+        );
+        assert!(
+            reason.contains("ref()s this one"),
+            "names the fix: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_publish_model_with_storage_of_its_own_is_rejected() {
+        // `table` and `incremental` never reach this gate — they are streamable
+        // materializations, so the guard above catches them first with the louder message
+        // about the pipeline that would stop being derived. What is left is everything that
+        // is neither, and the reason is the same fact read once more: these rows are a
+        // delta, not a state, so storing them under the model's name would mean something
+        // different from what dbt builds there nightly.
+        let reason = publish_reason(&[("ddi_publish", "webpubsub")], AGG, "materialized_view");
+        assert!(reason.contains("must not have storage"), "got: {reason}");
+        assert!(reason.contains("delta"), "says why: {reason}");
+        assert!(reason.contains("view"), "names what to use: {reason}");
+    }
+
+    #[test]
+    fn an_unknown_backend_names_the_ones_this_build_has() {
+        let reason = publish_reason(&[("ddi_publish", "webpubsubb")], AGG, "view");
+        assert!(reason.contains("webpubsubb"), "got: {reason}");
+        assert!(
+            reason.contains("webpubsub."),
+            "names the alternatives: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_publish_model_reading_a_second_relation_is_rejected() {
+        let mut m = publish_manifest(&[("ddi_publish", "webpubsub")], AGG, "view");
+        m.nodes
+            .get_mut("model.p.orders_live")
+            .unwrap()
+            .depends_on
+            .nodes
+            .push("model.p.other".into());
+        let v = analyze(&m, "model.p.orders_live");
+        let Verdict::Rejected { reason, .. } = v else {
+            panic!("expected a rejection, got {v:?}");
+        };
+        assert!(reason.contains("reads exactly one"), "got: {reason}");
+        assert!(
+            reason.contains("only thing in memory"),
+            "says why: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_publish_model_reading_an_undeclared_relation_is_rejected() {
+        let reason = publish_reason(
+            &[("ddi_publish", "webpubsub")],
+            "SELECT c.name, sum(o.amount) AS d FROM silver.orders_header o, ref.countries c \
+             GROUP BY c.name",
+            "view",
+        );
+        assert!(
+            reason.contains("not supported") || reason.contains("countries"),
+            "got: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_publish_model_on_an_upsert_host_is_rejected() {
+        let mut m = publish_manifest(&[("ddi_publish", "webpubsub")], AGG, "view");
+        m.nodes
+            .get_mut("model.p.orders_header")
+            .unwrap()
+            .meta
+            .insert("ddi_write_mode".into(), serde_json::Value::from("upsert"));
+        let v = analyze(&m, "model.p.orders_live");
+        let Verdict::Rejected { reason, .. } = v else {
+            panic!("expected a rejection, got {v:?}");
+        };
+        assert!(reason.contains("append-only"), "got: {reason}");
+        assert!(reason.contains("double-count"), "says why: {reason}");
+    }
+
+    #[test]
+    fn a_publish_model_on_an_unstreamable_host_quotes_the_hosts_own_reason() {
+        let mut m = publish_manifest(&[("ddi_publish", "webpubsub")], AGG, "view");
+        // Break the host: two streaming relations.
+        m.nodes
+            .get_mut("model.p.orders_header")
+            .unwrap()
+            .depends_on
+            .nodes
+            .push("model.p.other".into());
+        let v = analyze(&m, "model.p.orders_live");
+        let Verdict::Rejected { reason, .. } = v else {
+            panic!("expected a rejection, got {v:?}");
+        };
+        assert!(
+            reason.contains("streams from exactly one"),
+            "quotes it: {reason}"
+        );
+        assert!(reason.contains("Fix that model first"), "got: {reason}");
+    }
+
+    #[test]
+    fn a_group_name_that_would_need_escaping_is_rejected() {
+        let reason = publish_reason(
+            &[
+                ("ddi_publish", "webpubsub"),
+                ("ddi_publish_group", "sales/eu"),
+            ],
+            AGG,
+            "view",
+        );
+        assert!(reason.contains("sales/eu"), "got: {reason}");
+        assert!(
+            reason.contains("browser subscribes to"),
+            "says why: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_non_combinable_aggregate_is_rejected_with_the_validators_reason() {
+        let reason = publish_reason(
+            &[("ddi_publish", "webpubsub")],
+            "SELECT country, avg(amount) AS a FROM silver.orders_header GROUP BY country",
+            "view",
+        );
+        assert!(reason.contains("avg()"), "got: {reason}");
+        assert!(
+            reason.contains("sum() and count()"),
+            "names the fix: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_publish_model_without_compiled_code_says_to_run_dbt_compile() {
+        let mut m = publish_manifest(&[("ddi_publish", "webpubsub")], AGG, "view");
+        m.nodes
+            .get_mut("model.p.orders_live")
+            .unwrap()
+            .compiled_code = None;
+        let v = analyze(&m, "model.p.orders_live");
+        let Verdict::Rejected { reason, .. } = v else {
+            panic!("expected a rejection, got {v:?}");
+        };
+        assert!(reason.contains("dbt compile"), "got: {reason}");
+    }
+
+    #[test]
+    fn two_publish_models_for_one_host_reject_both() {
+        // No innocent party: one pipeline pushes one payload per commit, so picking one
+        // silently would be worse than refusing both.
+        let mut m = publish_manifest(&[("ddi_publish", "webpubsub")], AGG, "view");
+        let mut meta = HashMap::new();
+        meta.insert("ddi_publish".into(), serde_json::Value::from("webpubsub"));
+        m.nodes.insert(
+            "model.p.orders_live_v2".to_string(),
+            Node {
+                name: "orders_live_v2".into(),
+                resource_type: "model".into(),
+                schema: "silver".into(),
+                compiled_code: Some(AGG.into()),
+                depends_on: DependsOn {
+                    nodes: vec!["model.p.orders_header".to_string()],
+                },
+                config: NodeConfig {
+                    materialized: Some("view".into()),
+                    ..Default::default()
+                },
+                meta,
+                ..Default::default()
+            },
+        );
+
+        let verdicts = analyze_all(&m);
+        assert_eq!(
+            verdicts.iter().filter(|v| v.is_publication()).count(),
+            0,
+            "both must be refused: {verdicts:?}"
+        );
+        for name in ["orders_live", "orders_live_v2"] {
+            let v = verdicts.iter().find(|v| v.name() == name).unwrap();
+            let reason = v.reason().unwrap_or_default();
+            assert!(
+                reason.contains("orders_live_v2"),
+                "{name} names the other: {reason}"
+            );
+            assert!(
+                reason.contains("could not tell them apart"),
+                "got: {reason}"
+            );
+        }
+        // And the host is untouched: a contested dashboard must not stop ingestion.
+        assert!(verdicts.iter().any(|v| v.is_streamable()));
+    }
+
+    #[test]
+    fn a_publish_model_pointing_at_another_publish_model_is_rejected_not_recursed() {
+        // Two of these pointing at each other used to recurse until the stack ran out.
+        // dbt will not emit a cycle, but the manifest is an input to this program rather
+        // than something it produced, so "cannot be correct" has to come out as a reason.
+        let mut m = publish_manifest(&[("ddi_publish", "webpubsub")], AGG, "view");
+        let mut meta = HashMap::new();
+        meta.insert("ddi_publish".into(), serde_json::Value::from("webpubsub"));
+        m.nodes.insert(
+            "model.p.orders_live_2".to_string(),
+            Node {
+                name: "orders_live_2".into(),
+                resource_type: "model".into(),
+                schema: "silver".into(),
+                compiled_code: Some("SELECT count(*) AS c FROM silver.orders_live".into()),
+                depends_on: DependsOn {
+                    nodes: vec!["model.p.orders_live".to_string()],
+                },
+                config: NodeConfig {
+                    materialized: Some("view".into()),
+                    ..Default::default()
+                },
+                meta,
+                ..Default::default()
+            },
+        );
+
+        let v = analyze(&m, "model.p.orders_live_2");
+        let Verdict::Rejected { reason, .. } = v else {
+            panic!("expected a rejection, got {v:?}");
+        };
+        assert!(reason.contains("itself a publish model"), "got: {reason}");
+    }
+
+    #[test]
+    fn two_publish_models_referring_to_each_other_terminate() {
+        // The cycle proper. Reaching an assertion at all is the point of this test: before
+        // the guard, analyze_all would overflow the stack here.
+        let mut m = publish_manifest(&[("ddi_publish", "webpubsub")], AGG, "view");
+        m.nodes
+            .get_mut("model.p.orders_live")
+            .unwrap()
+            .depends_on
+            .nodes = vec!["model.p.orders_live_2".to_string()];
+        let mut meta = HashMap::new();
+        meta.insert("ddi_publish".into(), serde_json::Value::from("webpubsub"));
+        m.nodes.insert(
+            "model.p.orders_live_2".to_string(),
+            Node {
+                name: "orders_live_2".into(),
+                resource_type: "model".into(),
+                schema: "silver".into(),
+                compiled_code: Some("SELECT count(*) AS c FROM silver.orders_live".into()),
+                depends_on: DependsOn {
+                    nodes: vec!["model.p.orders_live".to_string()],
+                },
+                config: NodeConfig {
+                    materialized: Some("view".into()),
+                    ..Default::default()
+                },
+                meta,
+                ..Default::default()
+            },
+        );
+
+        let verdicts = analyze_all(&m);
+        assert!(
+            verdicts.iter().filter(|v| v.is_publication()).count() == 0,
+            "neither may publish: {verdicts:?}"
+        );
+    }
+
+    #[test]
+    fn a_publish_model_that_depends_on_itself_is_rejected() {
+        let mut m = publish_manifest(&[("ddi_publish", "webpubsub")], AGG, "view");
+        m.nodes
+            .get_mut("model.p.orders_live")
+            .unwrap()
+            .depends_on
+            .nodes = vec!["model.p.orders_live".to_string()];
+        let v = analyze(&m, "model.p.orders_live");
+        let Verdict::Rejected { reason, .. } = v else {
+            panic!("expected a rejection, got {v:?}");
+        };
+        assert!(reason.contains("itself a publish model"), "got: {reason}");
     }
 }

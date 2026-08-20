@@ -5,10 +5,12 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use tracing::warn;
+
 use crate::error::{Error, Result};
 use crate::lookup::{LookupConfig, ResolvedLookup};
 use crate::source::{ChangePolicy, Version};
-use crate::transform::validate::normalise_sql_with_lookups;
+use crate::transform::validate::{normalise_publish_sql, normalise_sql_with_lookups};
 
 fn default_allowed_latency() -> u64 {
     30
@@ -282,6 +284,16 @@ pub struct PipelineConfig {
     pub source_relation: Option<String>,
     #[serde(default)]
     pub target_relation: Option<String>,
+
+    /// The live payload this pipeline's commits carry, when a dbt model declared one.
+    ///
+    /// Last by preference rather than by constraint. `toml 0.8` reorders a table's scalars
+    /// ahead of its sub-tables when serialising, so field order here is free — `lookups` is a
+    /// `Vec<LookupConfig>` sitting at field four with two dozen scalars after it, and round
+    /// trips. It reads best last, and `a_pinned_publication_round_trips_through_toml` is what
+    /// actually holds the convert path to working.
+    #[serde(default)]
+    pub publish: Option<PublishModel>,
 }
 
 /// Where the lake is and how to reach it. Deployment, not semantics.
@@ -361,6 +373,14 @@ pub struct ResolvedPipeline {
     pub source_relation: Option<String>,
     /// Fully qualified catalog name of the target.
     pub target_relation: Option<String>,
+    /// What a dbt model asked to publish after each commit of this pipeline.
+    ///
+    /// `Some` only when a model asked, this pipeline is append-only, and the deployment
+    /// configured somewhere to send it. Any of those missing leaves it `None` and the
+    /// pipeline streams exactly as it would have.
+    pub publish: Option<PublishModel>,
+    /// Where that payload goes. Paired with `publish`: both or neither.
+    pub publish_to: Option<PublisherConfig>,
 }
 
 impl ResolvedPipeline {
@@ -400,6 +420,264 @@ pub struct Config {
     /// is set these are ignored — the manifest wins, so there is one place to look.
     #[serde(default, rename = "pipeline")]
     pub pipelines: Vec<PipelineConfig>,
+
+    /// Where realtime payloads go. Omit it and nothing publishes, whatever dbt asks for.
+    #[serde(default)]
+    pub publish: Option<PublisherConfig>,
+
+    /// Set by `--no-publish`, not by the file. Disables publication for the whole process
+    /// without touching the dbt project or the deployment's own config.
+    #[serde(skip)]
+    pub publish_disabled: bool,
+}
+
+/// Which realtime backend a payload goes to.
+///
+/// One variant today. The trait behind it takes any implementation, so a second backend is
+/// one impl and one arm here — but designing the abstraction against a sample of one would
+/// be speculation, so it stays an enum rather than a plugin surface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublisherKind {
+    /// Azure Web PubSub, addressed by its data-plane REST API.
+    #[default]
+    Webpubsub,
+}
+
+impl PublisherKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "webpubsub" => Some(PublisherKind::Webpubsub),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PublisherKind::Webpubsub => "webpubsub",
+        }
+    }
+
+    /// Every spelling this build accepts, for an error that names the alternatives.
+    pub fn known() -> &'static str {
+        "webpubsub"
+    }
+}
+
+/// Where realtime payloads go, when a dbt model asks for one.
+///
+/// Deployment-level, beside [`StorageConfig`], for two reasons. It carries a credential, and
+/// `ddi dbt convert` deliberately omits `[storage]` from what it writes because that file is
+/// meant to be readable in a merge request — a secret under `[[pipeline]]` would be printed
+/// into it. It is also the only placement that works at all when `manifest` is set, since
+/// hand-written `[[pipeline]]` entries are ignored then.
+///
+/// Absent means nothing publishes, whatever the dbt models ask for. That is a supported
+/// state, not a misconfiguration: a dev deployment with no hub must still stream.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublisherConfig {
+    #[serde(rename = "type", default)]
+    pub kind: PublisherKind,
+
+    /// The connection string itself. Prefer `connection_string_env`; this exists because a
+    /// test needs to point at a local address without mutating process-global environment.
+    #[serde(default)]
+    pub connection_string: Option<String>,
+
+    /// Name of the environment variable holding the connection string.
+    #[serde(default)]
+    pub connection_string_env: Option<String>,
+
+    pub hub: String,
+
+    /// 0..=300, per the service. A live delta that is a minute stale is worthless, so let
+    /// the service drop it rather than replay it at a browser that reconnects later.
+    #[serde(default = "default_message_ttl_secs")]
+    pub message_ttl_secs: u32,
+
+    /// Shorter than the Trino client's, deliberately: a publish taking five seconds is
+    /// already useless to a dashboard and is holding up the next batch.
+    #[serde(default = "default_publish_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// Consecutive failures before the breaker opens and stops paying to build payloads
+    /// nobody is receiving.
+    #[serde(default = "default_publish_failure_threshold")]
+    pub failure_threshold: u32,
+
+    /// How long the breaker stays open before letting one request through again.
+    #[serde(default = "default_publish_breaker_cooldown_secs")]
+    pub breaker_cooldown_secs: u64,
+
+    /// Below the service's 1 MB frame limit, with room for the envelope around the rows.
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: String,
+}
+
+fn default_message_ttl_secs() -> u32 {
+    60
+}
+fn default_publish_timeout_secs() -> u64 {
+    5
+}
+fn default_publish_failure_threshold() -> u32 {
+    5
+}
+fn default_publish_breaker_cooldown_secs() -> u64 {
+    30
+}
+fn default_max_message_bytes() -> String {
+    "900KB".into()
+}
+
+/// Hand-written so a connection string cannot reach a log through `{:?}` on a `Config`, a
+/// `ResolvedPipeline`, or anything that contains one.
+impl std::fmt::Debug for PublisherConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublisherConfig")
+            .field("kind", &self.kind)
+            .field("hub", &self.hub)
+            .field(
+                "connection_string",
+                &self.connection_string.as_ref().map(|_| "<redacted>"),
+            )
+            .field("connection_string_env", &self.connection_string_env)
+            .field("message_ttl_secs", &self.message_ttl_secs)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("failure_threshold", &self.failure_threshold)
+            .field("breaker_cooldown_secs", &self.breaker_cooldown_secs)
+            .field("max_message_bytes", &self.max_message_bytes)
+            .finish()
+    }
+}
+
+impl PublisherConfig {
+    /// Everything that can be judged without reaching the network.
+    ///
+    /// Never called in a way that can fail a pipeline: a publisher is a leaf, and a
+    /// deployment whose hub is misspelled must still stream to Delta. The caller warns.
+    pub fn check(&self) -> std::result::Result<(), String> {
+        match (&self.connection_string, &self.connection_string_env) {
+            (None, None) => {
+                return Err(
+                    "[publish] needs a credential: set connection_string_env to the \
+                            name of an environment variable holding the Web PubSub \
+                            connection string"
+                        .into(),
+                )
+            }
+            (Some(_), Some(_)) => {
+                return Err("[publish] sets both connection_string and \
+                            connection_string_env; use one, and prefer the env form"
+                    .into())
+            }
+            _ => {}
+        }
+        if !crate::dbt::analyze::valid_group(&self.hub) {
+            return Err(format!(
+                "[publish].hub is {:?}. It goes into a request path, so it must be 1-128 \
+                 characters of A-Z a-z 0-9 . _ : - starting with a letter or digit.",
+                self.hub
+            ));
+        }
+        if self.timeout_secs == 0 || self.timeout_secs > 300 {
+            return Err(format!(
+                "[publish].timeout_secs is {}; a publish that slow is already useless to a \
+                 dashboard and is holding up the next batch. Use 1..=300.",
+                self.timeout_secs
+            ));
+        }
+        if self.breaker_cooldown_secs > 86_400 {
+            return Err(format!(
+                "[publish].breaker_cooldown_secs is {}, which is longer than a day",
+                self.breaker_cooldown_secs
+            ));
+        }
+        // The service's own bound. Sending outside it is a 400 at the far end, which is a
+        // worse way to find out than a line at startup.
+        if self.message_ttl_secs > 300 {
+            return Err(format!(
+                "[publish].message_ttl_secs is {}, and the service accepts 0..=300",
+                self.message_ttl_secs
+            ));
+        }
+        let bytes = parse_size(&self.max_message_bytes, "[publish].max_message_bytes")
+            .map_err(|e| e.to_string())?;
+        if bytes == 0 || bytes > 1_000_000 {
+            return Err(format!(
+                "[publish].max_message_bytes is {}, and the service's frame limit is 1 MB; \
+                 leave room for the envelope around the rows",
+                self.max_message_bytes
+            ));
+        }
+        Ok(())
+    }
+
+    /// The connection string, from wherever it was configured.
+    pub fn connection_string(&self) -> std::result::Result<String, String> {
+        if let Some(s) = &self.connection_string {
+            return Ok(s.clone());
+        }
+        let name = self
+            .connection_string_env
+            .as_deref()
+            .ok_or_else(|| "no connection string configured".to_string())?;
+        std::env::var(name).map_err(|_| {
+            format!("[publish].connection_string_env names {name:?}, which is not set")
+        })
+    }
+
+    pub fn max_message_bytes(&self) -> u64 {
+        parse_size(&self.max_message_bytes, "max_message_bytes")
+            .unwrap_or(900_000)
+            .min(1_000_000)
+    }
+}
+
+/// What a dbt model asked to publish, pinned onto the pipeline whose commits carry it.
+///
+/// Not a pipeline of its own: no Delta target, no `txn` action, no offset, no part in the
+/// nightly handover. It rides on one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishModel {
+    /// The dbt model the SQL came from, so a dashboard can name what it renders.
+    pub model: String,
+    pub kind: PublisherKind,
+    /// The channel browsers subscribe to.
+    pub group: String,
+    /// A single SELECT over `source`, which at run time is the committed batch.
+    pub publish_sql: String,
+}
+
+/// Why this pipeline must not publish, if it must not.
+///
+/// Reached from `resolve_publish`, which runs on the *expanded* list — so by the time this
+/// sees a staged upsert it has already become an appending half and a merging half, and the
+/// appending half would answer "no problem" about rows going into a private staging table.
+///
+/// That case is therefore not this function's to catch, and is not left to it: `expand_staged`
+/// clears `publish` on both halves unconditionally as it builds them. **Do not delete those
+/// two lines on the strength of this check** — it cannot see what they prevent.
+fn publish_problem(p: &PipelineConfig) -> Option<String> {
+    p.publish.as_ref()?;
+    if p.write_mode.keeps_one_row_per_key() {
+        return Some(format!(
+            "pipeline {:?} is write_mode = {:?} and cannot publish. A merge replaces the row \
+             already stored under a key, so the committed batch does not say what the \
+             dashboard delta is — the value it replaced is not in it, and adding the new row \
+             would double-count. Publish from an append-only model and aggregate current \
+             state downstream.",
+            p.name,
+            match p.write_mode {
+                WriteMode::Upsert => "upsert",
+                WriteMode::StagedUpsert => "staged_upsert",
+                WriteMode::Append => "append",
+            }
+        ));
+    }
+    None
 }
 
 /// A pipeline that will not run, and why.
@@ -521,6 +799,13 @@ fn expand_staged(pipelines: &[PipelineConfig]) -> Vec<PipelineConfig> {
         ingest.name = crate::stage::ingest_name(&p.name);
         ingest.app_id = crate::stage::ingest_app_id(&p.app_id);
         ingest.target_uri = stage_uri.clone();
+        // Neither half may publish, and the ingest half is why this is stated here rather
+        // than left to the resolver. Two lines below it becomes `write_mode = Append`, so by
+        // the time anything downstream asks "is this append-only?" the answer is yes — while
+        // the rows it commits are going into a private staging table that gets merged away.
+        // `publish_problem` refuses the combination against the operator's own entry before
+        // this split happens; this makes it true of the halves as well.
+        ingest.publish = None;
         // The stage is not in anybody's catalog, and claiming it is would send the locator
         // looking for a table nothing has declared.
         ingest.target_relation = None;
@@ -547,6 +832,9 @@ fn expand_staged(pipelines: &[PipelineConfig]) -> Vec<PipelineConfig> {
         apply.source_uri = stage_uri;
         apply.source_relation = None;
         apply.write_mode = WriteMode::Upsert;
+        // This half merges, so `publish_problem` would refuse it anyway. Stated for the
+        // same reason as on the ingest half: neither is a thing the operator wrote.
+        apply.publish = None;
         // Already applied on the way in. Running the transform twice would apply it to its
         // own output, and re-resolving a lookup here would pin it to the wrong instant.
         apply.transform_sql = None;
@@ -801,6 +1089,54 @@ impl Config {
                 .or_insert_with(|| reason.clone());
         }
 
+        // Said once here rather than once per pipeline, and never fatal: a deployment whose
+        // hub is misspelled must still stream to Delta. Every pipeline that would have
+        // published says so individually in `resolve_publish`.
+        if let Some(sink) = &self.publish {
+            if let Err(reason) = sink.check() {
+                tracing::warn!("realtime publishing is disabled: {reason}");
+            }
+        }
+
+        // Two pipelines pushing to one group interleave their messages on a socket a browser
+        // cannot demultiplex by anything but the envelope. A client that filters correctly
+        // merely ignores the foreign ones; one that does not re-baselines forever. Either way
+        // it is a mistake, and unlike a duplicate app_id it costs nothing to keep streaming
+        // through — so the *publication* is dropped from every sharer and the pipelines run.
+        // Only pipelines that could actually publish contest a group. An upsert entry, or one
+        // whose publication is refused for any other reason, will never send anything — so
+        // letting it collide would take a healthy neighbour's dashboard down for company.
+        let mut group_users: HashMap<&str, Vec<&str>> = HashMap::new();
+        if !self.publish_disabled && self.publish.is_some() {
+            for p in pipelines {
+                if let Some(m) = &p.publish {
+                    if publish_problem(p).is_none() {
+                        group_users
+                            .entry(m.group.as_str())
+                            .or_default()
+                            .push(&p.name);
+                    }
+                }
+            }
+        }
+        let contested_groups: BTreeSet<&str> = group_users
+            .iter()
+            .filter(|(_, users)| users.len() > 1)
+            .flat_map(|(group, users)| {
+                warn!(
+                    "pipelines {} all publish to group {group:?}. One group is one stream to a \
+                     browser, so their messages would interleave with nothing to tell them \
+                     apart. None of them will publish; all of them keep streaming to Delta.",
+                    users
+                        .iter()
+                        .map(|n| format!("{n:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                users.iter().copied()
+            })
+            .collect();
+
         let d = &self.runtime;
         let mut ok = Vec::new();
         for p in pipelines {
@@ -809,7 +1145,13 @@ impl Config {
                 continue;
             }
             match self.resolve_one(p, d) {
-                Ok(r) => ok.push(r),
+                Ok(mut r) => {
+                    if contested_groups.contains(p.name.as_str()) {
+                        r.publish = None;
+                        r.publish_to = None;
+                    }
+                    ok.push(r)
+                }
                 Err(e) => reject(
                     &p.name,
                     match e {
@@ -852,6 +1194,112 @@ impl Config {
     ///
     /// Messages here name the fault, not the pipeline: the caller already knows which one it
     /// is asking about, and repeats it when reporting.
+    /// Pair what a dbt model asked to publish with somewhere to send it.
+    ///
+    /// Returns `(None, None)` for every way this can be wrong, having said which one it was.
+    /// That is the whole contract: a dashboard setting must never be able to stop ingestion.
+    /// The two files involved have different owners — an analyst edits the dbt project, an
+    /// operator edits the deployment — so the combination "a model asks, this environment
+    /// has no hub" is a normal state of a dev deployment rather than a mistake, and even the
+    /// genuine mistakes are about a payload nobody is receiving yet.
+    ///
+    /// This deliberately departs from how contradictory *pipeline* settings are treated a
+    /// few lines up, where an upsert key on an append pipeline is rejected rather than
+    /// ignored. Those two keys live in one file owned by one person, and getting them wrong
+    /// means the rows are wrong. Neither is true here.
+    fn resolve_publish(
+        &self,
+        p: &PipelineConfig,
+    ) -> (Option<PublishModel>, Option<PublisherConfig>) {
+        let Some(model) = &p.publish else {
+            return (None, None);
+        };
+
+        if self.publish_disabled {
+            tracing::info!(
+                pipeline = %p.name,
+                model = %model.model,
+                "--no-publish: not publishing, streaming as normal"
+            );
+            return (None, None);
+        }
+
+        if let Some(reason) = publish_problem(p) {
+            tracing::warn!(pipeline = %p.name, "{reason}");
+            return (None, None);
+        }
+
+        let Some(sink) = &self.publish else {
+            tracing::info!(
+                pipeline = %p.name,
+                model = %model.model,
+                "this model declares ddi_publish, but this deployment has no [publish] \
+                 section to send it to. The Delta stream is unaffected."
+            );
+            return (None, None);
+        };
+
+        if let Err(reason) = sink.check() {
+            tracing::warn!(
+                pipeline = %p.name,
+                "not publishing: {reason}. The Delta stream is unaffected."
+            );
+            return (None, None);
+        }
+
+        if sink.kind != model.kind {
+            tracing::warn!(
+                pipeline = %p.name,
+                "model {:?} asks to publish to {:?}, but [publish] is configured for {:?}. \
+                 Not publishing; the Delta stream is unaffected.",
+                model.model,
+                model.kind.as_str(),
+                sink.kind.as_str()
+            );
+            return (None, None);
+        }
+
+        // Judged here rather than left to the first request. The dbt gate already applies
+        // this, but a pinned config is meant to be read and edited by hand, and a group that
+        // would have to be escaped would otherwise pass load, log "each committed batch will
+        // also be published", and then fail on every batch until the breaker opened.
+        if !crate::dbt::analyze::valid_group(&model.group) {
+            tracing::warn!(
+                pipeline = %p.name,
+                "not publishing: group {:?} goes into a request path and into a browser's \
+                 subscription, so it must be 1-128 characters of A-Z a-z 0-9 . _ : - \
+                 starting with a letter or digit. The Delta stream is unaffected.",
+                model.group
+            );
+            return (None, None);
+        }
+
+        // Normalised here for the same reason `transform_sql` is: what runs must be what the
+        // validator approved, and a dialect spelling is rewritten once rather than on every
+        // batch. dbt's own gate already validated this, so a failure here is either a
+        // hand-written config or a manifest that went around it.
+        let publish_sql = match normalise_publish_sql(&model.publish_sql) {
+            Ok(sql) => sql,
+            Err(e) => {
+                tracing::warn!(
+                    pipeline = %p.name,
+                    "not publishing: publish SQL for model {:?} is not valid: {e}. The Delta \
+                     stream is unaffected.",
+                    model.model
+                );
+                return (None, None);
+            }
+        };
+
+        (
+            Some(PublishModel {
+                publish_sql,
+                ..model.clone()
+            }),
+            Some(sink.clone()),
+        )
+    }
+
     fn resolve_one(&self, p: &PipelineConfig, d: &Defaults) -> Result<ResolvedPipeline> {
         if p.app_id.trim().is_empty() {
             return Err(Error::Config(
@@ -1002,6 +1450,12 @@ impl Config {
             "target_file_size",
         )?;
 
+        // A publication is a leaf, so nothing here may return `Err`: every way this can be
+        // wrong leaves the pipeline streaming to Delta exactly as it would have, and says so.
+        // The dbt path rejects the bad combinations far earlier and far more loudly — this is
+        // the last gate, for hand-written config and for anything dbt let through.
+        let (publish, publish_to) = self.resolve_publish(p);
+
         Ok(ResolvedPipeline {
             name: p.name.clone(),
             app_id: p.app_id.clone(),
@@ -1033,6 +1487,8 @@ impl Config {
             storage: crate::storage::Storage::new(self.storage.options.clone()),
             source_relation: p.source_relation.clone(),
             target_relation: p.target_relation.clone(),
+            publish,
+            publish_to,
         })
     }
 }
@@ -1635,5 +2091,271 @@ target_uri = "/tmp/same"
         );
         let r = Config::from_toml_str(&toml).unwrap().resolve().unwrap();
         assert_eq!(r.len(), 2);
+    }
+
+    // ---- Realtime publication ----
+    //
+    // The property every one of these is about: a publisher is a leaf. Nothing to do with a
+    // dashboard may hold back a pipeline that would otherwise stream to Delta.
+
+    const PUBLISH_SINK: &str = r#"
+[publish]
+type = "webpubsub"
+connection_string = "Endpoint=https://x.webpubsub.azure.com;AccessKey=k;Version=1.0;"
+hub = "ddi"
+"#;
+
+    /// An appending pipeline whose dbt model asked to publish.
+    fn publishing_toml(extra: &str) -> String {
+        format!(
+            "{extra}\n[[pipeline]]\nname = \"orders\"\napp_id = \"ddi.orders\"\n\
+             source_uri = \"/tmp/bronze/orders\"\ntarget_uri = \"/tmp/silver/orders\"\n\
+             [pipeline.publish]\nmodel = \"orders_live\"\nkind = \"webpubsub\"\n\
+             group = \"sales\"\npublish_sql = \"SELECT country, sum(amount) AS d FROM \
+             source GROUP BY country\"\n"
+        )
+    }
+
+    fn only(r: &Resolved) -> &ResolvedPipeline {
+        assert_eq!(r.pipelines.len(), 1, "expected exactly one pipeline: {r:?}");
+        &r.pipelines[0]
+    }
+
+    #[test]
+    fn a_publish_model_plus_a_sink_resolves_to_a_publication() {
+        let r = Config::from_toml_str(&publishing_toml(PUBLISH_SINK))
+            .unwrap()
+            .resolve_all()
+            .unwrap();
+        let p = only(&r);
+        let publish = p.publish.as_ref().expect("should publish");
+        assert_eq!(publish.group, "sales");
+        assert_eq!(publish.model, "orders_live");
+        assert!(p.publish_to.is_some(), "and knows where to send it");
+        // Normalised on the way through, exactly like transform_sql.
+        assert!(publish.publish_sql.contains("GROUP BY"), "{publish:?}");
+    }
+
+    #[test]
+    fn no_publish_table_means_no_publisher_and_the_pipeline_still_runs() {
+        let r = Config::from_toml_str(&publishing_toml(""))
+            .unwrap()
+            .resolve_all()
+            .unwrap();
+        let p = only(&r);
+        assert!(p.publish.is_none(), "nothing to send it to");
+        assert!(p.publish_to.is_none());
+        assert!(
+            r.rejected.is_empty(),
+            "and nothing was held back: {:?}",
+            r.rejected
+        );
+    }
+
+    #[test]
+    fn the_no_publish_flag_overrides_a_configured_sink() {
+        let mut cfg = Config::from_toml_str(&publishing_toml(PUBLISH_SINK)).unwrap();
+        cfg.publish_disabled = true;
+        let r = cfg.resolve_all().unwrap();
+        assert!(only(&r).publish.is_none());
+        assert!(r.rejected.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_publish_table_is_not_fatal_to_the_fleet() {
+        // The failure mode this is written against: one bad line in the deployment config
+        // taking down ingestion for every pipeline in the process.
+        let sink = "[publish]\ntype = \"webpubsub\"\nhub = \"ddi\"\n";
+        let r = Config::from_toml_str(&publishing_toml(sink))
+            .unwrap()
+            .resolve_all()
+            .unwrap();
+        let p = only(&r);
+        assert!(p.publish.is_none(), "no credential, so nothing publishes");
+        assert!(
+            r.rejected.is_empty(),
+            "but the pipeline runs: {:?}",
+            r.rejected
+        );
+    }
+
+    #[test]
+    fn a_publish_sink_needs_exactly_one_credential_form() {
+        let both = PublisherConfig {
+            kind: PublisherKind::Webpubsub,
+            connection_string: Some("Endpoint=https://x;AccessKey=k;".into()),
+            connection_string_env: Some("DDI_WPS".into()),
+            hub: "ddi".into(),
+            message_ttl_secs: 60,
+            timeout_secs: 5,
+            failure_threshold: 5,
+            breaker_cooldown_secs: 30,
+            max_message_bytes: "900KB".into(),
+        };
+        let e = both.check().unwrap_err();
+        assert!(e.contains("both"), "got: {e}");
+    }
+
+    #[test]
+    fn a_message_ttl_outside_the_services_range_is_refused_at_load() {
+        let sink = format!("{PUBLISH_SINK}message_ttl_secs = 900\n");
+        let r = Config::from_toml_str(&publishing_toml(&sink))
+            .unwrap()
+            .resolve_all()
+            .unwrap();
+        assert!(
+            only(&r).publish.is_none(),
+            "0..=300 is the service's own bound"
+        );
+        assert!(r.rejected.is_empty());
+    }
+
+    #[test]
+    fn a_message_cap_above_the_frame_limit_is_refused() {
+        let sink = format!("{PUBLISH_SINK}max_message_bytes = \"4MB\"\n");
+        let r = Config::from_toml_str(&publishing_toml(&sink))
+            .unwrap()
+            .resolve_all()
+            .unwrap();
+        assert!(only(&r).publish.is_none());
+    }
+
+    #[test]
+    fn an_upsert_pipeline_cannot_publish() {
+        let toml = format!(
+            "{PUBLISH_SINK}{UPSERT}[pipeline.publish]\nmodel = \"orders_live\"\n\
+             kind = \"webpubsub\"\ngroup = \"sales\"\n\
+             publish_sql = \"SELECT count(*) AS c FROM source\"\n"
+        );
+        let r = Config::from_toml_str(&toml).unwrap().resolve_all().unwrap();
+        let p = only(&r);
+        assert!(
+            p.publish.is_none(),
+            "a merge does not say what the delta was"
+        );
+        assert!(
+            r.rejected.is_empty(),
+            "but it still streams: {:?}",
+            r.rejected
+        );
+    }
+
+    #[test]
+    fn publish_problem_refuses_a_staged_upsert_before_it_is_split() {
+        // The half of this that `publish_problem` actually owns. Asked of the operator's own
+        // entry, which is the only form in which a staged upsert still says it merges — after
+        // the split the ingest half claims write_mode = Append. The test below covers the
+        // other half of the defence, and would pass even if this check were deleted.
+        let mut p: PipelineConfig = toml::from_str(
+            "name = \"style\"\napp_id = \"ddi.style\"\nsource_uri = \"/a\"\n\
+             target_uri = \"/b\"\nwrite_mode = \"staged_upsert\"\n",
+        )
+        .unwrap();
+        p.publish = Some(PublishModel {
+            model: "style_live".into(),
+            kind: PublisherKind::Webpubsub,
+            group: "style".into(),
+            publish_sql: "SELECT count(*) AS c FROM source".into(),
+        });
+        let reason = publish_problem(&p).expect("a staged upsert must not publish");
+        assert!(reason.contains("staged_upsert"), "got: {reason}");
+        assert!(reason.contains("double-count"), "says why: {reason}");
+    }
+
+    #[test]
+    fn neither_half_of_a_staged_upsert_can_publish() {
+        // The laundering hazard: `expand_staged` rewrites the ingest half to
+        // `write_mode = Append`, so anything asking after the split gets "yes, append-only"
+        // about rows going into a private staging table.
+        let toml = format!(
+            "{PUBLISH_SINK}{STAGED}[pipeline.publish]\nmodel = \"style_live\"\n\
+             kind = \"webpubsub\"\ngroup = \"style\"\n\
+             publish_sql = \"SELECT count(*) AS c FROM source\"\n"
+        );
+        let r = Config::from_toml_str(&toml).unwrap().resolve_all().unwrap();
+        assert!(!r.pipelines.is_empty(), "the pipeline still runs");
+        for p in &r.pipelines {
+            assert!(
+                p.publish.is_none(),
+                "half {:?} must not publish from a staged upsert",
+                p.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_publish_model_whose_sql_is_invalid_does_not_hold_back_the_pipeline() {
+        let toml = format!(
+            "{PUBLISH_SINK}\n[[pipeline]]\nname = \"orders\"\napp_id = \"ddi.orders\"\n\
+             source_uri = \"/tmp/bronze/orders\"\ntarget_uri = \"/tmp/silver/orders\"\n\
+             [pipeline.publish]\nmodel = \"orders_live\"\nkind = \"webpubsub\"\n\
+             group = \"sales\"\npublish_sql = \"SELECT avg(amount) AS a FROM source\"\n"
+        );
+        let r = Config::from_toml_str(&toml).unwrap().resolve_all().unwrap();
+        assert!(only(&r).publish.is_none(), "avg is not a delta");
+        assert!(
+            r.rejected.is_empty(),
+            "and the pipeline runs: {:?}",
+            r.rejected
+        );
+    }
+
+    #[test]
+    fn a_connection_string_never_appears_in_a_debug_rendering() {
+        let cfg = Config::from_toml_str(&publishing_toml(PUBLISH_SINK)).unwrap();
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("AccessKey=k"),
+            "a Config is logged at startup: {rendered}"
+        );
+        assert!(rendered.contains("redacted"), "got: {rendered}");
+    }
+
+    #[test]
+    fn two_pipelines_publishing_to_one_group_both_stop_publishing_and_keep_streaming() {
+        // One group is one stream to a browser. Two producers on it interleave with nothing
+        // in the envelope to tell a client which is which — a correct client ignores the
+        // foreign ones, an incorrect one re-baselines forever. Neither is worth shipping, and
+        // neither is worth stopping ingestion over.
+        let toml = format!(
+            "{PUBLISH_SINK}\n[[pipeline]]\nname = \"a\"\napp_id = \"ddi.a\"\n\
+             source_uri = \"/tmp/bronze/a\"\ntarget_uri = \"/tmp/silver/a\"\n\
+             [pipeline.publish]\nmodel = \"a_live\"\nkind = \"webpubsub\"\ngroup = \"sales\"\n\
+             publish_sql = \"SELECT count(*) AS c FROM source\"\n\
+             \n[[pipeline]]\nname = \"b\"\napp_id = \"ddi.b\"\n\
+             source_uri = \"/tmp/bronze/b\"\ntarget_uri = \"/tmp/silver/b\"\n\
+             [pipeline.publish]\nmodel = \"b_live\"\nkind = \"webpubsub\"\ngroup = \"sales\"\n\
+             publish_sql = \"SELECT count(*) AS c FROM source\"\n"
+        );
+        let r = Config::from_toml_str(&toml).unwrap().resolve_all().unwrap();
+        assert_eq!(r.pipelines.len(), 2, "both still run: {:?}", r.rejected);
+        assert!(
+            r.rejected.is_empty(),
+            "and neither is held back: {:?}",
+            r.rejected
+        );
+        for p in &r.pipelines {
+            assert!(p.publish.is_none(), "{:?} must not publish", p.name);
+            assert!(p.publish_to.is_none());
+        }
+    }
+
+    #[test]
+    fn distinct_groups_are_left_alone() {
+        let toml = format!(
+            "{PUBLISH_SINK}\n[[pipeline]]\nname = \"a\"\napp_id = \"ddi.a\"\n\
+             source_uri = \"/tmp/bronze/a\"\ntarget_uri = \"/tmp/silver/a\"\n\
+             [pipeline.publish]\nmodel = \"a_live\"\nkind = \"webpubsub\"\ngroup = \"sales\"\n\
+             publish_sql = \"SELECT count(*) AS c FROM source\"\n\
+             \n[[pipeline]]\nname = \"b\"\napp_id = \"ddi.b\"\n\
+             source_uri = \"/tmp/bronze/b\"\ntarget_uri = \"/tmp/silver/b\"\n\
+             [pipeline.publish]\nmodel = \"b_live\"\nkind = \"webpubsub\"\ngroup = \"orders\"\n\
+             publish_sql = \"SELECT count(*) AS c FROM source\"\n"
+        );
+        let r = Config::from_toml_str(&toml).unwrap().resolve_all().unwrap();
+        assert_eq!(r.pipelines.len(), 2);
+        for p in &r.pipelines {
+            assert!(p.publish.is_some(), "{:?} should publish", p.name);
+        }
     }
 }

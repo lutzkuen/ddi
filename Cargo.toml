@@ -54,6 +54,21 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # dbt's profiles.yml. serde_norway is the maintained fork of serde_yaml.
 serde_norway = "0.9"
 
+# HMAC-SHA256 and base64url, for the bearer token the Azure Web PubSub data plane
+# authenticates with. Same argument as `reqwest` above: one protocol shape is a small amount
+# of code to own rather than taking a vendor SDK, and signing a token — as opposed to
+# verifying one — parses no attacker-controlled input.
+#
+# `sha2` and `base64` already resolve in the tree beneath datafusion and the object store;
+# they are declared here anyway, because relying on another crate's feature set for our own
+# signing is how a build breaks silently after an unrelated bump. `hmac` is the only new
+# entry in the lockfile, and its own dependencies (digest, crypto-common, subtle) are all
+# already present. `ring` would have cost nothing at all, but it is here only as a rustls
+# internal and depending on it directly would couple our signing to the TLS stack's version.
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "io-util"] }

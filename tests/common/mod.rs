@@ -126,6 +126,8 @@ pub fn pipeline_cfg(name: &str, source: &str, target: &str) -> ResolvedPipeline 
         dq_uri: None,
         source_relation: None,
         target_relation: None,
+        publish: None,
+        publish_to: None,
         storage: delta_delta_ingest::storage::Storage::default(),
     }
 }

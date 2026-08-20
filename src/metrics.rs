@@ -94,9 +94,68 @@ pub struct PipelineMetrics {
     /// healthy and the backlog alert stays quiet while the stream is hours dead. Staleness
     /// is the reading that survives that, whatever the failure was.
     pub last_progress_unixtime: AtomicI64,
+
+    // Realtime publication only. All zero on a pipeline that does not publish, which is the
+    // honest reading: it never builds a payload and never sends one.
+    //
+    // None of these belongs in a health check. A publisher is a leaf: it cannot fail a
+    // commit, so a pipeline whose publishes are all failing is *healthy and behind on a
+    // dashboard*, not broken. `ddi_pipeline_up` deliberately does not move with them.
+    /// Messages the service accepted.
+    ///
+    /// **Not a delivery count.** A group nobody has joined accepts a message and discards
+    /// it, so this counts what left this process, not what any browser saw.
+    pub publish_sent: AtomicU64,
+    /// Payloads that could not be built or could not be sent. The batch committed anyway.
+    pub publish_failed: AtomicU64,
+    /// Batches where nothing was attempted because the breaker was open.
+    ///
+    /// Distinct from `publish_failed` on purpose: a run of failures becomes a run of skips,
+    /// and conflating them would hide the moment publication stopped being tried at all.
+    pub publish_skipped: AtomicU64,
+    /// Messages sent with `complete: false` because the payload was over the size cap.
+    ///
+    /// Every one of these makes a client reload a baseline. Sustained non-zero means the
+    /// publish model is grouping by something with too many values to push.
+    pub publish_truncated: AtomicU64,
+    /// Rows across all payloads built, whether or not they were sent.
+    pub publish_rows: AtomicU64,
+    /// Bytes across all payloads sent, for sizing against the service's frame limit.
+    pub publish_bytes: AtomicU64,
+    /// 1 when this pipeline has a publisher, 0 when it does not.
+    ///
+    /// The gauge that answers "is this dashboard being fed at all?", which no counter can:
+    /// a pipeline that never publishes and one whose publishes all fail both leave
+    /// `ddi_publish_sent_total` at zero.
+    pub publish_configured: AtomicI64,
 }
 
 impl PipelineMetrics {
+    /// Record what the realtime publisher did for one batch.
+    ///
+    /// Deliberately *not* routed through `mark_progress` or `observe_error`: publication
+    /// sits outside the health story entirely. A pipeline whose every publish is failing is
+    /// committing to Delta exactly as it should, so letting this touch `up` would page
+    /// somebody about a dashboard.
+    pub fn observe_publish(&self, stats: &crate::publish::PublishStats) {
+        if stats.sent {
+            self.publish_sent.fetch_add(1, Ordering::Relaxed);
+            self.publish_bytes
+                .fetch_add(stats.bytes as u64, Ordering::Relaxed);
+        }
+        if stats.failed {
+            self.publish_failed.fetch_add(1, Ordering::Relaxed);
+        }
+        if stats.skipped {
+            self.publish_skipped.fetch_add(1, Ordering::Relaxed);
+        }
+        if stats.truncated {
+            self.publish_truncated.fetch_add(1, Ordering::Relaxed);
+        }
+        self.publish_rows
+            .fetch_add(stats.rows as u64, Ordering::Relaxed);
+    }
+
     /// Note that this pipeline just did something successfully.
     pub fn mark_progress(&self) {
         self.up.store(1, Ordering::Relaxed);
@@ -199,7 +258,7 @@ impl Metrics {
         let map = self.pipelines.read().unwrap();
         let mut s = String::new();
 
-        let metrics: [MetricSpec; 23] = [
+        let metrics: [MetricSpec; 30] = [
             (
                 "ddi_batches_committed_total",
                 "counter",
@@ -344,6 +403,53 @@ impl Metrics {
                  max_concurrent_upsert_merges is the throughput, not the storage.",
                 |m| m.merge_queue_millis.load(Ordering::Relaxed) as i64,
             ),
+            (
+                "ddi_publish_sent_total",
+                "counter",
+                "Realtime messages the service accepted. NOT a delivery count: a group \
+                 with no subscribers accepts and discards.",
+                |m| m.publish_sent.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_publish_failed_total",
+                "counter",
+                "Realtime payloads that could not be built or sent. The batch committed \
+                 anyway — publishing cannot fail a commit.",
+                |m| m.publish_failed.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_publish_skipped_total",
+                "counter",
+                "Batches where publication was not attempted because the breaker was open \
+                 after repeated failures.",
+                |m| m.publish_skipped.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_publish_truncated_total",
+                "counter",
+                "Messages sent without their rows because the payload was over the size \
+                 cap. Each one makes a client reload a baseline.",
+                |m| m.publish_truncated.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_publish_rows_total",
+                "counter",
+                "Rows across all realtime payloads built.",
+                |m| m.publish_rows.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_publish_bytes_total",
+                "counter",
+                "Bytes across all realtime messages sent. Watch against the service's 1 MB \
+                 frame limit.",
+                |m| m.publish_bytes.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_publish_configured",
+                "gauge",
+                "1 when this pipeline has a realtime publisher, 0 when it does not.",
+                |m| m.publish_configured.load(Ordering::Relaxed),
+            ),
         ];
 
         for (name, kind, help, get) in metrics {
@@ -459,5 +565,104 @@ mod tests {
             out.contains("ddi_batches_committed_total{pipeline=\"orders_header\"} 3"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn a_publish_failure_does_not_clear_ddi_pipeline_up() {
+        // The distinction the whole design rests on. A publisher is a leaf: a pipeline whose
+        // every publish fails is committing to Delta exactly as it should, and paging
+        // somebody about it would be paging them about a dashboard.
+        let m = Metrics::new();
+        let p = m.pipeline("orders");
+        p.mark_progress();
+        assert_eq!(p.up.load(Ordering::Relaxed), 1);
+
+        for _ in 0..5 {
+            p.observe_publish(&crate::publish::PublishStats {
+                failed: true,
+                ..Default::default()
+            });
+        }
+
+        assert_eq!(p.up.load(Ordering::Relaxed), 1, "still healthy");
+        assert_eq!(p.errors.load(Ordering::Relaxed), 0, "and not an error");
+        assert_eq!(p.publish_failed.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn publish_counters_separate_sent_failed_skipped_and_truncated() {
+        let m = Metrics::new();
+        let p = m.pipeline("orders");
+
+        p.observe_publish(&crate::publish::PublishStats {
+            sent: true,
+            rows: 3,
+            bytes: 120,
+            ..Default::default()
+        });
+        p.observe_publish(&crate::publish::PublishStats {
+            sent: true,
+            truncated: true,
+            rows: 9_000,
+            bytes: 400,
+            ..Default::default()
+        });
+        p.observe_publish(&crate::publish::PublishStats {
+            failed: true,
+            ..Default::default()
+        });
+        // A run of failures becomes a run of skips once the breaker opens; conflating the
+        // two would hide the moment publication stopped being attempted at all.
+        p.observe_publish(&crate::publish::PublishStats {
+            skipped: true,
+            ..Default::default()
+        });
+
+        assert_eq!(p.publish_sent.load(Ordering::Relaxed), 2);
+        assert_eq!(p.publish_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(p.publish_skipped.load(Ordering::Relaxed), 1);
+        assert_eq!(p.publish_truncated.load(Ordering::Relaxed), 1);
+        assert_eq!(p.publish_rows.load(Ordering::Relaxed), 9_003);
+        assert_eq!(p.publish_bytes.load(Ordering::Relaxed), 520, "sent only");
+    }
+
+    #[test]
+    fn the_publish_series_are_rendered_for_every_pipeline() {
+        let m = Metrics::new();
+        m.pipeline("orders")
+            .publish_configured
+            .store(1, Ordering::Relaxed);
+        let rendered = m.render();
+        for name in [
+            "ddi_publish_sent_total",
+            "ddi_publish_failed_total",
+            "ddi_publish_skipped_total",
+            "ddi_publish_truncated_total",
+            "ddi_publish_rows_total",
+            "ddi_publish_bytes_total",
+            "ddi_publish_configured",
+        ] {
+            assert!(
+                rendered.contains(name),
+                "{name} is missing from:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("ddi_publish_configured{pipeline=\"orders\"} 1"),
+            "got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_pipeline_that_does_not_publish_reads_zero_rather_than_absent() {
+        // So a dashboard can tell "not configured" from "configured and silent".
+        let m = Metrics::new();
+        let _ = m.pipeline("orders");
+        let rendered = m.render();
+        assert!(
+            rendered.contains("ddi_publish_configured{pipeline=\"orders\"} 0"),
+            "got:\n{rendered}"
+        );
+        assert!(rendered.contains("ddi_publish_sent_total{pipeline=\"orders\"} 0"));
     }
 }

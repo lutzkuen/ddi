@@ -16,3 +16,12 @@ models:
     meta:
       ddi_timestamp: _timestamp
       ddi_key: order_id
+
+  # Not a pipeline: ddi never writes this table, and there is no such table to write.
+  # It says what to push to a dashboard when orders_stg commits a batch, and it rides on
+  # that model's commits. Publication is best-effort and strictly after the Delta commit,
+  # so nothing here can affect what orders_stg wrote.
+  - name: orders_live
+    meta:
+      ddi_publish: webpubsub    # opt in, and which backend
+      ddi_publish_group: orders # the channel a browser subscribes to

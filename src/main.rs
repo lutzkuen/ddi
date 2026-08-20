@@ -80,6 +80,14 @@ struct Cli {
     #[arg(long, global = true, value_name = "DIR", env = "DBT_PROFILES_DIR")]
     profiles_dir: Option<PathBuf>,
 
+    /// Do not publish realtime payloads, whatever the dbt models and `[publish]` say.
+    ///
+    /// The Delta stream is identical either way — publication is a leaf — so this is the
+    /// switch for running a copy of production against the same config without a second
+    /// writer pushing to the same dashboard group.
+    #[arg(long, global = true, env = "DDI_NO_PUBLISH")]
+    no_publish: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -148,7 +156,10 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
-    let cfg = Config::from_path(&cli.config)?;
+    let mut cfg = Config::from_path(&cli.config)?;
+    // Applied to the config rather than checked at each call site, so there is one place
+    // where publication can be off and nothing downstream has to remember to ask.
+    cfg.publish_disabled = cli.no_publish;
 
     // The dbt subcommands read a manifest, not the pipeline list, so they must work
     // before any pipelines exist — that is the point at which you are deciding what to
@@ -239,6 +250,17 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
                     "{:<24} {} -> {}  (app_id={}, change_policy={:?}, write_mode={mode})",
                     p.name, p.source_uri, p.target_uri, p.app_id, p.change_policy
                 );
+                // Shown only when it is on, because silence has to mean "not publishing" —
+                // and every way this can be off already said so as a warning at load.
+                if let Some(publish) = &p.publish {
+                    println!(
+                        "{:<24}   publishes {} -> {} group {:?}",
+                        "",
+                        publish.model,
+                        publish.kind.as_str(),
+                        publish.group
+                    );
+                }
             }
             println!("\n{} pipeline(s) valid.", pipelines.len());
             if !rejected.is_empty() {
@@ -393,7 +415,7 @@ async fn dbt_command(sub: &DbtCommand, cfg: &Config, cli: &Cli) -> delta_delta_i
                 }
             }
 
-            let (mut ok, mut no, mut unknown) = (0usize, 0usize, 0usize);
+            let (mut ok, mut no, mut unknown, mut publishes) = (0usize, 0usize, 0usize, 0usize);
             let mut why: std::collections::BTreeMap<String, usize> = Default::default();
 
             for v in &verdicts {
@@ -404,6 +426,22 @@ async fn dbt_command(sub: &DbtCommand, cfg: &Config, cli: &Cli) -> delta_delta_i
                             println!(
                                 "streamable  {:<28} {} -> {}",
                                 s.name, s.source_relation, s.target_relation
+                            );
+                        }
+                    }
+                    // Listed on its own line rather than folded into the streamable count,
+                    // because it is not a pipeline: it is a payload another model's commits
+                    // carry. Without this line a typo in `ddi_publish` would be invisible —
+                    // the model simply would not appear anywhere.
+                    Verdict::Publishes(p) => {
+                        publishes += 1;
+                        if !rejected_only {
+                            println!(
+                                "publishes   {:<28} -> {}  ({}, group={})",
+                                p.name,
+                                p.host_relation,
+                                p.kind.as_str(),
+                                p.group
                             );
                         }
                     }
@@ -421,8 +459,8 @@ async fn dbt_command(sub: &DbtCommand, cfg: &Config, cli: &Cli) -> delta_delta_i
             }
 
             println!(
-                "\n{ok} streamable, {no} not streamable, {unknown} could not be judged, \
-                 of {} model(s).",
+                "\n{ok} streamable, {publishes} publishes, {no} not streamable, {unknown} \
+                 could not be judged, of {} model(s).",
                 verdicts.len()
             );
             if unknown > 0 {
@@ -512,10 +550,15 @@ async fn run_all(
             .store(0, Ordering::Relaxed);
     }
     for p in &pipelines {
-        metrics
-            .pipeline(&p.name)
-            .config_valid
-            .store(1, Ordering::Relaxed);
+        let m = metrics.pipeline(&p.name);
+        m.config_valid.store(1, Ordering::Relaxed);
+        // Set here rather than on the first publish, because the question it answers is
+        // "should this dashboard be getting anything at all?" — and a pipeline that has no
+        // publisher and one whose publishes are all failing both leave the counters at zero.
+        m.publish_configured.store(
+            i64::from(p.publish.is_some() && p.publish_to.is_some()),
+            Ordering::Relaxed,
+        );
     }
 
     if let Some(addr) = metrics_addr {
@@ -802,6 +845,7 @@ async fn attempt(
                 rows,
                 upsert,
                 rejected,
+                published,
                 ..
             }) => {
                 // A step that got this far means the pipeline is working, whatever happened
@@ -837,10 +881,15 @@ async fn attempt(
                     m.merge_queue_millis
                         .fetch_add(u.queue_millis, Ordering::Relaxed);
                 }
+                if let Some(p) = published {
+                    m.observe_publish(&p);
+                }
             }
             Ok(StepOutcome::Skipped {
                 through_version,
                 rejected,
+                published,
+                ..
             }) => {
                 progressed.store(true, Ordering::Relaxed);
                 m.mark_progress();
@@ -855,6 +904,9 @@ async fn attempt(
                 m.commits_skipped.fetch_add(1, Ordering::Relaxed);
                 m.last_source_version
                     .store(through_version as i64, Ordering::Relaxed);
+                if let Some(p) = published {
+                    m.observe_publish(&p);
+                }
             }
             Err(e) => {
                 // Hand it to the supervisor above, which backs off and reopens. Not counted
