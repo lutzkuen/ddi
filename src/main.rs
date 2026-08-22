@@ -778,6 +778,22 @@ async fn drive(
                 }
 
                 attempts += 1;
+                // Capacity is not transience, and it is the one failure where retrying
+                // promptly hurts the pipelines that are still healthy. Retrying a second
+                // later re-runs the same scan into the same full directory, and while it does
+                // it holds the whole shared spill budget — starving every neighbour's
+                // legitimate merge spill. The bytes themselves are released when the failed
+                // plan drops, so this does not accumulate; what it wastes is other people's
+                // headroom and a great deal of object-store egress.
+                //
+                // Set before the wait rather than after it, because the ordinary path applies
+                // the doubling to the *next* attempt and the point here is that the *first*
+                // retry already waits. Not fatal, deliberately: the cause may be a
+                // neighbour's transient merge rather than this pipeline's own size, and that
+                // heals.
+                if matches!(e, delta_delta_ingest::Error::Capacity(_)) {
+                    backoff = RETRY_MAX;
+                }
                 let wait = jitter(backoff, &name, attempts);
                 error!(
                     pipeline = %name,

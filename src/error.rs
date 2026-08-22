@@ -181,3 +181,35 @@ impl From<deltalake::datafusion::error::DataFusionError> for Error {
         crate::spill::classify(e, "datafusion")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deltalake::datafusion::error::DataFusionError;
+
+    #[test]
+    fn a_capacity_failure_is_not_read_as_a_transform_error() {
+        // The two want opposite handling from the retry loop, and mapping every DataFusion
+        // error to `Transform` made them indistinguishable — so a pipeline that had run out
+        // of disk retried a second later, forever, holding the whole shared spill budget
+        // while it did.
+        let e = Error::from(DataFusionError::ResourcesExhausted(
+            "The used disk space during the spilling process has exceeded the allowable limit \
+             of 100.0 GB."
+                .into(),
+        ));
+        assert!(matches!(e, Error::Capacity(_)), "{e}");
+
+        let e = Error::from(DataFusionError::Plan("no such column".into()));
+        assert!(matches!(e, Error::Transform(_)), "{e}");
+    }
+
+    #[test]
+    fn a_capacity_failure_names_the_budget_and_the_three_ways_out() {
+        let m = Error::Capacity("the spill directory is full".into()).to_string();
+        assert!(m.contains("no other pipeline was stopped"), "{m}");
+        assert!(m.contains("max_temp_directory_size"), "{m}");
+        assert!(m.contains("headroom"), "{m}");
+        assert!(m.contains("max_concurrent_upsert_preflights"), "{m}");
+    }
+}
