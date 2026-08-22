@@ -87,6 +87,20 @@ pub struct PipelineMetrics {
     /// which of the two a stuck stream is: a retry that will work eventually, or a retry
     /// that will not.
     pub source_file_vacuumed: AtomicI64,
+    /// 1 once this pipeline ran out of spill space or memory rather than being wrong.
+    ///
+    /// The same shape as [`Self::source_file_vacuumed`] and for the same reason: from
+    /// outside, a pipeline retrying a capacity failure and a pipeline retrying a storage
+    /// blip look identical, and only one of them will heal on its own. Raised, never lowered
+    /// here; cleared by a step that actually succeeds.
+    pub capacity_exhausted: AtomicI64,
+    /// Passes the last startup uniqueness check took over this target's key column.
+    ///
+    /// One is the ordinary answer. More means the target's key space did not fit
+    /// `[runtime] max_grain_check_memory` and was read in congruence classes — correct, and
+    /// linear in this number, which is the only warning an operator gets that a start is
+    /// going to be slow. See [`crate::grain`].
+    pub grain_check_passes: AtomicU64,
     /// Unix seconds at the last successful step. -1 until the first one.
     ///
     /// The lag gauge cannot cover a pipeline that fails while *opening*: it never reaches
@@ -164,6 +178,9 @@ impl PipelineMetrics {
         // while the file is still gone, so clearing there would flap the gauge once per
         // retry instead of holding it up until the stream actually recovers.
         self.source_file_vacuumed.store(0, Ordering::Relaxed);
+        // Same argument: a step that succeeded found the room it needed, so whatever was
+        // full is not full any more.
+        self.capacity_exhausted.store(0, Ordering::Relaxed);
         if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             self.last_progress_unixtime
                 .store(d.as_secs() as i64, Ordering::Relaxed);
@@ -188,6 +205,12 @@ impl PipelineMetrics {
         // arrives.
         if matches!(e, crate::Error::SourceFileVacuumed { .. }) {
             self.source_file_vacuumed.store(1, Ordering::Relaxed);
+        }
+        // Not the same thing as `up = 0`, which every failure sets. This one says the machine
+        // ran out rather than the data being wrong — which is what decides whether an
+        // operator reaches for the config or for the data.
+        if matches!(e, crate::Error::Capacity(_)) {
+            self.capacity_exhausted.store(1, Ordering::Relaxed);
         }
     }
 
@@ -258,7 +281,7 @@ impl Metrics {
         let map = self.pipelines.read().unwrap();
         let mut s = String::new();
 
-        let metrics: [MetricSpec; 30] = [
+        let metrics: [MetricSpec; 32] = [
             (
                 "ddi_batches_committed_total",
                 "counter",
@@ -445,6 +468,21 @@ impl Metrics {
                 |m| m.publish_bytes.load(Ordering::Relaxed) as i64,
             ),
             (
+                "ddi_capacity_exhausted",
+                "gauge",
+                "1 once this pipeline ran out of spill space or memory. Raised, never \
+                 lowered; cleared only by a step that succeeds.",
+                |m| m.capacity_exhausted.load(Ordering::Relaxed),
+            ),
+            (
+                "ddi_grain_check_passes",
+                "gauge",
+                "Passes the last startup uniqueness check took over this target's key \
+                 column. More than one means the key space did not fit \
+                 [runtime] max_grain_check_memory.",
+                |m| m.grain_check_passes.load(Ordering::Relaxed) as i64,
+            ),
+            (
                 "ddi_publish_configured",
                 "gauge",
                 "1 when this pipeline has a realtime publisher, 0 when it does not.",
@@ -472,6 +510,29 @@ impl Metrics {
              ddi_preflights_in_flight {}\n",
             gate.merges_in_flight(),
             gate.preflights_in_flight(),
+        ));
+
+        // Also process-wide, and for a harder reason than the gate's: the spill budget is one
+        // directory with one counter, shared by every session this process builds. There is
+        // no pipeline to attribute a byte of it to — and that is exactly why it needs a
+        // gauge. A fleet can walk up to a shared budget together, and without this the first
+        // anyone hears about it is a pipeline that will not start.
+        let spill = crate::spill::current();
+        s.push_str(&format!(
+            "# HELP ddi_spill_bytes Bytes DataFusion currently holds in its temporary \
+             directory, process-wide.\n\
+             # TYPE ddi_spill_bytes gauge\n\
+             ddi_spill_bytes {}\n\
+             # HELP ddi_spill_files Spill files open right now, process-wide.\n\
+             # TYPE ddi_spill_files gauge\n\
+             ddi_spill_files {}\n\
+             # HELP ddi_spill_limit_bytes The budget those two are measured against. Never \
+             zero: unset means DataFusion's own 100GB.\n\
+             # TYPE ddi_spill_limit_bytes gauge\n\
+             ddi_spill_limit_bytes {}\n",
+            spill.used_bytes(),
+            spill.active_files(),
+            spill.limit_bytes(),
         ));
         s
     }

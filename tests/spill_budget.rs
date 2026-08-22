@@ -143,3 +143,53 @@ async fn the_error_a_full_spill_directory_produces_names_the_key_that_raises_it(
     );
     assert!(m.contains("no other pipeline was stopped"), "{m}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_spill_gauges_say_what_the_disk_manager_says() {
+    let installed = installed();
+    let m = delta_delta_ingest::metrics::Metrics::new();
+    // A pipeline has to exist for the labelled series to render; the spill gauges are
+    // process-wide and unlabelled, like the gate's.
+    m.pipeline("anything");
+    let rendered = m.render();
+
+    assert!(
+        rendered.contains(&format!(
+            "ddi_spill_limit_bytes {}",
+            installed.limit_bytes()
+        )),
+        "the budget an alert divides by has to be exported: {rendered}"
+    );
+    assert!(rendered.contains("ddi_spill_bytes "), "{rendered}");
+    assert!(rendered.contains("ddi_spill_files "), "{rendered}");
+    assert!(rendered.contains("ddi_capacity_exhausted{pipeline=\"anything\"} 0"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn running_out_of_capacity_raises_a_gauge_a_storage_blip_does_not() {
+    installed();
+    let m = delta_delta_ingest::metrics::Metrics::new();
+    let p = m.pipeline("thirsty");
+
+    p.observe_error(&delta_delta_ingest::Error::Other("a storage blip".into()));
+    assert!(m
+        .render()
+        .contains("ddi_capacity_exhausted{pipeline=\"thirsty\"} 0"));
+
+    p.observe_error(&delta_delta_ingest::Error::Capacity(
+        "the spill directory".into(),
+    ));
+    assert!(m
+        .render()
+        .contains("ddi_capacity_exhausted{pipeline=\"thirsty\"} 1"));
+
+    // Raised, never lowered by another failure — only by a step that actually worked.
+    p.observe_error(&delta_delta_ingest::Error::Other("something else".into()));
+    assert!(m
+        .render()
+        .contains("ddi_capacity_exhausted{pipeline=\"thirsty\"} 1"));
+    p.mark_progress();
+    assert!(m
+        .render()
+        .contains("ddi_capacity_exhausted{pipeline=\"thirsty\"} 0"));
+}
