@@ -792,12 +792,11 @@ async fn drive(
                 // promptly hurts the pipelines that are still healthy. Retrying a second
                 // later re-runs the same scan into the same full directory, and while it does
                 // it holds the whole shared spill budget — starving every neighbour's
-                // legitimate merge spill. Nearly all of it is released when the failed plan
-                // drops, but not quite all: DataFusion charges the write that broke the cap
-                // and then returns before recording it, so a little stays charged to the
-                // shared counter per failure (see `crate::spill`). Retrying every second
-                // therefore does accumulate, slowly, on top of wasting other people's
-                // headroom and a great deal of object-store egress.
+                // legitimate merge spill. Worse than that while it lasts: DataFusion strands
+                // the write that broke the cap in the shared counter, so each attempt leaves
+                // the budget looking fuller than it is until `crate::spill` notices and
+                // replaces the manager. Retrying every second means doing that every second,
+                // on top of a great deal of object-store egress.
                 //
                 // Set before the wait rather than after it, because the ordinary path applies
                 // the doubling to the *next* attempt and the point here is that the *first*

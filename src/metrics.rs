@@ -523,18 +523,22 @@ impl Metrics {
              directory, process-wide.\n\
              # TYPE ddi_spill_bytes gauge\n\
              ddi_spill_bytes {}\n\
-             # HELP ddi_spill_files Spill files open right now, process-wide. Zero here with \
-             ddi_spill_bytes above zero means the counter is carrying residue from a capacity \
-             failure; a restart clears it.\n\
+             # HELP ddi_spill_files Spill files open right now, process-wide.\n\
              # TYPE ddi_spill_files gauge\n\
              ddi_spill_files {}\n\
              # HELP ddi_spill_limit_bytes The budget those two are measured against. Never \
              zero: unset means DataFusion's own 100GB.\n\
              # TYPE ddi_spill_limit_bytes gauge\n\
-             ddi_spill_limit_bytes {}\n",
+             ddi_spill_limit_bytes {}\n\
+             # HELP ddi_spill_stranded_bytes_total Spill bytes abandoned because DataFusion \
+             left them charged after a capacity failure. Above zero means this process has hit \
+             its spill cap and recovered; it does not mean anything is wrong now.\n\
+             # TYPE ddi_spill_stranded_bytes_total counter\n\
+             ddi_spill_stranded_bytes_total {}\n",
             spill.used_bytes(),
             spill.active_files(),
             spill.limit_bytes(),
+            spill.stranded_bytes(),
         ));
         s
     }

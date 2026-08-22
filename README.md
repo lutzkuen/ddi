@@ -1029,6 +1029,17 @@ pipeline that has nothing to do with the mistake. A cap of zero is refused rathe
 guessed at: "unbounded" and "never spill" are both plausible readings of it and they point in
 opposite directions.
 
+One wrinkle worth knowing about, because it is upstream's arithmetic rather than a choice made
+here. When a spill actually breaks the cap, DataFusion charges the offending write to the shared
+total and then returns the error *before* recording that write on the file — so the cleanup that
+follows gives back the older, smaller figure and the difference stays charged. It is not a
+rounding error: a file that broke a 100 KB budget stranded 490 KB in a reproduction. Left alone
+the counter would sit permanently above the cap and every later spill in the process would be
+refused, including one in a pipeline that had nothing to do with the overrun. `ddi` notices
+(no open spill files, yet bytes still charged — which can only be residue) and opens a fresh
+temporary directory, logging what was abandoned and counting it in
+`ddi_spill_stranded_bytes_total`. Nothing is lost but the accounting, and spilling continues.
+
 Watch `ddi_spill_bytes` against `ddi_spill_limit_bytes`; a ratio near one means the next merge
 fails. `ddi_capacity_exhausted` says which pipeline it failed for — and a capacity failure
 stops that pipeline only, waits the full backoff rather than retrying every second, and leaves
@@ -1393,6 +1404,7 @@ correctness still holds (the `txn` action prevents double-apply) — it just was
 | `ddi_spill_bytes` | gauge | Bytes DataFusion currently holds in its temporary directory, process-wide (no `pipeline` label). |
 | `ddi_spill_files` | gauge | Spill files open right now, process-wide. |
 | `ddi_spill_limit_bytes` | gauge | The budget those two are measured against. Never zero: unset means DataFusion's own 100 GB. |
+| `ddi_spill_stranded_bytes_total` | counter | Spill bytes abandoned because DataFusion left them charged after a capacity failure. Above zero means this process hit its cap and recovered. |
 | `ddi_pipeline_restarts_total` | counter | Reopens after a failure. |
 | `ddi_rows_rejected_total` | counter | Rows written to the data-quality table. |
 | `ddi_batches_fully_rejected_total` | counter | Batches where every row was rejected. |
