@@ -132,7 +132,9 @@ start, so there is no generated file to keep in sync.
 manifest = "/path/to/dbt_project/target/manifest.json"
 
 [runtime]
-allowed_latency_secs = 30      # poll interval once caught up
+allowed_latency_secs    = 30      # poll interval once caught up
+temp_directory          = "/var/spill"  # where DataFusion spills; keep it off the container's writable layer
+max_temp_directory_size = "8GB"         # shared by every pipeline; set it below the volume's real size
 
 [storage.options]
 azure_storage_account_name = "mylake"
@@ -504,6 +506,55 @@ peers keep running, and `ddi_pipeline_up` says which of them are healthy. That m
 worth turning on: `--metrics-addr 127.0.0.1:9100`, then alert on `ddi_pipeline_up == 0 for
 10m` and `increase(ddi_batches_fully_rejected_total[15m]) > 0` — the second catches an
 upstream type change, where every row is quarantined and the target silently stops growing.
+Add `ddi_spill_bytes / ddi_spill_limit_bytes > 0.8`, which is the one that fires *before*
+anything breaks.
+
+**The exception is the pod being evicted, and there is no error to find afterwards.** See
+below.
+
+### When the pod is evicted for ephemeral storage
+
+Every pipeline in it stops at once, no pipeline logged anything, and the metrics that would
+have explained it died with the process. That shape is almost always spill.
+
+Anything DataFusion cannot hold in memory — a merge's join, a sort, the startup uniqueness
+check — is written to a temporary directory. Unset, that directory is the container's own
+writable layer, and Kubernetes charges every byte of it to the pod's `ephemeral-storage`.
+Going over is not an error the process can catch: the kubelet kills it from outside. It is
+the one failure `ddi` cannot contain, which is why the two settings below are worth writing
+down in any container even when nothing has gone wrong yet.
+
+```yaml
+volumes:
+  - name: spill
+    emptyDir:
+      sizeLimit: 16Gi          # without this, an emptyDir is still charged to the pod
+volumeMounts:
+  - name: spill
+    mountPath: /var/spill
+```
+
+```toml
+[runtime]
+temp_directory          = "/var/spill"
+max_temp_directory_size = "12GB"        # below the volume: the budget is checked after each
+                                        # write, not before, so leave headroom
+```
+
+The cap covers the whole process, not each pipeline — every session `ddi` builds shares one
+directory and one counter. Unset it is DataFusion's own 100 GB, which is larger than most
+pods' limit, so unset is not "unbounded" but "bounded above the point at which the pod dies".
+`ddi` warns about that at startup rather than lowering it for you, because it cannot see your
+pod's limit.
+
+With both set, the same overrun becomes one pipeline reporting `out of capacity:` and backing
+off while its peers keep running. Alert on `ddi_spill_bytes / ddi_spill_limit_bytes > 0.8` to
+see it coming, and on `ddi_capacity_exhausted == 1` to see which stream it was.
+
+If it was the startup uniqueness check, `ddi_grain_check_passes` says how many times that
+pipeline reads its target's key column — the check itself writes nothing to disk, but a large
+number means a slow start, and `[runtime] max_grain_check_memory` is the knob. Doubling it
+halves the passes.
 
 ### A source file that was vacuumed before you read it
 
@@ -594,6 +645,12 @@ column in silver, an upsert will not blank it.
 | `upserts into ... which pipeline ... reads as its source` | A downstream pipeline cannot read an upserted target unless it also upserts on the same key with `ignore_changes` |
 | `write_mode = "upsert" needs upsert_key` | Set `ddi_key` on the model (or `upsert_key` in the TOML) |
 | `adds ... and the object store no longer has that file` | The source vacuumed a file this pipeline had not read yet; restore the file, or rebuild the target and resume past that version |
+| `out of capacity: ...` | This pipeline ran out of spill space or memory. It stopped alone; nothing was written to its target |
+| `used disk space during the spilling process` | The process's spill budget is full — raise `[runtime] max_temp_directory_size`, or run fewer merges and preflights at once |
+| `is zero bytes` | A spill cap of `0` is refused: "unbounded" and "never spill" are both plausible readings and they point in opposite directions |
+| `is not usable` | `[runtime] temp_directory` cannot be created or written to, checked with a real probe file at startup — in Kubernetes this is usually an unmounted volume |
+| `would need about ... passes` | The target's key space is far larger than `[runtime] max_grain_check_memory`; raise it, or set `upsert_grain_check = "off"` |
+| `upsert_grain_check = "off"` | A warning, on every start: the target is *not* being checked for duplicate keys, and that is your assertion rather than a verified fact |
 | `cannot resume from ...` | The source's *log* no longer reaches that version — `delta.logRetentionDuration` (30 days by default), not the file retention above; recreate the target or use a new `app_id`, with `starting_version` past it |
 
 Logs are quiet by default. `RUST_LOG=debug,delta_delta_ingest=trace` for detail.

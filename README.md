@@ -954,7 +954,9 @@ does to *itself* and the wrong one for the work it does to a **target**, because
 work is where pipelines stop being independent: a merge reads back a slice of the table it
 writes, and the startup uniqueness check reads all of it. Neither is proportional to the
 batch, so neither gets smaller when batches do — and dividing the budget more finely only
-makes each pipeline spill sooner while the same number of scans run at once.
+makes each pipeline spill sooner while the same number of scans run at once. Spilling sooner
+spends a different budget, on local disk, which the next section is about: the two run in
+opposite directions, and a tighter `max_memory` produces *more* spill rather than less.
 
 ```toml
 [runtime]
@@ -981,6 +983,103 @@ here was first diagnosed by correlation from outside the process, and twice that
 cargo test --profile release-lean --test memory_shape -- --ignored --nocapture --test-threads=1
 ROWS=6000000 BUDGET_MB=512 cargo test --profile release-lean --test memory_shape -- --ignored --nocapture
 ```
+
+## Where spilling goes, and what bounds it
+
+```toml
+[runtime]
+temp_directory          = "/var/spill"   # optional; the OS temporary directory when unset
+max_temp_directory_size = "8GB"          # optional; DataFusion's own 100GB when unset
+```
+
+**The cap is process-wide, and it is worth being precise about why**, because DataFusion's
+own is not. DataFusion stores the limit on a `DiskManager` and checks it against that same
+`DiskManager`'s counter — so out of the box it is per `RuntimeEnv`, and `ddi` builds a
+`RuntimeEnv` per DataFusion *operation*: one per merge attempt, one per transform batch, one
+per startup check. Eleven pipelines each honouring a hundred gigabytes is not a hundred
+gigabytes. `ddi` builds one runtime at startup and derives every other from it, so they all
+share one directory and one counter, and `max_temp_directory_size` means what it reads as:
+bytes this process may have on local disk, full stop.
+
+Unset is not "unbounded". Unset is DataFusion's 100 GB, which is larger than most pods'
+`ephemeral-storage` limit — so unset means "bounded above the point at which the pod is
+killed". `ddi` will not lower that default for you, because it cannot see your pod's limit
+and an upgrade must not change behaviour for someone who edited nothing. It warns at startup
+instead.
+
+Set the cap **below** the volume's real size. It is checked after each write rather than as
+an admission check, so it can be overshot by about one buffer per open spill file, and it
+counts only what DataFusion wrote — it knows nothing about free space or anything else in
+the pod.
+
+In Kubernetes, where the directory points decides who is charged:
+
+- **Unset**, or a path on the container's own filesystem, is the writable layer. The kubelet
+  counts every byte of it as the pod's local ephemeral storage, and going over is an
+  *eviction* — not an error, not a log line, and it takes every other pipeline in the pod
+  with it. That is the one failure `ddi` cannot contain from the inside.
+- A default-medium `emptyDir` is still charged to the pod unless it carries its own
+  `sizeLimit`; `medium: Memory` moves the cost to the memory limit rather than removing it.
+- A separate `PersistentVolumeClaim` is the only shape genuinely outside the kubelet's
+  ephemeral-storage accounting.
+
+The directory is created and probed with a real write at startup — a volume that was not
+mounted stops `ddi validate`, rather than surfacing an hour later as a sort failing inside a
+pipeline that has nothing to do with the mistake. A cap of zero is refused rather than
+guessed at: "unbounded" and "never spill" are both plausible readings of it and they point in
+opposite directions.
+
+Watch `ddi_spill_bytes` against `ddi_spill_limit_bytes`; a ratio near one means the next merge
+fails. `ddi_capacity_exhausted` says which pipeline it failed for — and a capacity failure
+stops that pipeline only, waits the full backoff rather than retrying every second, and leaves
+its target untouched.
+
+## The startup uniqueness check
+
+An upsert pipeline proves its target holds one row per key before it merges into it, because
+a merge matches on the *stored* row: against a target that already holds a key twice it
+updates both copies, forever, and every count and sum over that table stays wrong.
+
+```toml
+[runtime]
+max_grain_check_memory = "512MB"   # optional; 512MB when unset
+```
+
+The check **writes nothing to a temporary directory, at any target size, under any
+configuration**. That is a property of its shape rather than a limit it is held to: it hashes
+the key column to eight bytes a row, keeps only the hashes in one congruence class of the key
+space, sorts them in place and looks for two the same. Nothing registers with the memory pool
+and nothing asks the disk manager for a file.
+
+What it trades instead is *how many times it reads the target*. Eight bytes per row divided by
+`max_grain_check_memory` is the number of classes, and each class is one pass over the key
+column alone:
+
+| `max_grain_check_memory` | 6 million rows | 500 million | 2 billion |
+|---|---|---|---|
+| 256 MB | 1 | 18 | 69 |
+| **512 MB** (default) | **1** | 9 | 35 |
+| 1 GB | 1 | 5 | 18 |
+| 4 GB | 1 | 2 | 5 |
+
+Almost every target is one pass, and one pass is strictly cheaper than the `GROUP BY` this
+replaced — no plan, no repartition, no spill. The row count comes from the target's own log,
+so the arithmetic costs no IO. A target that would need more than 256 passes is refused at
+startup with the number in the message, rather than run silently for hours, and any target
+taking more than one logs the count when the pipeline opens. Watch `ddi_grain_check_passes`.
+
+The expensive answer is always "the target is fine": a broken one is answered by the first
+pass that meets a duplicate.
+
+Sixty-four bits of hash is not exact on its own — at two billion keys the birthday bound puts
+about a tenth of a collision in every run — so a pass *nominates* rather than answers, and a
+second pass resolves the nominees against the real key values. Reporting a collision as a
+duplicate would refuse a perfectly correct table, which is the worse of the two errors this
+check can make.
+
+A pipeline that cannot pay the passes can set `upsert_grain_check = "off"`, which is an
+assertion you have made and `ddi` has not verified. It warns on every start, because getting
+it wrong is not recoverable by retrying.
 
 ## Storage
 
@@ -1261,6 +1360,11 @@ correctness still holds (the `txn` action prevents double-apply) — it just was
 - **Star-schema fan trap.** With header + line-item fan-out, denormalised header columns on
   line rows make `SUM` multiply by line count. The tool does not cause it; the design permits
   it.
+- **Spill is local disk, and Kubernetes counts it.** Anything DataFusion cannot hold in
+  memory goes to `[runtime] temp_directory`, and unset that is the container's writable layer
+  — which the kubelet charges to the pod's `ephemeral-storage`. Exceeding it evicts the pod
+  rather than failing a query, so there is no error to find afterwards and every pipeline in
+  the pod goes down together. Set the directory and the cap in any container.
 
 ### Metrics
 
@@ -1281,6 +1385,11 @@ correctness still holds (the `txn` action prevents double-apply) — it just was
 | `ddi_pipeline_config_valid` | gauge | 1 when the configuration was accepted, 0 when the pipeline was held back at load and never started. |
 | `ddi_pipeline_seconds_since_progress` | gauge | Since the last completed step; -1 before the first. |
 | `ddi_source_file_vacuumed` | gauge | 1 while the pipeline is stopped on a source data file the object store no longer has. |
+| `ddi_capacity_exhausted` | gauge | 1 once this pipeline ran out of spill space or memory. Raised, never lowered; cleared by a step that succeeds. |
+| `ddi_grain_check_passes` | gauge | Passes the last startup uniqueness check took over this target's key column. 0 in append mode. |
+| `ddi_spill_bytes` | gauge | Bytes DataFusion currently holds in its temporary directory, process-wide (no `pipeline` label). |
+| `ddi_spill_files` | gauge | Spill files open right now, process-wide. |
+| `ddi_spill_limit_bytes` | gauge | The budget those two are measured against. Never zero: unset means DataFusion's own 100 GB. |
 | `ddi_pipeline_restarts_total` | counter | Reopens after a failure. |
 | `ddi_rows_rejected_total` | counter | Rows written to the data-quality table. |
 | `ddi_batches_fully_rejected_total` | counter | Batches where every row was rejected. |

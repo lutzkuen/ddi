@@ -9,6 +9,28 @@ max_files_per_batch       = 1000
 max_output_rows_per_batch = 5000000  # guards unnest amplification
 target_file_size          = "128MB"
 
+# The three below are PROCESS-wide, unlike the five above them: they are shared by every
+# pipeline in this file rather than applied to each. ([defaults] is the [runtime] table under
+# another name, so do not add a second [runtime] heading here — TOML reads that as a
+# duplicate key, not as a second table.)
+#
+# Where DataFusion writes what it cannot hold in memory. Unset it is the OS temporary
+# directory, which inside a container is the writable layer — and Kubernetes charges that to
+# the pod's ephemeral-storage, where going over evicts the pod instead of failing a query.
+# That is the one failure ddi cannot contain from the inside, so set both in any container.
+# temp_directory          = "/var/spill"
+#
+# Bytes of spill this whole process may hold at once. Unset it is DataFusion's own 100GB,
+# which is larger than most pods' limit — so unset is not "unbounded", it is "bounded above
+# the point at which the pod is killed". Set it BELOW the volume: the budget is checked after
+# each write rather than before, so leave headroom.
+# max_temp_directory_size = "8GB"
+#
+# How much memory one startup uniqueness check may hold. It writes nothing to disk however
+# large the target is; what this buys is fewer passes over the key column. Eight bytes per
+# target row divided by this is the number of passes, so doubling it halves them.
+# max_grain_check_memory  = "512MB"
+
 # A row the target will not take — a price that says "n/a" against a DECIMAL column — is
 # written to <target_uri>__ddi_dq with the reason attached, and the rest of the batch
 # commits. That table is never created here: make it, and rejects are set aside; leave it

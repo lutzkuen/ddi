@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use deltalake::arrow::array::RecordBatch;
 use deltalake::arrow::datatypes::SchemaRef;
 use deltalake::datafusion::datasource::MemTable;
-use deltalake::datafusion::prelude::{SessionConfig, SessionContext};
+use deltalake::datafusion::prelude::SessionContext;
 
 use crate::error::{Error, Result};
 use crate::lookup::LookupSnapshot;
@@ -92,13 +92,16 @@ impl SqlTransform {
         batches: Vec<RecordBatch>,
         lookups: &[LookupSnapshot],
     ) -> Result<Vec<RecordBatch>> {
-        let config = SessionConfig::new()
+        let config = crate::budget::session_config()
             // Grain-preserving transforms need no repartitioning, and keeping it off makes
             // output row order track input order, which makes tests deterministic.
             .with_target_partitions(1);
         // Built against the process's memory budget, so a transform that sorts or groups
         // spills rather than growing. The batch it is handed is already bounded by
-        // `max_bytes_per_batch`; this bounds what the transform makes of it.
+        // `max_bytes_per_batch`; this bounds what the transform makes of it. Through
+        // `session_config` rather than a bare one so it agrees with every other session in
+        // the process about how spill is written — this is the highest-frequency session
+        // here, and it was the only one not covered.
         let ctx = SessionContext::new_with_state(
             deltalake::datafusion::execution::session_state::SessionStateBuilder::new()
                 .with_config(config)
