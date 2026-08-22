@@ -608,6 +608,45 @@ async fn a_target_that_already_holds_a_key_twice_is_refused_at_startup() {
 }
 
 #[tokio::test]
+async fn a_pipeline_that_asserts_its_own_grain_is_not_made_to_prove_it() {
+    // The escape hatch for a target whose key space is too large to check on every restart.
+    // It is an assertion the operator has made, not a fact ddi has verified — so it opens the
+    // pipeline on a target the default would refuse.
+    let lake = Lake::new().await;
+    lake.seed_silver(
+        &[(1, "placed", 10, None), (1, "shipped", 20, None)],
+        SaveMode::Append,
+    )
+    .await;
+
+    let mut cfg = lake.cfg();
+    cfg.upsert_grain_check = delta_delta_ingest::config::GrainCheck::Off;
+    Pipeline::open(cfg)
+        .await
+        .expect("an asserted grain is not checked");
+}
+
+#[tokio::test]
+async fn turning_the_check_off_is_not_the_default() {
+    // Guarding the one thing this must not regress: a change about disk does not get to
+    // weaken a corruption guard for anyone who upgrades and edits nothing.
+    let lake = Lake::new().await;
+    assert_eq!(
+        lake.cfg().upsert_grain_check,
+        delta_delta_ingest::config::GrainCheck::Always
+    );
+    lake.seed_silver(
+        &[(1, "placed", 10, None), (1, "shipped", 20, None)],
+        SaveMode::Append,
+    )
+    .await;
+    assert!(
+        Pipeline::open(lake.cfg()).await.is_err(),
+        "a duplicated key still stops a pipeline that did not opt out"
+    );
+}
+
+#[tokio::test]
 async fn restarting_mid_stream_resumes_without_replaying_or_skipping() {
     let lake = Lake::new().await;
     lake.arrive(&[ev(1, "placed", 10)]).await;

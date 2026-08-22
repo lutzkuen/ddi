@@ -136,6 +136,7 @@ fn pipeline(declared_source: &str, declared_target: &str) -> ResolvedPipeline {
         upsert_key: None,
         upsert_lookback: None,
         upsert_tiebreak: Vec::new(),
+        upsert_grain_check: Default::default(),
         stage_for: None,
         dq_uri: None,
         storage: Default::default(),

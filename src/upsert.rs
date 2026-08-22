@@ -701,6 +701,7 @@ pub async fn preflight(
     sequence_column: &str,
     lookback: Option<Lookback>,
     tiebreak: &[String],
+    grain: crate::config::GrainCheck,
 ) -> Result<u32> {
     let named = |c: &str| -> Result<&DataType> {
         target_schema
@@ -774,7 +775,21 @@ pub async fn preflight(
         ));
     }
 
-    assert_one_row_per_key(target, key_column).await
+    match grain {
+        crate::config::GrainCheck::Always => assert_one_row_per_key(target, key_column).await,
+        crate::config::GrainCheck::Off => {
+            // WARN and not INFO because this is the one setting here that can silently corrupt
+            // a target, and an operator scrolling past it should have to notice.
+            tracing::warn!(
+                key_column,
+                "upsert_grain_check = \"off\": the target is NOT being checked for duplicate \
+                 keys. If it holds any, this merge will update every copy of them forever and \
+                 every count and sum over this table will stay wrong. This setting is an \
+                 assertion you have made, not a fact ddi has verified."
+            );
+            Ok(0)
+        }
+    }
 }
 
 /// Refuse to start on a target that already holds a key twice.

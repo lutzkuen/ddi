@@ -221,6 +221,7 @@ impl Pipeline {
                 sequence,
                 cfg.upsert_lookback,
                 &cfg.upsert_tiebreak,
+                cfg.upsert_grain_check,
             )
             .await
             .map_err(|e| Error::Config(format!("pipeline {:?}: {e}", cfg.name)))?;

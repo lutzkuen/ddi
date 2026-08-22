@@ -157,6 +157,24 @@ impl Default for Defaults {
     }
 }
 
+/// Whether to prove the target's grain at startup.
+///
+/// Two values only, and no "once": the tempting third option is to skip the check on a target
+/// this tool already owns, and the obvious signal for that is unsound. `app_id` is a plain
+/// config field independent of `write_mode`, and `Sink::properties` writes the `txn` action on
+/// the *append* path as well as the merge path — so a pipeline that ran append-only and was
+/// then switched to upsert already has one, and the check would be skipped in exactly the
+/// scenario [`crate::upsert`] says it exists for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrainCheck {
+    /// Prove it on every start. The default, and the only value that is a proof.
+    #[default]
+    Always,
+    /// Do not prove it. An assertion the operator has made, which this tool has not verified.
+    Off,
+}
+
 /// How a batch reaches the target.
 ///
 /// Mirrors [`ChangePolicy`]'s shape: a small snake_case enum with the safe option as the
@@ -304,6 +322,22 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub upsert_tiebreak: Vec<String>,
 
+    /// Whether to prove the target holds one row per key before merging into it.
+    ///
+    /// `"always"` is the default and the only value that is a proof. It costs one or more
+    /// streaming passes over the key column at every start — see
+    /// [`Defaults::max_grain_check_memory`] for how many, and note that it writes nothing to
+    /// disk however large the target is.
+    ///
+    /// `"off"` skips it. This is an assertion *you* have made and this tool has not verified,
+    /// and getting it wrong is not recoverable by retrying: a merge matches on the stored row,
+    /// so against a target that already holds a key twice it updates both copies forever, and
+    /// every count and sum over that table stays wrong, silently, from then on. It logs a
+    /// warning on every start for that reason. The honest use is "this target has one row per
+    /// key because I just rebuilt it that way, and I cannot pay the passes on every restart".
+    #[serde(default)]
+    pub upsert_grain_check: GrainCheck,
+
     /// Where `write_mode = "staged_upsert"` parks rows between its two halves.
     ///
     /// Defaults to `<target_uri>__ddi_stage`, which is what almost every pipeline should
@@ -417,6 +451,9 @@ pub struct ResolvedPipeline {
     /// Columns compared after `dedup_timestamp` to settle a tie, left to right. Empty means
     /// position in the batch decides, which is stable only while batches are.
     pub upsert_tiebreak: Vec<String>,
+    /// Whether this pipeline proves its target's grain at startup. See
+    /// [`PipelineConfig::upsert_grain_check`].
+    pub upsert_grain_check: GrainCheck,
     /// Set only on the ingest half of a staged upsert: the real target its stage feeds.
     ///
     /// Two things follow from it, and both are why the field exists rather than a pair of
@@ -875,6 +912,9 @@ fn expand_staged(pipelines: &[PipelineConfig]) -> Vec<PipelineConfig> {
         ingest.upsert_key = None;
         ingest.upsert_lookback = None;
         ingest.upsert_tiebreak = Vec::new();
+        // The stage is this tool's own table, appended to and truncated by nobody else, so
+        // there is no grain to prove — and the setting belongs to the half that merges.
+        ingest.upsert_grain_check = GrainCheck::default();
         // Rejects belong beside the real target, not beside the stage. Pinned explicitly
         // because the default derives from `target_uri`, which for this half is the stage.
         ingest.dq_uri = Some(
@@ -1603,6 +1643,7 @@ impl Config {
             upsert_key,
             upsert_lookback,
             upsert_tiebreak: p.upsert_tiebreak.clone(),
+            upsert_grain_check: p.upsert_grain_check,
             stage_for: p.stage_for.clone(),
             dq_uri: p.dq_uri.clone(),
             storage: crate::storage::Storage::new(self.storage.options.clone()),
@@ -1711,6 +1752,44 @@ transform_sql = "SELECT order_id FROM source"
             Config::from_toml_str(&format!("[runtime]\ntemp_directroy = \"/tmp\"\n{BASE}"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn upsert_grain_check_is_always_unless_it_is_deliberately_turned_off() {
+        // The one thing in this change that must not regress: a resource fix does not get to
+        // quietly weaken a corruption guard for people who upgrade and edit nothing.
+        let r = Config::from_toml_str(UPSERT).unwrap().resolve().unwrap();
+        assert_eq!(r[0].upsert_grain_check, GrainCheck::Always);
+
+        let off = UPSERT.replace(
+            "write_mode = \"upsert\"",
+            "write_mode = \"upsert\"\nupsert_grain_check = \"off\"",
+        );
+        let r = Config::from_toml_str(&off).unwrap().resolve().unwrap();
+        assert_eq!(r[0].upsert_grain_check, GrainCheck::Off);
+    }
+
+    #[test]
+    fn upsert_grain_check_accepts_only_always_or_off() {
+        let toml = UPSERT.replace(
+            "write_mode = \"upsert\"",
+            "write_mode = \"upsert\"\nupsert_grain_check = \"once\"",
+        );
+        let e = Config::from_toml_str(&toml).unwrap_err().to_string();
+        assert!(e.contains("unknown variant"), "{e}");
+    }
+
+    #[test]
+    fn a_staged_upsert_does_not_check_the_grain_of_its_own_stage() {
+        // The ingest half writes into a table nothing else touches, so it has no grain to
+        // prove — and the operator's setting belongs to the half that merges.
+        let r = staged();
+        let ingest = r
+            .iter()
+            .find(|p| p.stage_for.is_some())
+            .expect("an ingest half");
+        assert!(!ingest.write_mode.is_upsert());
+        assert_eq!(ingest.upsert_grain_check, GrainCheck::Always);
     }
 
     #[test]

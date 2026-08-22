@@ -161,6 +161,11 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
                 Some(serde_json::Value::String(one)) => vec![one.clone()],
                 _ => Vec::new(),
             },
+            // Deliberately not readable from dbt meta. Turning the grain check off is an
+            // operational decision about one deployment's restart cost, and it can silently
+            // corrupt the target if the assertion behind it is wrong — so it belongs in the
+            // TOML somebody deploys, not in a model definition that every environment shares.
+            upsert_grain_check: Default::default(),
             // Defaults to <target>__ddi_dq; declared only when it lives somewhere else.
             dq_uri: tgt.meta_str("ddi_dq").map(str::to_string),
             upsert_lookback: tgt.meta_str("ddi_upsert_lookback").map(str::to_string),
