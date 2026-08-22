@@ -202,6 +202,9 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
         );
     }
 
+    let ceiling = cfg.grain_ceiling()?;
+    let _ = delta_delta_ingest::grain::install(ceiling);
+
     // The count limit and the memory limit answer different questions and are deliberately
     // not derived from one another: the budget bounds what one pipeline holds, the gate
     // bounds how many of them are reading a target at the same instant. See `crate::gate`.
@@ -230,6 +233,13 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
              container."
         ),
     }
+    info!(
+        bytes = ceiling.bytes(),
+        source = ?ceiling.source(),
+        "each startup uniqueness check may hold about {} — eight bytes per key, so a target \
+         larger than that is read in more than one pass",
+        bytesize::ByteSize(ceiling.bytes())
+    );
     match (&spill_dir, spill_configured) {
         (Some(d), true) => info!(
             limit_bytes = spill_limit,
@@ -860,6 +870,8 @@ async fn attempt(
     }
     let mut current = locator.refresh(cfg).await;
     let mut pipeline = Pipeline::open(current.clone()).await?;
+    m.grain_check_passes
+        .store(pipeline.grain_check_passes() as u64, Ordering::Relaxed);
     // Cleared on the way out however this returns — including an unwind — so a panicked
     // task cannot leave the fleet's health gauge claiming it is fine.
     let _up = Up::held(m);
@@ -885,6 +897,8 @@ async fn attempt(
             );
             current = fresh;
             pipeline = Pipeline::open(current.clone()).await?;
+            m.grain_check_passes
+                .store(pipeline.grain_check_passes() as u64, Ordering::Relaxed);
         }
 
         let outcome = pipeline.step().await;

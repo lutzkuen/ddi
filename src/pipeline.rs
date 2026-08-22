@@ -91,6 +91,9 @@ pub struct Pipeline {
     dq: Option<DataQuality>,
     /// What decoding this source costs, shared with the stream that sizes batches by it.
     amplification: Arc<crate::budget::Amplification>,
+    /// Passes the startup uniqueness check took, so the supervisor can export it. Zero on an
+    /// appending pipeline, which has no grain to check.
+    grain_check_passes: u32,
     /// Identities checked when the pipeline opened. Re-checking every selected snapshot stops a
     /// drop/recreate at the same URI from silently changing a lookup halfway through a run.
     lookup_table_ids: BTreeMap<String, String>,
@@ -200,6 +203,9 @@ impl Pipeline {
             None => Dedup::default(),
         };
 
+        // Zero when this pipeline appends, which is not the same as "the check found
+        // nothing": an appending target has no grain to hold.
+        let mut grain_check_passes = 0u32;
         if cfg.write_mode.is_upsert() {
             // resolve() guarantees both of these are set for an upsert pipeline.
             let key = cfg.upsert_key.as_deref().expect("checked in resolve");
@@ -208,7 +214,7 @@ impl Pipeline {
             // the whole target, and every upsert pipeline in the process reaches this line
             // within a second of every other. See `crate::gate`.
             let _pass = crate::gate::current().preflight().await;
-            upsert::preflight(
+            grain_check_passes = upsert::preflight(
                 &target,
                 &target_schema,
                 key,
@@ -223,8 +229,21 @@ impl Pipeline {
                 upsert_key = %key,
                 sequence = %sequence,
                 lookback = ?cfg.upsert_lookback,
+                grain_check_passes,
                 "rows will replace the key they already have, when they are newer"
             );
+            // Said out loud rather than left to a gauge, because a target whose key space did
+            // not fit the ceiling reads itself once per pass, and the first person to deploy
+            // that would otherwise decide the pipeline is hung.
+            if grain_check_passes > 1 {
+                info!(
+                    pipeline = %cfg.name,
+                    grain_check_passes,
+                    "the target's key space did not fit [runtime] max_grain_check_memory, so \
+                     the uniqueness check read it {grain_check_passes} times. Nothing was \
+                     written to disk; raise that setting to trade memory for passes."
+                );
+            }
         }
 
         // Whether bad rows can be set aside is decided here, once, rather than on the batch
@@ -283,6 +302,7 @@ impl Pipeline {
             dedup,
             dq,
             amplification,
+            grain_check_passes,
             lookup_table_ids: lookup_validation.table_ids,
             lookup_current_on_open: lookup_validation.use_current_on_open,
             warned_lookup_table_id_changes: BTreeSet::new(),
@@ -293,6 +313,15 @@ impl Pipeline {
 
     pub fn name(&self) -> &str {
         &self.cfg.name
+    }
+
+    /// Passes the startup uniqueness check took over this target's key column.
+    ///
+    /// One is the ordinary answer and zero means this pipeline appends. Exported as
+    /// `ddi_grain_check_passes` because it is the only warning that a restart of this
+    /// pipeline is going to be slow, and it is set by a number an operator can change.
+    pub fn grain_check_passes(&self) -> u32 {
+        self.grain_check_passes
     }
 
     pub fn cursor(&self) -> StreamCursor {

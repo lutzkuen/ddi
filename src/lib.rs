@@ -10,6 +10,7 @@ pub mod dedup;
 pub mod dq;
 pub mod error;
 pub mod gate;
+pub mod grain;
 pub mod locate;
 pub mod lookup;
 pub mod metrics;

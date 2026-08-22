@@ -115,6 +115,28 @@ pub struct Defaults {
     /// the next merge fails. `ddi_capacity_exhausted` is which pipeline it failed for.
     #[serde(default)]
     pub max_temp_directory_size: Option<String>,
+
+    /// How much memory one startup uniqueness check may hold.
+    ///
+    /// The check is exact and its cost is set by the target rather than the batch — so it is
+    /// the one thing here bounded by *choosing how many times to read the target* rather than
+    /// by reading less of it. This number sets that trade: eight bytes per row, divided by
+    /// the ceiling, is how many passes it takes. Doubling it halves them. The resolved pass
+    /// count is logged when a pipeline opens, and a target that would need more than a couple
+    /// of hundred passes is refused rather than started, because at that point it is a cost
+    /// surprise and not a check.
+    ///
+    /// Per check, not per process. With `max_concurrent_upsert_preflights` unset every upsert
+    /// pipeline reaches its check within a second of every other, so the process-wide figure
+    /// is this number times that count; setting the preflight gate is what makes the two the
+    /// same. Unset takes 512MB — deliberately *not* a fraction of [`Self::max_memory`],
+    /// because the check runs behind that gate, once, before this pipeline has a batch in
+    /// flight, so it is not competing with the steady-state work the memory budget divides.
+    /// It is clamped down only when the whole process budget is smaller than that.
+    ///
+    /// Watch `ddi_grain_check_passes`. See [`crate::grain`].
+    #[serde(default)]
+    pub max_grain_check_memory: Option<String>,
 }
 
 impl Default for Defaults {
@@ -130,6 +152,7 @@ impl Default for Defaults {
             max_concurrent_upsert_preflights: None,
             temp_directory: None,
             max_temp_directory_size: None,
+            max_grain_check_memory: None,
         }
     }
 }
@@ -1063,6 +1086,17 @@ impl Config {
             })
             .transpose()?;
         crate::spill::Spill::resolve(self.runtime.temp_directory.as_deref(), cap)
+    }
+
+    /// How much memory one startup uniqueness check may hold.
+    pub fn grain_ceiling(&self) -> Result<crate::grain::Ceiling> {
+        let configured = self
+            .runtime
+            .max_grain_check_memory
+            .as_deref()
+            .map(|s| parse_size(s, "runtime.max_grain_check_memory"))
+            .transpose()?;
+        crate::grain::Ceiling::resolve(configured)
     }
 
     pub fn from_toml_str(s: &str) -> Result<Self> {

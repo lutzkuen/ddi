@@ -701,7 +701,7 @@ pub async fn preflight(
     sequence_column: &str,
     lookback: Option<Lookback>,
     tiebreak: &[String],
-) -> Result<()> {
+) -> Result<u32> {
     let named = |c: &str| -> Result<&DataType> {
         target_schema
             .field_with_name(c)
@@ -788,96 +788,58 @@ pub async fn preflight(
 ///
 /// # Cost
 ///
-/// One streaming pass over the key column alone — the projection is pushed into the Delta
-/// scan, so no other column is decoded. Memory is bounded by the number of *distinct* keys
-/// rather than by the table, and the walk stops at the first few duplicates it finds:
-/// knowing that the grain is broken is the whole answer, and three examples are enough to
-/// act on.
+/// One pass over the key column alone — the projection is pushed into the Delta scan, so no
+/// other column is decoded — repeated once per congruence class of the key space, where the
+/// number of classes is eight bytes per target row divided by
+/// [`crate::config::Defaults::max_grain_check_memory`]. For almost every target that is one
+/// pass. It holds a fixed number of bytes and writes **nothing** to any temporary directory,
+/// which is a property of its shape rather than of a limit it is held to; see [`crate::grain`]
+/// for why, and for why the obvious `GROUP BY ... HAVING ... LIMIT 3` could not be bounded and
+/// did not stop early.
 ///
-/// It is still proportional to the key count, which is why it happens once at startup rather
-/// than per batch. See [`crate::dedup::Dedup::read`] for the same reasoning applied to the
-/// watermark.
-async fn assert_one_row_per_key(target: &DeltaTable, key_column: &str) -> Result<()> {
-    use deltalake::arrow::array::{Array, AsArray, Int64Array};
-    use deltalake::datafusion::prelude::SessionContext;
-
+/// It stops at the first few duplicates it finds, so the expensive answer is always "the
+/// target is fine" and never "the target is broken". It is still proportional to the target,
+/// which is why it happens once at startup rather than per batch, and why it runs behind
+/// `max_concurrent_upsert_preflights`. See [`crate::dedup::Dedup::read`] for the same
+/// reasoning applied to the watermark — this function used to be the exception to it, and the
+/// exception is what evicted a pod.
+async fn assert_one_row_per_key(target: &DeltaTable, key_column: &str) -> Result<u32> {
     /// Enough to show the operator the shape of the problem without gathering all of it.
     const EXAMPLES: usize = 3;
 
-    // Asked as an aggregate rather than answered by hand, and the reason is memory. The
-    // obvious implementation — stream the key column and keep a `HashSet` of what has been
-    // seen — is O(distinct keys) resident, on every start, for the life of the check. At
-    // ~74 bytes per key that is a third of a gigabyte on a six-million-row target, held by
-    // every upsert pipeline at once, at exactly the moment every other pipeline is also
-    // starting. It is the same shape [`crate::dedup::Dedup::read`] used to have.
-    //
-    // DataFusion's grouped aggregate answers the identical question, exits on the same
-    // three examples, and lives inside the session's memory pool — so it spills rather than
-    // grows, and it is bounded by [`crate::config::Runtime::max_memory`] like everything
-    // else rather than being a special case that budget has to know about.
-    let provider = target
-        .table_provider()
-        .await
-        .map_err(|e| Error::Other(format!("upsert: cannot read the target's grain: {e}")))?;
-
-    let ctx = SessionContext::new_with_state(crate::budget::session(target)?);
-    ctx.register_table("target", provider)
-        .map_err(|e| Error::Other(format!("upsert: cannot register the target: {e}")))?;
-
-    let key = quote(key_column);
-    let sql = format!(
-        "SELECT {key} AS k, count(*) AS n FROM target GROUP BY {key} \
-         HAVING count(*) > 1 LIMIT {EXAMPLES}"
-    );
-    let found = ctx
-        .sql(&sql)
-        .await
-        .map_err(|e| Error::Config(format!("upsert key {key_column:?} cannot be grouped: {e}")))?
-        .collect()
-        .await
-        .map_err(|e| {
-            Error::Other(format!(
-                "upsert: cannot scan the target to check its grain: {e}"
-            ))
-        })?;
-
-    let mut examples: Vec<String> = Vec::new();
-    for b in &found {
-        let keys = cast(b.column(0), &DataType::Utf8).map_err(|e| {
-            Error::Config(format!("upsert key {key_column:?} is not comparable: {e}"))
-        })?;
-        let keys = keys.as_string::<i32>();
-        let counts = b
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("count(*) is int64");
-        for i in 0..b.num_rows() {
-            let k = if keys.is_null(i) {
-                "NULL"
-            } else {
-                keys.value(i)
-            };
-            examples.push(format!("{k:?} ({} rows)", counts.value(i)));
+    match crate::grain::check(target, key_column, crate::grain::ceiling(), EXAMPLES).await? {
+        crate::grain::Grain::Unique { rows, passes } => {
+            tracing::debug!(
+                key_column,
+                ?rows,
+                passes,
+                "the target holds one row per key"
+            );
+            Ok(passes)
+        }
+        crate::grain::Grain::Duplicated { examples, passes } => {
+            tracing::debug!(
+                key_column,
+                passes,
+                "the target does not hold one row per key"
+            );
+            let mut examples: Vec<String> = examples
+                .into_iter()
+                .map(|d| format!("{:?} ({} rows)", d.key, d.rows))
+                .collect();
+            examples.sort();
+            Err(Error::Config(format!(
+                "the target already holds {key_column:?} more than once — for example {}. A \
+                 merge matches on the stored row, so it would update every copy rather than \
+                 collapse them, and the duplicates would stay forever. This is what an \
+                 append-only target looks like after a key was restated. Collapse the target \
+                 to one row per key first (a one-off `CREATE OR REPLACE TABLE ... AS SELECT \
+                 ... QUALIFY row_number() OVER (PARTITION BY {key_column} ORDER BY <sequence> \
+                 DESC) = 1`), then start this pipeline.",
+                examples.join(", ")
+            )))
         }
     }
-
-    if examples.is_empty() {
-        tracing::debug!(key_column, "the target holds one row per key");
-        return Ok(());
-    }
-    examples.sort();
-
-    Err(Error::Config(format!(
-        "the target already holds {key_column:?} more than once — for example {}. A merge \
-         matches on the stored row, so it would update every copy rather than collapse \
-         them, and the duplicates would stay forever. This is what an append-only target \
-         looks like after a key was restated. Collapse the target to one row per key first \
-         (a one-off `CREATE OR REPLACE TABLE ... AS SELECT ... QUALIFY row_number() OVER \
-         (PARTITION BY {key_column} ORDER BY <sequence> DESC) = 1`), then start this \
-         pipeline.",
-        examples.join(", ")
-    )))
 }
 
 fn column(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
