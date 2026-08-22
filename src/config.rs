@@ -79,6 +79,42 @@ pub struct Defaults {
     /// and would then throttle steady state for the rest of the run.
     #[serde(default)]
     pub max_concurrent_upsert_preflights: Option<usize>,
+
+    /// Where DataFusion writes what it cannot hold in memory.
+    ///
+    /// Unset means the OS temporary directory — `$TMPDIR`, else `/tmp`. Inside a container
+    /// that is the writable layer, and Kubernetes charges every byte of it to the pod's
+    /// `ephemeral-storage`. So the way a spill kills this process is not an error: it is an
+    /// eviction, with no log line, taking every other pipeline with it. That is the one
+    /// failure this tool cannot contain from the inside. Point this at a volume and the
+    /// failure becomes a query that stops.
+    ///
+    /// It is a *process* setting, like [`Self::max_memory`], and more strictly so: every
+    /// session this tool builds shares one disk manager, so one directory and one budget
+    /// cover the fleet. The directory is created and written to once at startup, so a volume
+    /// that was not mounted is a startup failure rather than a first-sort failure an hour
+    /// later. See [`crate::spill`].
+    #[serde(default)]
+    pub temp_directory: Option<String>,
+
+    /// How many bytes of spill this whole process may hold on disk at once.
+    ///
+    /// A *process* number, and for a stronger reason than `max_memory`'s: DataFusion counts
+    /// spill per `DiskManager`, and this process builds a `RuntimeEnv` — and so, without
+    /// help, a `DiskManager` — per operation rather than per pipeline. Divided N ways it
+    /// would bound nothing, because nobody can say what N is. Shared, it is the one number
+    /// that can be compared against the volume behind [`Self::temp_directory`].
+    ///
+    /// Unset means DataFusion's own 100GB default — which is larger than most pods'
+    /// ephemeral-storage limit, so unset is not "unbounded", it is "bounded above the point
+    /// at which the pod is killed". Set it *below* the volume's real size and leave headroom:
+    /// the budget is checked after each write, not before, so it can be overshot by about one
+    /// buffer per open spill file.
+    ///
+    /// Watch `ddi_spill_bytes` against `ddi_spill_limit_bytes`; a ratio sitting near one means
+    /// the next merge fails. `ddi_capacity_exhausted` is which pipeline it failed for.
+    #[serde(default)]
+    pub max_temp_directory_size: Option<String>,
 }
 
 impl Default for Defaults {
@@ -92,6 +128,8 @@ impl Default for Defaults {
             max_memory: None,
             max_concurrent_upsert_merges: None,
             max_concurrent_upsert_preflights: None,
+            temp_directory: None,
+            max_temp_directory_size: None,
         }
     }
 }
@@ -978,6 +1016,55 @@ impl Config {
         Ok(crate::budget::Budget::resolve(configured, running))
     }
 
+    /// The process's spill budget, resolved and probed against the filesystem.
+    ///
+    /// Fatal rather than held back, like [`Self::budget`] and unlike a bad pipeline: a spill
+    /// directory belongs to the deployment, not to one stream, so there is no single entry to
+    /// name in a rejection. It joins the faults `resolve_all` already aborts on. It has one
+    /// side effect — it creates the directory it was given, and writes a probe file into it —
+    /// which is deliberate, and means `ddi validate` also validates the pod rather than only
+    /// the file.
+    pub fn spill(&self) -> Result<crate::spill::Spill> {
+        let cap = self
+            .runtime
+            .max_temp_directory_size
+            .as_deref()
+            .map(|s| {
+                let n = parse_size(s, "runtime.max_temp_directory_size")?;
+                // `crate::gate::Gate::new` reads a configured 0 as 1 rather than deadlocking,
+                // and this deliberately does the opposite. The difference is what 0 *means*:
+                // a zero semaphore is a pipeline that never runs again, which nobody typed on
+                // purpose, so the nearest sensible reading wins. A zero disk budget is a
+                // coherent policy — "never spill" — implemented by DataFusion as an error on
+                // the first byte written by every sort, grouped aggregate and merge join in
+                // the process. The two plausible intentions ("unbounded" and "no disk at all")
+                // point in opposite directions, and guessing between them is how a fleet goes
+                // quiet.
+                if n == 0 {
+                    return Err(Error::Config(format!(
+                        "runtime.max_temp_directory_size is {s:?}, which is zero bytes — and a \
+                         zero spill budget is not \"do not spill\", it is every sort, grouped \
+                         aggregate and merge join in this process failing the moment it writes \
+                         its first byte. Give it a real size below the volume behind \
+                         runtime.temp_directory (\"8GB\"), or remove the key to keep \
+                         DataFusion's own 100GB default."
+                    )));
+                }
+                if n < crate::spill::MIN_TEMP_DIRECTORY_SIZE {
+                    return Err(Error::Config(format!(
+                        "runtime.max_temp_directory_size is {s:?}, which is under the 1MB \
+                         floor. DataFusion writes a spill file in batches and checks the total \
+                         after each one, so a budget this small is exceeded by the first write \
+                         and every query that spills would fail rather than run slowly. Give it \
+                         at least \"1MB\", and in a container something like \"8GB\"."
+                    )));
+                }
+                Ok(n)
+            })
+            .transpose()?;
+        crate::spill::Spill::resolve(self.runtime.temp_directory.as_deref(), cap)
+    }
+
     pub fn from_toml_str(s: &str) -> Result<Self> {
         toml::from_str(s).map_err(|e| Error::Config(format!("invalid config: {e}")))
     }
@@ -1505,6 +1592,92 @@ source_uri = "/tmp/bronze/orders"
 target_uri = "/tmp/silver/orders"
 transform_sql = "SELECT order_id FROM source"
 "#;
+
+    /// A `[runtime]` table plus the one pipeline `BASE` has, so a spill key can be tested
+    /// against a config that is otherwise valid.
+    fn with_runtime(keys: &str) -> Config {
+        Config::from_toml_str(&format!("[runtime]\n{keys}\n{BASE}")).expect("valid TOML")
+    }
+
+    #[test]
+    fn a_spill_directory_and_a_cap_are_read_from_the_runtime_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = with_runtime(&format!(
+            "temp_directory = {:?}\nmax_temp_directory_size = \"8GB\"",
+            dir.path().to_str().unwrap()
+        ));
+        let spill = cfg.spill().expect("a fresh tempdir is usable");
+        // bytesize is decimal, as `max_bytes_per_batch` already is.
+        assert_eq!(spill.limit_bytes(), 8_000_000_000);
+        assert_eq!(spill.directory(), Some(dir.path()));
+        assert!(spill.cap_was_configured());
+    }
+
+    #[test]
+    fn no_spill_keys_means_the_os_temp_directory_and_datafusions_own_cap() {
+        let spill = Config::from_toml_str(BASE).unwrap().spill().unwrap();
+        assert_eq!(spill.directory(), None);
+        assert!(!spill.cap_was_configured());
+        assert_eq!(spill.limit_bytes(), 100 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_spill_cap_of_zero_is_refused_because_it_is_not_the_unbounded_default() {
+        // All three parse to Ok(0), so none of them is caught by `parse_size`.
+        for written in ["0", "0GB", "0B"] {
+            let e = with_runtime(&format!("max_temp_directory_size = {written:?}"))
+                .spill()
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("runtime.max_temp_directory_size"), "{e}");
+            assert!(e.contains("zero bytes"), "{e}");
+            assert!(e.contains("8GB"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_spill_cap_below_one_megabyte_names_the_floor_and_the_size_to_write() {
+        let e = with_runtime("max_temp_directory_size = \"64KB\"")
+            .spill()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("1MB"), "{e}");
+        assert!(e.contains("after each one"), "{e}");
+    }
+
+    #[test]
+    fn a_spill_cap_that_is_not_a_size_names_the_key_and_the_value() {
+        let e = with_runtime("max_temp_directory_size = \"8 gigs\"")
+            .spill()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("runtime.max_temp_directory_size"), "{e}");
+        assert!(e.contains("8 gigs"), "{e}");
+        assert!(e.contains("cannot parse size"), "{e}");
+    }
+
+    #[test]
+    fn a_spill_directory_that_cannot_be_used_is_refused_at_load_not_at_the_first_sort() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("mounted-nowhere");
+        std::fs::write(&file, b"x").unwrap();
+        let e = with_runtime(&format!("temp_directory = {:?}", file.to_str().unwrap()))
+            .spill()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("runtime.temp_directory"), "{e}");
+        assert!(e.contains("is not usable"), "{e}");
+    }
+
+    #[test]
+    fn a_misspelled_spill_key_is_rejected_rather_than_ignored() {
+        // `deny_unknown_fields` already does this; pinned now that there are neighbours close
+        // enough in spelling to typo into.
+        assert!(
+            Config::from_toml_str(&format!("[runtime]\ntemp_directroy = \"/tmp\"\n{BASE}"))
+                .is_err()
+        );
+    }
 
     #[test]
     fn minimal_config_resolves() {

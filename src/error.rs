@@ -136,6 +136,33 @@ pub enum Error {
     #[error("transform error: {0}")]
     Transform(String),
 
+    /// Something ran out of a resource rather than being wrong.
+    ///
+    /// Its own variant rather than [`Self::Transform`], because the two want opposite
+    /// handling and from inside a retry loop they are indistinguishable. A transform error is
+    /// a fact about the data: retrying is pointless and free. This is a fact about the
+    /// machine, and retrying it a second later re-runs the same scan into the same full
+    /// directory — every backoff period, for days. That loop, not the single scan, is what
+    /// turns one large grain check into sustained ephemeral-storage pressure and a Kubernetes
+    /// eviction that takes every healthy pipeline with it.
+    ///
+    /// `drive` in `main` reads this variant and waits the full backoff instead of a second;
+    /// [`crate::metrics::PipelineMetrics`] raises a gauge for it, the way it already does for
+    /// [`Self::SourceFileVacuumed`], so an operator can tell "retrying, and it will work" from
+    /// "retrying, and it never will".
+    #[error(
+        "out of capacity: {0}\n\
+         \n\
+         Nothing was written to the target, and no other pipeline was stopped. Three things \
+         fix it, in the order they are usually right. Give the work less to do: a narrower \
+         upsert_lookback, or a smaller max_bytes_per_batch. Give the process more room: a \
+         larger volume at [runtime] temp_directory with [runtime] max_temp_directory_size \
+         raised to match — leave headroom, because the budget is checked after each write and \
+         not before. Or run fewer of these at once: [runtime] max_concurrent_upsert_merges and \
+         max_concurrent_upsert_preflights."
+    )]
+    Capacity(String),
+
     #[error("schema mismatch: {0}")]
     Schema(String),
 
@@ -144,7 +171,13 @@ pub enum Error {
 }
 
 impl From<deltalake::datafusion::error::DataFusionError> for Error {
+    /// Not every DataFusion error is a fact about the data.
+    ///
+    /// `ResourcesExhausted` is a fact about the machine, and mapping it to
+    /// [`Error::Transform`] made the two indistinguishable to the retry loop — which then
+    /// re-ran the scan that had just run out of disk, a second later, forever. See
+    /// [`crate::spill::classify`].
     fn from(e: deltalake::datafusion::error::DataFusionError) -> Self {
-        Error::Transform(e.to_string())
+        crate::spill::classify(e, "datafusion")
     }
 }

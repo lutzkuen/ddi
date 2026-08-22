@@ -19,6 +19,7 @@ pub mod publish;
 pub mod schema;
 pub mod sink;
 pub mod source;
+pub mod spill;
 pub mod stage;
 pub mod stats;
 pub mod storage;

@@ -185,6 +185,23 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
     let budget = cfg.budget(pipelines.len())?;
     budget.clone().install();
 
+    // The third and fourth process-wide limits. The spill budget is the only one whose
+    // resource lives outside the process: memory is the container's and the kernel reports it,
+    // disk is the node's and the way it is reported is a pod eviction. See `crate::spill` for
+    // why one shared counter rather than a share each.
+    let spill = cfg.spill()?;
+    let spill_dir = spill.directory().map(|p| p.display().to_string());
+    let spill_limit = spill.limit_bytes();
+    let spill_configured = spill.cap_was_configured();
+    if !delta_delta_ingest::spill::install(spill) {
+        warn!(
+            "the spill budget was resolved after something in this process had already built a \
+             DataFusion runtime, so [runtime] temp_directory and max_temp_directory_size are \
+             NOT in force. Spilling falls back to the OS temporary directory and DataFusion's \
+             own 100GB. This is a bug in ddi's startup order, not in your config."
+        );
+    }
+
     // The count limit and the memory limit answer different questions and are deliberately
     // not derived from one another: the budget bounds what one pipeline holds, the gate
     // bounds how many of them are reading a target at the same instant. See `crate::gate`.
@@ -211,6 +228,42 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
             "no memory budget: neither [runtime] max_memory nor a container limit. Nothing \
              here is bounded by size, which is fine on a workstation and worth setting in a \
              container."
+        ),
+    }
+    match (&spill_dir, spill_configured) {
+        (Some(d), true) => info!(
+            limit_bytes = spill_limit,
+            directory = %d,
+            "the whole process may hold about {} of DataFusion spill at once, under {d}, \
+             shared by every pipeline in it",
+            bytesize::ByteSize(spill_limit)
+        ),
+        (Some(d), false) => {
+            info!(directory = %d, "DataFusion spills into {d}");
+            if delta_delta_ingest::budget::in_a_container() {
+                warn!(
+                    "[runtime] temp_directory is set but max_temp_directory_size is not, so \
+                     DataFusion's own {} default stands. This process is in a container, where \
+                     that is larger than most pods' ephemeral-storage limit — which means the \
+                     pod is evicted before the budget is ever reached.",
+                    bytesize::ByteSize(spill_limit)
+                );
+            }
+        }
+        (None, true) => warn!(
+            limit_bytes = spill_limit,
+            "[runtime] max_temp_directory_size is set but temp_directory is not, so spill goes \
+             to $TMPDIR (or /tmp). In a container that is the writable layer, which Kubernetes \
+             charges to the pod's ephemeral-storage. The budget will hold; the accounting will \
+             still be against the pod."
+        ),
+        (None, false) => info!(
+            limit_bytes = spill_limit,
+            "no spill budget: [runtime] temp_directory and max_temp_directory_size are both \
+             unset, so DataFusion spills into the OS temporary directory up to its own {}. \
+             Fine on a workstation; in a container that is the setting between a slow query \
+             and an evicted pod.",
+            bytesize::ByteSize(spill_limit)
         ),
     }
     let command = cli.command.unwrap_or(Command::Run);

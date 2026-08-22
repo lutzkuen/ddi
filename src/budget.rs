@@ -35,11 +35,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use deltalake::datafusion::common::config::SpillCompression;
 use deltalake::datafusion::execution::memory_pool::{
     FairSpillPool, MemoryPool, UnboundedMemoryPool,
 };
-use deltalake::datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use deltalake::datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use deltalake::datafusion::prelude::SessionConfig;
 use deltalake::DeltaTable;
 
 use crate::error::{Error, Result};
@@ -136,12 +137,52 @@ pub fn current() -> Budget {
     INSTALLED.get().cloned().unwrap_or_else(Budget::unbounded)
 }
 
-/// A DataFusion runtime holding this pipeline's share, with somewhere to spill to.
+/// True when this process is inside a container that limits its memory.
+///
+/// Only used to decide whether a missing spill cap is worth a warning: on a workstation
+/// DataFusion's 100 GB default is fine, and in a pod it is larger than the ephemeral-storage
+/// limit that will kill the process first.
+pub fn in_a_container() -> bool {
+    cgroup_limit().is_some()
+}
+
+/// A DataFusion runtime holding this pipeline's share of memory, and the process's share of
+/// disk.
+///
+/// Two budgets, two lifetimes, and the asymmetry is the point. The memory pool is built fresh
+/// here, per operation, because memory is reclaimed when the operation ends and a
+/// per-operation pool is the honest shape for it. The disk manager is *not* built here — it is
+/// cloned out of [`crate::spill`], so every runtime in this process counts its spill into one
+/// atomic. Build one per operation and each gets its own hundred-gigabyte allowance, which is
+/// what this process did before and what evicted a pod.
+///
+/// **Do not add `.with_temp_file_path(..)` or `.with_max_temp_directory_size(..)` to this
+/// chain.** Both of those set `disk_manager_builder`, and `RuntimeEnvBuilder::build` *prefers*
+/// that over the shared manager — so either call silently constructs a new `DiskManager` and
+/// restores exactly the bug this exists to remove. The place to set them is
+/// [`crate::spill::Spill::resolve`], once.
 pub fn runtime() -> Result<Arc<deltalake::datafusion::execution::runtime_env::RuntimeEnv>> {
-    RuntimeEnvBuilder::new()
+    crate::spill::current()
+        .runtime_builder()
         .with_memory_pool(current().pool())
         .build_arc()
         .map_err(|e| Error::Other(format!("cannot build a bounded session: {e}")))
+}
+
+/// What every session in this process agrees on, before a caller adds its own settings.
+///
+/// `Lz4Frame` and not `Zstd`: `datafusion-common` declares `arrow-ipc` with the `lz4` feature
+/// and default features off, so lz4 is guaranteed by our own dependency graph. `zstd` is
+/// active only by incidental feature unification with some other crate in the tree, which an
+/// unrelated bump could remove — turning the spill codec into a runtime error on the first
+/// spill, which is the worst possible place for a change about spilling to fail.
+pub fn session_config() -> SessionConfig {
+    let mut c = SessionConfig::new();
+    // DataFusion's default is `Uncompressed`. Every byte written here is charged against the
+    // process's one disk budget, and against the pod's ephemeral storage underneath it, so
+    // trading a little CPU for a smaller footprint is the right way round for this tool.
+    c.options_mut().execution.spill_compression = SpillCompression::Lz4Frame;
+    c
 }
 
 /// A DataFusion session bounded by the budget, able to read `table`.
@@ -150,6 +191,11 @@ pub fn runtime() -> Result<Arc<deltalake::datafusion::execution::runtime_env::Ru
 /// not carry the one delta-rs would have registered, and a scan through it would fail to
 /// find the table's files.
 pub fn session(table: &DeltaTable) -> Result<SessionState> {
+    session_with(table, session_config())
+}
+
+/// As [`session`], with plan-level settings only the caller knows it needs.
+pub fn session_with(table: &DeltaTable, config: SessionConfig) -> Result<SessionState> {
     let runtime = runtime()?;
 
     let log_store = table.log_store();
@@ -157,6 +203,7 @@ pub fn session(table: &DeltaTable) -> Result<SessionState> {
     runtime.register_object_store(&url, log_store.root_object_store(None));
 
     Ok(SessionStateBuilder::new()
+        .with_config(config)
         .with_runtime_env(runtime)
         .with_default_features()
         .build())
