@@ -1057,10 +1057,13 @@ column alone:
 
 | `max_grain_check_memory` | 6 million rows | 500 million | 2 billion |
 |---|---|---|---|
-| 256 MB | 1 | 18 | 69 |
-| **512 MB** (default) | **1** | 9 | 35 |
-| 1 GB | 1 | 5 | 18 |
-| 4 GB | 1 | 2 | 5 |
+| `"256MB"` | 1 | 19 | 73 |
+| `"512MB"` (default) | **1** | 10 | 37 |
+| `"1GB"` | 1 | 5 | 19 |
+| `"4GB"` | 1 | 2 | 5 |
+
+Sizes here are decimal, as everywhere else in this file — `"512MB"` is 512,000,000 bytes, and
+seven eighths of that at eight bytes a hash is 56 million keys per pass.
 
 Almost every target is one pass, and one pass is strictly cheaper than the `GROUP BY` this
 replaced — no plan, no repartition, no spill. The row count comes from the target's own log,

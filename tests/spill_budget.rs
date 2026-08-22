@@ -17,6 +17,7 @@ use std::sync::{Arc, OnceLock};
 
 use common::*;
 use delta_delta_ingest::{budget, spill};
+use deltalake::datafusion::execution::disk_manager::DiskManagerBuilder;
 
 /// Small enough to be obviously not DataFusion's default, large enough to be a legal cap.
 const BUDGET: u64 = 4 * 1024 * 1024;
@@ -192,4 +193,59 @@ async fn running_out_of_capacity_raises_a_gauge_a_storage_blip_does_not() {
     assert!(m
         .render()
         .contains("ddi_capacity_exhausted{pipeline=\"thirsty\"} 0"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_spill_that_breaks_the_budget_reaches_a_pipeline_as_a_capacity_failure() {
+    // The end-to-end shape of the incident, and the reason Error::Capacity exists at all.
+    // Before this, every DataFusion failure that arrived through delta-rs became Error::Delta
+    // and every one that arrived directly became Error::Transform — so a full spill directory
+    // was indistinguishable from a wrong answer, the supervisor retried it a second later
+    // forever, and ddi_capacity_exhausted never moved.
+    //
+    // Driving a merge into a genuine 4 MiB overrun would need a target far too large for CI,
+    // so what is exercised here is the classification and the plumbing on top of a real
+    // DiskManager that has really been pushed past its cap.
+    let installed = installed();
+    let dm = std::sync::Arc::new(
+        DiskManagerBuilder::default()
+            .with_max_temp_directory_size(64 * 1024)
+            .build()
+            .unwrap(),
+    );
+    let mut f = dm.create_tmp_file("a merge spilling").unwrap();
+    std::fs::write(f.path(), vec![0u8; 256 * 1024]).unwrap();
+    let raised = f
+        .update_disk_usage()
+        .expect_err("256 KiB does not fit a 64 KiB budget");
+
+    // Exactly the sentence DataFusion produces, not one written by hand.
+    let text = raised.to_string();
+    assert!(
+        text.contains("used disk space during the spilling process"),
+        "{text}"
+    );
+
+    // Through delta-rs, as a merge's failure really arrives.
+    let e = spill::classify_delta(
+        deltalake::DeltaTableError::Generic(text.clone()),
+        "upsert: merging into the target",
+    );
+    assert!(
+        matches!(e, delta_delta_ingest::Error::Capacity(_)),
+        "a full spill directory must not read as an ordinary Delta error: {e}"
+    );
+    assert!(e.to_string().contains("[runtime] max_temp_directory_size"));
+
+    // And the gauge the operator alerts on moves for it.
+    let m = delta_delta_ingest::metrics::Metrics::new();
+    let p = m.pipeline("merging");
+    p.observe_error(&e);
+    assert!(m
+        .render()
+        .contains("ddi_capacity_exhausted{pipeline=\"merging\"} 1"));
+
+    // The process budget is untouched by any of this: the throwaway manager above is not the
+    // installed one, which is the property the whole module rests on.
+    assert_eq!(installed.limit_bytes(), BUDGET);
 }

@@ -523,7 +523,9 @@ impl Metrics {
              directory, process-wide.\n\
              # TYPE ddi_spill_bytes gauge\n\
              ddi_spill_bytes {}\n\
-             # HELP ddi_spill_files Spill files open right now, process-wide.\n\
+             # HELP ddi_spill_files Spill files open right now, process-wide. Zero here with \
+             ddi_spill_bytes above zero means the counter is carrying residue from a capacity \
+             failure; a restart clears it.\n\
              # TYPE ddi_spill_files gauge\n\
              ddi_spill_files {}\n\
              # HELP ddi_spill_limit_bytes The budget those two are measured against. Never \

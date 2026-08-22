@@ -93,10 +93,15 @@ pub enum CeilingSource {
 
 impl Ceiling {
     /// Below this a pass holds so few keys that even a small target needs hundreds.
-    pub const MIN: u64 = 16 * 1024 * 1024;
+    ///
+    /// Decimal, not binary, and for the same reason [`crate::spill::MIN_TEMP_DIRECTORY_SIZE`]
+    /// is: `bytesize` reads `"16MB"` as sixteen million, and the refusal message tells the
+    /// operator to write exactly that. A binary floor would reject its own advice.
+    pub const MIN: u64 = 16_000_000;
     /// Not derived from `max_memory`, and that is deliberate — see the field doc on
-    /// [`crate::config::Defaults::max_grain_check_memory`].
-    pub const DEFAULT: u64 = 512 * 1024 * 1024;
+    /// [`crate::config::Defaults::max_grain_check_memory`]. Decimal so that writing the
+    /// default out explicitly resolves to the default.
+    pub const DEFAULT: u64 = 512_000_000;
     /// An eighth is reserved for the scan's Arrow batches, the row encoder and the candidate
     /// list, so `bytes` is what the process grows by rather than what one `Vec` is.
     const USABLE_NUM: u64 = 7;
@@ -184,18 +189,25 @@ impl Class {
         h % self.modulus == self.residue
     }
 
-    /// The two classes whose union is exactly this one.
-    pub fn split(self) -> (Class, Class) {
-        (
+    /// The two classes whose union is exactly this one, or `None` at the end of the u64.
+    ///
+    /// Fallible rather than `self.modulus * 2`, because an unchecked double is a panic sixty
+    /// -three splits down and a panic escapes the supervisor's retry loop — which kills the
+    /// pipeline for the life of the process instead of failing it. Nothing should reach this
+    /// now that a pass compacts instead of splitting on repeats (see [`scan_class`]), so
+    /// `None` means an assumption has broken, and the caller says so with the key in hand.
+    pub fn split(self) -> Option<(Class, Class)> {
+        let modulus = self.modulus.checked_mul(2)?;
+        Some((
             Class {
-                modulus: self.modulus * 2,
+                modulus,
                 residue: self.residue,
             },
             Class {
-                modulus: self.modulus * 2,
+                modulus,
                 residue: self.residue + self.modulus,
             },
-        )
+        ))
     }
 }
 
@@ -262,8 +274,8 @@ pub fn live_rows(target: &DeltaTable) -> Result<(Option<u64>, u64)> {
 pub fn initial_modulus(rows: Option<u64>, bytes: u64, ceiling: Ceiling) -> u64 {
     let cap = ceiling.hashes_per_pass().max(1) as u64;
     let est = rows.unwrap_or(bytes / Ceiling::ASSUMED_BYTES_PER_ROW);
-    // One per cent of slack. On a class of 58.7M that is about 75 standard deviations
-    // (σ = √58.7e6 ≈ 7,660, i.e. 0.013%), so anything past it is not fluctuation — it is a
+    // One per cent of slack. On a class of 56M that is about 75 standard deviations
+    // (σ = √56e6 ≈ 7,483, i.e. 0.013%), so anything past it is not fluctuation — it is a
     // wrong row count or a skewed hash, and the split mechanism is what handles those.
     //
     // Not rounded up to a power of two: splitting works for any modulus, and rounding 35 to 64
@@ -370,7 +382,23 @@ where
                 // Classes already finished are never redone: the keys of `(m, j)` are exactly
                 // those of `(2m, j)` ∪ `(2m, j+m)`, so an answer for the coarse class answers
                 // both fine ones.
-                let (a, b) = class.split();
+                //
+                // A class overflows only on *distinct* keys — repeats are compacted away
+                // inside the pass — so splitting always halves the population that caused it
+                // and this terminates. The `None` arm is the proof obligation for that
+                // sentence: if it is ever reached, the invariant is broken and the operator
+                // gets a message rather than an unwind.
+                let Some((a, b)) = class.split() else {
+                    return Err(Error::Config(format!(
+                        "the startup uniqueness check on {key_column:?} divided the key space \
+                         as far as it can and one class is still too large. That should not be \
+                         reachable — a class is only split for distinct keys, and splitting \
+                         halves those — so this is a bug in ddi rather than a fact about your \
+                         target. Set upsert_grain_check = \"off\" on this pipeline to start it \
+                         while it is investigated. Nothing was written and no other pipeline \
+                         was stopped."
+                    )));
+                };
                 queue.push_front(b);
                 queue.push_front(a);
             }
@@ -410,22 +438,61 @@ fn declared_schema(target: &DeltaTable) -> Result<deltalake::arrow::datatypes::S
 
 /// A projected streaming scan of the key column alone.
 ///
-/// `LoadBuilder` wraps the table provider's scan in one `CoalescePartitionsExec` — no
-/// aggregate, no sort, no repartition. Nothing in that plan registers a spillable
-/// `MemoryConsumer`, so `DiskManager::create_tmp_file` is never reached. That is why this
-/// check's disk footprint is zero by construction rather than by configuration.
+/// One `CoalescePartitionsExec` over the provider's scan — no aggregate, no sort, no
+/// repartition. Nothing in that plan registers a spillable `MemoryConsumer`, so
+/// `DiskManager::create_tmp_file` is never reached. That is why this check's disk footprint is
+/// zero by construction rather than by configuration.
+///
+/// Built by hand rather than through `LoadBuilder::with_columns`, and the reason is a real
+/// trap: that builder resolves the column name to an index against the snapshot's *declared*
+/// schema and then hands the index to a provider whose schema orders partition columns last.
+/// On a partitioned target whose partition column is declared before the key, the two orders
+/// disagree and the scan silently returns a different column — after which this check would
+/// be hashing the wrong values, and the "column is not in the target table" error it raised
+/// would name a table that does contain it. Resolving against the schema the scan actually
+/// uses is the whole difference.
 async fn key_stream(
     target: &DeltaTable,
     key_column: &str,
 ) -> Result<deltalake::datafusion::execution::SendableRecordBatchStream> {
-    let (_t, stream) = target
-        .clone()
-        .scan_table()
-        .with_columns(vec![key_column.to_string()])
-        .with_session_state(Arc::new(crate::budget::session(target)?))
+    use deltalake::datafusion::catalog::TableProvider;
+    use deltalake::datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use deltalake::datafusion::physical_plan::ExecutionPlan;
+
+    let provider = target
+        .table_provider()
         .await
-        .map_err(Error::Delta)?;
-    Ok(stream)
+        .map_err(|e| Error::Other(format!("upsert: cannot read the target's grain: {e}")))?;
+    let schema = TableProvider::schema(provider.as_ref());
+    let idx = schema.index_of(key_column).map_err(|_| {
+        Error::Config(format!(
+            "upsert column {key_column:?} is not in the target table. Columns: [{}]",
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    })?;
+
+    let state = crate::budget::session(target)?;
+    let scan = provider
+        .scan(&state, Some(&vec![idx]), &[], None)
+        .await
+        .map_err(|e| {
+            Error::Other(format!(
+                "upsert: cannot scan the target to check its grain: {e}"
+            ))
+        })?;
+    // One partition, so the pass sees every row on one stream and the buffer it fills is the
+    // only thing holding rows.
+    let plan = Arc::new(CoalescePartitionsExec::new(scan));
+    plan.execute(0, state.task_ctx()).map_err(|e| {
+        Error::Other(format!(
+            "upsert: cannot scan the target to check its grain: {e}"
+        ))
+    })
 }
 
 /// One pass: hash the key column, keep the hashes in `class`, and report the repeats.
@@ -451,13 +518,14 @@ where
         .map(|r| (r.saturating_mul(101) / 100).div_ceil(class.modulus) as usize)
         .unwrap_or(1 << 16);
     let mut hashes: Vec<u64> = Vec::with_capacity(expected.min(cap).max(1));
+    // Hashes this class has already seen twice. A subset of what `hashes` held, kept apart
+    // so a repeated key costs one slot rather than one per row.
+    let mut nominated: Vec<u64> = Vec::new();
 
     let mut converter: Option<RowConverter> = None;
 
     while let Some(batch) = stream.try_next().await.map_err(|e| {
-        Error::Other(format!(
-            "upsert: cannot scan the target to check its grain: {e}"
-        ))
+        crate::spill::classify(e, "upsert: cannot scan the target to check its grain")
     })? {
         if batch.num_rows() == 0 {
             continue;
@@ -496,27 +564,51 @@ where
             if !class.holds(h) {
                 continue;
             }
-            if hashes.len() == cap {
+            hashes.push(h);
+            if hashes.len() + nominated.len() < cap {
+                continue;
+            }
+            // Full. Before concluding the class is too wide, take out what is *repeated* —
+            // and this is the whole reason the buffer is compacted rather than simply
+            // overflowing. Splitting separates distinct keys; it can never separate rows that
+            // share one key value, because equal keys are congruent modulo everything. A
+            // class holding one key a million times would therefore overflow, split, and
+            // overflow again forever, doubling the modulus until it left u64 and panicked —
+            // on precisely the broken target this check exists to report.
+            compact(&mut hashes, &mut nominated);
+            // If compaction barely helped, the class really is holding too many *distinct*
+            // keys, and splitting it halves them. The slack stops a class that sits exactly
+            // at the boundary from re-sorting on every row.
+            if hashes.len() + nominated.len() > cap - cap / 4 {
                 return Ok(PassOutcome::Overflowed);
             }
-            hashes.push(h);
         }
     }
 
+    compact(&mut hashes, &mut nominated);
+    Ok(PassOutcome::Candidates(nominated))
+}
+
+/// Move every hash seen at least twice out of `hashes` and into `nominated`.
+///
+/// Both come back sorted and distinct, and no hash is in both — a nomination is final, so
+/// holding it in `hashes` as well would let one repeated key consume a slot per occurrence,
+/// which is the unbounded growth this exists to prevent. Together they never exceed the
+/// pass's ceiling, which is what makes the memory bound a fact about the loop rather than
+/// about the data.
+fn compact(hashes: &mut Vec<u64>, nominated: &mut Vec<u64>) {
     hashes.sort_unstable();
-    let mut candidates = Vec::new();
-    let mut i = 1;
-    while i < hashes.len() {
-        if hashes[i] == hashes[i - 1] {
-            candidates.push(hashes[i]);
-            // Skip the rest of the run: one nomination per distinct hash is enough.
-            while i < hashes.len() && hashes[i] == hashes[i - 1] {
-                i += 1;
-            }
+    for w in hashes.windows(2) {
+        if w[0] == w[1] {
+            nominated.push(w[0]);
         }
-        i += 1;
     }
-    Ok(PassOutcome::Candidates(candidates))
+    nominated.sort_unstable();
+    nominated.dedup();
+    hashes.dedup();
+    // A hash already nominated needs no further evidence, so later copies of it are dropped
+    // rather than accumulated. `nominated` is sorted, so this is a binary search per entry.
+    hashes.retain(|h| nominated.binary_search(h).is_err());
 }
 
 /// Resolve nominated hashes against the real key values.
@@ -545,9 +637,7 @@ where
         let mut converter: Option<RowConverter> = None;
 
         while let Some(batch) = stream.try_next().await.map_err(|e| {
-            Error::Other(format!(
-                "upsert: cannot scan the target to check its grain: {e}"
-            ))
+            crate::spill::classify(e, "upsert: cannot scan the target to check its grain")
         })? {
             if batch.num_rows() == 0 {
                 continue;
@@ -692,7 +782,7 @@ mod tests {
             modulus: 6,
             residue: 4,
         };
-        let (a, b) = c.split();
+        let (a, b) = c.split().expect("a small modulus splits");
         for h in 0u64..2_000 {
             if !c.holds(h) {
                 assert!(!a.holds(h) && !b.holds(h), "{h} escaped the class");
@@ -710,7 +800,7 @@ mod tests {
         for modulus in [1u64, 2, 3, 7, 35] {
             for residue in 0..modulus {
                 let c = Class { modulus, residue };
-                let (a, b) = c.split();
+                let (a, b) = c.split().expect("a small modulus splits");
                 let whole: HashSet<u64> = (0..5_000).filter(|h| c.holds(*h)).collect();
                 let halves: HashSet<u64> =
                     (0..5_000).filter(|h| a.holds(*h) || b.holds(*h)).collect();
@@ -724,16 +814,16 @@ mod tests {
         let rows = Some(2_000_000_000u64);
         let mut previous = u64::MAX;
         for mb in [256u64, 512, 1024, 4096] {
-            let n = initial_modulus(rows, 0, ceiling_of(mb * 1024 * 1024));
+            let n = initial_modulus(rows, 0, ceiling_of(mb * 1_000_000));
             assert!(
                 n < previous,
                 "{mb}MB needed {n}, which is not fewer than {previous}"
             );
             previous = n;
         }
-        // The published table: 512 MiB holds 58,720,256 hashes, so two billion rows plus one
-        // per cent of slack is 35 classes.
-        assert_eq!(initial_modulus(rows, 0, ceiling_of(512 * 1024 * 1024)), 35);
+        // The published table: 512MB holds 56,000,000 hashes, so two billion rows plus one per
+        // cent of slack is 37 classes.
+        assert_eq!(initial_modulus(rows, 0, ceiling_of(Ceiling::DEFAULT)), 37);
     }
 
     #[test]
@@ -762,6 +852,9 @@ mod tests {
         let e = Ceiling::resolve(Some(1024)).unwrap_err().to_string();
         assert!(e.contains("runtime.max_grain_check_memory"), "{e}");
         assert!(e.contains("16MB"), "{e}");
+        // The size the message prescribes must itself be accepted — a floor that rejects its
+        // own advice sends the operator round a loop.
+        assert!(Ceiling::resolve(Some(bytesize::ByteSize::mb(16).as_u64())).is_ok());
         assert!(Ceiling::resolve(Some(Ceiling::MIN)).is_ok());
     }
 
@@ -777,8 +870,8 @@ mod tests {
 
     #[test]
     fn the_ceiling_is_a_count_of_hashes_and_leaves_room_for_the_scan() {
-        let c = ceiling_of(512 * 1024 * 1024);
-        assert_eq!(c.hashes_per_pass(), 58_720_256);
+        let c = ceiling_of(Ceiling::DEFAULT);
+        assert_eq!(c.hashes_per_pass(), 56_000_000);
         // Seven eighths, so the batch in flight and the candidate list are inside the number
         // an operator wrote down rather than beside it.
         assert!((c.hashes_per_pass() as u64) * 8 < c.bytes());

@@ -165,7 +165,9 @@ impl Sink {
             write = write.with_target_file_size(Some(size));
         }
 
-        let table = write.await.map_err(Error::Delta)?;
+        let table = write
+            .await
+            .map_err(|e| crate::spill::classify_delta(e, "append: writing the batch"))?;
         debug!(
             app_id = %self.app_id,
             source_version,
@@ -256,7 +258,12 @@ impl Sink {
             })
             .map_err(Error::Delta)?;
 
-        let (table, metrics) = merge.await.map_err(Error::Delta)?;
+        // Classified rather than wrapped: a merge joins a slice of the target against the
+        // batch, so it is the largest spiller here, and a full spill directory arriving as a
+        // plain Delta error is indistinguishable from a wrong answer to the retry loop.
+        let (table, metrics) = merge
+            .await
+            .map_err(|e| crate::spill::classify_delta(e, "upsert: merging into the target"))?;
 
         let stats = UpsertStats {
             rows_in: rows,

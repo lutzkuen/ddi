@@ -51,6 +51,18 @@
 //! The cap is also enforced *after* each write rather than as an admission check
 //! (`RefCountedTempFile::update_disk_usage`), so it can be overshot by roughly one write
 //! buffer per open spill file. Set it below the volume, never equal to it.
+//!
+//! And the counter drifts upward when the cap is actually hit. `update_disk_usage` adds the
+//! new file size to the shared total, then returns `ResourcesExhausted` *before* recording
+//! that size on the file — so the `Drop` that follows subtracts the older, smaller figure and
+//! the difference stays charged forever. Per failure it is about one write buffer; it is
+//! upstream's arithmetic, not something this module can correct, because `DiskManager` exposes
+//! no way to set its atomic. It mattered less before this change only because each operation
+//! had its own manager and the residue died with it. What it means in practice: after a run of
+//! capacity failures the effective budget is a little smaller than the configured one, and
+//! `ddi_spill_files == 0` alongside `ddi_spill_bytes > 0` is the witness — with no open spill
+//! file the true on-disk figure is zero, so whatever the gauge reads then is residue. A restart
+//! clears it. Leave headroom for that as well.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -70,7 +82,11 @@ use crate::error::{Error, Result};
 /// DataFusion checks the total *after* each write, so a budget under one spill batch is
 /// exceeded by the first one — and every sort, grouped aggregate and merge join in the
 /// process would fail rather than run slowly.
-pub const MIN_TEMP_DIRECTORY_SIZE: u64 = 1024 * 1024;
+///
+/// Decimal, not binary, because `bytesize` reads `"1MB"` as a million and the refusal message
+/// tells the operator to write exactly that. A binary floor here would reject its own advice.
+/// `max_bytes_per_batch` already counts this way.
+pub const MIN_TEMP_DIRECTORY_SIZE: u64 = 1_000_000;
 
 /// The process's spill directory and budget, and the prototype that shares them out.
 pub struct Spill {
@@ -124,7 +140,17 @@ impl Spill {
                 // creates a single level, and a spill path is almost always nested under a
                 // mount point.
                 std::fs::create_dir_all(&path).map_err(|e| Error::Config(unusable(d, &e)))?;
-                let probe = path.join(format!("ddi-spill-probe-{}", std::process::id()));
+                // Unique per call, not just per process. Two `Spill::resolve` calls racing on
+                // one directory — which is what a test binary does, and what a future
+                // supervisor restart would do — would otherwise pick the same name, and the
+                // slower one's `remove_file` would fail with ENOENT on a directory that is
+                // perfectly writable.
+                static PROBE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let probe = path.join(format!(
+                    "ddi-spill-probe-{}-{}",
+                    std::process::id(),
+                    PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
                 std::fs::write(&probe, b"ddi")
                     .and_then(|_| std::fs::remove_file(&probe))
                     .map_err(|e| Error::Config(unusable(d, &e)))?;
@@ -252,6 +278,13 @@ pub fn current() -> Arc<Spill> {
 /// in.
 const DISK_EXHAUSTED: &str = "used disk space during the spilling process";
 
+/// The prefix `DataFusionError::ResourcesExhausted` renders with.
+///
+/// Needed because delta-rs stringifies a DataFusion error it does not special-case into
+/// `DeltaTableError::Generic`, so by the time a merge or a write failure reaches this crate the
+/// variant is gone and the text is all that is left. See [`classify_delta`].
+const EXHAUSTED: &str = "Resources exhausted:";
+
 /// Read a DataFusion error as a capacity failure, or leave it alone.
 ///
 /// `ResourcesExhausted` is raised by memory pools too, so the variant alone would misattribute
@@ -261,7 +294,27 @@ pub fn classify(e: DataFusionError, context: &str) -> Error {
     if !matches!(e.find_root(), DataFusionError::ResourcesExhausted(_)) {
         return Error::Transform(format!("{context}: {e}"));
     }
+    capacity(e.to_string(), context)
+}
+
+/// Read a delta-rs failure as a capacity failure, or leave it as [`Error::Delta`].
+///
+/// The merge and the write — the two things here that spill at target scale — reach this crate
+/// through delta-rs, which has already collapsed the DataFusion error into a string. So this
+/// matches on the text where [`classify`] can match on the variant. Both end up in the same
+/// place, and that place is the only reason [`Error::Capacity`] exists: without it a full
+/// spill directory is indistinguishable from a wrong answer, and the supervisor retries it a
+/// second later, forever, holding the shared budget while it does.
+pub fn classify_delta(e: deltalake::DeltaTableError, context: &str) -> Error {
     let s = e.to_string();
+    if !s.contains(EXHAUSTED) {
+        return Error::Delta(e);
+    }
+    capacity(s, context)
+}
+
+/// Say which budget ran out, given the message that says one did.
+fn capacity(s: String, context: &str) -> Error {
     let spill = current();
     let which = if s.contains(DISK_EXHAUSTED) {
         // The byte count as well as the human size, and deliberately: DataFusion renders the
@@ -400,6 +453,45 @@ mod tests {
         // zero, and so an operator cannot read "unset" as "unbounded".
         assert!(Spill::unbounded().limit_bytes() > 0);
         assert!(current().limit_bytes() > 0);
+    }
+
+    #[test]
+    fn a_capacity_failure_that_arrives_through_delta_rs_is_still_a_capacity_failure() {
+        // The path that actually matters, and the one a From<DataFusionError> impl never sees:
+        // the merge and the write reach this crate through delta-rs, which collapses anything
+        // it does not special-case into `DeltaTableError::Generic(err.to_string())`. The
+        // variant is gone by then, so the text is all there is to match on.
+        let e = classify_delta(
+            deltalake::DeltaTableError::Generic(
+                "Resources exhausted: The used disk space during the spilling process has \
+                 exceeded the allowable limit of 4.0 MB."
+                    .into(),
+            ),
+            "upsert: merging into the target",
+        );
+        assert!(matches!(e, Error::Capacity(_)), "{e}");
+        let m = e.to_string();
+        assert!(m.contains("max_temp_directory_size"), "{m}");
+
+        // A memory pool exhausted inside a merge is still capacity, and still not the disk.
+        let e = classify_delta(
+            deltalake::DeltaTableError::Generic(
+                "Resources exhausted: Failed to allocate additional 1024 bytes for \
+                 GroupedHashAggregateStream"
+                    .into(),
+            ),
+            "upsert: merging into the target",
+        );
+        assert!(matches!(e, Error::Capacity(_)), "{e}");
+        assert!(e.to_string().contains("max_memory"), "{e}");
+
+        // Everything else keeps the shape it always had, including the variant — a schema
+        // mismatch must not become a capacity failure that waits five minutes to retry.
+        let e = classify_delta(
+            deltalake::DeltaTableError::Generic("Error during planning: no such column".into()),
+            "upsert: merging into the target",
+        );
+        assert!(matches!(e, Error::Delta(_)), "{e}");
     }
 
     #[test]

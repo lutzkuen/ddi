@@ -288,3 +288,77 @@ async fn an_empty_target_holds_one_row_per_key() {
         other => panic!("an empty target cannot hold a key twice: {other:?}"),
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_key_repeated_past_the_ceiling_is_reported_rather_than_splitting_forever() {
+    // The case the check exists for, and the one that used to panic. Splitting separates
+    // distinct keys; it can never separate rows that share a key value, because equal keys are
+    // congruent modulo everything. So a class holding one key more times than a pass can hold
+    // overflowed, split, and overflowed again — doubling the modulus until it left u64 —
+    // instead of reporting the duplicate. A pass now compacts repeats out of its buffer, so
+    // one repeated key costs one slot however many rows carry it.
+    installed_spill();
+    let mut keys: Vec<String> = distinct(20);
+    // Forty copies of one key against a ceiling that holds fourteen hashes.
+    keys.extend(std::iter::repeat_n("order-repeated".to_string(), 40));
+    let (_d, t) = table_of(&keys.iter().map(|k| Some(k.as_str())).collect::<Vec<_>>()).await;
+
+    match grain::check(&t, "key", Ceiling::exactly(128), 3)
+        .await
+        .unwrap()
+    {
+        Grain::Duplicated { examples, .. } => {
+            assert_eq!(examples.len(), 1);
+            assert_eq!(examples[0].key, "order-repeated");
+            assert_eq!(examples[0].rows, 40);
+        }
+        other => panic!("a key repeated past the ceiling is still a duplicate: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_that_is_almost_all_one_key_still_answers() {
+    // The extreme of the same shape: nothing but repeats, and far more of them than any pass
+    // holds. What is on trial is termination, and that the answer is right.
+    installed_spill();
+    let keys: Vec<String> = std::iter::repeat_n("only-key".to_string(), 300).collect();
+    let (_d, t) = table_of(&keys.iter().map(|k| Some(k.as_str())).collect::<Vec<_>>()).await;
+
+    match grain::check(&t, "key", Ceiling::exactly(128), 3)
+        .await
+        .unwrap()
+    {
+        Grain::Duplicated { examples, .. } => {
+            assert_eq!(examples[0].key, "only-key");
+            assert_eq!(examples[0].rows, 300);
+        }
+        other => panic!("three hundred copies of one key is a duplicate: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn many_keys_each_repeated_past_the_ceiling_are_all_still_found() {
+    // Repeats compacted out of the buffer must not lose their identity: each distinct repeated
+    // key is nominated once, and the verification pass resolves every one of them.
+    installed_spill();
+    let mut keys: Vec<String> = Vec::new();
+    for i in 0..5 {
+        keys.extend(std::iter::repeat_n(format!("dup-{i}"), 30));
+    }
+    keys.extend(distinct(30));
+    let (_d, t) = table_of(&keys.iter().map(|k| Some(k.as_str())).collect::<Vec<_>>()).await;
+
+    match grain::check(&t, "key", Ceiling::exactly(128), 5)
+        .await
+        .unwrap()
+    {
+        Grain::Duplicated { examples, .. } => {
+            assert_eq!(examples.len(), 5, "got {examples:?}");
+            for d in &examples {
+                assert!(d.key.starts_with("dup-"), "{d:?}");
+                assert_eq!(d.rows, 30);
+            }
+        }
+        other => panic!("five repeated keys are five duplicates: {other:?}"),
+    }
+}

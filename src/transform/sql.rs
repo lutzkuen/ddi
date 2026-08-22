@@ -133,10 +133,13 @@ impl SqlTransform {
             .sql(&self.sql)
             .await
             .map_err(|e| Error::Transform(format!("transform_sql failed to plan: {e}")))?;
+        // Through `classify` rather than straight to `Transform`, because a transform that
+        // sorts or groups spills, and a full spill directory is a fact about the machine that
+        // wants the opposite handling from a fact about the data. See `crate::spill`.
         let out = df
             .collect()
             .await
-            .map_err(|e| Error::Transform(format!("transform_sql failed to execute: {e}")))?;
+            .map_err(|e| crate::spill::classify(e, "transform_sql failed to execute"))?;
         Ok(out)
     }
 }

@@ -141,9 +141,7 @@ impl Dedup {
         let mut rows_scanned = 0usize;
 
         while let Some(batch) = stream.try_next().await.map_err(|e| {
-            Error::Other(format!(
-                "dedup: cannot scan the target to read its watermark: {e}"
-            ))
+            crate::spill::classify(e, "dedup: cannot scan the target to read its watermark")
         })? {
             if batch.num_rows() == 0 {
                 continue;

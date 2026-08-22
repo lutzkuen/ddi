@@ -1721,6 +1721,15 @@ transform_sql = "SELECT order_id FROM source"
     }
 
     #[test]
+    fn the_size_the_floor_message_prescribes_is_itself_accepted() {
+        // A floor that rejects its own advice sends the operator round a loop. bytesize reads
+        // "1MB" as a million, so a 1 MiB floor would refuse exactly what it just told them to
+        // write.
+        let cfg = with_runtime("max_temp_directory_size = \"1MB\"");
+        assert!(cfg.spill().is_ok(), "{:?}", cfg.spill().err());
+    }
+
+    #[test]
     fn a_spill_cap_that_is_not_a_size_names_the_key_and_the_value() {
         let e = with_runtime("max_temp_directory_size = \"8 gigs\"")
             .spill()
