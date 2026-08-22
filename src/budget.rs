@@ -194,6 +194,34 @@ pub fn session(table: &DeltaTable) -> Result<SessionState> {
     session_with(table, session_config())
 }
 
+/// A session for a delta-rs *write*, bounded like every other one.
+///
+/// Not [`session`], and the difference is not cosmetic. delta-rs plans a write through its own
+/// `MetricObserver` node, which only its `DeltaPlanner` can turn into an execution plan — so a
+/// plain `SessionStateBuilder` fails the write outright with "no installed planner". The merge
+/// path escapes this because delta-rs rebuilds the state it is handed and re-attaches the
+/// planner; the write path uses what it is given as-is.
+///
+/// `DeltaSessionContext::with_runtime_env` is therefore exactly the right shape: it is what
+/// delta-rs would have built for itself, on our runtime instead of one nobody configured. What
+/// that buys is the point of handing it over at all — the write now draws on the process's
+/// memory budget and spills into the process's one disk budget, rather than into an
+/// `UnboundedMemoryPool` and a private hundred gigabytes in the OS temporary directory.
+///
+/// The one thing it does not carry is [`session_config`]'s spill compression, because
+/// `DeltaSessionContext` builds its own config and does not take one. A write's spill is small
+/// and bounded by the batch; it is the scans and merges that spill at target scale, and those
+/// go through [`session`].
+pub fn delta_session(table: &DeltaTable) -> Result<SessionState> {
+    let runtime = runtime()?;
+
+    let log_store = table.log_store();
+    let url = log_store.root_url().clone();
+    runtime.register_object_store(&url, log_store.root_object_store(None));
+
+    Ok(deltalake::delta_datafusion::DeltaSessionContext::with_runtime_env(runtime).state())
+}
+
 /// As [`session`], with plan-level settings only the caller knows it needs.
 pub fn session_with(table: &DeltaTable, config: SessionConfig) -> Result<SessionState> {
     let runtime = runtime()?;

@@ -212,8 +212,14 @@ impl DataQuality {
                 ),
             ]);
 
+        // As in `Sink::commit`: without this delta-rs builds a runtime with an unbounded
+        // memory pool and its own private spill budget, outside everything `crate::budget` and
+        // `crate::spill` account for. A quarantine write is small, and "small" is not a bound.
+        let session = std::sync::Arc::new(crate::budget::delta_session(&table)?);
+
         match table
             .write(vec![batch])
+            .with_session_state(session)
             .with_save_mode(SaveMode::Append)
             .with_cast_safety(false)
             .with_commit_properties(props)

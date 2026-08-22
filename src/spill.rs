@@ -264,9 +264,15 @@ pub fn classify(e: DataFusionError, context: &str) -> Error {
     let s = e.to_string();
     let spill = current();
     let which = if s.contains(DISK_EXHAUSTED) {
+        // The byte count as well as the human size, and deliberately: DataFusion renders the
+        // same number in binary units inside the sentence above ("4.0 MB" for 4 MiB) and this
+        // tool renders it in decimal ones everywhere else. Two spellings of one number in one
+        // message reads as two different numbers, so the exact one settles it.
         format!(
-            "the process's spill budget ([runtime] max_temp_directory_size, currently {}{})",
+            "the process's spill budget ([runtime] max_temp_directory_size, currently {} \
+             ({} bytes){})",
             bytesize::ByteSize(spill.limit_bytes()),
+            spill.limit_bytes(),
             match spill.directory() {
                 Some(d) => format!(", in {}", d.display()),
                 None => ", in the OS temporary directory".to_string(),

@@ -140,8 +140,19 @@ impl Sink {
     ) -> Result<DeltaTable> {
         let props = self.properties(source_version);
 
+        // The same runtime every other session in this process gets. A plain append has little
+        // to spill today — an in-memory input, and no partition columns anywhere in this
+        // tool's config — but delta-rs builds its own SessionState when it is not given one,
+        // with an unbounded memory pool and a DiskManager this process has never seen. A
+        // runtime nobody configured is precisely the hole `crate::spill` exists to close, and
+        // leaving one open because it happens to be quiet is how it gets loud later. Taken
+        // before `write` moves the table, and `delta_session` rather than `session` because a
+        // write is planned through delta-rs's own node — see there.
+        let session = std::sync::Arc::new(crate::budget::delta_session(&table)?);
+
         let mut write = table
             .write(batches)
+            .with_session_state(session)
             .with_save_mode(SaveMode::Append)
             // NOTE the polarity: `safe = true` makes a failed cast produce NULL, which is
             // precisely the silent data-quality failure this tool exists to avoid. `false`
