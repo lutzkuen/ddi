@@ -7,216 +7,15 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use common::{append, create_table, open, pipeline_cfg, read_ids, Fixture};
+use common::{append, create_table, open, pipeline_cfg, read_ids, FakeHub, Fixture, HubBehaviour};
 use delta_delta_ingest::config::{PublishModel, PublisherConfig, PublisherKind, ResolvedPipeline};
 use delta_delta_ingest::pipeline::{Pipeline, StepOutcome};
 use delta_delta_ingest::publish::Envelope;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-
-/// What the far end should do with a request.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HubBehaviour {
-    /// The documented success: 202 Accepted.
-    Accept,
-    /// A server-side failure.
-    Fail,
-    /// Accept the connection and never answer, so the client's timeout is what ends it.
-    Hang,
-}
-
-/// One captured request: its full head, its body, and the status we answered with.
-///
-/// The whole head is kept, not just the start line: the Authorization header is the one part
-/// of this request that no other test can observe, and without it here the header could be
-/// deleted outright with the suite still green.
-type Captured = Arc<Mutex<Vec<(String, Vec<u8>, u16)>>>;
-
-/// A stand-in for the Web PubSub data plane.
-///
-/// Reads the request to its `Content-Length` in a loop rather than in a single read: a body
-/// can arrive split across packets, and the envelope assertions are the point of this file,
-/// so a truncated read would make them silently weak instead of failing.
-struct FakeHub {
-    pub addr: String,
-    pub requests: Captured,
-    pub hits: Arc<AtomicU64>,
-    behaviour: Arc<AtomicU64>,
-}
-
-impl HubBehaviour {
-    fn code(self) -> u64 {
-        match self {
-            HubBehaviour::Accept => 0,
-            HubBehaviour::Fail => 1,
-            HubBehaviour::Hang => 2,
-        }
-    }
-    fn from_code(c: u64) -> Self {
-        match c {
-            1 => HubBehaviour::Fail,
-            2 => HubBehaviour::Hang,
-            _ => HubBehaviour::Accept,
-        }
-    }
-}
-
-impl FakeHub {
-    async fn start(behaviour: HubBehaviour) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = format!("http://{}", listener.local_addr().unwrap());
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let hits = Arc::new(AtomicU64::new(0));
-        let behaviour = Arc::new(AtomicU64::new(behaviour.code()));
-
-        let sink = requests.clone();
-        let counter = hits.clone();
-        let mode = behaviour.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                let sink = sink.clone();
-                let counter = counter.clone();
-                let mode = mode.clone();
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 4096];
-
-                    // Headers first, so Content-Length is known.
-                    let header_end = loop {
-                        match socket.read(&mut chunk).await {
-                            Ok(0) => return,
-                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                            Err(_) => return,
-                        }
-                        if let Some(i) = find(&buf, b"\r\n\r\n") {
-                            break i + 4;
-                        }
-                    };
-
-                    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-                    let len: usize = head
-                        .lines()
-                        .find_map(|l| {
-                            let (k, v) = l.split_once(':')?;
-                            k.trim()
-                                .eq_ignore_ascii_case("content-length")
-                                .then(|| v.trim().parse().ok())?
-                        })
-                        .unwrap_or(0);
-
-                    // Then exactly as many body bytes as were promised.
-                    while buf.len() - header_end < len {
-                        match socket.read(&mut chunk).await {
-                            Ok(0) => break,
-                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                            Err(_) => break,
-                        }
-                    }
-
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    let behaviour = HubBehaviour::from_code(mode.load(Ordering::SeqCst));
-                    let status = match behaviour {
-                        HubBehaviour::Accept => 202,
-                        HubBehaviour::Fail => 500,
-                        HubBehaviour::Hang => 0,
-                    };
-                    // Recorded before the response is written, so a test inspecting the
-                    // capture after the client returned always sees it.
-                    sink.lock()
-                        .unwrap()
-                        .push((head.clone(), buf[header_end..].to_vec(), status));
-
-                    match behaviour {
-                        HubBehaviour::Accept => {
-                            let _ = socket
-                                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                                .await;
-                        }
-                        HubBehaviour::Fail => {
-                            let _ = socket
-                                .write_all(
-                                    b"HTTP/1.1 500 Internal Server Error\r\n\
-                                      Content-Length: 11\r\n\r\nhub is down",
-                                )
-                                .await;
-                        }
-                        // Never answers. The publisher's own timeout has to end this.
-                        HubBehaviour::Hang => {
-                            tokio::time::sleep(Duration::from_secs(120)).await;
-                        }
-                    }
-                });
-            }
-        });
-
-        Self {
-            addr,
-            requests,
-            hits,
-            behaviour,
-        }
-    }
-
-    /// Change what the far end does from here on, so one test can lose exactly one message.
-    fn set(&self, behaviour: HubBehaviour) {
-        self.behaviour.store(behaviour.code(), Ordering::SeqCst);
-    }
-
-    /// Every envelope that arrived, whether or not it was accepted.
-    fn envelopes(&self) -> Vec<Envelope> {
-        self.parse(|_| true)
-    }
-
-    /// Only the envelopes a client would actually have received.
-    fn delivered(&self) -> Vec<Envelope> {
-        self.parse(|status| status == 202)
-    }
-
-    fn parse(&self, keep: impl Fn(u16) -> bool) -> Vec<Envelope> {
-        self.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, _, status)| keep(*status))
-            .map(|(_, body, _)| {
-                serde_json::from_slice(body).unwrap_or_else(|e| {
-                    panic!(
-                        "body was not a ddi envelope ({e}): {}",
-                        String::from_utf8_lossy(body)
-                    )
-                })
-            })
-            .collect()
-    }
-
-    fn heads(&self) -> Vec<String> {
-        self.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(head, _, _)| head.clone())
-            .collect()
-    }
-
-    fn request_lines(&self) -> Vec<String> {
-        self.heads()
-            .iter()
-            .map(|h| h.lines().next().unwrap_or_default().to_string())
-            .collect()
-    }
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
 
 /// A pipeline that publishes one row per batch to `hub`.
 fn publishing_cfg(f: &Fixture, name: &str, hub: &FakeHub, timeout_secs: u64) -> ResolvedPipeline {
@@ -226,6 +25,7 @@ fn publishing_cfg(f: &Fixture, name: &str, hub: &FakeHub, timeout_secs: u64) -> 
         kind: PublisherKind::Webpubsub,
         group: "sales".into(),
         publish_sql: "SELECT count(*) AS rows_delta, sum(id) AS id_delta FROM source".into(),
+        near_time: false,
     });
     cfg.publish_to = Some(PublisherConfig {
         kind: PublisherKind::Webpubsub,
@@ -530,6 +330,7 @@ async fn an_unreachable_hub_does_not_stop_the_pipeline() {
         kind: PublisherKind::Webpubsub,
         group: "sales".into(),
         publish_sql: "SELECT count(*) AS rows_delta FROM source".into(),
+        near_time: false,
     });
     cfg.publish_to = Some(PublisherConfig {
         kind: PublisherKind::Webpubsub,
@@ -596,6 +397,7 @@ async fn an_upsert_pipeline_does_not_publish_even_when_asked_directly() {
         kind: PublisherKind::Webpubsub,
         group: "sales".into(),
         publish_sql: "SELECT count(*) AS rows_delta FROM source".into(),
+        near_time: false,
     });
     cfg.publish_to = Some(PublisherConfig {
         kind: PublisherKind::Webpubsub,

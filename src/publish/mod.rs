@@ -18,6 +18,7 @@
 //! carries on; see [`Envelope`].
 
 pub mod jwt;
+pub mod near_time;
 pub mod webpubsub;
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -675,6 +676,7 @@ mod tests {
             kind: PublisherKind::Webpubsub,
             group: "sales".into(),
             publish_sql: sql.into(),
+            near_time: false,
         }
     }
 

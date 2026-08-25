@@ -269,13 +269,26 @@ impl Pipeline {
 
         // Same reasoning as the data-quality line above: which mode this pipeline is in is
         // said once at startup rather than discovered during an incident. Every way a
-        // publisher can be absent is a normal state, so all three are logged at info.
-        let publisher = crate::publish::Publisher::open(&cfg);
+        // publisher can be absent is a normal state, so all four are logged at info.
+        //
+        // `near_time` pipelines get no post-commit publisher at all — a second, independent
+        // reader (`crate::publish::near_time`) publishes from the source directly instead,
+        // on its own task and cursor. Building one here too would mean two publishers
+        // feeding the same group with two unrelated gap-detection chains.
+        let publisher = match &cfg.publish {
+            Some(m) if m.near_time => None,
+            _ => crate::publish::Publisher::open(&cfg),
+        };
         match (&publisher, &cfg.publish) {
             (Some(p), _) => info!(
                 pipeline = %cfg.name,
                 publish = %p.describe(),
                 "each committed batch will also be published"
+            ),
+            (None, Some(m)) if m.near_time => info!(
+                pipeline = %cfg.name,
+                model = %m.model,
+                "publishing near-time from the source instead of after each commit"
             ),
             // Reached when the resolver approved a sink and `Publisher::open` then declined
             // it — an unparseable connection string, an unset environment variable, a write
@@ -931,76 +944,7 @@ impl Pipeline {
     /// file and one delta-rs-written file would not even be a batch: two schemas, one
     /// transform.
     async fn scan(&self, batch: &LogBatch) -> Result<Vec<RecordBatch>> {
-        use deltalake::parquet::arrow::async_reader::{
-            ParquetObjectReader, ParquetRecordBatchStreamBuilder,
-        };
-        use deltalake::Path as StorePath;
-
-        let store = self.source.log_store().object_store(None);
-        let declared = arrow_schema_of(&batch.schema)?;
-        let partition_cols: Vec<String> = self
-            .source
-            .snapshot()
-            .map_err(Error::Delta)?
-            .metadata()
-            .partition_columns()
-            .to_vec();
-
-        let mut out = Vec::new();
-        for (i, add) in batch.files.iter().enumerate() {
-            let path = StorePath::parse(&add.path)
-                .map_err(|e| Error::Other(format!("bad file path {:?}: {e}", add.path)))?;
-            // Two of the three calls below reach storage — the metadata load and the row
-            // group fetches; `build` only reshapes what the first already read — and both
-            // fail in one of two ways that need opposite answers: something transient,
-            // which the supervisor's backoff clears, or a file the store does not have,
-            // which no amount of waiting brings back. The second used to arrive here as a
-            // generic transform error and retry until somebody read the logs. `build` goes
-            // through the same classifier for uniformity; its NotFound arm never fires.
-            let unreadable = |verb: &str, e: deltalake::parquet::errors::ParquetError| {
-                if is_not_found(&e) {
-                    Error::SourceFileVacuumed {
-                        source_uri: self.cfg.source_uri.clone(),
-                        version: batch.version_of(i),
-                        path: add.path.clone(),
-                    }
-                } else {
-                    Error::Transform(format!("{verb} {:?}: {e}", add.path))
-                }
-            };
-            // Supply the size from the Add action rather than letting the reader probe
-            // for it. The probe is a suffix range request ("last N bytes"), which Azure
-            // Blob Storage does not implement — on local disk it works, so this only
-            // surfaces against real object storage.
-            let reader = ParquetObjectReader::new(store.clone(), path)
-                .with_file_size(add.size.max(0) as u64);
-            let stream = ParquetRecordBatchStreamBuilder::new(reader)
-                .await
-                .map_err(|e| unreadable("cannot open", e))?
-                .build()
-                .map_err(|e| unreadable("cannot read", e))?;
-
-            // Deleted between the footer read and here, or deleted while a later row group
-            // was still outstanding: the store re-opens the object per range request, so a
-            // vacuum landing mid-file surfaces at this call rather than the one above.
-            let batches: Vec<RecordBatch> = stream
-                .try_collect()
-                .await
-                .map_err(|e| unreadable("read failed for", e))?;
-
-            for b in batches {
-                // Before the partition columns, which come from the log as text and are
-                // cast by the coercer, not from the file.
-                let b = crate::schema::read_as_declared(b, &declared)
-                    .map_err(|e| Error::Schema(format!("{:?}: {e}", add.path)))?;
-                out.push(if partition_cols.is_empty() {
-                    b
-                } else {
-                    attach_partition_columns(b, &partition_cols, &add.partition_values)?
-                });
-            }
-        }
-        Ok(out)
+        scan_source(&self.source, &self.cfg.source_uri, batch).await
     }
 
     /// Run until caught up, then return how many batches were committed.
@@ -1088,6 +1032,87 @@ fn is_commit_conflict(e: &Error) -> bool {
 ///
 /// The walk, rather than one `downcast_ref`, because a backend is free to wrap its miss in
 /// `Generic { source }` on the way out.
+/// Read a batch's files as Arrow, cast to the schema the log declared them under.
+///
+/// A free function, not a method, so [`crate::publish::near_time`] can read the same files
+/// the same way through its own independently-opened source table — the logic has nothing
+/// in it that is specific to `Pipeline`.
+pub(crate) async fn scan_source(
+    source: &DeltaTable,
+    source_uri: &str,
+    batch: &LogBatch,
+) -> Result<Vec<RecordBatch>> {
+    use deltalake::parquet::arrow::async_reader::{
+        ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+    };
+    use deltalake::Path as StorePath;
+
+    let store = source.log_store().object_store(None);
+    let declared = arrow_schema_of(&batch.schema)?;
+    let partition_cols: Vec<String> = source
+        .snapshot()
+        .map_err(Error::Delta)?
+        .metadata()
+        .partition_columns()
+        .to_vec();
+
+    let mut out = Vec::new();
+    for (i, add) in batch.files.iter().enumerate() {
+        let path = StorePath::parse(&add.path)
+            .map_err(|e| Error::Other(format!("bad file path {:?}: {e}", add.path)))?;
+        // Two of the three calls below reach storage — the metadata load and the row
+        // group fetches; `build` only reshapes what the first already read — and both
+        // fail in one of two ways that need opposite answers: something transient,
+        // which the supervisor's backoff clears, or a file the store does not have,
+        // which no amount of waiting brings back. The second used to arrive here as a
+        // generic transform error and retry until somebody read the logs. `build` goes
+        // through the same classifier for uniformity; its NotFound arm never fires.
+        let unreadable = |verb: &str, e: deltalake::parquet::errors::ParquetError| {
+            if is_not_found(&e) {
+                Error::SourceFileVacuumed {
+                    source_uri: source_uri.to_string(),
+                    version: batch.version_of(i),
+                    path: add.path.clone(),
+                }
+            } else {
+                Error::Transform(format!("{verb} {:?}: {e}", add.path))
+            }
+        };
+        // Supply the size from the Add action rather than letting the reader probe
+        // for it. The probe is a suffix range request ("last N bytes"), which Azure
+        // Blob Storage does not implement — on local disk it works, so this only
+        // surfaces against real object storage.
+        let reader =
+            ParquetObjectReader::new(store.clone(), path).with_file_size(add.size.max(0) as u64);
+        let stream = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .map_err(|e| unreadable("cannot open", e))?
+            .build()
+            .map_err(|e| unreadable("cannot read", e))?;
+
+        // Deleted between the footer read and here, or deleted while a later row group
+        // was still outstanding: the store re-opens the object per range request, so a
+        // vacuum landing mid-file surfaces at this call rather than the one above.
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| unreadable("read failed for", e))?;
+
+        for b in batches {
+            // Before the partition columns, which come from the log as text and are
+            // cast by the coercer, not from the file.
+            let b = crate::schema::read_as_declared(b, &declared)
+                .map_err(|e| Error::Schema(format!("{:?}: {e}", add.path)))?;
+            out.push(if partition_cols.is_empty() {
+                b
+            } else {
+                attach_partition_columns(b, &partition_cols, &add.partition_values)?
+            });
+        }
+    }
+    Ok(out)
+}
+
 fn is_not_found(e: &(dyn std::error::Error + 'static)) -> bool {
     use deltalake::logstore::object_store::Error as ObjectStoreError;
 

@@ -120,6 +120,7 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
             change_policy: Default::default(),
             transform_sql: s.transform_sql.clone(),
             allowed_latency_secs: None,
+            near_time_poll_interval_secs: None,
             max_bytes_per_batch: None,
             max_files_per_batch: None,
             max_output_rows_per_batch: None,
@@ -182,6 +183,7 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
                     kind: p.kind,
                     group: p.group.clone(),
                     publish_sql: p.sql.clone(),
+                    near_time: p.near_time,
                 }),
         });
     }

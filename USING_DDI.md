@@ -435,6 +435,61 @@ baseline every time somebody ran `OPTIMIZE` on a bronze table.
 or not serialisable — so `rows` is empty and `row_count` says how many there were. Reload
 rather than assume nothing happened.
 
+### Near-time publish
+
+Everything above waits for the next commit — sized for good target file sizes, which can
+take a while to fill and write — before sending anything. `ddi_publish_near_time: true`
+trades that latency for the at-most-once guarantee: instead of a post-commit publisher, a
+second reader polls the *source* directly, on its own cursor and its own cadence
+(`near_time_poll_interval_secs`, 2 seconds by default, independent of
+`allowed_latency_secs`), and publishes as soon as it gets to the rows — whether or not a
+target commit has happened yet, or ever groups them the same way. The target commit itself
+is untouched: same `max_bytes_per_batch`, same `target_file_size`, same everything.
+
+```yaml
+models:
+  - name: orders_live
+    meta:
+      ddi_publish: webpubsub
+      ddi_publish_group: orders
+      ddi_publish_near_time: true
+```
+
+A model publishes one way or the other, never both — turning this on replaces the
+post-commit publisher for that model rather than adding a second stream to the same group,
+so a client still only ever has one gap-detection chain to follow.
+
+Two things follow from reading the source instead of a commit, and a client has to know
+both:
+
+* **`target_version` is always `null`.** There is no commit to attach one to, so the
+  client's `m.target_version <= B` check — "this message is already in the baseline I just
+  reloaded" — never fires for a near-time message. In the ordinary path that check is what
+  makes a reload cheap to recover from; here it does nothing, so a reload can re-apply rows
+  the reload's own baseline already contains. That is a real, if usually brief, way to
+  overcount until the next reload discards it — accept it, or read the baseline more often
+  than a gap alone would force.
+* **Delivery is best-effort in a way the ordinary path is not.** A transient failure that
+  is retried can resend a batch, and — because this reader keeps no state of its own — every
+  restart resumes from the target's last *durably committed* offset rather than from
+  wherever it had itself gotten to, which can be well behind. The existing client protocol
+  still catches this the same way it catches any other gap: the restarted reader's first
+  message carries `prev_source_version: null`, which will not match the client's `last`, so
+  the client reloads and resets — it is not left silently double-counting a resend it had no
+  way to know about.
+
+What it does not do, because doing it right needs a committed batch to anchor to:
+
+* **No rebuild suppression.** The ordinary path's dedup (rows a prior rebuild already wrote)
+  runs against the target; this reader never touches the target, so a rebuild can make it
+  transiently republish rows the commit path goes on to suppress.
+* **No data-quality quarantine.** A row that fails to coerce to the target schema is
+  dropped from that message and logged, not written to the data-quality table — there is no
+  commit for that write to ride along with.
+* **No lookups**, for now. Refused at config load (`ddi_publish_near_time` on a model whose
+  host pipeline has any `lookups` configured is a rejection, the same as the write-mode
+  checks above) rather than silently running without them.
+
 ### What `ddi` does not do
 
 It does not hold browser connections, mint client access tokens, or serve a negotiate
@@ -454,7 +509,9 @@ failures becomes a run of skips once the breaker opens and stops attempting them
 
 None of them moves `ddi_pipeline_up`. A pipeline whose every publish is failing is streaming
 to Delta exactly as it should, and paging somebody about it would be paging them about a
-dashboard.
+dashboard. The same counters serve `ddi_publish_near_time` pipelines too — a model publishes
+one way or the other, never both, so there is no ambiguity about which path a given
+increment came from.
 
 ---
 

@@ -190,6 +190,7 @@ fn pipeline(source: &str, target: &str) -> ResolvedPipeline {
                 .into(),
         ),
         allowed_latency_secs: 1,
+        near_time_poll_interval_secs: 1,
         max_bytes_per_batch: 256 * 1024 * 1024,
         max_files_per_batch: 1_000,
         max_output_rows_per_batch: 5_000_000,

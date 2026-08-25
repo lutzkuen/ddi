@@ -11,6 +11,7 @@ use delta_delta_ingest::gate;
 use delta_delta_ingest::locate::{self, Locator};
 use delta_delta_ingest::metrics::Metrics;
 use delta_delta_ingest::pipeline::{Pipeline, StepOutcome};
+use delta_delta_ingest::publish::near_time::{NearTimeOutcome, NearTimeReader};
 use delta_delta_ingest::trino::TrinoClient;
 use tokio::signal;
 use tokio_util_shim::CancellationToken;
@@ -642,6 +643,18 @@ async fn run_all(
     // pipeline before it finished — which, in `run` mode, is never.
     let mut tasks = tokio::task::JoinSet::new();
     for cfg in pipelines {
+        // A second, independent task for a `near_time` pipeline — its own cursor and
+        // cadence, entirely decoupled from the commit path. Spawned into the same `JoinSet`
+        // so it shares this fleet's shutdown fan-out and "one task's failure is local"
+        // handling, but it is otherwise unrelated to `drive`: see `drive_near_time`.
+        if cfg.publish.as_ref().is_some_and(|m| m.near_time) {
+            let m = metrics.clone();
+            let t = token.clone();
+            let l = locator.clone();
+            let cfg = cfg.clone();
+            tasks.spawn(async move { drive_near_time(cfg, l, m, t, once).await });
+        }
+
         let m = metrics.clone();
         let t = token.clone();
         let l = locator.clone();
@@ -998,6 +1011,110 @@ async fn attempt(
                 // here: `drive` does that once, so a retry is one error, not two.
                 return Err(e);
             }
+        }
+    }
+}
+
+/// One tokio task per `near_time`-enabled pipeline, supervised the same way [`drive`] is,
+/// but entirely independent of it: no shared state beyond the `Arc<PipelineMetrics>` both
+/// tasks look up by name, and one dying never affects the other. See the module doc on
+/// [`delta_delta_ingest::publish::near_time`] for why this exists as a second task rather
+/// than a branch inside `drive`'s own loop — it reads the source directly, on its own
+/// cursor and cadence, so it cannot be folded into a loop paced by `allowed_latency_secs`
+/// and `Pipeline::step`.
+async fn drive_near_time(
+    cfg: ResolvedPipeline,
+    locator: Arc<Locator>,
+    metrics: Metrics,
+    token: CancellationToken,
+    once: bool,
+) -> delta_delta_ingest::Result<()> {
+    let name = cfg.name.clone();
+    let m = metrics.pipeline(&name);
+    let mut backoff = RETRY_MIN;
+    let mut attempts = 0u32;
+
+    loop {
+        match attempt_near_time(&cfg, &locator, &m, &token, once).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if once {
+                    error!(pipeline = %name, "near-time publish: {e}");
+                    return Err(e);
+                }
+                if token.is_cancelled() {
+                    return Ok(());
+                }
+                attempts += 1;
+                let wait = jitter(backoff, &name, attempts);
+                warn!(
+                    pipeline = %name,
+                    retry_in_ms = wait.as_millis() as u64,
+                    attempt = attempts,
+                    "near-time publish failed; retrying independently of the commit path, \
+                     which is unaffected: {e}"
+                );
+                sleep_or_cancel(wait, &token).await;
+                if token.is_cancelled() {
+                    return Ok(());
+                }
+                backoff = RETRY_MAX.min(backoff * 2);
+            }
+        }
+    }
+}
+
+/// Open a near-time reader and poll it until it is done, cancelled, or fails.
+///
+/// Deliberately touches neither `m.up` nor `m.restarts`: those are the main pipeline's
+/// liveness/restart signals, and the README already establishes the principle that publish
+/// activity must never move them — `ddi_pipeline_up` says nothing about whether publish is
+/// failing, and that holds just as much for this path as for the post-commit one.
+/// `PublishStats` still reach the existing `publish_*` counters via `observe_publish`, since
+/// a pipeline runs one publish mode or the other and those counters mean the same thing
+/// either way.
+async fn attempt_near_time(
+    cfg: &ResolvedPipeline,
+    locator: &Arc<Locator>,
+    m: &Arc<delta_delta_ingest::metrics::PipelineMetrics>,
+    token: &CancellationToken,
+    once: bool,
+) -> delta_delta_ingest::Result<()> {
+    let name = cfg.name.clone();
+    let idle = Duration::from_secs(cfg.near_time_poll_interval_secs.max(1));
+
+    if token.is_cancelled() {
+        return Ok(());
+    }
+    // Refreshed once, at open, rather than every poll: a relocation is picked up on this
+    // task's next reopen (any failure, or a process restart), which is less prompt than the
+    // main path's continuous check but consistent with this feature's best-effort framing.
+    let current = locator.refresh(cfg).await;
+    let Some(mut reader) = NearTimeReader::open(&current).await? else {
+        // Not a `near_time` pipeline, or its setup is broken and already warned about —
+        // either way there is nothing to retry.
+        return Ok(());
+    };
+
+    loop {
+        if token.is_cancelled() {
+            info!(pipeline = %name, "near-time publisher stopped");
+            return Ok(());
+        }
+
+        match reader.poll().await {
+            Ok(NearTimeOutcome::CaughtUp) => {
+                if once {
+                    return Ok(());
+                }
+                tokio::time::sleep(idle).await;
+            }
+            Ok(NearTimeOutcome::Polled { published }) => {
+                if let Some(p) = published {
+                    m.observe_publish(&p);
+                }
+            }
+            Err(e) => return Err(e),
         }
     }
 }

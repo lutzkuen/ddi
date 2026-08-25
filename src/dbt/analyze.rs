@@ -73,6 +73,8 @@ pub struct Publication {
     pub group: String,
     /// Compiled SQL rewritten to read `source` — at run time, the committed batch.
     pub sql: String,
+    /// `meta.ddi_publish_near_time`. See [`crate::config::PublishModel::near_time`].
+    pub near_time: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,8 +474,8 @@ fn analyze_publish(manifest: &Manifest, unique_id: &str, node: &Node, name: &str
     // A publication rides on a pipeline's commits, and there are none without one. Asked of
     // the host's own verdict so the reason quoted is the one the analyst will see against
     // that model too, rather than a second opinion that could drift from it.
-    match analyze(manifest, host_id) {
-        Verdict::Streamable(_) => {}
+    let host_lookups = match analyze(manifest, host_id) {
+        Verdict::Streamable(s) => s.lookups,
         other => {
             let detail = other.reason().unwrap_or("it is not streamable").to_string();
             return reject(
@@ -485,7 +487,7 @@ fn analyze_publish(manifest: &Manifest, unique_id: &str, node: &Node, name: &str
                 ),
             );
         }
-    }
+    };
 
     // Append-only in v1, refused here as well as at config load. A merge replaces the row
     // already stored under a key, so the committed batch does not say what the dashboard
@@ -537,6 +539,36 @@ fn analyze_publish(manifest: &Manifest, unique_id: &str, node: &Node, name: &str
         );
     }
 
+    // Same reasoning again: a non-boolean here would silently fall back to the safe default
+    // (the ordinary, post-commit publisher) rather than the low-latency one the analyst
+    // presumably meant to turn on.
+    let near_time = match node.meta_value("ddi_publish_near_time") {
+        None => false,
+        Some(v) => match v.as_bool() {
+            Some(b) => b,
+            None => {
+                return reject(
+                    name,
+                    format!(
+                        "declares meta.ddi_publish_near_time={v}, and it must be a plain \
+                         boolean. Omit the key to use the ordinary, post-commit publisher."
+                    ),
+                )
+            }
+        },
+    };
+    if near_time && !host_lookups.is_empty() {
+        return reject(
+            name,
+            format!(
+                "declares meta.ddi_publish_near_time=true, but {:?} configures lookups. \
+                 Near-time publish reads the source directly and does not yet support \
+                 lookups.",
+                host.name
+            ),
+        );
+    }
+
     // The same rewrite the streaming path uses, so the host relation becomes `source` — which
     // at run time is the committed batch. No new rewriting code: `add_relation_replacements`
     // registers both `schema.table` and `catalog.schema.table`, and the rewriter is CTE-aware.
@@ -578,6 +610,7 @@ fn analyze_publish(manifest: &Manifest, unique_id: &str, node: &Node, name: &str
         kind,
         group,
         sql: rewrite.sql,
+        near_time,
     }))
 }
 

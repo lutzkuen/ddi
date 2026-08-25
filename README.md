@@ -1323,6 +1323,17 @@ Append-only in v1. A merge replaces the row stored under a key, so the committed
 not contain the value it replaced and a delta cannot be derived from it; `ddi_publish` on an
 upserting model is refused.
 
+**Near-time, optionally.** The path above is deliberately downstream of a commit that has
+already succeeded — that is what makes it at-most-once and lets every envelope carry a
+confirmed `target_version`. `ddi_publish_near_time: true` trades that away: instead of
+waiting on the next commit-sized batch (sized for good file sizes, which can take a while
+to accumulate and write), a second, independent reader publishes straight from the source
+on its own cursor and cadence. The commit path is completely unaffected — same batching,
+same file sizes — but the realtime feed for that model is no longer tied to a commit at
+all: `target_version` is always absent, and a restart can resend a batch. See
+[USING_DDI.md](USING_DDI.md) §8 for what that costs a client and what this mode does not
+yet support (lookups, chiefly).
+
 `ddi` does not hold browser connections, mint client access tokens, or serve a negotiate
 endpoint — its only HTTP surface is `/metrics`, and token-minting would mean authenticating
 dashboard users, which it has no notion of. See [USING_DDI.md](USING_DDI.md) §8 for the

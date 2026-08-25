@@ -15,6 +15,11 @@ use crate::transform::validate::{normalise_publish_sql, normalise_sql_with_looku
 fn default_allowed_latency() -> u64 {
     30
 }
+fn default_near_time_poll_interval_secs() -> u64 {
+    // Deliberately far below `allowed_latency_secs`: the whole point of near-time publish is
+    // to not wait for however long a commit-sized batch takes to accumulate and write.
+    2
+}
 fn default_max_bytes() -> String {
     "256MB".into()
 }
@@ -35,6 +40,10 @@ fn default_max_output_rows() -> usize {
 pub struct Defaults {
     #[serde(default = "default_allowed_latency")]
     pub allowed_latency_secs: u64,
+    /// How often a `near_time = true` publisher polls the source, independent of
+    /// `allowed_latency_secs` — see [`PublishModel::near_time`].
+    #[serde(default = "default_near_time_poll_interval_secs")]
+    pub near_time_poll_interval_secs: u64,
     #[serde(default = "default_max_bytes")]
     pub max_bytes_per_batch: String,
     #[serde(default = "default_target_file_size")]
@@ -143,6 +152,7 @@ impl Default for Defaults {
     fn default() -> Self {
         Self {
             allowed_latency_secs: default_allowed_latency(),
+            near_time_poll_interval_secs: default_near_time_poll_interval_secs(),
             max_bytes_per_batch: default_max_bytes(),
             target_file_size: default_target_file_size(),
             max_files_per_batch: default_max_files(),
@@ -249,6 +259,8 @@ pub struct PipelineConfig {
 
     #[serde(default)]
     pub allowed_latency_secs: Option<u64>,
+    #[serde(default)]
+    pub near_time_poll_interval_secs: Option<u64>,
     #[serde(default)]
     pub max_bytes_per_batch: Option<String>,
     #[serde(default)]
@@ -430,6 +442,8 @@ pub struct ResolvedPipeline {
     pub change_policy: ChangePolicy,
     pub transform_sql: Option<String>,
     pub allowed_latency_secs: u64,
+    /// How often a `near_time = true` publisher polls the source. Unused otherwise.
+    pub near_time_poll_interval_secs: u64,
     pub max_bytes_per_batch: u64,
     pub max_files_per_batch: usize,
     pub max_output_rows_per_batch: usize,
@@ -747,6 +761,20 @@ pub struct PublishModel {
     pub group: String,
     /// A single SELECT over `source`, which at run time is the committed batch.
     pub publish_sql: String,
+
+    /// Publish from the source directly, on its own cursor and cadence, instead of from the
+    /// committed batch after the target commit lands.
+    ///
+    /// Off by default: the ordinary mode is downstream of a Delta commit that has already
+    /// succeeded, which is what makes it at-most-once and lets every envelope carry a
+    /// confirmed `target_version`. `near_time` trades that away for latency — it polls the
+    /// source independently of the target commit (see [`crate::publish::near_time`]), so
+    /// `target_version` is always absent, a transient failure that is retried can resend a
+    /// batch, and a restart can replay a bounded window already sent. It replaces the
+    /// ordinary post-commit publish for this model rather than running alongside it, so a
+    /// group only ever carries one gap-detection chain.
+    #[serde(default)]
+    pub near_time: bool,
 }
 
 /// Why this pipeline must not publish, if it must not.
@@ -1390,6 +1418,16 @@ impl Config {
             return (None, None);
         }
 
+        if model.near_time && !p.lookups.is_empty() {
+            tracing::warn!(
+                pipeline = %p.name,
+                model = %model.model,
+                "not publishing: near-time publish does not yet support pipelines with \
+                 lookups. The Delta stream is unaffected."
+            );
+            return (None, None);
+        }
+
         let Some(sink) = &self.publish else {
             tracing::info!(
                 pipeline = %p.name,
@@ -1627,6 +1665,9 @@ impl Config {
             change_policy: p.change_policy,
             transform_sql,
             allowed_latency_secs: p.allowed_latency_secs.unwrap_or(d.allowed_latency_secs),
+            near_time_poll_interval_secs: p
+                .near_time_poll_interval_secs
+                .unwrap_or(d.near_time_poll_interval_secs),
             max_bytes_per_batch: max_bytes,
             max_files_per_batch: p.max_files_per_batch.unwrap_or(d.max_files_per_batch),
             max_output_rows_per_batch: p
@@ -2432,6 +2473,61 @@ hub = "ddi"
     }
 
     #[test]
+    fn near_time_defaults_to_off_and_the_poll_interval_defaults_to_two_seconds() {
+        let r = Config::from_toml_str(&publishing_toml(PUBLISH_SINK))
+            .unwrap()
+            .resolve_all()
+            .unwrap();
+        let p = only(&r);
+        assert!(!p.publish.as_ref().unwrap().near_time);
+        assert_eq!(p.near_time_poll_interval_secs, 2);
+    }
+
+    #[test]
+    fn near_time_and_its_poll_interval_can_be_set() {
+        let toml = format!(
+            "{PUBLISH_SINK}\n[[pipeline]]\nname = \"orders\"\napp_id = \"ddi.orders\"\n\
+             source_uri = \"/tmp/bronze/orders\"\ntarget_uri = \"/tmp/silver/orders\"\n\
+             near_time_poll_interval_secs = 1\n\
+             [pipeline.publish]\nmodel = \"orders_live\"\nkind = \"webpubsub\"\n\
+             group = \"sales\"\nnear_time = true\n\
+             publish_sql = \"SELECT country, sum(amount) AS d FROM source GROUP BY country\"\n"
+        );
+        let r = Config::from_toml_str(&toml).unwrap().resolve_all().unwrap();
+        let p = only(&r);
+        assert!(p.publish.as_ref().unwrap().near_time);
+        assert_eq!(p.near_time_poll_interval_secs, 1);
+    }
+
+    #[test]
+    fn near_time_is_refused_for_a_pipeline_that_configures_lookups() {
+        // Near-time publish reads the source directly and does not run the pinned-snapshot
+        // machinery lookups need, so the combination is refused rather than silently
+        // running without them.
+        let toml = format!(
+            "{PUBLISH_SINK}\n[[pipeline]]\nname = \"orders\"\napp_id = \"ddi.orders\"\n\
+             source_uri = \"/tmp/bronze/orders\"\ntarget_uri = \"/tmp/silver/orders\"\n\
+             transform_sql = \"SELECT o.country, o.amount FROM source AS o LEFT JOIN \
+             fx_rates AS fx ON fx.currency = o.currency\"\n\
+             [pipeline.publish]\nmodel = \"orders_live\"\nkind = \"webpubsub\"\n\
+             group = \"sales\"\nnear_time = true\n\
+             publish_sql = \"SELECT country, sum(amount) AS d FROM source GROUP BY country\"\n\
+             [[pipeline.lookups]]\nname = \"fx_rates\"\nuri = \"/tmp/fx_rates\"\n"
+        );
+        let r = Config::from_toml_str(&toml).unwrap().resolve_all().unwrap();
+        let p = only(&r);
+        assert!(
+            p.publish.is_none(),
+            "lookups and near-time publish do not yet mix"
+        );
+        assert!(
+            r.rejected.is_empty(),
+            "but the pipeline still streams: {:?}",
+            r.rejected
+        );
+    }
+
+    #[test]
     fn no_publish_table_means_no_publisher_and_the_pipeline_still_runs() {
         let r = Config::from_toml_str(&publishing_toml(""))
             .unwrap()
@@ -2551,6 +2647,7 @@ hub = "ddi"
             kind: PublisherKind::Webpubsub,
             group: "style".into(),
             publish_sql: "SELECT count(*) AS c FROM source".into(),
+            near_time: false,
         });
         let reason = publish_problem(&p).expect("a staged upsert must not publish");
         assert!(reason.contains("staged_upsert"), "got: {reason}");

@@ -159,6 +159,7 @@ mod tests {
             change_policy: Default::default(),
             transform_sql: None,
             allowed_latency_secs: 1,
+            near_time_poll_interval_secs: 1,
             max_bytes_per_batch: 1,
             max_files_per_batch: 1,
             max_output_rows_per_batch: 1,
