@@ -48,6 +48,13 @@ cargo build --release          # binary at target/release/ddi
 On a small machine, `cargo build --profile release-lean` trades some runtime speed for a
 build that fits in about 2 GB.
 
+A pre-built image is also published on every push to `main`, tagged by commit SHA — pin
+to that SHA rather than a moving tag:
+
+```bash
+docker pull ghcr.io/lutzkuen/ddi:<commit-sha>
+```
+
 ---
 
 ## 3. Prepare your tables
