@@ -35,6 +35,19 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      # A release tag (`vX.Y.Z`) asserts a version; the binary itself asserts one too, via
+      # `#[command(version)]` in main.rs, which prints Cargo.toml's version at compile time.
+      # Nothing else keeps those in sync — catch a mismatch here, before it ships as an
+      # image whose `--version` output contradicts the tag it was pushed under.
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
       # The image was never built here, which is how a binary that could not start got
       # published: `docker build` does not execute what it copies, so the build stage
       # succeeded and the breakage waited for whoever first ran the container.
@@ -46,16 +59,31 @@ jobs:
       # Downstream repos (e.g. dat_kafka_connect's dat-ddi/Dockerfile) pin DDI_REF to an
       # exact commit and otherwise rebuild this whole dependency tree from scratch on every
       # bump. Pushing here, tagged by SHA, gives them a pre-built image to pull instead.
-      # PRs stay local-only: nothing to publish yet, and a fork PR's GITHUB_TOKEN can't
-      # push to ghcr.io regardless.
-      - name: Compute image tag
+      # A release tag additionally gets a human-readable `:<version>` and a `:latest` that
+      # tracks the newest release, not the newest commit. PRs stay local-only: nothing to
+      # publish yet, and a fork PR's GITHUB_TOKEN can't push to ghcr.io regardless.
+      - name: Compute image tags
         id: tag
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "value=ddi:ci" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=ghcr.io/${{ github.repository }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            echo "primary=ddi:ci" >> "$GITHUB_OUTPUT"
+            echo "all=ddi:ci" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          repo="ghcr.io/${{ github.repository }}"
+          sha_tag="$repo:${{ github.sha }}"
+          echo "primary=$sha_tag" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "all<<TAGS"
+            echo "$sha_tag"
+            if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+              echo "$repo:${GITHUB_REF_NAME#v}"
+              echo "$repo:latest"
+            fi
+            echo "TAGS"
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
         if: github.event_name != 'pull_request'
         with:
@@ -68,13 +96,14 @@ jobs:
           file: docker/Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           load: ${{ github.event_name == 'pull_request' }}
-          tags: ${{ steps.tag.outputs.value }}
+          tags: ${{ steps.tag.outputs.all }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       # Again from the outside, because the in-image RUN proves it starts during the build
       # and this proves it starts the way an operator will invoke it. On a push, this pulls
-      # the image just published above — `docker run` fetches it implicitly.
-      - run: docker run --rm ${{ steps.tag.outputs.value }} --version
+      # the image just published above — `docker run` fetches it implicitly. Any one of the
+      # tags just pushed names the same image, so the primary (SHA) tag is enough here.
+      - run: docker run --rm ${{ steps.tag.outputs.primary }} --version
 
   licenses:
     name: licence policy

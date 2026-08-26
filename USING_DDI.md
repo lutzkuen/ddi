@@ -55,6 +55,14 @@ to that SHA rather than a moving tag:
 docker pull ghcr.io/lutzkuen/ddi:<commit-sha>
 ```
 
+Tagged releases (`vX.Y.Z`) additionally publish `:X.Y.Z` and `:latest` — the newest
+release, not the newest commit:
+
+```bash
+docker pull ghcr.io/lutzkuen/ddi:0.2.0
+docker pull ghcr.io/lutzkuen/ddi:latest
+```
+
 ---
 
 ## 3. Prepare your tables
