@@ -34,6 +34,15 @@ pub struct Streamable {
     pub target_relation: String,
     /// The compiled SQL rewritten to read `source`. `None` for a straight copy.
     pub transform_sql: Option<String>,
+    /// Where to start reading the source when this pipeline has never committed.
+    ///
+    /// Declared on the *source*, as `meta.ddi_starting_version`, because it is a fact about
+    /// that relation's log rather than about the model: the version it names is one the
+    /// source's own `delta.logRetentionDuration` has not reclaimed. `None` means version 0 —
+    /// the whole log — which is what every model wants until its source is old enough to have
+    /// lost the beginning of it. See [`crate::Error::BootstrapUnreachable`], which is what
+    /// asks an operator to set this and tells them the value.
+    pub starting_version: Option<u64>,
 }
 
 /// One dbt-declared lookup relation used by a streamable model.
@@ -240,6 +249,31 @@ pub fn analyze(manifest: &Manifest, unique_id: &str) -> Verdict {
     }
     let (source_unique_id, source) = sources[0];
 
+    // Validated rather than defaulted, and loudly: a `meta` block is an untyped map, so
+    // `ddi_starting_version: "tenn"` would otherwise read as "not set" and leave the pipeline
+    // failing exactly as it did before somebody tried to fix it. Accepts a string as well as a
+    // number because several dbt codegen paths quote everything, which is the same latitude
+    // `ddi_lookup_pre_history_version` gives for the same reason.
+    let starting_version = match source.meta_value("ddi_starting_version") {
+        None => None,
+        Some(value) => match value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        {
+            Some(version) => Some(version),
+            None => {
+                return reject(
+                    &name,
+                    format!(
+                        "source {} declares ddi_starting_version={value}; it must be a \
+                         non-negative Delta version",
+                        source.qualified()
+                    ),
+                );
+            }
+        },
+    };
+
     let mut lookup_names = BTreeSet::new();
     let mut streamable_lookups = Vec::with_capacity(lookups.len());
     for (unique_id, lookup, lookup_name) in lookups {
@@ -347,6 +381,7 @@ pub fn analyze(manifest: &Manifest, unique_id: &str) -> Verdict {
         lookups: streamable_lookups,
         target_relation: node.qualified(),
         transform_sql: Some(rewrite.sql),
+        starting_version,
     }))
 }
 

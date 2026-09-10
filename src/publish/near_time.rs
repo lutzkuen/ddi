@@ -118,6 +118,7 @@ impl NearTimeReader {
 
         let stream = LogStreamBuilder::new(&source)
             .with_starting_cursor(cursor)
+            .with_source_uri(&cfg.source_uri)
             .with_change_policy(cfg.change_policy)
             .with_max_files_per_batch(cfg.max_files_per_batch)
             .with_max_bytes_per_batch(cfg.max_bytes_per_batch);

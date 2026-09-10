@@ -651,6 +651,64 @@ What it will not do is skip the commit or read the compacted replacements instea
 files hold the missing rows, but they hold already-consumed rows too, and nothing in a
 compaction says which are which. Prevention is the source's retention setting, above.
 
+### A pipeline that has never run, on a source older than its log retention
+
+`delta.logRetentionDuration` is 30 days by default, so a source that has been live longer
+than that no longer has a version 0. A pipeline declared against it but not yet run is
+configured to start from a version that no longer exists, and it cannot start at all:
+
+```
+ERROR ddi: pipeline failed; retrying. Other pipelines are unaffected. pipeline has never
+committed and cannot start: starting_version = 0 is no longer in the commit log of
+abfss://raw@acct.dfs.core.windows.net/orders. The oldest version the log still holds is
+1203 (committed 2026-08-11T03:14:00+00:00), and the head is 1290.
+```
+
+Nothing unusual has to have happened, and no `VACUUM` is involved — this is the ordinary
+default catching up with a pipeline that was declared and then left alone. Its neighbours
+in the same process are unaffected, and a pipeline that had already committed once is
+unaffected too, because it resumes from its own `txn` action rather than from
+`starting_version`.
+
+The recovery is the one value the message names, set once:
+
+```toml
+starting_version = 1203
+```
+
+or, for a dbt-managed deployment, on the **source** the model reads:
+
+```yaml
+sources:
+  - name: raw
+    tables:
+      - name: orders
+        meta:
+          ddi_starting_version: 1203
+```
+
+Be clear about what that accepts: rows the source wrote before version 1203 are not
+ingested by this pipeline, and will not be. Nothing still readable is skipped — no earlier
+version survives in the log at all — but if the target has to hold those rows, something
+else has to load them from a snapshot of the source. The message prints the floor's own
+commit timestamp so that decision is about a date rather than a version number.
+
+The value is consumed exactly once. The first batch writes a `txn` action, after which
+`starting_version` is never consulted again for this `app_id`, so it cannot re-skip anything
+later — and leaving it in the config is correct, because it is also the right answer if the
+pipeline is ever restarted from scratch.
+
+Two things that do work for a pipeline which *has* committed do nothing here, for the same
+reason in both cases: there is no `txn` action to clear. Recreating the target changes
+nothing, and neither does a new `app_id`.
+
+Alert on `ddi_bootstrap_unreachable == 1`. It is held until a step succeeds, so it does not
+flap, and it is deliberately a different series from `ddi_resume_unreachable` — that one
+means a pipeline which *had* committed can no longer read what it owed the target, which no
+setting recovers and which needs a deliberate rebuild. One is a value to set; the other is a
+maintenance window. To prevent either, raise `delta.logRetentionDuration` on the source
+above the longest gap you intend to allow between declaring a pipeline and first running it.
+
 ### Deletes and updates upstream
 
 By default a `DELETE`, `UPDATE` or `MERGE` on the source stops the pipeline rather than
@@ -723,7 +781,9 @@ column in silver, an upsert will not blank it.
 | `is not usable` | `[runtime] temp_directory` cannot be created or written to, checked with a real probe file at startup — in Kubernetes this is usually an unmounted volume |
 | `would need about ... passes` | The target's key space is far larger than `[runtime] max_grain_check_memory`; raise it, or set `upsert_grain_check = "off"` |
 | `upsert_grain_check = "off"` | A warning, on every start: the target is *not* being checked for duplicate keys, and that is your assertion rather than a verified fact |
-| `cannot resume from ...` | The source's *log* no longer reaches that version — `delta.logRetentionDuration` (30 days by default), not the file retention above; recreate the target or use a new `app_id`, with `starting_version` past it |
+| `cannot resume from ...` | The source's *log* no longer reaches the version this pipeline must resume at — `delta.logRetentionDuration` (30 days by default), not the file retention above. Rows it owed the target are gone; `starting_version` cannot help, because it is consulted only while no `txn` action exists. Recreate the target, or use a new `app_id` |
+| `pipeline has never committed and cannot start` | Same cause, but nothing has been committed yet, so it is recoverable: set `starting_version` to the version the message names. See below |
+| `delta error: Invalid table version: 0` | Fixed in this version, and it was the above misreported. If you still see it, the binary predates the fix |
 
 Logs are quiet by default. `RUST_LOG=debug,delta_delta_ingest=trace` for detail.
 

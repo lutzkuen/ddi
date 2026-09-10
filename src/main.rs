@@ -816,7 +816,20 @@ async fn drive(
                 // retry already waits. Not fatal, deliberately: the cause may be a
                 // neighbour's transient merge rather than this pipeline's own size, and that
                 // heals.
-                if matches!(e, delta_delta_ingest::Error::Capacity(_)) {
+                // The same argument for the two halves of a source log that no longer reaches
+                // the version this pipeline needs. Neither heals by itself — one waits for a
+                // value an operator sets, the other for a rebuild they perform — and both are
+                // raised while *opening*, which rereads the target to find its watermark. At
+                // one second that is a rescan of the target every second, for days, per stuck
+                // pipeline, for nothing. The gauges are what make the wait safe to take:
+                // `ddi_bootstrap_unreachable` and `ddi_resume_unreachable` say a human is
+                // needed, so nobody is relying on the retry to notice.
+                if matches!(
+                    e,
+                    delta_delta_ingest::Error::Capacity(_)
+                        | delta_delta_ingest::Error::BootstrapUnreachable { .. }
+                        | delta_delta_ingest::Error::CursorUnavailable { .. }
+                ) {
                     backoff = RETRY_MAX;
                 }
                 let wait = jitter(backoff, &name, attempts);

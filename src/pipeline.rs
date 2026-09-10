@@ -148,9 +148,20 @@ impl Pipeline {
         let lookup_validation = validate_lookup_tables(&cfg, &source, &target).await?;
 
         let offsets = OffsetStore::new(&cfg.app_id, cfg.starting_version);
-        let cursor = resume_cursor(&cfg, &offsets, &source, &target).await?;
+        let resume = resume_cursor(&cfg, &offsets, &source, &target).await?;
 
-        let cursor = adjust_for_replaced_source(&cfg, &source, &target, cursor).await?;
+        let cursor =
+            adjust_for_replaced_source(&cfg, &source, &target, resume.cursor, resume.bootstrapping)
+                .await?;
+
+        // After the adjustment, because a replaced source restarts from `starting_version` and
+        // it is the version actually about to be read that has to be readable. Before the
+        // stream, because this is the failure the stream could not describe: it died resolving
+        // the source's head, which every poll does first, so no cursor of ours was ever
+        // implicated in the error an operator saw.
+        if resume.bootstrapping {
+            refuse_an_unreachable_bootstrap(&cfg, &source, cursor).await?;
+        }
 
         let target_schema: SchemaRef = target
             .snapshot()
@@ -160,6 +171,7 @@ impl Pipeline {
 
         let stream = LogStreamBuilder::new(&source)
             .with_starting_cursor(cursor)
+            .with_source_uri(&cfg.source_uri)
             .with_change_policy(cfg.change_policy)
             .with_max_files_per_batch(cfg.max_files_per_batch)
             .with_max_bytes_per_batch(cfg.max_bytes_per_batch)
@@ -1313,12 +1325,20 @@ async fn adjust_for_replaced_source(
     source: &DeltaTable,
     target: &DeltaTable,
     cursor: StreamCursor,
+    bootstrapping: bool,
 ) -> Result<StreamCursor> {
-    let head = source
-        .log_store()
-        .get_latest_version(0)
-        .await
-        .map_err(Error::Delta)?;
+    // `source` is already loaded — `Storage::open` loads it — so its snapshot version *is*
+    // the head, and asking the log store again would be both a second round trip and a
+    // liability: `get_latest_version` floors the kernel's log segment at the version it is
+    // given, so the hardcoded `0` this used to pass failed outright once the source's own
+    // `delta.logRetentionDuration` reclaimed commit 0. That failure arrived here, in
+    // `Pipeline::open`, as `delta error: Invalid table version: 0` — before the stream
+    // existed, which is why none of this module's own errors could describe it.
+    //
+    // Reading it off the snapshot is also not staler in a direction that matters: a commit
+    // landing between the open and this line lowers the head relative to now, which makes
+    // `log_went_backwards` *less* likely to fire, never more.
+    let head = source.version();
 
     // Identity is the reliable signal. The log going backwards is the fallback for
     // targets written before we recorded it.
@@ -1327,7 +1347,15 @@ async fn adjust_for_replaced_source(
         .source_table_id;
     let current = table_id(source);
     let different_table = matches!((&recorded, &current), (Some(a), Some(b)) if a != b);
-    let log_went_backwards = cursor.version > head.saturating_add(1);
+    // "Backwards" is a comparison against a position this pipeline reached, so a pipeline
+    // that has never committed has nothing for the log to have gone backwards *from*. Its
+    // cursor is the configured `starting_version`, and a `starting_version` above the head is
+    // a source that has not produced that commit yet — which the reader already treats as
+    // "caught up", not as an error. Without this guard that config read as a dropped and
+    // recreated source, and a pipeline told to start ahead of its source either refused to
+    // open or restarted from the same version forever.
+    let log_went_backwards =
+        !bootstrapping && matches!(head, Some(h) if cursor.version > h.saturating_add(1));
 
     if !different_table && !log_went_backwards {
         return Ok(cursor);
@@ -1377,16 +1405,32 @@ async fn resume_cursor(
     offsets: &OffsetStore,
     source: &DeltaTable,
     target: &DeltaTable,
-) -> Result<StreamCursor> {
-    let own = offsets.resume_cursor(target).await?;
+) -> Result<Resume> {
+    let stored = offsets.last_committed_version(target).await?;
+    // Taken from the one authority on it rather than inferred from the cursor, because every
+    // other signal is ambiguous in the direction that matters. A cursor equal to
+    // `starting_version` does not mean "never committed" — a rebuilt target resolves to the
+    // same value through the branches below — and an empty target does not mean it either,
+    // since a `txn` action outlives the rows it was committed with.
+    let bootstrapping = stored.is_none();
+    let own = match stored {
+        Some(v) => StreamCursor::at_version(v + 1),
+        None => StreamCursor::at_version(cfg.starting_version),
+    };
 
     if cfg.watermark_uri.is_none() && cfg.dedup_timestamp.is_none() {
-        return Ok(own);
+        return Ok(Resume {
+            cursor: own,
+            bootstrapping,
+        });
     }
 
     let state = watermark::target_state(target, &cfg.app_id, watermark::DEFAULT_MAX_SCAN).await?;
     let watermark::TargetState::OverwrittenAt(at) = state else {
-        return Ok(own);
+        return Ok(Resume {
+            cursor: own,
+            bootstrapping,
+        });
     };
 
     // dedup_key needs no cooperation from the rebuilding writer, so it is tried first: the
@@ -1421,7 +1465,15 @@ async fn resume_cursor(
             "target was rebuilt by another writer; rescanning and skipping rows the target \
              already covers"
         );
-        return Ok(from);
+        // Not a bootstrap, whatever the txn action says. Another writer has rewritten this
+        // target and the position above was derived from what that rewrite left behind, so
+        // there is coverage here to lose — which is exactly what the bootstrap recovery is
+        // allowed to assume there is not. A cursor that then turns out to be unreadable has
+        // to read as the refusal it is, not as an invitation to move `starting_version`.
+        return Ok(Resume {
+            cursor: from,
+            bootstrapping: false,
+        });
     }
 
     let uri = cfg
@@ -1455,7 +1507,114 @@ async fn resume_cursor(
              offset"
         );
     }
-    Ok(reset)
+    // Same argument as the dedup branch: dbt's watermark is an assertion about what the
+    // target already covers, so this position is not a bootstrap even when no txn action of
+    // ours survives the rebuild.
+    Ok(Resume {
+        cursor: reset,
+        bootstrapping: false,
+    })
+}
+
+/// Where a pipeline resumes, and whether it has ever committed.
+///
+/// The second half is carried rather than recomputed because two decisions downstream turn on
+/// it and both are unsafe to guess. `adjust_for_replaced_source` may only call a log
+/// "backwards" relative to a position this pipeline actually reached, and
+/// `refuse_an_unreachable_bootstrap` may only offer to move `starting_version` forward when
+/// nothing depends on the versions that would be skipped.
+#[derive(Clone, Copy, Debug)]
+struct Resume {
+    cursor: StreamCursor,
+    /// True only when the target holds no `txn` action for this `app_id` *and* the cursor is
+    /// the configured `starting_version` rather than a position derived from another writer's
+    /// coverage of the target. Both halves are load-bearing: the first is the only authority
+    /// on "has this pipeline ever committed", and the second keeps a dbt handover — where the
+    /// target is populated and its watermark says which rows are missing — out of a recovery
+    /// whose whole premise is that there is no such claim to honour.
+    bootstrapping: bool,
+}
+
+/// Refuse to start a pipeline whose first version the source's log no longer holds.
+///
+/// The condition this exists for reached an operator as `delta error: Invalid table version:
+/// 0`, repeated every five minutes in a shared process log, and nothing in it named the
+/// pipeline, the table, the versions involved, or a way out — see
+/// [`crate::Error::BootstrapUnreachable`], and `LogStreamBuilder::latest_version` for why
+/// version 0 was what got blamed.
+///
+/// Only reachable for a pipeline that has never committed, which is what makes it an error
+/// with a cheap answer rather than an error about lost data: there is no offset to contradict,
+/// so the operator may simply say where to start instead. The committed case stays with
+/// [`crate::Error::CursorUnavailable`], raised from the reader, and keeps its refusal.
+async fn refuse_an_unreachable_bootstrap(
+    cfg: &ResolvedPipeline,
+    source: &DeltaTable,
+    cursor: StreamCursor,
+) -> Result<()> {
+    // One HEAD request on the commit this pipeline is about to read, and only for a pipeline
+    // that has never committed — so it is paid once per open for a pipeline that is starting,
+    // and never again after its first batch lands.
+    if source
+        .log_store()
+        .read_commit_entry(cursor.version)
+        .await
+        .map_err(Error::Delta)?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let head = source.version();
+
+    // Above the head is "not yet", not "no longer": the source has not written that commit.
+    // The reader already treats it as caught up, and turning it into an error here would
+    // break a pipeline deployed ahead of the source it reads. Said out loud all the same,
+    // because a pipeline that is idle and healthy-looking for a reason nobody chose is the
+    // one failure mode worse than a loud loop.
+    if matches!(head, Some(h) if cursor.version > h) {
+        warn!(
+            pipeline = %cfg.name,
+            source_uri = %cfg.source_uri,
+            starting_version = cursor.version,
+            source_head = ?head,
+            "pipeline has never committed and starts above the source's head, so it will \
+             ingest nothing until the source reaches that version. If that is not \
+             deliberate, starting_version is set too high."
+        );
+        return Ok(());
+    }
+
+    let (oldest_available, committed_at) =
+        match crate::source::earliest_readable_commit(source).await? {
+            Some((v, at)) => (v, at),
+            // No commit JSON at all. The snapshot was rebuilt from a checkpoint, so the table
+            // reads, but nothing in the log can be streamed and no version would be a safe answer
+            // to substitute. Named rather than returned as a `delta error` for the same reason
+            // this function exists.
+            None => {
+                return Err(Error::Other(format!(
+                    "pipeline {:?}: the commit log of {:?} holds no commit files at all, so \
+                 there is no version this pipeline can start from. Its snapshot still reads, \
+                 which means a checkpoint survived a log cleanup that took every commit with \
+                 it. Nothing can be streamed from this table until it is written to again; a \
+                 pipeline pointed at it has to be started from a version that does not yet \
+                 exist, or the target loaded from a snapshot of the source by other means.",
+                    cfg.name, cfg.source_uri
+                )));
+            }
+        };
+
+    Err(Error::BootstrapUnreachable {
+        source_uri: cfg.source_uri.clone(),
+        configured: cursor.version,
+        oldest_available,
+        oldest_available_committed_at: committed_at.map(|at| at.to_rfc3339()),
+        // The snapshot's version, so this agrees with `oldest_available` about which log was
+        // read. `unwrap_or(oldest_available)` is unreachable for a loaded table and is the
+        // only answer that cannot read as a gap wider than the log.
+        head: head.unwrap_or(oldest_available),
+    })
 }
 
 /// Re-attach Delta partition values, which live in the log rather than in the parquet.

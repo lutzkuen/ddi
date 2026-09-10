@@ -608,10 +608,13 @@ Because the process no longer exits when a stream dies, metrics stop being optio
 | `ddi_pipeline_seconds_since_progress` | Staleness. Still moves when a pipeline fails while *opening*, which lag does not. |
 | `ddi_pipeline_restarts_total` | Reopens after a failure. Climbing steadily = stuck on something a human must fix. |
 | `ddi_source_file_vacuumed` | 1 while a stream is stuck on a source file that no longer exists. The one failure waiting does not fix. |
+| `ddi_bootstrap_unreachable` | 1 while a pipeline that has never committed cannot start, because its `starting_version` has aged out of the source's log. Recoverable by setting a version the log still holds. |
+| `ddi_resume_unreachable` | 1 while a pipeline that *has* committed cannot read the version it must resume at. Not recoverable by configuration. |
 | `ddi_rows_rejected_total` | Rows sent to the data-quality table. |
 | `ddi_batches_fully_rejected_total` | Batches where *every* row was rejected. |
 
-Alert on `ddi_pipeline_up == 0 for 10m`, on `ddi_source_file_vacuumed == 1`, and on
+Alert on `ddi_pipeline_up == 0 for 10m`, on `ddi_source_file_vacuumed == 1`, on
+`ddi_bootstrap_unreachable == 1` and `ddi_resume_unreachable == 1`, and on
 `increase(ddi_batches_fully_rejected_total[15m]) > 0`. The last one matters more than it
 looks: there is no bad-row threshold, so an upstream type change quarantines the whole batch
 and the target simply stops growing — no error, no lag, nothing else to notice it by.
@@ -676,6 +679,14 @@ Two recoveries are safe, and which one applies is a question about your storage,
   Recreate the table, or give the pipeline a new `app_id`. Which rebuild is right is not
   something `ddi` will decide: an append target and an upsert target need different ones,
   the target may have been read downstream already, and only you know which.
+
+The same `starting_version` rule read the other way is what makes the *bootstrap* case
+cheap: a pipeline that has never committed holds no `txn` action, so `starting_version` is
+still live and saying where to start is the whole recovery. `ddi` keeps the two apart —
+`ddi_bootstrap_unreachable` against `ddi_resume_unreachable`, and two differently worded
+errors — precisely so that nobody schedules a rebuild for a target that has never been
+written to. See [A pipeline that has never run, on a source older than its log
+retention](USING_DDI.md#a-pipeline-that-has-never-run-on-a-source-older-than-its-log-retention).
 
 What `ddi` will *not* do is skip the commit, or quietly treat the compaction's output as an
 equivalent batch. Both would produce a target that is wrong in a way nothing downstream
@@ -1410,6 +1421,8 @@ correctness still holds (the `txn` action prevents double-apply) — it just was
 | `ddi_pipeline_config_valid` | gauge | 1 when the configuration was accepted, 0 when the pipeline was held back at load and never started. |
 | `ddi_pipeline_seconds_since_progress` | gauge | Since the last completed step; -1 before the first. |
 | `ddi_source_file_vacuumed` | gauge | 1 while the pipeline is stopped on a source data file the object store no longer has. |
+| `ddi_bootstrap_unreachable` | gauge | 1 while a pipeline that has never committed cannot start: its `starting_version` is no longer in the source's commit log. Recoverable — set a version the log still holds, accepting the gap. Cleared only by a step that succeeds. |
+| `ddi_resume_unreachable` | gauge | 1 while a pipeline that has committed cannot read the version it must resume at. Rows it owed the target are gone; needs a deliberate rebuild, not a setting. Cleared only by a step that succeeds. |
 | `ddi_capacity_exhausted` | gauge | 1 once this pipeline ran out of spill space or memory. Raised, never lowered; cleared by a step that succeeds. |
 | `ddi_grain_check_passes` | gauge | Passes the last startup uniqueness check took over this target's key column. 0 in append mode. |
 | `ddi_spill_bytes` | gauge | Bytes DataFusion currently holds in its temporary directory, process-wide (no `pipeline` label). |
@@ -1454,6 +1467,10 @@ from.
 Alert on **`ddi_pipeline_up == 0 for 10m`** for a stream that is down, on
 **`ddi_source_file_vacuumed == 1`** for one that will not come back without a human (see
 [A source file that is no longer there](#a-source-file-that-is-no-longer-there)), on
+**`ddi_bootstrap_unreachable == 1`** for a pipeline that has never managed to start and needs
+one value set, on **`ddi_resume_unreachable == 1`** for one that has committed and can no
+longer read what it owed its target — the two are separate series because one is a config
+change and the other a maintenance window — on
 **`increase(ddi_batches_fully_rejected_total[15m]) > 0`** for a target that has silently
 stopped growing, and on `ddi_source_lag_versions` for backlog. Use
 `ddi_pipeline_seconds_since_progress` rather than lag where the failure might be in startup:

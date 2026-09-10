@@ -50,6 +50,13 @@ name       = "orders_header"
 app_id     = "ddi.orders_header"
 source_uri = "abfss://lake@acct.dfs.core.windows.net/bronze/orders"
 target_uri = "abfss://lake@acct.dfs.core.windows.net/silver/orders"
+# Where to start when this pipeline has never committed. 0 is the whole log.
+#
+# Consulted ONLY while the target holds no `txn` action for this `app_id` — so it is read
+# once, on a pipeline's first run, and never again. That also makes it the recovery when a
+# source has outlived its own `delta.logRetentionDuration` (30 days by default) and version 0
+# is gone: set this to a version the log still holds, which `ddi` names in the error, and
+# accept that rows written before it are not ingested.
 starting_version = 0
 # fail | skip_change_commits | ignore_changes
 change_policy    = "fail"

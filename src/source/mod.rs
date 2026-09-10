@@ -7,4 +7,6 @@ pub mod cursor;
 pub mod log_stream;
 
 pub use cursor::{StreamCursor, Version};
-pub use log_stream::{classify, ChangePolicy, CommitClass, LogBatch, LogStreamBuilder};
+pub use log_stream::{
+    classify, earliest_readable_commit, ChangePolicy, CommitClass, LogBatch, LogStreamBuilder,
+};

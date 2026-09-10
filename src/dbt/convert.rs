@@ -116,7 +116,9 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
             source_uri,
             target_uri,
             lookups,
-            starting_version: 0,
+            // 0 unless the source said otherwise, which is the whole log and the right answer
+            // until the source is old enough to have lost the start of it.
+            starting_version: s.starting_version.unwrap_or(0),
             change_policy: Default::default(),
             transform_sql: s.transform_sql.clone(),
             allowed_latency_secs: None,

@@ -77,14 +77,92 @@ pub enum Error {
         writer: i32,
     },
 
-    /// The requested resume point is no longer readable.
+    /// The resume point of a pipeline that has already started is no longer readable.
+    ///
+    /// Raised from the stream, which is reached only once the point the pipeline opened at
+    /// *was* readable — so this is the commit that went missing underneath a running
+    /// pipeline, and [`Self::BootstrapUnreachable`] is the one that fires before a pipeline
+    /// has ever started. They are separate variants because the recoveries are opposites: a
+    /// pipeline that has never committed can be told where to start instead, and one that
+    /// has cannot.
     #[error(
-        "cannot resume from {cursor}: the source's commit log no longer contains version \
-         {}. The log has most likely been truncated by VACUUM or a log-retention policy. \
-         Choose a newer starting_version, or rebuild the target from scratch.",
+        "cannot resume from {cursor}: the commit log of {source_uri} no longer contains \
+         version {}. Most likely a log-retention policy reclaimed it — \
+         delta.logRetentionDuration, 30 days by default, which is a different setting from \
+         the file retention behind a vacuumed-file error.\n\
+         \n\
+         If this pipeline has already committed to this target, that version held rows it \
+         was responsible for, and they cannot be recovered from the log. Note in particular \
+         what does *not* work: starting_version cannot move the resume point, because it is \
+         consulted only while the target holds no txn action for this app_id, and a txn \
+         action survives an overwrite. So an in-place rebuild resumes here again. Recreate \
+         the target table, or give the pipeline a new app_id — and which rebuild is right is \
+         a decision only you can make, because an append target and an upsert target need \
+         different ones and something downstream may already have read this one.\n\
+         \n\
+         To stop it recurring, raise delta.logRetentionDuration on the source above the \
+         longest outage or backlog you intend to allow, and keep it at or above \
+         delta.deletedFileRetentionDuration — a log that outlives the files it names buys \
+         nothing.",
         .cursor.version
     )]
-    CursorUnavailable { cursor: StreamCursor },
+    CursorUnavailable {
+        // Not `source`: thiserror reads a field of that name as the error's cause.
+        source_uri: String,
+        cursor: StreamCursor,
+    },
+
+    /// The version a pipeline would start from aged out before it ever committed.
+    ///
+    /// The bootstrap twin of [`Self::CursorUnavailable`], and its own variant because this is
+    /// the one form of the condition whose recovery costs nothing. The target holds no txn
+    /// action for this app_id, so no commit of this pipeline's depends on the versions the
+    /// log has lost, and `starting_version` is still consulted — which it stops being the
+    /// moment one batch lands. Without the distinction an operator is told to rebuild a
+    /// target that has never been written to.
+    ///
+    /// It also exists because of what the log said before it: `delta error: Invalid table
+    /// version: 0`, raised from delta-rs and naming neither the pipeline, nor the table, nor
+    /// the way out. See `LogStreamBuilder::latest_version` for why that was what surfaced.
+    #[error(
+        "pipeline has never committed and cannot start: starting_version = {configured} is \
+         no longer in the commit log of {source_uri}. The oldest version the log still holds \
+         is {oldest_available}{}, and the head is {head}.\n\
+         \n\
+         Nothing unusual has to have happened for this: delta.logRetentionDuration is 30 \
+         days by default, so a source older than that no longer has version 0, and a \
+         pipeline that was created but never ran until now starts from a version that is \
+         already gone. No VACUUM anybody ran is implicated.\n\
+         \n\
+         The recovery is one value, set once: starting_version = {oldest_available} on this \
+         pipeline. Be clear about what that accepts — rows the source wrote before version \
+         {oldest_available} are not ingested by this pipeline, and will not be. Nothing that \
+         is still readable is skipped, because no earlier version survives in the log at \
+         all; but if the target has to hold those rows, something else has to load them from \
+         a snapshot of the source.\n\
+         \n\
+         Two recoveries that work for a pipeline which has committed do nothing here, and \
+         for the same reason in both cases — there is no txn action to clear. Recreating the \
+         target changes nothing. Giving the pipeline a new app_id changes nothing.\n\
+         \n\
+         To stop it recurring, raise delta.logRetentionDuration on the source above the \
+         longest gap you intend to allow between declaring a pipeline and first running it.",
+        .oldest_available_committed_at
+            .as_deref()
+            .map(|at| format!(" (committed {at})"))
+            .unwrap_or_default()
+    )]
+    BootstrapUnreachable {
+        // Not `source`: thiserror reads a field of that name as the error's cause.
+        source_uri: String,
+        configured: crate::source::Version,
+        oldest_available: crate::source::Version,
+        /// RFC 3339, read from the commit object's storage metadata — the same clock Delta
+        /// time travel uses. `None` when the object's metadata could not be read, which must
+        /// not turn a diagnosable error into an undiagnosable one.
+        oldest_available_committed_at: Option<String>,
+        head: crate::source::Version,
+    },
 
     /// A file an unconsumed commit added is no longer in storage.
     ///

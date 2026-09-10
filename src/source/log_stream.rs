@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use deltalake::kernel::{Action, Add, Remove, StructType};
 use deltalake::logstore::object_store::ObjectStoreExt;
 use deltalake::logstore::{commit_uri_from_version, get_actions, LogStore};
-use deltalake::{DeltaTable, DeltaTableConfig};
+use deltalake::{DeltaTable, DeltaTableConfig, DeltaTableError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -120,6 +120,29 @@ pub struct LogStreamBuilder {
     /// Source head as of the last `next_batch` poll. `None` before the first poll.
     /// Recorded rather than re-fetched: `next_batch` already pays for this read.
     head: Option<Version>,
+    /// How the operator spells this table, for errors to name it by.
+    ///
+    /// The log store's own root URL is a normalised `file://`/`abfss://` form that need not
+    /// match what is in anybody's config, and an error an operator cannot grep their own
+    /// configuration for is most of the way to being no error at all. Defaults to that
+    /// normalised form so a reader built without one still names something real.
+    source_uri: String,
+    /// A version of the source log this stream has seen exist, to floor the head lookup at.
+    ///
+    /// Not an optimisation, though it is also one — a listing that starts at the head is
+    /// shorter than one that starts at the beginning of a year-old table. It exists because
+    /// `LogStore::get_latest_version` takes that floor as a *requirement*: the kernel's
+    /// `LogSegment::for_table_changes` rejects a segment whose first commit is not exactly
+    /// the version asked for. Flooring at a hardcoded `0` therefore stopped working the
+    /// moment the source's own `delta.logRetentionDuration` reclaimed commit 0, and did so
+    /// as `delta error: Invalid table version: 0` — a failure to read the head, reported as
+    /// if version 0 were the one being asked for, on every poll, for every pipeline on that
+    /// source.
+    ///
+    /// Seeded from the loaded snapshot's version, which is present by construction, and
+    /// advanced to each head it resolves so that it stays recent and therefore stays inside
+    /// whatever the retention window is.
+    version_floor: Version,
     /// What decoding this source's files has cost, per byte the log said they were.
     ///
     /// Shared with the pipeline, which updates it after every read. It is the only thing
@@ -140,6 +163,11 @@ impl LogStreamBuilder {
             pin_lookup_snapshots: false,
             schema_cache: HashMap::new(),
             head: None,
+            source_uri: table.log_store().root_url().to_string(),
+            // `Storage::open` loads the table, so this is the head and it is readable. The
+            // `unwrap_or(0)` is unreachable for a loaded handle, and 0 is the right answer
+            // for an unloaded one: a table with no snapshot has no later version to floor at.
+            version_floor: table.version().unwrap_or(0),
             amplification: Arc::new(crate::budget::Amplification::default()),
         }
     }
@@ -166,6 +194,12 @@ impl LogStreamBuilder {
             Some(b) => self.max_bytes_per_batch.min(b),
             None => self.max_bytes_per_batch,
         }
+    }
+
+    /// Name this source the way the operator's configuration does.
+    pub fn with_source_uri(mut self, uri: impl Into<String>) -> Self {
+        self.source_uri = uri.into();
+        self
     }
 
     pub fn with_starting_cursor(mut self, c: StreamCursor) -> Self {
@@ -232,8 +266,54 @@ impl LogStreamBuilder {
     }
 
     /// The table's current head version.
-    pub async fn latest_version(&self) -> Result<Version> {
-        Ok(self.log_store.get_latest_version(0).await?)
+    ///
+    /// Floored at a version this stream has watched exist rather than at `0`; see
+    /// [`Self::version_floor`] for why that distinction is the whole of this function.
+    ///
+    /// The floor can still go stale in two ways, and the kernel reports both identically, as
+    /// `InvalidVersion`: retention can reclaim the floor itself on a stream that has been
+    /// idle long enough, and a source that was dropped and recreated can have a head *below*
+    /// the floor. So a stale floor is re-resolved once, from the log rather than from the
+    /// stale snapshot, and the lookup retried — which covers both, and leaves
+    /// `adjust_for_replaced_source` to decide what a log that went backwards means.
+    pub async fn latest_version(&mut self) -> Result<Version> {
+        let stale = match self.log_store.get_latest_version(self.version_floor).await {
+            Ok(v) => {
+                // Forward only. A head below the floor cannot be reported by this call — the
+                // kernel errors instead — so this is just the ordinary advance.
+                self.version_floor = v;
+                return Ok(v);
+            }
+            Err(DeltaTableError::InvalidVersion(_)) if self.version_floor != 0 => None,
+            // A floor of 0 that is rejected is the original bug's own shape, and there is no
+            // newer floor to fall back to: the log does not reach back to 0 and this stream
+            // has never seen a version that it does. Re-resolve from the log all the same —
+            // it is one listing, and it is the difference between recovering and not.
+            Err(DeltaTableError::InvalidVersion(v)) => Some(v),
+            Err(e) => return Err(Error::Delta(e)),
+        };
+
+        let mut table = DeltaTable::new(self.log_store.clone(), without_files());
+        table.load().await.map_err(Error::Delta)?;
+        let Some(resolved) = table.version() else {
+            // Never store this as a floor: 0 is exactly the value that does not work here,
+            // and storing it would pay for this re-resolve on every poll from now on while
+            // still failing.
+            return Err(Error::Other(format!(
+                "cannot resolve the head version of {}: its log does not reach back to \
+                 version {}, and reloading it produced no version at all. The table may be \
+                 mid-creation, or its log may have been truncated with no checkpoint left to \
+                 rebuild a snapshot from.",
+                self.log_store.root_url(),
+                stale.unwrap_or(self.version_floor),
+            )));
+        };
+        debug!(
+            stale_floor = self.version_floor,
+            resolved, "source log no longer reaches the floor we held; re-resolved it"
+        );
+        self.version_floor = resolved;
+        Ok(self.log_store.get_latest_version(resolved).await?)
     }
 
     /// The source head as observed by the last [`Self::next_batch`] poll.
@@ -273,7 +353,10 @@ impl LogStreamBuilder {
                 // A gap inside the range we were asked to read means the log has been
                 // truncated underneath us. Silently skipping would drop data.
                 if files.is_empty() {
-                    return Err(Error::CursorUnavailable { cursor });
+                    return Err(Error::CursorUnavailable {
+                        source_uri: self.source_uri.clone(),
+                        cursor,
+                    });
                 }
                 break;
             };
@@ -463,6 +546,59 @@ impl LogStreamBuilder {
         self.schema_cache.insert(version, schema.clone());
         Ok(schema)
     }
+}
+
+/// The oldest commit a table's log still holds, and when the store says it was written.
+///
+/// What an operator has to know to recover a pipeline whose `starting_version` has aged out,
+/// and the one fact nothing else in ddi reports: the head is in every log line, the
+/// configured version is in their own config, and the floor is only in the object store.
+///
+/// Read by listing `_delta_log` rather than by probing versions one at a time, because the
+/// gap can be any size and a probe loop is one request per reclaimed commit. Commit objects
+/// are zero-padded to a fixed width, so lexicographic order is numeric order and the answer
+/// is the first match — `list` on every store ddi supports yields keys in that order.
+///
+/// `None` means the log holds no commit at all, which is not a truncated table but an
+/// unreadable one: callers must say so rather than substituting a version.
+pub async fn earliest_readable_commit(
+    table: &DeltaTable,
+) -> Result<Option<(Version, Option<DateTime<Utc>>)>> {
+    use futures::TryStreamExt;
+
+    let log_store = table.log_store();
+    let store = log_store.object_store(None);
+    let mut listing = store.list(Some(log_store.log_path()));
+
+    let mut oldest: Option<(Version, Option<DateTime<Utc>>)> = None;
+    while let Some(meta) = listing.try_next().await.map_err(|e| {
+        Error::Other(format!(
+            "cannot list the commit log of {} to find its oldest surviving version: {e}",
+            log_store.root_url()
+        ))
+    })? {
+        let Some(name) = meta.location.filename() else {
+            continue;
+        };
+        // `NNNNNNNNNNNNNNNNNNNN.json` and nothing else. Deliberately not delta-rs's
+        // `extract_version_from_filename`, which also matches `.checkpoint.parquet` and
+        // `.json` sidecars — a checkpoint at a version whose commit is gone is exactly the
+        // shape this function exists to look at, so counting it would answer the opposite
+        // of the question.
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if stem.len() != 20 || !stem.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(version) = stem.parse::<Version>() else {
+            continue;
+        };
+        if oldest.is_none_or(|(held, _)| version < held) {
+            oldest = Some((version, Some(meta.last_modified)));
+        }
+    }
+    Ok(oldest)
 }
 
 /// Load the log, but not the list of files it leaves live.

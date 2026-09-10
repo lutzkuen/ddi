@@ -87,6 +87,25 @@ pub struct PipelineMetrics {
     /// which of the two a stuck stream is: a retry that will work eventually, or a retry
     /// that will not.
     pub source_file_vacuumed: AtomicI64,
+    /// 1 while this pipeline has never committed and the version it would start from is no
+    /// longer in the source's log.
+    ///
+    /// The same shape as [`Self::source_file_vacuumed`], and added for the same complaint:
+    /// before it, a pipeline whose `starting_version` had aged out of
+    /// `delta.logRetentionDuration` retried every five minutes forever behind a generic
+    /// `delta error`, and the only way to find it was to grep a shared process log. It is
+    /// separate from [`Self::resume_unreachable`] because the two have opposite recoveries —
+    /// this one is a value an operator sets, that one is a rebuild — so an alert that cannot
+    /// tell them apart cannot route.
+    pub bootstrap_unreachable: AtomicI64,
+    /// 1 while this pipeline has committed before and the version it must resume at is no
+    /// longer in the source's log.
+    ///
+    /// The dangerous twin of [`Self::bootstrap_unreachable`]: rows this pipeline was
+    /// responsible for are gone, and no setting recovers them. Worth its own series precisely
+    /// because it is indistinguishable from a storage blip from outside — every other
+    /// `up = 0` heals on its own, and this one never does.
+    pub resume_unreachable: AtomicI64,
     /// 1 once this pipeline ran out of spill space or memory rather than being wrong.
     ///
     /// The same shape as [`Self::source_file_vacuumed`] and for the same reason: from
@@ -181,6 +200,13 @@ impl PipelineMetrics {
         // Same argument: a step that succeeded found the room it needed, so whatever was
         // full is not full any more.
         self.capacity_exhausted.store(0, Ordering::Relaxed);
+        // And same again for both halves of an unreadable log position: a step that
+        // succeeded read the commit it needed, so the log reaches far enough now — either
+        // because somebody set a reachable starting_version, or because the target was
+        // rebuilt. Note that a `CaughtUp` step counts, which is correct: a pipeline told to
+        // start above the head is waiting, not stuck.
+        self.bootstrap_unreachable.store(0, Ordering::Relaxed);
+        self.resume_unreachable.store(0, Ordering::Relaxed);
         if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             self.last_progress_unixtime
                 .store(d.as_secs() as i64, Ordering::Relaxed);
@@ -205,6 +231,16 @@ impl PipelineMetrics {
         // arrives.
         if matches!(e, crate::Error::SourceFileVacuumed { .. }) {
             self.source_file_vacuumed.store(1, Ordering::Relaxed);
+        }
+        // Raised, never lowered here, for the reason above and one more specific to these
+        // two: both are raised while *opening*, which is the earliest thing an attempt does,
+        // so a later attempt getting further and failing on something else is the normal way
+        // a half-fixed pipeline behaves and says nothing about the log.
+        if matches!(e, crate::Error::BootstrapUnreachable { .. }) {
+            self.bootstrap_unreachable.store(1, Ordering::Relaxed);
+        }
+        if matches!(e, crate::Error::CursorUnavailable { .. }) {
+            self.resume_unreachable.store(1, Ordering::Relaxed);
         }
         // Not the same thing as `up = 0`, which every failure sets. This one says the machine
         // ran out rather than the data being wrong — which is what decides whether an
@@ -281,7 +317,7 @@ impl Metrics {
         let map = self.pipelines.read().unwrap();
         let mut s = String::new();
 
-        let metrics: [MetricSpec; 32] = [
+        let metrics: [MetricSpec; 34] = [
             (
                 "ddi_batches_committed_total",
                 "counter",
@@ -355,6 +391,24 @@ impl Metrics {
                  longer has. Cleared only by a step that succeeds, so it does not flap. 0 \
                  otherwise.",
                 |m| m.source_file_vacuumed.load(Ordering::Relaxed),
+            ),
+            (
+                "ddi_bootstrap_unreachable",
+                "gauge",
+                "1 while this pipeline has never committed and its starting_version is no \
+                 longer in the source's commit log. Recoverable: set starting_version to a \
+                 version the log still holds, accepting the gap. Cleared only by a step that \
+                 succeeds. 0 otherwise.",
+                |m| m.bootstrap_unreachable.load(Ordering::Relaxed),
+            ),
+            (
+                "ddi_resume_unreachable",
+                "gauge",
+                "1 while this pipeline has committed before and the version it must resume at \
+                 is no longer in the source's commit log. Not recoverable by configuration: \
+                 rows this pipeline owed the target are gone and it needs a deliberate \
+                 rebuild. Cleared only by a step that succeeds. 0 otherwise.",
+                |m| m.resume_unreachable.load(Ordering::Relaxed),
             ),
             (
                 "ddi_pipeline_restarts_total",
