@@ -38,7 +38,7 @@ use crate::transform::sql::SOURCE_TABLE;
 const TRINO_FROM_UNIXTIME_TIME_ZONE: &str = "Europe/Amsterdam";
 
 /// A rejected construct, with the alternative spelled out.
-fn reject(what: &str, why: &str, instead: &str) -> Error {
+pub(crate) fn reject(what: &str, why: &str, instead: &str) -> Error {
     Error::Config(format!("{what} is not supported: {why} Instead: {instead}"))
 }
 
@@ -114,11 +114,17 @@ pub(crate) fn parse_permissively(
     sql: &str,
     subject: &str,
 ) -> Result<std::collections::VecDeque<Statement>> {
+    use crate::transform::dialect::{prepare_trino_text, TrinoDialect};
     use deltalake::datafusion::sql::sqlparser::dialect::ClickHouseDialect;
 
-    match DFParser::parse_sql(sql) {
+    // Spellings with no grammar in any dialect — `FORMAT JSON`, `KEY`, `ARRAY(JSON)` —
+    // are rewritten before parsing; see `crate::transform::dialect`.
+    let sql = prepare_trino_text(sql);
+
+    match DFParser::parse_sql(&sql) {
         Ok(s) => Ok(s),
-        Err(native) => DFParser::parse_sql_with_dialect(sql, &ClickHouseDialect {})
+        Err(native) => DFParser::parse_sql_with_dialect(&sql, &TrinoDialect)
+            .or_else(|_| DFParser::parse_sql_with_dialect(&sql, &ClickHouseDialect {}))
             // Report the native error: it is the one that describes the engine the query
             // will actually run on, and the fallback's complaint about a different grammar
             // would only mislead.
@@ -214,6 +220,13 @@ fn validate_sql_with_grain(
     // point therefore works on one parser's AST, whichever one let the text in.
     crate::transform::unnest::rewrite_json_array_casts(&mut query)?;
     rewrite_trino_from_unixtime(&mut query)?;
+    // `json_object` / `json_array` / `CAST(.. AS JSON)` become the functions that build
+    // them, and only then are lambdas folded into `transform` / `filter` calls: a lambda
+    // body is checked and rendered to text at that point, so every rewrite that has to
+    // reach inside one has already run. See `crate::transform::json_build` and
+    // `crate::transform::lambda`.
+    crate::transform::json_build::rewrite_constructors(&mut query)?;
+    crate::transform::lambda::rewrite(&mut query)?;
     if let SqlStatement::Query(q) = reparse_natively(&SqlStatement::Query(query.clone()), grain)? {
         query = q;
     }
@@ -222,6 +235,9 @@ fn validate_sql_with_grain(
 
     check_query(&query, &BTreeSet::new(), lookups, grain)?;
 
+    // The text of a folded lambda is a literal holding SQL; rendering one that was parsed
+    // needs its quotes doubled again first. See `crate::transform::lambda::reencode`.
+    crate::transform::lambda::reencode(&mut query);
     let rewritten = Statement::Statement(Box::new(SqlStatement::Query(query)));
 
     // Everything above may have been read by the fallback parser, so prove the result is
@@ -242,9 +258,10 @@ fn validate_sql_with_grain(
 /// Validate `sql` and return the text the engine should actually run.
 ///
 /// Identical to what was written, except where a dialect spelling had to be rewritten into
-/// one this engine executes -- currently Trino's `CROSS JOIN UNNEST` and named-zone
-/// `from_unixtime`; see
-/// [`crate::transform::unnest`] and [`rewrite_trino_from_unixtime`].
+/// one this engine executes -- Trino's `CROSS JOIN UNNEST`, named-zone `from_unixtime`,
+/// the JSON constructors and lambdas; see [`crate::transform::unnest`],
+/// [`rewrite_trino_from_unixtime`], [`crate::transform::json_build`] and
+/// [`crate::transform::lambda`].
 ///
 /// The config keeps the model's own text; only the *resolved* pipeline carries this. That
 /// way `ddi dbt convert` still pins what dbt says, and what runs is still what dbt meant.
@@ -866,7 +883,7 @@ const COMBINABLE_AGGREGATES: &[&str] = &["sum", "count", "min", "max"];
 ///
 /// The registry is unioned with [`FOREIGN_AGGREGATE_SPELLINGS`] rather than replacing it,
 /// because the two cover different mistakes and neither subsumes the other.
-fn aggregates() -> &'static BTreeSet<String> {
+pub(crate) fn aggregates() -> &'static BTreeSet<String> {
     static AGGREGATES: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
     AGGREGATES.get_or_init(|| {
         use deltalake::datafusion::functions_aggregate::all_default_aggregate_functions;

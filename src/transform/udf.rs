@@ -27,6 +27,8 @@ pub fn register_udfs(ctx: &SessionContext) {
         ctx.register_udf(ScalarUDF::from(ArrayReduce::new(op)));
     }
     crate::transform::json::register(ctx);
+    crate::transform::json_build::register(ctx);
+    crate::transform::lambda::register(ctx);
 }
 
 /// `array_length(array) -> int64`

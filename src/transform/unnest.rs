@@ -182,9 +182,21 @@ fn rewrite_select(select: &mut Select) -> Result<()> {
     let alias = base_alias(base);
     let qualifier = format!("{alias}.");
 
+    // DataFusion's unnest builds the element column without the list element's field
+    // metadata, which is where an element's JSON type lives (see
+    // `crate::transform::json::JSON_MARKER`). An element of `CAST(.. AS ARRAY(JSON))` is
+    // JSON in Trino, so it is marked again on the way out.
+    let element = if elements_are_json(&found.array) {
+        format!(
+            "{}(unnest({}))",
+            crate::transform::json_build::AS_JSON,
+            found.array
+        )
+    } else {
+        format!("unnest({})", found.array)
+    };
     let inner = format!(
-        "SELECT {qualifier}*, unnest({array}) AS {column} FROM {base}",
-        array = found.array,
+        "SELECT {qualifier}*, {element} AS {column} FROM {base}",
         column = found.column,
     );
     let from = format!("({inner}) AS {alias}");
@@ -314,9 +326,23 @@ fn find(select: &Select) -> Result<Option<Found>> {
     };
 
     Ok(Some(Found {
-        array: array_exprs[0].to_string(),
+        // Not `to_string()`: a folded lambda's body is a literal holding SQL, and it has to
+        // be re-encoded before it renders. See `crate::transform::lambda::render_expr`.
+        array: crate::transform::lambda::render_expr(&array_exprs[0]),
         column,
     }))
+}
+
+/// Are the elements of this array expression JSON-typed — is it `CAST(.. AS ARRAY(JSON))`,
+/// possibly behind `filter` calls, which keep their input's elements? A `transform`'s
+/// elements are whatever its body produced, which is not known from the text.
+fn elements_are_json(array: &str) -> bool {
+    let mut text = array.trim_start().to_ascii_lowercase();
+    let filter = format!("{}(", crate::transform::lambda::FILTER);
+    while let Some(rest) = text.strip_prefix(&filter) {
+        text = rest.trim_start().to_string();
+    }
+    text.starts_with("json_array_elements(")
 }
 
 /// The name the source is known by in the outer query.
@@ -442,7 +468,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            got.contains("unnest(json_array_elements(json_extract(o.data, '$.lines'))) AS li"),
+            got.contains(
+                "ddi_as_json(unnest(json_array_elements(json_extract(o.data, '$.lines')))) AS li"
+            ),
             "got: {got}"
         );
         assert!(!got.contains("CAST"), "the cast is gone: {got}");
