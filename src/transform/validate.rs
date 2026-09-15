@@ -235,6 +235,9 @@ fn validate_sql_with_grain(
 
     check_query(&query, &BTreeSet::new(), lookups, grain)?;
 
+    // The text of a folded lambda is a literal holding SQL; rendering one that was parsed
+    // needs its quotes doubled again first. See `crate::transform::lambda::reencode`.
+    crate::transform::lambda::reencode(&mut query);
     let rewritten = Statement::Statement(Box::new(SqlStatement::Query(query)));
 
     // Everything above may have been read by the fallback parser, so prove the result is

@@ -366,16 +366,14 @@ impl Parser<'_> {
 // Writing
 // ---------------------------------------------------------------------------------------
 
-/// How a number that was text becomes text again.
+/// How a number that was text becomes text again. An integer is always its digits; the
+/// two spellings differ on anything with a point or an exponent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Numbers {
-    /// The digits as they were: what `json_extract` copies.
-    Verbatim,
-    /// Integers as they were; anything with a point or exponent through
-    /// `BigDecimal.toString()`: what `json_parse` stores.
+    /// Through `BigDecimal.toString()`: what `json_parse` stores.
     BigDecimal,
-    /// Integers as they were; anything with a point or exponent through
-    /// `Double.toString()`: what `FORMAT JSON` re-reads.
+    /// Through `Double.toString()`: what `json_extract` copies and what `FORMAT JSON`,
+    /// `json_query` and `json_array_get` read back.
     JavaDouble,
 }
 
@@ -448,15 +446,31 @@ pub(crate) fn to_string(json: &Json, members: Members, numbers: Numbers) -> Stri
 }
 
 /// A JSON string: quoted and escaped the way Jackson does it — `"`, `\` and control
-/// characters escaped, everything else, `/` and non-ASCII included, left alone.
+/// characters escaped (the short forms where they exist, `\u00XX` with upper-case hex
+/// otherwise), everything else, `/` and non-ASCII included, left alone.
 pub(crate) fn quote(s: &str) -> String {
-    serde_json::to_string(s).expect("a str always serialises")
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn number_text(n: &str, numbers: Numbers) -> String {
     let is_float = n.contains(['.', 'e', 'E']);
     match numbers {
-        Numbers::Verbatim => n.to_string(),
         _ if !is_float => n.to_string(),
         Numbers::BigDecimal => java_bigdecimal_text(n),
         Numbers::JavaDouble => match n.parse::<f64>() {
@@ -633,14 +647,15 @@ mod tests {
     }
 
     #[test]
-    fn extract_keeps_order_and_digits_and_compacts() {
+    fn extract_keeps_order_and_repeats_and_compacts() {
+        // A streaming copy: members as written, repeats included, floats as doubles.
         assert_eq!(
             roundtrip(
                 r#"{ "b" : 1.10 , "a" : [ 1e2 , "x\/y" , null ] , "b" : 2 }"#,
                 Members::Verbatim,
-                Numbers::Verbatim
+                Numbers::JavaDouble
             ),
-            r#"{"b":1.10,"a":[1e2,"x/y",null],"b":2}"#
+            r#"{"b":1.1,"a":[100.0,"x/y",null],"b":2}"#
         );
     }
 
@@ -672,9 +687,12 @@ mod tests {
     fn strings_are_escaped_like_jackson() {
         let j = parse(r#""q\" bs\\ nl\n tab\t ctl\u0001 slash\/ é \ud83d\ude00""#).unwrap();
         assert_eq!(
-            to_string(&j, Members::Verbatim, Numbers::Verbatim),
+            to_string(&j, Members::Verbatim, Numbers::JavaDouble),
             r#""q\" bs\\ nl\n tab\t ctl\u0001 slash/ é 😀""#
         );
+        // Jackson spells the hex digits of a `\u` escape in upper case, and leaves DEL alone.
+        assert_eq!(quote("a\u{1b}b"), "\"a\\u001Bb\"");
+        assert_eq!(quote("\u{b}\u{7f}"), "\"\\u000B\u{7f}\"");
     }
 
     #[test]
@@ -756,14 +774,28 @@ mod tests {
         // From the documentation examples.
         assert_eq!(order(&["key1", "key2"]), vec!["key1", "key2"]);
         assert_eq!(order(&["x", "y"]), vec!["x", "y"]);
-        // Thirteen keys spill the table to 32 slots.
+        // Hashing is over UTF-16 code units, so an astral character counts as two.
+        assert_eq!(
+            order(&["naïve", "😀", "a", "日本", "b"]),
+            vec!["a", "b", "naïve", "😀", "日本"]
+        );
+        // Thirteen keys spill the table to 32 slots; twelve do not.
         let many: Vec<String> = (0..13).map(|i| format!("k{i}")).collect();
         let refs: Vec<&str> = many.iter().map(String::as_str).collect();
-        let got = java_hashmap_order(&refs);
-        assert_eq!(got.len(), 13);
-        let mut sorted = got.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, (0..13).collect::<Vec<_>>());
+        assert_eq!(
+            order(&refs),
+            vec!["k0", "k1", "k2", "k3", "k4", "k5", "k11", "k6", "k10", "k7", "k8", "k12", "k9"]
+        );
+        assert_eq!(
+            order(&[
+                "id", "type", "sku", "qty", "price", "currency", "customer", "country", "status",
+                "created", "updated", "version"
+            ]),
+            vec![
+                "country", "price", "created", "qty", "currency", "id", "type", "sku", "updated",
+                "version", "customer", "status"
+            ]
+        );
     }
 
     #[test]

@@ -47,20 +47,25 @@ use deltalake::arrow::array::{
 };
 use deltalake::arrow::buffer::OffsetBuffer;
 use deltalake::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
+use deltalake::datafusion::common::tree_node::TreeNode;
 use deltalake::datafusion::common::{DFSchema, Result as DFResult, ScalarValue};
 use deltalake::datafusion::error::DataFusionError;
+use deltalake::datafusion::logical_expr::simplify::SimplifyContext;
 use deltalake::datafusion::logical_expr::{
-    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    Volatility,
+    ColumnarValue, Expr as LogicalExpr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility,
 };
+use deltalake::datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use deltalake::datafusion::physical_expr::PhysicalExpr;
 use deltalake::datafusion::prelude::SessionContext;
 use deltalake::datafusion::sql::sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName,
-    OneOrManyWithParens, Query, Value, VisitMut, VisitorMut,
+    AccessExpr, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+    FunctionArguments, Ident, ObjectName, OneOrManyWithParens, Query, Subscript, Value, VisitMut,
+    VisitorMut,
 };
 
 use crate::error::{Error, Result};
+use crate::transform::json::JSON_MARKER;
 use crate::transform::validate::{aggregates, reject};
 
 pub(crate) const TRANSFORM: &str = "ddi_transform";
@@ -163,6 +168,14 @@ fn replacement(expr: &Expr) -> Result<Option<Expr>> {
         return Ok(None);
     };
     let name = bare_name(&f.name);
+    if name == TRANSFORM || name == FILTER {
+        // Already folded — this is normalised text being normalised again, which
+        // `SqlTransform::new` does — or written out by hand. Either way the body is checked
+        // as if it had just been written: the gate has to hold on its own output. The
+        // literals are then re-encoded for rendering; see [`literal`].
+        check_folded(f, &name)?;
+        return Ok(Some(reencoded(f)));
+    }
     let Some(kind) = Kind::from_spelling(&name) else {
         // Any other function handed a lambda is one this engine does not evaluate.
         if let FunctionArguments::List(list) = &f.args {
@@ -224,16 +237,12 @@ fn replacement(expr: &Expr) -> Result<Option<Expr>> {
     };
     // The body is planned against a field of this name. Unquoted identifiers are
     // lower-cased by the planner, so the field is too; a quoted one is kept as written.
-    let param_name = if param.quote_style.is_some() {
-        param.value.clone()
-    } else {
-        param.value.to_ascii_lowercase()
-    };
+    let param_name = planner_name(param);
 
     check_body(&lambda.body, spelling)?;
 
     let mut body = (*lambda.body).clone();
-    let captures = capture(&mut body, param);
+    let captures = capture(&mut body, &param_name);
 
     let mut args = vec![
         array.clone(),
@@ -252,6 +261,96 @@ fn replacement(expr: &Expr) -> Result<Option<Expr>> {
         clauses: vec![],
     });
     Ok(Some(Expr::Function(call)))
+}
+
+/// Check a `ddi_transform` / `ddi_filter` call whose body is already text.
+///
+/// The text is parsed back into an expression and held to the same rules as a body that
+/// was just written, and every `__capture_N` it names has to be one of the arguments that
+/// follow, so a hand-written call cannot reach past the gate either.
+fn check_folded(f: &Function, name: &str) -> Result<()> {
+    use deltalake::datafusion::sql::sqlparser::dialect::GenericDialect;
+    use deltalake::datafusion::sql::sqlparser::parser::Parser;
+    use deltalake::datafusion::sql::sqlparser::tokenizer::Token;
+
+    let spelling = if name == TRANSFORM {
+        "transform"
+    } else {
+        "filter"
+    };
+    let shape = || {
+        reject(
+            &format!("this form of {name}()"),
+            "it is the folded form of a lambda call, and takes an array, the parameter \
+             name, the body as text, then the captured values.",
+            &format!("write {spelling}(<array>, x -> <expr>) and let it be folded."),
+        )
+    };
+    let FunctionArguments::List(list) = &f.args else {
+        return Err(shape());
+    };
+    let text_at = |n: usize| match list.args.get(n) {
+        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(v)))) => match &v.value {
+            Value::SingleQuotedString(text) => Some(text.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (Some(_param), Some(body)) = (text_at(1), text_at(2)) else {
+        return Err(shape());
+    };
+    let parsed = Parser::new(&GenericDialect {})
+        .try_with_sql(&body)
+        .and_then(|mut p| {
+            let expr = p.parse_expr()?;
+            p.expect_token(&Token::EOF)?;
+            Ok(expr)
+        })
+        .map_err(|e| {
+            reject(
+                &format!("the body {body:?} of a folded {spelling}()"),
+                &format!("it does not parse as an expression: {e}."),
+                &format!("write {spelling}(<array>, x -> <expr>) and let it be folded."),
+            )
+        })?;
+    check_body(&parsed, spelling)?;
+
+    // Every capture the body names must be an argument that follows it.
+    let captures = list.args.len().saturating_sub(3);
+    struct Refs(Vec<usize>);
+    impl VisitorMut for Refs {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            if let Expr::Identifier(id) = expr {
+                if let Some(n) = id.value.strip_prefix("__capture_") {
+                    if let Ok(n) = n.parse::<usize>() {
+                        self.0.push(n);
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut refs = Refs(Vec::new());
+    let mut copy = parsed;
+    let _ = copy.visit(&mut refs);
+    if let Some(n) = refs.0.into_iter().find(|n| *n >= captures) {
+        return Err(reject(
+            &format!("the body of a folded {spelling}() naming __capture_{n}"),
+            &format!("only {captures} captured value(s) follow the body."),
+            &format!("write {spelling}(<array>, x -> <expr>) and let it be folded."),
+        ));
+    }
+    Ok(())
+}
+
+/// The name the planner will know an identifier by: lower-cased unless quoted.
+fn planner_name(id: &Ident) -> String {
+    if id.quote_style.is_some() {
+        id.value.clone()
+    } else {
+        id.value.to_ascii_lowercase()
+    }
 }
 
 fn usage(spelling: &str) -> Error {
@@ -287,6 +386,18 @@ fn check_body(body: &Expr, spelling: &str) -> Result<()> {
 
         fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
             if self.found.is_some() {
+                return ControlFlow::Break(());
+            }
+            // A nested transform()/filter() has already been folded by the time the body
+            // is checked, so any lambda still here is somewhere no function evaluates it.
+            if matches!(expr, Expr::Lambda(_)) {
+                self.found = Some(reject(
+                    &format!("a lambda inside a {}() lambda", self.spelling),
+                    "only transform() and filter() evaluate one, and this is not the \
+                     argument of either.",
+                    "write the nested lambda as transform(<array>, y -> <expr>) or \
+                     filter(<array>, y -> <expr>).",
+                ));
                 return ControlFlow::Break(());
             }
             let Expr::Function(f) = expr else {
@@ -339,19 +450,23 @@ fn check_body(body: &Expr, spelling: &str) -> Result<()> {
 ///
 /// A compound name whose head is the parameter — `e.price` on an array of structs — is a
 /// field access on the element and stays. Any other compound name is a qualified column of
-/// the row (`fx_rates.rate`) and is captured whole.
-fn capture(body: &mut Expr, param: &Ident) -> Vec<Expr> {
+/// the row (`fx_rates.rate`) and is captured whole. In an access chain such as
+/// `li.dims[1].w` the field names are not references to anything, so they stay too; only
+/// its root and its subscripts can hold a capture.
+///
+/// `param` is the name the planner will know the parameter by — see [`planner_name`] —
+/// and a reference is compared to it the same way, so `X -> x + 1` is one name and
+/// `"X" -> x + 1` is two, exactly as Trino reads them.
+fn capture(body: &mut Expr, param: &str) -> Vec<Expr> {
     struct Captures<'a> {
-        param: &'a Ident,
+        param: &'a str,
         seen: Vec<Expr>,
+        /// The access chain currently being walked, whose field names are not references.
+        protected: Option<*const Expr>,
     }
     impl Captures<'_> {
         fn is_param(&self, id: &Ident) -> bool {
-            if self.param.quote_style.is_some() || id.quote_style.is_some() {
-                id.value == self.param.value
-            } else {
-                id.value.eq_ignore_ascii_case(&self.param.value)
-            }
+            planner_name(id) == self.param
         }
         fn index(&mut self, e: &Expr) -> usize {
             if let Some(i) = self.seen.iter().position(|s| s == e) {
@@ -364,6 +479,33 @@ fn capture(body: &mut Expr, param: &Ident) -> Vec<Expr> {
     impl VisitorMut for Captures<'_> {
         type Break = ();
         fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            if self.protected.is_some() {
+                return ControlFlow::Continue(());
+            }
+            if let Expr::CompoundFieldAccess { root, access_chain } = expr {
+                // Captures may sit in the root and in a subscript; a field name is not one.
+                let _ = root.visit(self);
+                for access in access_chain.iter_mut() {
+                    if let AccessExpr::Subscript(sub) = access {
+                        match sub {
+                            Subscript::Index { index } => {
+                                let _ = index.visit(self);
+                            }
+                            Subscript::Slice {
+                                lower_bound,
+                                upper_bound,
+                                stride,
+                            } => {
+                                for e in [lower_bound, upper_bound, stride].into_iter().flatten() {
+                                    let _ = e.visit(self);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.protected = Some(expr as *const Expr);
+                return ControlFlow::Continue(());
+            }
             let captured = match expr {
                 Expr::Identifier(id) => !self.is_param(id),
                 Expr::CompoundIdentifier(parts) => !parts.first().is_some_and(|p| self.is_param(p)),
@@ -375,10 +517,18 @@ fn capture(body: &mut Expr, param: &Ident) -> Vec<Expr> {
             }
             ControlFlow::Continue(())
         }
+
+        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            if self.protected == Some(expr as *const Expr) {
+                self.protected = None;
+            }
+            ControlFlow::Continue(())
+        }
     }
     let mut c = Captures {
         param,
         seen: Vec::new(),
+        protected: None,
     };
     let _ = body.visit(&mut c);
     c.seen
@@ -388,8 +538,54 @@ fn capture_name(n: usize) -> String {
     format!("__capture_{n}")
 }
 
+/// A string literal that renders correctly however many quotes its text holds.
+///
+/// A body is SQL, so it holds string literals of its own, whose quotes are doubled — and
+/// `sqlparser` renders a literal by doubling a quote *unless it is already doubled*, which
+/// it takes for an escape. A body such as `f(x, ''$.q'')` would therefore render with one
+/// level of escaping too few and parse back wrong. Doubling every quote up front makes
+/// every run even, so the renderer leaves the text exactly as it is: a literal whose
+/// rendering is the correct escaping of the text, and whose parse is the text again.
+///
+/// The value held in the AST is therefore not the text but its escaping; nothing reads it
+/// back without parsing it first, except [`reencoded`], which re-applies this to a call
+/// that was parsed rather than built.
 fn literal(text: &str) -> Expr {
-    Expr::Value(Value::SingleQuotedString(text.to_string()).into())
+    Expr::Value(Value::SingleQuotedString(text.replace('\'', "''")).into())
+}
+
+/// A folded call as parsed, with its text arguments re-encoded for rendering.
+fn reencoded(f: &Function) -> Expr {
+    let mut call = f.clone();
+    if let FunctionArguments::List(list) = &mut call.args {
+        for arg in list.args.iter_mut().take(3).skip(1) {
+            if let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(v))) = arg {
+                if let Value::SingleQuotedString(text) = &v.value {
+                    *arg = FunctionArg::Unnamed(FunctionArgExpr::Expr(literal(text)));
+                }
+            }
+        }
+    }
+    Expr::Function(call)
+}
+
+/// Re-encode the text arguments of every folded call in `query` — see [`literal`] — so
+/// that a query that was parsed renders correctly. Run before rendering.
+pub(crate) fn reencode(query: &mut Query) {
+    struct V;
+    impl VisitorMut for V {
+        type Break = ();
+        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            if let Expr::Function(f) = expr {
+                let name = bare_name(&f.name);
+                if name == TRANSFORM || name == FILTER {
+                    *expr = reencoded(f);
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let _ = query.visit(&mut V);
 }
 
 fn bare_name(name: &ObjectName) -> String {
@@ -416,10 +612,59 @@ struct Compiled {
 
 /// Planned bodies, by function, text and input schema. A lambda is planned once per
 /// process rather than once per batch: the planner is not free, and the body does not
-/// change.
+/// change. A body that calls a function whose value can change between batches — `now()`,
+/// `random()` — is planned every time instead, so it means what it would mean at the top
+/// of the query.
 fn cache() -> &'static Mutex<HashMap<String, Arc<Compiled>>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<Compiled>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// How many bodies are planned and kept. For tests.
+#[cfg(test)]
+pub(crate) fn cached_bodies() -> usize {
+    cache().lock().expect("lambda cache").len()
+}
+
+/// A field as the body is planned against it: only the JSON marker survives from the
+/// metadata, because nothing else a source table attaches to a column — Delta column
+/// mapping ids, say — changes what an expression over it means, and a key that rendered
+/// them would differ from one batch to the next.
+fn planning_field(name: &str, field: &FieldRef) -> Field {
+    let mut metadata = HashMap::new();
+    if let Some(marker) = field.metadata().get(JSON_MARKER) {
+        metadata.insert(JSON_MARKER.to_string(), marker.clone());
+    }
+    Field::new(name, field.data_type().clone(), true).with_metadata(metadata)
+}
+
+/// A rendering of a type that does not depend on the iteration order of any metadata map.
+fn canonical_type(dt: &DataType) -> String {
+    let field = |f: &FieldRef| {
+        let mut md: Vec<_> = f.metadata().iter().collect();
+        md.sort();
+        format!(
+            "{}:{}:{}:{:?}",
+            f.name(),
+            canonical_type(f.data_type()),
+            f.is_nullable(),
+            md
+        )
+    };
+    match dt {
+        DataType::List(f) => format!("List<{}>", field(f)),
+        DataType::LargeList(f) => format!("LargeList<{}>", field(f)),
+        DataType::FixedSizeList(f, n) => format!("FixedSizeList<{},{n}>", field(f)),
+        DataType::Struct(fields) => {
+            let inner: Vec<String> = fields.iter().map(field).collect();
+            format!("Struct<{}>", inner.join(","))
+        }
+        DataType::Map(f, sorted) => format!("Map<{},{sorted}>", field(f)),
+        DataType::Dictionary(k, v) => {
+            format!("Dictionary<{},{}>", canonical_type(k), canonical_type(v))
+        }
+        other => other.to_string(),
+    }
 }
 
 fn compile(
@@ -429,16 +674,28 @@ fn compile(
     element: &FieldRef,
     captures: &[FieldRef],
 ) -> DFResult<Arc<Compiled>> {
-    let mut fields = vec![Field::new(param, element.data_type().clone(), true)
-        .with_metadata(element.metadata().clone())];
+    let mut fields = vec![planning_field(param, element)];
     for (n, c) in captures.iter().enumerate() {
-        fields.push(
-            Field::new(capture_name(n), c.data_type().clone(), true)
-                .with_metadata(c.metadata().clone()),
-        );
+        fields.push(planning_field(&capture_name(n), c));
     }
     let schema = Arc::new(Schema::new(fields));
-    let key = format!("{}\u{0}{param}\u{0}{body}\u{0}{schema:?}", kind.name());
+    let rendered: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            format!(
+                "{}:{}:{:?}",
+                f.name(),
+                canonical_type(f.data_type()),
+                f.metadata().get(JSON_MARKER)
+            )
+        })
+        .collect();
+    let key = format!(
+        "{}\u{0}{param}\u{0}{body}\u{0}{}",
+        kind.name(),
+        rendered.join("|")
+    );
     if let Some(hit) = cache().lock().expect("lambda cache").get(&key) {
         return Ok(Arc::clone(hit));
     }
@@ -446,19 +703,48 @@ fn compile(
     let spelling = kind.spelling();
     let ctx = SessionContext::new();
     crate::transform::udf::register_udfs(&ctx);
+    let state = ctx.state();
     let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
-    let logical = ctx.parse_sql_expr(body, &df_schema).map_err(|e| {
+    let logical = state.create_logical_expr(body, &df_schema).map_err(|e| {
         DataFusionError::Plan(format!(
             "{spelling}: the lambda body `{body}` does not plan over an element of type {} \
              (as `{param}`): {e}",
             element.data_type()
         ))
     })?;
-    let expr = ctx.create_physical_expr(logical, &df_schema).map_err(|e| {
-        DataFusionError::Plan(format!(
-            "{spelling}: the lambda body `{body}` does not plan: {e}"
+    // Whether the body may be kept: a function that is not immutable — `now()` is stable
+    // within a query, `random()` not even that — must be planned per batch.
+    let keep = !logical.exists(|e| {
+        Ok(matches!(
+            e,
+            LogicalExpr::ScalarFunction(f)
+                if f.func.signature().volatility != Volatility::Immutable
         ))
     })?;
+    // What the top of the query gets: coercion, then simplification — which is where
+    // `now()`, `current_date` and `arrow_cast` are turned into what they mean — then the
+    // function rewrites `create_physical_expr` applies.
+    let simplifier = ExprSimplifier::new(
+        SimplifyContext::default()
+            .with_schema(Arc::new(df_schema.clone()))
+            .with_config_options(Arc::clone(state.config_options()))
+            .with_query_execution_start_time(state.execution_props().query_execution_start_time),
+    );
+    let simplified = simplifier
+        .coerce(logical, &df_schema)
+        .and_then(|e| simplifier.simplify(e))
+        .map_err(|e| {
+            DataFusionError::Plan(format!(
+                "{spelling}: the lambda body `{body}` does not plan: {e}"
+            ))
+        })?;
+    let expr = state
+        .create_physical_expr(simplified, &df_schema)
+        .map_err(|e| {
+            DataFusionError::Plan(format!(
+                "{spelling}: the lambda body `{body}` does not plan: {e}"
+            ))
+        })?;
     let out = expr.return_field(&schema)?;
     if kind == Kind::Filter && out.data_type() != &DataType::Boolean {
         return Err(DataFusionError::Plan(format!(
@@ -469,10 +755,12 @@ fn compile(
     }
 
     let compiled = Arc::new(Compiled { schema, expr, out });
-    cache()
-        .lock()
-        .expect("lambda cache")
-        .insert(key, Arc::clone(&compiled));
+    if keep {
+        cache()
+            .lock()
+            .expect("lambda cache")
+            .insert(key, Arc::clone(&compiled));
+    }
     Ok(compiled)
 }
 
@@ -533,7 +821,9 @@ impl ScalarUDFImpl for LambdaFn {
 
     fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
         match (self.kind, arg_types.first()) {
-            (Kind::Filter, Some(t)) => Ok(t.clone()),
+            (Kind::Filter, Some(DataType::List(f) | DataType::LargeList(f))) => {
+                Ok(DataType::List(Arc::clone(f)))
+            }
             _ => Err(self.err(
                 "the return type depends on the lambda body, which return_field_from_args \
                  plans; this path should not be reached",
@@ -550,7 +840,8 @@ impl ScalarUDFImpl for LambdaFn {
         let captures = args.arg_fields.get(3..).unwrap_or_default();
         let compiled = compile(self.kind, &param, &body, &element, captures)?;
         let field = match self.kind {
-            Kind::Filter => array.as_ref().clone().with_name(self.name()),
+            // Always a `List`, whatever width the input's offsets had: that is what is built.
+            Kind::Filter => Field::new(self.name(), DataType::List(element), array.is_nullable()),
             Kind::Transform => Field::new(
                 self.name(),
                 DataType::List(Arc::new(item_field(&compiled.out))),
@@ -601,15 +892,14 @@ impl ScalarUDFImpl for LambdaFn {
         let row_index = UInt32Array::from(row_index);
         let mut columns = vec![Arc::clone(&elements)];
         for capture in &args.args[3..] {
-            let whole = match capture {
-                ColumnarValue::Array(a) => Arc::clone(a),
-                ColumnarValue::Scalar(s) => s.to_array_of_size(rows)?,
-            };
-            columns.push(deltalake::arrow::compute::take(
-                whole.as_ref(),
-                &row_index,
-                None,
-            )?);
+            columns.push(match capture {
+                ColumnarValue::Array(a) => {
+                    deltalake::arrow::compute::take(a.as_ref(), &row_index, None)?
+                }
+                // A constant is the same for every element: no need to spread it over the
+                // rows first.
+                ColumnarValue::Scalar(s) => s.to_array_of_size(count)?,
+            });
         }
 
         let result = if count == 0 {
@@ -620,12 +910,15 @@ impl ScalarUDFImpl for LambdaFn {
         };
 
         let out: ArrayRef = match self.kind {
-            Kind::Transform => Arc::new(ListArray::new(
-                Arc::new(item_field(&compiled.out)),
-                OffsetBuffer::<i32>::from_lengths(lengths),
-                result,
-                list.nulls().cloned(),
-            )),
+            Kind::Transform => Arc::new(
+                ListArray::try_new(
+                    Arc::new(item_field(&compiled.out)),
+                    OffsetBuffer::<i32>::from_lengths(lengths),
+                    result,
+                    list.nulls().cloned(),
+                )
+                .map_err(|e| self.err(format!("could not fold the results back: {e}")))?,
+            ),
             Kind::Filter => {
                 let verdicts = result.as_boolean();
                 // NULL is not true: the element goes, as it does in Trino.
@@ -645,12 +938,15 @@ impl ScalarUDFImpl for LambdaFn {
                 let DataType::List(field) = list.data_type() else {
                     unreachable!("a ListArray has a list type")
                 };
-                Arc::new(ListArray::new(
-                    Arc::clone(field),
-                    OffsetBuffer::<i32>::from_lengths(kept_lengths),
-                    kept,
-                    list.nulls().cloned(),
-                ))
+                Arc::new(
+                    ListArray::try_new(
+                        Arc::clone(field),
+                        OffsetBuffer::<i32>::from_lengths(kept_lengths),
+                        kept,
+                        list.nulls().cloned(),
+                    )
+                    .map_err(|e| self.err(format!("could not fold the results back: {e}")))?,
+                )
             }
         };
         Ok(ColumnarValue::Array(out))
@@ -687,6 +983,7 @@ fn item_field(out: &FieldRef) -> Field {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::transform::validate::{normalise_sql, validate_sql};
 
     #[test]
@@ -726,6 +1023,27 @@ mod tests {
             got.ends_with("'li.price * li.qty') AS t FROM source"),
             "no captures: {got}"
         );
+
+        // Nor is a field name in an access chain; its root and its subscript may be.
+        let got = normalise_sql(
+            "SELECT transform(items, li -> li.dims[i].w + (li).h + rows[1].n) AS t FROM source",
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            "SELECT ddi_transform(items, 'li', 'li.dims[__capture_0].w + (li).h + \
+             __capture_1[1].n', i, rows) AS t FROM source"
+        );
+    }
+
+    #[test]
+    fn the_parameter_is_matched_the_way_the_planner_reads_names() {
+        // `X` and `x` are one name; `"X"` is another, and so is a capture.
+        let got = normalise_sql("SELECT transform(xs, X -> x + X) AS t FROM source").unwrap();
+        assert!(got.contains("'x', 'x + X')"), "got: {got}");
+        let got =
+            normalise_sql("SELECT transform(xs, \"E\" -> \"E\" + E) AS t FROM source").unwrap();
+        assert!(got.contains("'E', '\"E\" + __capture_0', E)"), "got: {got}");
     }
 
     #[test]
@@ -812,6 +1130,95 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("this form of transform()"), "got: {e}");
+    }
+
+    #[test]
+    fn a_lambda_anywhere_else_in_a_body_is_refused() {
+        let e = validate_sql(
+            "SELECT transform(xs, x -> CASE WHEN x > 0 THEN x ELSE (y -> y) END) AS t FROM source",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("a lambda inside a transform() lambda"),
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn normalising_is_idempotent_and_the_folded_form_is_checked_too() {
+        let once = normalise_sql(
+            "SELECT transform(xs, x -> filter(ys, y -> y > x + rate)) AS t FROM source",
+        )
+        .unwrap();
+        let twice = normalise_sql(&once).unwrap();
+        assert_eq!(once, twice);
+
+        // The internal spelling is not a way past the gate.
+        for (sql, want) in [
+            (
+                "SELECT ddi_transform(xs, 'x', 'sum(x)') AS t FROM source",
+                "aggregate function sum()",
+            ),
+            (
+                "SELECT ddi_filter(xs, 'x', 'x > (SELECT max(y) FROM source)') AS t FROM source",
+                "a subquery inside a filter() lambda",
+            ),
+            (
+                "SELECT ddi_transform(xs, 'x', 'x -> x') AS t FROM source",
+                "a lambda inside a transform() lambda",
+            ),
+            (
+                "SELECT ddi_transform(xs, 'x') AS t FROM source",
+                "this form of ddi_transform()",
+            ),
+            (
+                "SELECT ddi_transform(xs, 'x', 'not an expression (') AS t FROM source",
+                "does not parse",
+            ),
+            (
+                "SELECT ddi_transform(xs, 'x', 'x + __capture_3', a) AS t FROM source",
+                "naming __capture_3",
+            ),
+        ] {
+            let e = validate_sql(sql).unwrap_err().to_string();
+            assert!(e.contains(want), "{sql}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_body_is_planned_once_however_its_metadata_maps_are_ordered() {
+        // Delta column mapping puts several metadata entries on every field, and a
+        // HashMap renders them in a per-instance order: the cache key must not see that.
+        let element = Arc::new(Field::new("item", DataType::Utf8, true));
+        let capture = |order: [&str; 3]| {
+            let mut md = HashMap::new();
+            for (k, v) in order.iter().zip(["1", "2", "3"]) {
+                md.insert(k.to_string(), v.to_string());
+            }
+            Arc::new(Field::new("rate", DataType::Float64, true).with_metadata(md))
+        };
+        let body = "CAST(x AS DOUBLE) * __capture_0 + 0.5";
+        compile(
+            Kind::Transform,
+            "x",
+            body,
+            &element,
+            &[capture(["a", "b", "c"])],
+        )
+        .unwrap();
+        let after_first = cached_bodies();
+        for _ in 0..25 {
+            compile(
+                Kind::Transform,
+                "x",
+                body,
+                &element,
+                &[capture(["c", "a", "b"])],
+            )
+            .unwrap();
+        }
+        assert_eq!(cached_bodies(), after_first, "one body, one entry");
     }
 
     #[test]

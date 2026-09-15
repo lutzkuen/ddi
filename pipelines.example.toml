@@ -112,8 +112,8 @@ FROM (SELECT order_id, unnest(line_items) AS li FROM source)
 # Row-local, so it streams: the array is a function of the one row and nothing else.
 # Written in Trino's spelling — `'key' VALUE expr`, `x -> expr` lambdas, `FORMAT JSON` —
 # and with Trino's rules, so Starburst can DESCRIBE the same model and rebuild it in batch
-# to the same bytes. The item objects are built `RETURNING JSON` so the array of them is an
-# array of JSON rather than of text; a JSON-typed value is embedded with
+# to the same bytes. The item objects are wrapped in `json_parse` so the array of them is
+# an array of JSON rather than of text; a JSON-typed value is embedded with
 # `json_format(..) FORMAT JSON`, the one way Starburst accepts it as a member.
 [[pipeline]]
 name       = "order_created_outbox"
@@ -136,10 +136,9 @@ SELECT orders.message_id,
                'orderCode' VALUE orders.order_code,
                'items'     VALUE json_format(CAST(transform(
                    filter(orders.entries, e -> json_extract_scalar(e, '$.product.fulfillmentModel') <> 'CP_SOLD_CP_FULFILLED'),
-                   e -> json_object(
+                   e -> json_parse(json_object(
                        'productVariantId' VALUE json_extract_scalar(e, '$.product.variantArticleId'),
-                       'quantity'         VALUE CAST(json_extract_scalar(e, '$.quantity') AS INTEGER)
-                       RETURNING JSON)
+                       'quantity'         VALUE CAST(json_extract_scalar(e, '$.quantity') AS INTEGER)))
                ) AS JSON)) FORMAT JSON
            )
        ) AS json_message

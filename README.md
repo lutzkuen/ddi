@@ -955,41 +955,51 @@ landing in a column somebody casts to a number. Malformed JSON stops the pipelin
 is a typed column, not arbitrary text.
 
 The text these produce is what Starburst produces, byte for byte: `json_extract` copies a
-value in its source order with its source digits (`1.10` stays `1.10`), and `json_parse`
-stores the canonical form Trino stores — keys sorted, whitespace gone, floats spelt the way
-`BigDecimal` spells them — so `json_format(json_parse(x))` agrees between the two engines.
+value in its source order, integers as written and floats re-spelt as doubles (`1.10`
+becomes `1.1`, as Jackson's copy does); `json_parse` stores the canonical form Trino stores
+— keys sorted, whitespace gone, floats spelt the way `BigDecimal` spells them — so
+`json_format(json_parse(x))` agrees between the two engines; `json_array_get` returns a
+string element without its quotes, as its Trino documentation warns.
 
 #### Building JSON: `json_object`, `json_array`, `CAST(.. AS JSON)`
 
 An outbox model wants the opposite of the readers above: one message per source row,
 carrying that row's own child array. Trino's constructors are implemented, in Trino's
-spelling — `'key' VALUE expr`, the optional `KEY`, `FORMAT JSON`, `NULL ON NULL` /
-`ABSENT ON NULL`, `RETURNING JSON` / `VARCHAR` — and with Trino's rules, including the ones
+spelling — `'key' VALUE expr` or `'key' : expr`, the optional `KEY`, `FORMAT JSON`, `NULL ON
+NULL` / `ABSENT ON NULL`, `RETURNING VARCHAR` — and with Trino's rules, including the ones
 nobody would design that way, because a model has to produce the same bytes in both engines:
 
-- **A constructor returns text**, not JSON, unless told `RETURNING JSON`. A constructor
-  nested *directly* inside another is embedded as JSON anyway (the analyzer treats the
-  nesting as an implicit `FORMAT JSON`); one that arrives any other way — through a `CASE`,
-  a `coalesce`, a CTE column — is text, embedded as an escaped string unless you write
-  `FORMAT JSON` after it.
+- **A constructor returns text**, not JSON; `RETURNING` takes only a character string type,
+  so `RETURNING JSON` is refused here as it is there, and `json_parse(json_object(..))` is
+  the JSON-typed value. A constructor nested *directly* inside another is embedded as JSON
+  anyway, as built (the analyzer treats the nesting as an implicit `FORMAT JSON`); one that
+  arrives any other way — through a `CASE`, a `coalesce`, a CTE column — is text, embedded as
+  an escaped string unless you write `FORMAT JSON` after it, which re-reads the text the way
+  Jackson's tree reader does: order kept, a repeated key resolved to its last value, floats as
+  doubles.
 - **A JSON-typed value** — `json_extract`, `json_array_get`, `json_parse`, `CAST(.. AS
-  JSON)` — used as a member without `FORMAT JSON` is cast to varchar first. A scalar survives
-  that as a string; an object or array fails, in Starburst at run time and here with the
-  spelling that works: `json_format(<value>) FORMAT JSON`. `FORMAT JSON` directly on a
-  JSON-typed value is an analysis error there and a config-load error here.
+  JSON)`, an element of `ARRAY(JSON)` — used as a member without `FORMAT JSON` is cast to
+  varchar first. A scalar survives that as a string; an object or array fails, in Starburst
+  at run time and here with the spelling that works: `json_format(<value>) FORMAT JSON`.
+  `FORMAT JSON` directly on a JSON-typed value is an analysis error there; here it is a
+  config-load error when the value is written in place, and an error when the query is
+  planned — before any row — when it arrives through a column. `CAST(<value> AS VARCHAR)`
+  is Trino's JSON-to-varchar cast, and a `CASE` or `coalesce` over JSON-typed values is
+  JSON-typed, both as there.
 - **Keys come out in `java.util.HashMap` order** — neither as written nor sorted; Trino's own
   test expects `key_1, key_2` to come out `key_2, key_1`. It is reproduced here so the two
   engines agree. A repeated key is an error, as it is there.
-- **`json_object` defaults to `NULL ON NULL`, `json_array` to `ABSENT ON NULL`.** Text is
-  escaped, numbers are numbers, decimals keep their scale (`12.3400`), doubles are spelt as
-  `Double.toString` spells them, timestamps as `2024-03-31 22:30:00.123 UTC`. An array or
-  row as a member is refused with the fix named, because Starburst would cast it to varchar
-  text, which is never what a message wants.
+- **`json_object` defaults to `NULL ON NULL`, `json_array` to `ABSENT ON NULL`**, and an
+  absent member takes no part in the duplicate check or the ordering. Text is escaped as
+  Jackson escapes it, numbers are numbers, decimals keep their scale (`12.3400`), doubles
+  are spelt as `Double.toString` spells them, timestamps as `2024-03-31 22:30:00.123 UTC`.
+  An array or row as a member is refused with the fix named, because Starburst would cast
+  it to varchar text, which is never what a message wants.
 
 Put together, this is the message-per-order model from the issue that asked for it, in the
-form that runs in both engines. The item objects are built `RETURNING JSON` so the array of
-them is an array of JSON rather than of text, and that array goes in as
-`json_format(..) FORMAT JSON`:
+form that runs in both engines. The item objects are wrapped in `json_parse` so the array of
+them is an array of JSON rather than of text — canonical, so their keys come out sorted —
+and that array goes in as `json_format(..) FORMAT JSON`:
 
 ```sql
 WITH orders AS (
@@ -1009,11 +1019,10 @@ SELECT orders.message_id,
                'items'     VALUE json_format(CAST(transform(
                    filter(orders.entries,
                           e -> json_extract_scalar(e, '$.product.fulfillmentModel') <> 'CP_SOLD_CP_FULFILLED'),
-                   e -> json_object(
+                   e -> json_parse(json_object(
                        'productVariantId'      VALUE json_extract_scalar(e, '$.product.variantArticleId'),
                        'quantity'              VALUE CAST(json_extract_scalar(e, '$.quantity') AS INTEGER),
-                       'nmvBeforeCancellation' VALUE CAST(json_extract_scalar(e, '$.price') AS DECIMAL(30, 4))
-                       RETURNING JSON)
+                       'nmvBeforeCancellation' VALUE CAST(json_extract_scalar(e, '$.price') AS DECIMAL(30, 4))))
                ) AS JSON)) FORMAT JSON
            )
        ) AS json_message
@@ -1021,11 +1030,11 @@ FROM orders
 ```
 
 Two things to know before comparing bytes with Starburst. `FORMAT JSON` re-reads the text
-it is given the way Jackson does: order kept, a repeated key resolved to its last value,
-whitespace dropped, and floats re-spelt as doubles — so a `DECIMAL(30,4)` that passes
-through it comes out `2.75`, not `2.7500`, in both engines. And a zoned timestamp is
-rendered at millisecond precision, which is how Starburst reads a Delta `timestamp`; cast to
-`VARCHAR` in the model if you need something else.
+it is given the way Jackson does, so a `DECIMAL(30,4)` that passes through it comes out
+`2.75`, not `2.7500`, in both engines — a directly nested constructor, which is not
+re-read, keeps `2.7500`. And a zoned timestamp is rendered at millisecond precision, which
+is how Starburst reads a Delta `timestamp`; cast to `VARCHAR` in the model if you need
+something else.
 
 ### Ordering, when using a watermark table
 

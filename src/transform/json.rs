@@ -150,10 +150,18 @@ fn resolve<'a>(doc: &'a Json, steps: &[Step]) -> Option<&'a Json> {
     Some(cur)
 }
 
-/// A value copied out as JSON text: as it was written, order and digits included, which
-/// is what Trino's streaming extractor does.
+/// A value copied out as JSON text the way Trino's streaming extractor copies it: members
+/// as written, repeats included, integers verbatim — and floats re-spelt as doubles,
+/// because Jackson's `copyCurrentStructure` reads a float token as a `double`.
 fn extract_text(v: &Json) -> String {
-    jsonval::to_string(v, Members::Verbatim, Numbers::Verbatim)
+    jsonval::to_string(v, Members::Verbatim, Numbers::JavaDouble)
+}
+
+/// A value read into a tree and written back, which is what `json_query`, `json_array_get`
+/// and `CAST(.. AS ARRAY(JSON))` do in Trino: a repeated key keeps its first position and
+/// its last value, floats are doubles.
+fn tree_text(v: &Json) -> String {
+    jsonval::to_string(v, Members::LastWins, Numbers::JavaDouble)
 }
 
 /// Every function this module provides.
@@ -229,10 +237,13 @@ pub(crate) fn element_field() -> FieldRef {
 /// `ddi` has no JSON *type*: `json` and `varchar` are both `Utf8`. What Trino keeps in
 /// its type system — that `json_extract` returns JSON while `json_extract_scalar` returns
 /// text — is kept here as a marker on the Arrow field. DataFusion carries field metadata
-/// through column references, aliases, CTEs and function results, so a value extracted
-/// two CTEs up is still known to be JSON where `json_object` decides how to embed it, and
-/// decides it the way Starburst does. The marker never leaves a transform — see
-/// [`strip_json_marker`] — so nothing that writes, compares or publishes a batch sees it.
+/// through column references, aliases, casts, CTEs and the results of the functions here,
+/// so a value extracted two CTEs up is still known to be JSON where `json_object` decides
+/// how to embed it, and decides it the way Starburst does. It does not carry it through a
+/// `CASE`, `coalesce`, `nullif` or an `UNNEST`; the config-load rewrites put it back at
+/// those points (`ddi_as_json`), so what Trino's type system would call JSON is JSON here
+/// too. The marker never leaves a transform — see [`strip_json_marker`] — so nothing that
+/// writes, compares or publishes a batch sees it.
 pub(crate) const JSON_MARKER: &str = "ddi:json";
 
 /// What the marker says a text field is.
@@ -452,7 +463,7 @@ impl ScalarUDFImpl for JsonFn {
                 // lookup in this module; malformed JSON already errored above.
                 Kind::ArrayElements => lists.push(doc.as_array().map(|a| {
                     a.iter()
-                        .map(|v| (!v.is_null()).then(|| extract_text(v)))
+                        .map(|v| (!v.is_null()).then(|| tree_text(v)))
                         .collect()
                 })),
                 Kind::ArrayContains => {
@@ -477,7 +488,15 @@ impl ScalarUDFImpl for JsonFn {
                         }
                         _ => None,
                     };
-                    text.push(got.filter(|v| !v.is_null()).map(extract_text));
+                    // Trino reads the element with `getValueAsString`, so a string comes
+                    // back without its quotes — invalid JSON, as its documentation warns —
+                    // a scalar as its text, and a container as a tree.
+                    text.push(got.and_then(|v| match v {
+                        Json::Null => None,
+                        Json::String(s) => Some(s.clone()),
+                        Json::Bool(_) | Json::Number(_) => v.scalar_text(),
+                        Json::Array(_) | Json::Object(_) => Some(tree_text(v)),
+                    }));
                 }
                 Kind::Extract | Kind::Query | Kind::ExtractScalar | Kind::Size | Kind::Exists => {
                     let path = arg2.expect("arity 2").1;
@@ -486,10 +505,10 @@ impl ScalarUDFImpl for JsonFn {
                     match self.kind {
                         // JSON in, JSON out: a string keeps its quotes, so the result
                         // composes with the other json_* functions. Unwrapping it here is
-                        // what `json_extract_scalar` is for.
-                        Kind::Extract | Kind::Query => {
-                            text.push(found.filter(|v| !v.is_null()).map(extract_text))
-                        }
+                        // what `json_extract_scalar` is for. A JSON null at the path is the
+                        // JSON value `null`; only a missing path is SQL NULL.
+                        Kind::Extract => text.push(found.map(extract_text)),
+                        Kind::Query => text.push(found.map(tree_text)),
                         Kind::ExtractScalar => text.push(found.and_then(Json::scalar_text)),
                         Kind::Size => nums.push(found.map(|v| v.size() as i64)),
                         Kind::Exists => bools.push(Some(found.is_some())),
@@ -601,7 +620,8 @@ mod tests {
     #[tokio::test]
     async fn extract_returns_containers_as_json_in_source_order() {
         // Trino's extractor copies the structure as it streams past, so the keys come out
-        // in the order the payload wrote them, and a number keeps its digits.
+        // in the order the payload wrote them; an integer keeps its digits and a float is
+        // re-spelt as a double, as Jackson's copy does.
         assert_eq!(
             one("json_extract(data, '$.customer')").await,
             Some(r#"{"id":42,"country":"DE"}"#.into())
@@ -610,6 +630,36 @@ mod tests {
             one("json_extract(data, '$.lines[0]')").await,
             Some(r#"{"sku":"A","qty":2}"#.into())
         );
+        let out = SqlTransform::new(
+            "SELECT json_extract(data, '$') AS a, json_query(data, '$') AS q, \
+                    json_extract(data, '$.n') AS n, json_format(json_extract(data, '$.z')) AS z \
+             FROM source",
+        )
+        .apply(vec![batch(&[
+            r#"{"b": 1.10, "a": 1e2, "b": 2, "n": null, "z": null}"#,
+        ])])
+        .await
+        .unwrap();
+        let col = |i: usize| {
+            let c = out[0]
+                .column(i)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (!c.is_null(0)).then(|| c.value(0).to_string())
+        };
+        // A streaming copy keeps a repeated key; a tree read keeps its last value.
+        assert_eq!(
+            col(0).as_deref(),
+            Some(r#"{"b":1.1,"a":100.0,"b":2,"n":null,"z":null}"#)
+        );
+        assert_eq!(
+            col(1).as_deref(),
+            Some(r#"{"b":2,"a":100.0,"n":null,"z":null}"#)
+        );
+        // A JSON null at the path is the value `null`, not a missing path.
+        assert_eq!(col(2).as_deref(), Some("null"));
+        assert_eq!(col(3).as_deref(), Some("null"));
     }
 
     #[tokio::test]
@@ -673,6 +723,32 @@ mod tests {
             one("json_array_length(json_extract(data, '$.lines'))").await,
             Some("2".into())
         );
+    }
+
+    #[tokio::test]
+    async fn array_get_returns_strings_unquoted_and_containers_as_a_tree() {
+        // Trino's own documentation: a string element comes back without its quotes.
+        let out = SqlTransform::new(
+            "SELECT json_array_get(data, 0) AS s, json_array_get(data, 1) AS n, \
+                    json_array_get(data, 2) AS o, json_array_get(data, 3) AS z FROM source",
+        )
+        .apply(vec![batch(&[
+            r#"["a\"b", 1.10, {"q": 1.10, "q": 2}, null]"#,
+        ])])
+        .await
+        .unwrap();
+        let col = |i: usize| {
+            let c = out[0]
+                .column(i)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (!c.is_null(0)).then(|| c.value(0).to_string())
+        };
+        assert_eq!(col(0).as_deref(), Some(r#"a"b"#));
+        assert_eq!(col(1).as_deref(), Some("1.10"));
+        assert_eq!(col(2).as_deref(), Some(r#"{"q":2}"#));
+        assert_eq!(col(3), None);
     }
 
     #[tokio::test]

@@ -54,7 +54,7 @@ fn deliveries() -> RecordBatch {
 }
 
 /// The model from the issue, in the spelling that runs in Starburst: the item objects are
-/// built `RETURNING JSON` so the array of them is an array of JSON rather than of text,
+/// wrapped in `json_parse` so the array of them is an array of JSON rather than of text,
 /// and the array is embedded with `json_format(..) FORMAT JSON`, the one way Starburst
 /// accepts a JSON-typed value as a member. The FX rate is a CTE column here; a pinned
 /// lookup's column is captured the same way, see the lookup test below.
@@ -84,7 +84,7 @@ select
                         e -> json_extract_scalar(e, '$.product.fulfillmentModel')
                              <> 'CP_SOLD_CP_FULFILLED'
                     ),
-                    e -> json_object(
+                    e -> json_parse(json_object(
                         'productVariantId' value
                             json_extract_scalar(e, '$.product.variantArticleId'),
                         'quantity' value cast(json_extract_scalar(e, '$.quantity') as integer),
@@ -98,8 +98,7 @@ select
                             * orders.fx_rate
                             as decimal(30, 4)
                         )
-                        returning json
-                    )
+                    ))
                 ) as json
             )) format json
         )
@@ -135,13 +134,14 @@ async fn one_message_per_order_with_that_orders_own_items() {
     let out = run(OUTBOX, vec![deliveries()]).await;
     let got = texts(&out, "json_message");
 
-    // Member order is Java's HashMap order, which is what Starburst emits; numbers that
-    // pass through FORMAT JSON are re-read as doubles there, and so here.
+    // Member order is Java's HashMap order, which is what Starburst emits — except inside
+    // the items, which `json_parse` canonicalised: keys sorted. Numbers that pass through
+    // FORMAT JSON are re-read as doubles there, and so here.
     assert_eq!(
         got,
         vec![
             Some(
-                r#"{"messageTime":"2024-03-31 22:30:00.123 UTC","data":{"orderCode":"A1","currency":"EUR","items":[{"quantity":1,"productVariantId":"V2","nmvBeforeCancellation":2.75}]},"messageId":"m1"}"#
+                r#"{"messageTime":"2024-03-31 22:30:00.123 UTC","data":{"orderCode":"A1","currency":"EUR","items":[{"nmvBeforeCancellation":2.75,"productVariantId":"V2","quantity":1}]},"messageId":"m1"}"#
                     .to_string()
             ),
             // An empty array maps to `[]` ...
@@ -155,7 +155,7 @@ async fn one_message_per_order_with_that_orders_own_items() {
                     .to_string()
             ),
             Some(
-                r#"{"messageTime":"2024-03-31 22:30:00.123 UTC","data":{"orderCode":"D4","currency":"EUR","items":[{"quantity":3,"productVariantId":"V3","nmvBeforeCancellation":9.9}]},"messageId":"m4"}"#
+                r#"{"messageTime":"2024-03-31 22:30:00.123 UTC","data":{"orderCode":"D4","currency":"EUR","items":[{"nmvBeforeCancellation":9.9,"productVariantId":"V3","quantity":3}]},"messageId":"m4"}"#
                     .to_string()
             ),
         ]
@@ -273,6 +273,168 @@ async fn a_lambda_over_an_array_of_structs_sees_the_elements_fields() {
         texts(&out, "skus"),
         vec![Some(r#"["A","B"]"#.into()), Some(r#"["C"]"#.into())]
     );
+}
+
+#[tokio::test]
+async fn a_sliced_struct_list_folds_the_same_as_the_whole_batch() {
+    // The property, on the typed fixture, with list offsets that no longer start at zero.
+    let sql = "SELECT order_id, \
+                      json_format(CAST(transform(line_items, li -> li.sku) AS JSON)) AS skus, \
+                      array_length(filter(line_items, li -> li.qty > nullif(li.qty, 1))) AS kept \
+               FROM source";
+    let whole = run(sql, vec![orders_with_line_items()]).await;
+    let src = orders_with_line_items();
+    let t = SqlTransform::new(sql);
+    let mut split = Vec::new();
+    for (start, len) in [(1, 1), (0, 1)] {
+        let out = t.apply(vec![src.slice(start, len)]).await.unwrap();
+        split.push((texts(&out, "skus"), texts(&out, "kept")));
+    }
+    assert_eq!(split[0].0, vec![Some(r#"["C"]"#.into())]);
+    assert_eq!(split[1].0, vec![Some(r#"["A","B"]"#.into())]);
+    assert_eq!(
+        texts(&whole, "skus"),
+        vec![Some(r#"["A","B"]"#.into()), Some(r#"["C"]"#.into())]
+    );
+    // qty > nullif(qty, 1): 2 > 2 false, 1 > NULL is NULL (dropped), 3 > 3 false.
+    assert_eq!(
+        texts(&whole, "kept"),
+        vec![Some("0".into()), Some("0".into())]
+    );
+    assert_eq!(split[0].1, vec![Some("0".into())]);
+}
+
+#[tokio::test]
+async fn nested_lambdas_run_with_the_outer_element_and_a_row_column_captured() {
+    let out = run(
+        "SELECT json_format(CAST(transform( \
+                    CAST('[1,2]' AS ARRAY(JSON)), \
+                    a -> array_length(filter( \
+                        CAST(json_extract(data, '$.orderEntries') AS ARRAY(JSON)), \
+                        b -> CAST(json_extract_scalar(b, '$.quantity') AS INTEGER) \
+                             >= CAST(a AS INTEGER)))) AS JSON)) AS counts \
+         FROM source",
+        vec![deliveries()],
+    )
+    .await;
+    // A1 has quantities 2 and 1: >= 1 -> 2, >= 2 -> 1. B2 none. C3 no list. D4 has 3.
+    assert_eq!(
+        texts(&out, "counts"),
+        vec![
+            Some("[2,1]".into()),
+            Some("[0,0]".into()),
+            Some("[null,null]".into()),
+            Some("[1,1]".into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn case_coalesce_and_nullif_work_inside_a_body_with_a_capture() {
+    let out = run(
+        "WITH o AS (SELECT data, 10 AS fallback FROM source) \
+         SELECT json_format(CAST(transform( \
+                    CAST(json_extract(o.data, '$.orderEntries') AS ARRAY(JSON)), \
+                    e -> CASE WHEN json_extract_scalar(e, '$.quantity') IS NULL \
+                              THEN coalesce(o.fallback, 0) \
+                              ELSE nullif(CAST(json_extract_scalar(e, '$.quantity') AS INTEGER), 1) \
+                         END) AS JSON)) AS q \
+         FROM o",
+        vec![deliveries()],
+    )
+    .await;
+    assert_eq!(
+        texts(&out, "q"),
+        vec![
+            Some("[2,null]".into()),
+            Some("[]".into()),
+            None,
+            Some("[3]".into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_quoted_parameter_is_one_name_and_an_unquoted_reference_another() {
+    let ok = run(
+        "SELECT json_format(CAST(transform(CAST('[1]' AS ARRAY(JSON)), \"E\" -> \"E\") AS JSON)) AS v \
+         FROM source",
+        vec![deliveries().slice(0, 1)],
+    )
+    .await;
+    assert_eq!(texts(&ok, "v"), vec![Some("[1]".into())]);
+    // `E` inside the body is a different name: a capture of a column that does not exist.
+    let e = SqlTransform::new(
+        "SELECT transform(CAST('[1]' AS ARRAY(JSON)), \"E\" -> E) AS v FROM source",
+    )
+    .apply(vec![deliveries().slice(0, 1)])
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        e.to_lowercase().contains("field") || e.contains("E"),
+        "got: {e}"
+    );
+}
+
+#[tokio::test]
+async fn a_large_list_input_is_accepted_by_both_functions() {
+    let out = run(
+        "WITH s AS (SELECT arrow_cast(transform(line_items, li -> li.sku), 'LargeList(Utf8)') AS skus FROM source) \
+         SELECT json_format(CAST(transform(skus, x -> x || '!') AS JSON)) AS shouted, \
+                json_format(CAST(filter(skus, x -> x <> 'A') AS JSON)) AS kept \
+         FROM s",
+        vec![orders_with_line_items()],
+    )
+    .await;
+    assert_eq!(
+        texts(&out, "shouted"),
+        vec![Some(r#"["A!","B!"]"#.into()), Some(r#"["C!"]"#.into())]
+    );
+    assert_eq!(
+        texts(&out, "kept"),
+        vec![Some(r#"["B"]"#.into()), Some(r#"["C"]"#.into())]
+    );
+}
+
+#[tokio::test]
+async fn a_simplify_only_function_in_a_body_means_what_it_means_outside() {
+    // current_date and arrow_cast are turned into values by the simplifier, which a body
+    // has to run too; a stable function is not cached across batches.
+    let out = run(
+        "SELECT json_format(CAST(transform(CAST('[1]' AS ARRAY(JSON)), \
+                    e -> arrow_cast(e, 'Int64') + CAST(current_date() - current_date() AS BIGINT)) AS JSON)) AS v \
+         FROM source",
+        vec![deliveries().slice(0, 1)],
+    )
+    .await;
+    assert_eq!(texts(&out, "v"), vec![Some("[1]".into())]);
+}
+
+#[test]
+fn the_example_config_validates_and_its_outbox_model_is_a_lambda() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/pipelines.example.toml"
+    ))
+    .unwrap();
+    let value: toml::Value = toml::from_str(&text).unwrap();
+    let pipelines = value["pipeline"].as_array().unwrap();
+    let mut outbox = None;
+    for p in pipelines {
+        if let Some(sql) = p.get("transform_sql").and_then(|v| v.as_str()) {
+            let lookups = std::collections::BTreeSet::new();
+            let normalised =
+                delta_delta_ingest::transform::validate::normalise_sql_with_lookups(sql, &lookups)
+                    .unwrap_or_else(|e| panic!("{}: {e}", p["name"]));
+            if p["name"].as_str() == Some("order_created_outbox") {
+                outbox = Some(normalised);
+            }
+        }
+    }
+    let outbox = outbox.expect("the outbox example is in the file");
+    assert!(outbox.contains("ddi_transform("), "{outbox}");
+    assert!(outbox.contains("ddi_json_object("), "{outbox}");
 }
 
 #[tokio::test]

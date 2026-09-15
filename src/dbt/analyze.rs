@@ -909,8 +909,8 @@ mod tests {
                  KEY 'messageId' VALUE orders.message_id, \n\
                  'items' value json_format(cast(transform(\n\
                      filter(orders.entries, e -> json_extract_scalar(e, '$.model') <> 'X'), \n\
-                     e -> json_object('qty' value cast(json_extract_scalar(e, '$.qty') as integer) \n\
-                                      returning json)) as json)) format json) as json_message \n\
+                     e -> json_parse(json_object('qty' value cast(json_extract_scalar(e, '$.qty') \n\
+                                      as integer)))) as json)) format json) as json_message \n\
              from orders",
         );
         let Verdict::Streamable(s) = v else {

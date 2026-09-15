@@ -12,31 +12,37 @@
 //! Starburst — and in an estate where the target table's columns are derived from the model
 //! by `DESCRIBE OUTPUT`, a model Starburst cannot read has no table. So the constructors
 //! are the ones Starburst already runs, spelt the way people write them — `'key' VALUE
-//! expr`, the optional `KEY`, `FORMAT JSON`, `NULL ON NULL` / `ABSENT ON NULL`,
-//! `RETURNING` — and, more to the point, *behaving* the way Starburst does, including the
-//! parts nobody would design that way:
+//! expr`, `'key' : expr`, the optional `KEY`, `FORMAT JSON`, `NULL ON NULL` / `ABSENT ON
+//! NULL`, `RETURNING VARCHAR` — and, more to the point, *behaving* the way Starburst does,
+//! including the parts nobody would design that way:
 //!
-//! - `json_object` and `json_array` return **text**, not JSON, unless told `RETURNING
-//!   JSON`. A constructor nested directly inside another is embedded as JSON anyway — the
-//!   analyzer treats the nesting as an implicit `FORMAT JSON` — but a constructor's result
-//!   that arrives any other way (through a `CASE`, a `coalesce`, a CTE column) is text,
-//!   and is embedded as an escaped string unless the model says `FORMAT JSON`.
+//! - `json_object` and `json_array` return **text**; `RETURNING` accepts only a character
+//!   string type, so `RETURNING JSON` is refused here as it is there. A constructor nested
+//!   directly inside another is embedded as JSON anyway — the analyzer treats the nesting as
+//!   an implicit `FORMAT JSON`, and keeps the inner value as it was built — but a
+//!   constructor's result that arrives any other way (through a `CASE`, a `coalesce`, a CTE
+//!   column) is text, and is embedded as an escaped string unless the model says `FORMAT
+//!   JSON`, which re-reads the text the way Jackson's tree reader does.
 //! - A JSON-typed value — `json_extract`, `json_array_get`, `json_parse`, `CAST(.. AS
-//!   JSON)` — used as a member without `FORMAT JSON` is cast to varchar first. That works
-//!   for a scalar and **fails for an object or array**, in Starburst at run time and here
-//!   too, with the spelling that works: `json_format(<value>) FORMAT JSON`. `FORMAT JSON`
-//!   directly on a JSON-typed value is an analysis error there and a config-load one here.
+//!   JSON)`, an element of `ARRAY(JSON)` — used as a member without `FORMAT JSON` is cast to
+//!   varchar first. That works for a scalar and **fails for an object or array**, in
+//!   Starburst at run time and here too, with the spelling that works: `json_format(<value>)
+//!   FORMAT JSON`. `FORMAT JSON` directly on a JSON-typed value is an analysis error there
+//!   and a config-load error here when the value is written in place; when it arrives as
+//!   a column, an error when the query is planned, before any row.
 //! - The members of a `json_object` come out in the order a `java.util.HashMap` iterates
 //!   them: neither as written nor sorted. See [`crate::transform::jsonval`], which
 //!   reproduces it so the two engines produce the same bytes. A repeated key is an error.
-//! - `json_object` defaults to `NULL ON NULL`, `json_array` to `ABSENT ON NULL`.
+//! - `json_object` defaults to `NULL ON NULL`, `json_array` to `ABSENT ON NULL`; an absent
+//!   member is absent from the duplicate check and the ordering too.
 //!
 //! # How a value is rendered
 //!
 //! | value | as a member | under `CAST(.. AS JSON)` |
 //! |---|---|---|
 //! | text | string, escaped | string, escaped |
-//! | text after `FORMAT JSON` | embedded, re-serialised as Jackson would | — |
+//! | text after `FORMAT JSON` | embedded, re-read as Jackson's tree reader would | — |
+//! | a nested constructor | embedded as built | — |
 //! | JSON-typed text | scalar as a string; object or array is an error | embedded verbatim |
 //! | integers | number | number |
 //! | decimals | number at the declared scale, `12.3400`, as `BigDecimal` spells it | same |
@@ -46,6 +52,16 @@
 //! | timestamp | `"2024-03-31 22:30:00.123456"`; zoned values render in UTC at millisecond precision with ` UTC` appended, the way Starburst reads a Delta `timestamp` | naive only; zoned is not castable there either |
 //! | array, row | an error naming the fix: Starburst would cast it to varchar text | array / object, recursively |
 //! | NULL | `null`, or absent | SQL NULL; `null` inside a container |
+//!
+//! # Where the JSON type is put back
+//!
+//! DataFusion drops field metadata — and with it the JSON marker — at a `CASE`, a
+//! `coalesce`, a `nullif` and an `UNNEST`. Trino's type system does not: a `CASE` over
+//! `json_extract` is JSON. So the rewrite here wraps such an expression in `ddi_as_json`
+//! wherever the marker matters, and [`crate::transform::unnest`] does the same for the
+//! elements of `CAST(.. AS ARRAY(JSON))`. In the other direction DataFusion *keeps* the
+//! marker through a cast, where Trino's type changes; `CAST(<json> AS VARCHAR)` becomes
+//! `ddi_text`, which is Trino's JSON-to-varchar cast.
 
 use std::any::Any;
 use std::ops::ControlFlow;
@@ -76,18 +92,20 @@ use crate::transform::json::{json_field, mark, marker_of, Marker};
 use crate::transform::jsonval::{self, Json, Members, Numbers};
 use crate::transform::validate::reject;
 
-/// `ddi_json_object(<flags>, key, value, key, value, ...)` — what `json_object(...)` becomes.
+/// `ddi_json_object(<nulls>, key, value, key, value, ...)` — what `json_object(...)` becomes.
 pub(crate) const OBJECT: &str = "ddi_json_object";
-/// `ddi_json_array(<flags>, value, value, ...)` — what `json_array(...)` becomes.
+/// `ddi_json_array(<nulls>, value, value, ...)` — what `json_array(...)` becomes.
 pub(crate) const ARRAY: &str = "ddi_json_array";
 /// `ddi_to_json(x)` — what `CAST(x AS JSON)` becomes.
 pub(crate) const TO_JSON: &str = "ddi_to_json";
 /// `ddi_format_json(x)` — what `x FORMAT JSON` becomes.
 pub(crate) const FORMAT_JSON: &str = "ddi_format_json";
-/// `ddi_embed_json(x)` — what a constructor nested directly in another becomes: the
-/// implicit `FORMAT JSON` Trino's analyzer applies, which also takes a `RETURNING JSON`
-/// result as it is.
+/// `ddi_embed_json(x)` — what a constructor nested directly in another becomes.
 pub(crate) const EMBED_JSON: &str = "ddi_embed_json";
+/// `ddi_as_json(x)` — the JSON type, put back where DataFusion dropped it.
+pub(crate) const AS_JSON: &str = "ddi_as_json";
+/// `ddi_text(x)` — what `CAST(<json> AS VARCHAR)` becomes: Trino's JSON-to-varchar cast.
+pub(crate) const TEXT: &str = "ddi_text";
 
 /// The functions of this module, registered on every transform session.
 pub fn register(ctx: &SessionContext) {
@@ -97,6 +115,8 @@ pub fn register(ctx: &SessionContext) {
         Build::ToJson,
         Build::FormatJson,
         Build::Embed,
+        Build::AsJson,
+        Build::Text,
     ] {
         ctx.register_udf(ScalarUDF::from(BuildFn::new(kind)));
     }
@@ -106,8 +126,8 @@ pub fn register(ctx: &SessionContext) {
 // The rewrite: Trino's calls into this module's functions
 // ---------------------------------------------------------------------------------------
 
-/// Replace every `json_object`, `json_array`, `CAST(.. AS JSON)` and `FORMAT JSON` in
-/// `query`, in place.
+/// Replace every `json_object`, `json_array`, `CAST(.. AS JSON)`, `FORMAT JSON` and
+/// `CAST(<json> AS VARCHAR)` in `query`, in place.
 ///
 /// Runs before validation, so a constructor written the way Starburst reads it is what the
 /// engine runs, and a spelling this module does not implement is refused at config load
@@ -157,7 +177,7 @@ fn replacement(expr: &Expr) -> Result<Option<Expr>> {
                 // `crate::transform::dialect` — and reads text as JSON.
                 CastKind::DoubleColon => {
                     let inner = unparenthesised(inner);
-                    if let Some(what) = json_typed_call(inner) {
+                    if let Some(what) = json_typed_name(inner) {
                         return Err(reject(
                             &format!("FORMAT JSON on {what}, which is a JSON-typed value"),
                             "Starburst reads FORMAT JSON only from text, and refuses it on \
@@ -168,7 +188,7 @@ fn replacement(expr: &Expr) -> Result<Option<Expr>> {
                     Ok(Some(call(FORMAT_JSON, vec![inner.clone()])))
                 }
                 // `CAST(x AS JSON)` converts a value: text becomes a JSON *string*.
-                CastKind::Cast => Ok(Some(call(TO_JSON, vec![(**inner).clone()]))),
+                CastKind::Cast => Ok(Some(call(TO_JSON, vec![with_json_type((**inner).clone())]))),
                 CastKind::TryCast | CastKind::SafeCast => Err(reject(
                     "TRY_CAST(.. AS JSON)",
                     "a value that cannot be rendered as JSON is a data-quality failure, not \
@@ -176,6 +196,15 @@ fn replacement(expr: &Expr) -> Result<Option<Expr>> {
                     "write CAST(x AS JSON).",
                 )),
             }
+        }
+        // `CAST(<json> AS VARCHAR)`: Trino's type changes, so the value does too.
+        Expr::Cast {
+            kind: CastKind::Cast,
+            expr: inner,
+            data_type,
+            ..
+        } if is_text_type(data_type) && is_json_typed(inner) => {
+            Ok(Some(call(TEXT, vec![(**inner).clone()])))
         }
         Expr::Function(f) => match bare_name(&f.name).as_str() {
             "json_object" => rewrite_object(f).map(Some),
@@ -190,6 +219,14 @@ fn is_json_type(data_type: &SqlType) -> bool {
     matches!(data_type, SqlType::JSON) || data_type.to_string().eq_ignore_ascii_case("JSON")
 }
 
+fn is_text_type(data_type: &SqlType) -> bool {
+    let rendered = data_type.to_string().to_ascii_uppercase();
+    rendered.starts_with("VARCHAR")
+        || rendered.starts_with("CHAR")
+        || rendered == "STRING"
+        || rendered == "TEXT"
+}
+
 fn unparenthesised(e: &Expr) -> &Expr {
     match e {
         Expr::Nested(inner) => unparenthesised(inner),
@@ -199,7 +236,11 @@ fn unparenthesised(e: &Expr) -> &Expr {
 
 /// The name of a JSON-typed call, when `e` is one: what Trino's analyzer would refuse
 /// `FORMAT JSON` on.
-fn json_typed_call(e: &Expr) -> Option<String> {
+fn json_typed_name(e: &Expr) -> Option<String> {
+    let e = unparenthesised(e);
+    if json_typed_by_branches(e) {
+        return Some("a CASE or coalesce over JSON-typed values".into());
+    }
     let Expr::Function(f) = e else {
         return None;
     };
@@ -207,7 +248,56 @@ fn json_typed_call(e: &Expr) -> Option<String> {
     match name.as_str() {
         "json_extract" | "json_array_get" | "json_parse" => Some(format!("{name}(..)")),
         n if n == TO_JSON => Some("CAST(.. AS JSON)".into()),
+        n if n == AS_JSON => Some("a JSON-typed value".into()),
         _ => None,
+    }
+}
+
+/// Is `e`, by its shape, a value of Trino's JSON type?
+fn is_json_typed(e: &Expr) -> bool {
+    json_typed_name(e).is_some()
+}
+
+/// A `CASE`, `coalesce`, `nullif`, `ifnull`, `nvl` or `if` with a JSON-typed branch: JSON
+/// in Trino's type system, text to DataFusion, which drops the marker at the branch point.
+fn json_typed_by_branches(e: &Expr) -> bool {
+    match unparenthesised(e) {
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            conditions.iter().any(|c| is_json_typed(&c.result))
+                || else_result.as_ref().is_some_and(|r| is_json_typed(r))
+        }
+        Expr::Function(f) => {
+            let FunctionArguments::List(list) = &f.args else {
+                return false;
+            };
+            let values: Vec<&Expr> = list
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                    _ => None,
+                })
+                .collect();
+            match bare_name(&f.name).as_str() {
+                "coalesce" | "nullif" | "ifnull" | "nvl" => values.iter().any(|v| is_json_typed(v)),
+                "if" => values.len() == 3 && values[1..].iter().any(|v| is_json_typed(v)),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// `e`, with the JSON type put back where DataFusion would drop it.
+fn with_json_type(e: Expr) -> Expr {
+    if json_typed_by_branches(&e) {
+        call(AS_JSON, vec![e])
+    } else {
+        e
     }
 }
 
@@ -257,48 +347,20 @@ fn literal(text: &str) -> Expr {
     Expr::Value(Value::SingleQuotedString(text.to_string()).into())
 }
 
-/// What the clauses of a constructor call asked for, as the flags literal encodes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Flags {
-    absent_on_null: bool,
-    returns_json: bool,
-}
-
-impl Flags {
-    fn encode(self) -> String {
-        format!(
-            "{},{}",
-            if self.absent_on_null {
-                "absent"
-            } else {
-                "null"
-            },
-            if self.returns_json { "json" } else { "varchar" }
-        )
-    }
-
-    fn decode(text: &str) -> Option<Self> {
-        let (nulls, returns) = text.split_once(',')?;
-        Some(Self {
-            absent_on_null: match nulls {
-                "absent" => true,
-                "null" => false,
-                _ => return None,
-            },
-            returns_json: match returns {
-                "json" => true,
-                "varchar" => false,
-                _ => return None,
-            },
-        })
+/// What a NULL member becomes, as the flags literal encodes it.
+fn nulls_flag(absent_on_null: bool) -> &'static str {
+    if absent_on_null {
+        "absent"
+    } else {
+        "null"
     }
 }
 
 fn parse_flags<'f>(
     what: &str,
     f: &'f Function,
-    absent_on_null: bool,
-) -> Result<(Flags, &'f FunctionArgumentList)> {
+    mut absent_on_null: bool,
+) -> Result<(bool, &'f FunctionArgumentList)> {
     if f.uses_odbc_syntax
         || !matches!(f.parameters, FunctionArguments::None)
         || f.filter.is_some()
@@ -326,27 +388,26 @@ fn parse_flags<'f>(
             &format!("write a plain {what}(...)."),
         ));
     }
-    let mut flags = Flags {
-        absent_on_null,
-        returns_json: false,
-    };
     for clause in &list.clauses {
         match clause {
             FunctionArgumentClause::JsonNullClause(JsonNullClause::NullOnNull) => {
-                flags.absent_on_null = false
+                absent_on_null = false
             }
             FunctionArgumentClause::JsonNullClause(JsonNullClause::AbsentOnNull) => {
-                flags.absent_on_null = true
+                absent_on_null = true
             }
             FunctionArgumentClause::JsonReturningClause(r) => {
-                let ty = r.data_type.to_string().to_ascii_uppercase();
-                if ty == "JSON" {
-                    flags.returns_json = true;
-                } else if !(ty.starts_with("VARCHAR") || ty.starts_with("CHAR") || ty == "STRING") {
+                if !is_text_type(&r.data_type) {
                     return Err(reject(
                         &format!("{what}(.. RETURNING {})", r.data_type),
-                        "only JSON and VARCHAR are types a JSON value can be returned as.",
-                        "write RETURNING JSON, or leave the clause out for VARCHAR.",
+                        "Starburst returns a constructor's result only as a character \
+                         string type, so a JSON-typed result cannot be asked for here.",
+                        &format!(
+                            "leave the clause out — varchar is the default — and wrap the \
+                             result in json_parse(..) where a JSON-typed value is wanted, \
+                             e.g. transform(xs, e -> json_parse({what}(..))) for an array of \
+                             them."
+                        ),
                     ));
                 }
             }
@@ -354,17 +415,17 @@ fn parse_flags<'f>(
                 return Err(reject(
                     &format!("{what}(.. {other})"),
                     "this clause is not part of a JSON constructor.",
-                    "write only NULL ON NULL, ABSENT ON NULL or RETURNING JSON / VARCHAR.",
+                    "write only NULL ON NULL, ABSENT ON NULL or RETURNING VARCHAR.",
                 ));
             }
         }
     }
-    Ok((flags, list))
+    Ok((absent_on_null, list))
 }
 
 fn rewrite_object(f: &Function) -> Result<Expr> {
-    let (flags, list) = parse_flags("json_object", f, false)?;
-    let mut args = vec![literal(&flags.encode())];
+    let (absent_on_null, list) = parse_flags("json_object", f, false)?;
+    let mut args = vec![literal(nulls_flag(absent_on_null))];
     for arg in &list.args {
         let (key, value) = match arg {
             FunctionArg::ExprNamed {
@@ -388,15 +449,15 @@ fn rewrite_object(f: &Function) -> Result<Expr> {
                 ));
             }
         };
-        args.push(key);
+        args.push(with_json_type(key));
         args.push(member(value));
     }
     Ok(call(OBJECT, args))
 }
 
 fn rewrite_array(f: &Function) -> Result<Expr> {
-    let (flags, list) = parse_flags("json_array", f, true)?;
-    let mut args = vec![literal(&flags.encode())];
+    let (absent_on_null, list) = parse_flags("json_array", f, true)?;
+    let mut args = vec![literal(nulls_flag(absent_on_null))];
     for arg in &list.args {
         match arg {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(value)) => args.push(member(value.clone())),
@@ -414,12 +475,12 @@ fn rewrite_array(f: &Function) -> Result<Expr> {
 }
 
 /// A member as Starburst would read it: a constructor nested directly is JSON, without
-/// being told.
+/// being told; a branch over JSON-typed values is JSON-typed.
 fn member(value: Expr) -> Expr {
     if is_nested_constructor(&value) {
         call(EMBED_JSON, vec![value])
     } else {
-        value
+        with_json_type(value)
     }
 }
 
@@ -433,9 +494,12 @@ enum Build {
     Array,
     ToJson,
     FormatJson,
-    /// `FormatJson` for a directly nested constructor: implicit, so a `RETURNING JSON`
-    /// result is taken as it is rather than refused.
+    /// A directly nested constructor: embedded as it was built.
     Embed,
+    /// Identity, marked JSON-typed.
+    AsJson,
+    /// Trino's JSON-to-varchar cast; identity on anything that is not JSON-typed.
+    Text,
 }
 
 impl Build {
@@ -446,6 +510,8 @@ impl Build {
             Build::ToJson => TO_JSON,
             Build::FormatJson => FORMAT_JSON,
             Build::Embed => EMBED_JSON,
+            Build::AsJson => AS_JSON,
+            Build::Text => TEXT,
         }
     }
 
@@ -456,6 +522,8 @@ impl Build {
             Build::Array => "json_array",
             Build::ToJson => "CAST(.. AS JSON)",
             Build::FormatJson | Build::Embed => "FORMAT JSON",
+            Build::AsJson => "a JSON-typed value",
+            Build::Text => "CAST(.. AS VARCHAR)",
         }
     }
 }
@@ -469,10 +537,8 @@ struct BuildFn {
 impl BuildFn {
     fn new(kind: Build) -> Self {
         let signature = match kind {
-            Build::ToJson | Build::FormatJson | Build::Embed => {
-                Signature::any(1, Volatility::Immutable)
-            }
-            _ => Signature::variadic_any(Volatility::Immutable),
+            Build::Object | Build::Array => Signature::variadic_any(Volatility::Immutable),
+            _ => Signature::any(1, Volatility::Immutable),
         };
         Self { kind, signature }
     }
@@ -481,15 +547,10 @@ impl BuildFn {
         DataFusionError::Execution(format!("{}: {msg}", self.kind.spelling()))
     }
 
-    fn flags(&self, first: Option<&ScalarValue>) -> DFResult<Flags> {
+    fn absent_on_null(&self, first: Option<&ScalarValue>) -> DFResult<bool> {
         match first {
-            Some(ScalarValue::Utf8(Some(s))) => Flags::decode(s).ok_or_else(|| {
-                self.err(format!(
-                    "{} is internal; write {}(...)",
-                    self.kind.name(),
-                    self.kind.spelling()
-                ))
-            }),
+            Some(ScalarValue::Utf8(Some(s))) if s == "absent" => Ok(true),
+            Some(ScalarValue::Utf8(Some(s))) if s == "null" => Ok(false),
             _ => Err(self.err(format!(
                 "{} is internal; write {}(...)",
                 self.kind.name(),
@@ -514,46 +575,34 @@ impl ScalarUDFImpl for BuildFn {
     }
 
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        let input = args.arg_fields.first();
         let field = match self.kind {
             Build::Object | Build::Array => {
-                let flags = self.flags(args.scalar_arguments.first().copied().flatten())?;
+                self.absent_on_null(args.scalar_arguments.first().copied().flatten())?;
                 if self.kind == Build::Object {
                     // `(flags, key, value, ...)`: the pairs must pair up, and a key is text.
                     if args.arg_fields.len() % 2 != 1 {
                         return Err(self.err("keys and values do not pair up"));
                     }
                     for (n, key) in args.arg_fields[1..].iter().step_by(2).enumerate() {
-                        if !is_text(key.data_type()) || marker_of(key).is_some() {
+                        if !is_text(key.data_type()) && key.data_type() != &DataType::Null {
                             return Err(self.err(format!(
                                 "key #{} has type {}; a key must be varchar",
                                 n + 1,
-                                describe(key)
+                                key.data_type()
                             )));
                         }
                     }
                 }
-                let plain = Field::new(self.name(), DataType::Utf8, false);
-                if flags.returns_json {
-                    mark(plain, Marker::Typed)
-                } else {
-                    plain
-                }
+                Field::new(self.name(), DataType::Utf8, false)
             }
-            Build::ToJson => {
-                let nullable = args.arg_fields.first().is_none_or(|f| f.is_nullable());
-                json_field(self.name(), nullable)
-            }
+            Build::ToJson => json_field(self.name(), input.is_none_or(|f| f.is_nullable())),
             Build::FormatJson | Build::Embed => {
-                let Some(input) = args.arg_fields.first() else {
+                let Some(input) = input else {
                     return Err(self.err("missing its argument"));
                 };
                 // The analysis error Starburst gives, at the same point: before any row.
-                // A nested constructor's own JSON result is the one exception.
-                let refused = match marker_of(input) {
-                    Some(Marker::Typed) if self.kind == Build::Embed => None,
-                    other => other,
-                };
-                if let Some(marker) = refused {
+                if let Some(marker) = marker_of(input) {
                     let what = match marker {
                         Marker::Typed => "a JSON-typed value",
                         Marker::Formatted => "a value already read with FORMAT JSON",
@@ -575,6 +624,24 @@ impl ScalarUDFImpl for BuildFn {
                     Marker::Formatted,
                 )
             }
+            Build::AsJson => {
+                let Some(input) = input else {
+                    return Err(self.err("missing its argument"));
+                };
+                if !is_text(input.data_type()) && input.data_type() != &DataType::Null {
+                    return Err(DataFusionError::Plan(format!(
+                        "{} is internal and takes text, got {}",
+                        AS_JSON,
+                        input.data_type()
+                    )));
+                }
+                json_field(self.name(), input.is_nullable())
+            }
+            Build::Text => Field::new(
+                self.name(),
+                DataType::Utf8,
+                input.is_none_or(|f| f.is_nullable()),
+            ),
         };
         Ok(Arc::new(field))
     }
@@ -588,19 +655,13 @@ impl ScalarUDFImpl for BuildFn {
                 let array = to_array(&args.args[0], rows)?;
                 render(&array, &args.arg_fields[0], Mode::Cast, who, 1)?
             }
-            Build::FormatJson | Build::Embed => {
+            Build::FormatJson => {
                 let array = to_array(&args.args[0], rows)?;
                 let text = as_text(&array).map_err(|e| self.err(e))?;
-                let verbatim = self.kind == Build::Embed
-                    && marker_of(&args.arg_fields[0]) == Some(Marker::Typed);
                 let mut out = Vec::with_capacity(rows);
                 for i in 0..rows {
                     if text.is_null(i) {
                         out.push(None);
-                        continue;
-                    }
-                    if verbatim {
-                        out.push(Some(text.value(i).to_string()));
                         continue;
                     }
                     let doc = jsonval::parse(text.value(i)).map_err(|e| {
@@ -620,31 +681,51 @@ impl ScalarUDFImpl for BuildFn {
                 }
                 out
             }
-            Build::Object | Build::Array => {
-                let first = match args.args.first() {
-                    Some(ColumnarValue::Scalar(s)) => Some(s),
-                    _ => None,
-                };
-                let flags = self.flags(first)?;
+            // A nested constructor's text was rendered by this module already, and the
+            // identity of a JSON-typed value is itself: both pass through as they are.
+            Build::Embed | Build::AsJson => {
+                let array = to_array(&args.args[0], rows)?;
+                let text = as_text(&array).map_err(|e| self.err(e))?;
+                (0..rows)
+                    .map(|i| (!text.is_null(i)).then(|| text.value(i).to_string()))
+                    .collect()
+            }
+            Build::Text => {
+                let array = to_array(&args.args[0], rows)?;
+                let field = &args.arg_fields[0];
+                match marker_of(field) {
+                    Some(_) => json_to_varchar(&array, who)?,
+                    None => {
+                        let text = as_text(&array).map_err(|e| self.err(e))?;
+                        (0..rows)
+                            .map(|i| (!text.is_null(i)).then(|| text.value(i).to_string()))
+                            .collect()
+                    }
+                }
+            }
+            Build::Object => {
+                let absent_on_null = self.absent_on_null(scalar_of(&args.args[0]))?;
+                let mut keys = Vec::with_capacity(args.args.len() / 2);
+                let mut values = Vec::with_capacity(args.args.len() / 2);
+                for (n, pair) in args.args[1..].chunks(2).enumerate() {
+                    let field = &args.arg_fields[1 + 2 * n];
+                    keys.push(key_column(&pair[0], field, who, n + 1)?);
+                    let value = to_array(&pair[1], rows)?;
+                    let value_field = &args.arg_fields[2 + 2 * n];
+                    values.push(render(&value, value_field, Mode::Member, who, n + 1)?);
+                }
+                build_objects(&keys, &values, rows, absent_on_null).map_err(|e| self.err(e))?
+            }
+            Build::Array => {
+                let absent_on_null = self.absent_on_null(scalar_of(&args.args[0]))?;
                 let mut columns = Vec::with_capacity(args.args.len() - 1);
                 for (n, (value, field)) in
                     args.args[1..].iter().zip(&args.arg_fields[1..]).enumerate()
                 {
                     let array = to_array(value, rows)?;
-                    // Position as the author counts: member 1, 2, ... for an array;
-                    // for an object, key 1, value 1, key 2, ...
-                    let position = if self.kind == Build::Object {
-                        n / 2 + 1
-                    } else {
-                        n + 1
-                    };
-                    columns.push(render(&array, field, Mode::Member, who, position)?);
+                    columns.push(render(&array, field, Mode::Member, who, n + 1)?);
                 }
-                if self.kind == Build::Object {
-                    build_objects(&columns, rows, flags.absent_on_null).map_err(|e| self.err(e))?
-                } else {
-                    build_arrays(&columns, rows, flags.absent_on_null)
-                }
+                build_arrays(&columns, rows, absent_on_null)
             }
         };
         Ok(ColumnarValue::Array(
@@ -653,62 +734,158 @@ impl ScalarUDFImpl for BuildFn {
     }
 }
 
-/// `{"k":v,...}` per row from rendered key and value columns, alternating.
+fn scalar_of(v: &ColumnarValue) -> Option<&ScalarValue> {
+    match v {
+        ColumnarValue::Scalar(s) => Some(s),
+        ColumnarValue::Array(_) => None,
+    }
+}
+
+/// A `json_object` key: the same for every row when it is a literal, which is nearly
+/// always, so it is rendered once rather than once per row.
+enum KeyColumn {
+    Constant(String),
+    PerRow(Vec<Option<String>>),
+}
+
+impl KeyColumn {
+    fn at(&self, row: usize) -> Option<&str> {
+        match self {
+            KeyColumn::Constant(k) => Some(k.as_str()),
+            KeyColumn::PerRow(keys) => keys[row].as_deref(),
+        }
+    }
+}
+
+/// The raw text of a key column. A JSON-typed key is what Trino's varchar cast makes of
+/// it, so `CAST(json_extract(..) AS VARCHAR)` keys as it does there.
+fn key_column(
+    value: &ColumnarValue,
+    field: &Field,
+    who: &str,
+    position: usize,
+) -> DFResult<KeyColumn> {
+    let bad = |msg: String| DataFusionError::Execution(format!("{who}: {msg}"));
+    let raw = |array: &ArrayRef| -> DFResult<Vec<Option<String>>> {
+        match marker_of(field) {
+            Some(_) => json_to_varchar(array, who),
+            None => {
+                let text = as_text(array).map_err(bad)?;
+                Ok((0..array.len())
+                    .map(|i| (!text.is_null(i)).then(|| text.value(i).to_string()))
+                    .collect())
+            }
+        }
+    };
+    match value {
+        ColumnarValue::Scalar(s) => {
+            let one = s.to_array_of_size(1)?;
+            match raw(&one)?.pop().flatten() {
+                Some(k) => Ok(KeyColumn::Constant(k)),
+                None => Err(bad(format!(
+                    "key #{position} is NULL; a key must not be null"
+                ))),
+            }
+        }
+        ColumnarValue::Array(a) => Ok(KeyColumn::PerRow(raw(a)?)),
+    }
+}
+
+/// `{"k":v,...}` per row.
 ///
-/// Keys were rendered as JSON strings, so they are already quoted; a `Json::String` is
-/// parsed back out of that to order them the way Trino does.
+/// Members are collected as Trino collects them: a NULL under `ABSENT ON NULL` is never
+/// inserted, so it neither repeats a key nor grows the table; what remains is ordered the
+/// way a `java.util.HashMap` iterates it. With literal keys and nothing absent — the common
+/// row — the order is computed once.
+// `row` indexes several parallel columns at once, which is not a loop over any one of them.
+#[allow(clippy::needless_range_loop)]
 fn build_objects(
-    columns: &[Vec<Option<String>>],
+    keys: &[KeyColumn],
+    values: &[Vec<Option<String>>],
     rows: usize,
     absent_on_null: bool,
 ) -> std::result::Result<Vec<Option<String>>, String> {
+    let constant: Option<Vec<&str>> = keys
+        .iter()
+        .map(|k| match k {
+            KeyColumn::Constant(k) => Some(k.as_str()),
+            KeyColumn::PerRow(_) => None,
+        })
+        .collect();
+    let mut prepared: Option<(Vec<usize>, Vec<String>)> = None;
+    if let Some(keys) = &constant {
+        let repeated = keys
+            .iter()
+            .enumerate()
+            .find(|(i, k)| keys[..*i].contains(k))
+            .map(|(_, k)| *k);
+        match repeated {
+            // A repeat is an error only among the members actually inserted, which under
+            // ABSENT ON NULL is decided row by row below.
+            Some(k) if !absent_on_null => return Err(duplicate(k, None)),
+            Some(_) => {}
+            None => {
+                let order = jsonval::java_hashmap_order(keys);
+                let quoted = keys.iter().map(|k| jsonval::quote(k)).collect();
+                prepared = Some((order, quoted));
+            }
+        }
+    }
+
     let mut out = Vec::with_capacity(rows);
     for row in 0..rows {
-        let mut keys: Vec<String> = Vec::with_capacity(columns.len() / 2);
-        let mut members: Vec<(String, Option<&str>)> = Vec::with_capacity(columns.len() / 2);
-        for (n, pair) in columns.chunks(2).enumerate() {
-            let (rendered_keys, values) = (&pair[0], &pair[1]);
-            let Some(quoted) = &rendered_keys[row] else {
-                return Err(format!(
-                    "key #{} is NULL in row {row}; a key must not be null",
-                    n + 1
-                ));
-            };
-            let key = match jsonval::parse(quoted) {
-                Ok(Json::String(k)) => k,
-                _ => return Err(format!("key #{} is not text in row {row}", n + 1)),
-            };
-            if keys.contains(&key) {
-                return Err(format!(
-                    "cannot construct a JSON object with duplicate key {key:?} (row {row}); \
-                     Starburst refuses it too"
-                ));
-            }
-            keys.push(key);
-            members.push((quoted.clone(), values[row].as_deref()));
-        }
-        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let present: Vec<usize> = (0..keys.len())
+            .filter(|&i| !(absent_on_null && values[i][row].is_none()))
+            .collect();
         let mut s = String::from("{");
         let mut first = true;
-        for i in jsonval::java_hashmap_order(&key_refs) {
-            let (quoted, value) = &members[i];
-            let value = match value {
-                Some(v) => v,
-                None if absent_on_null => continue,
-                None => "null",
-            };
+        let mut emit = |quoted_key: &str, value: Option<&str>, s: &mut String| {
             if !first {
                 s.push(',');
             }
             first = false;
-            s.push_str(quoted);
+            s.push_str(quoted_key);
             s.push(':');
-            s.push_str(value);
+            s.push_str(value.unwrap_or("null"));
+        };
+        match &prepared {
+            Some((order, quoted)) if present.len() == keys.len() => {
+                for &i in order {
+                    emit(&quoted[i], values[i][row].as_deref(), &mut s);
+                }
+            }
+            _ => {
+                let mut texts: Vec<&str> = Vec::with_capacity(present.len());
+                for &i in &present {
+                    let Some(k) = keys[i].at(row) else {
+                        return Err(format!(
+                            "key #{} is NULL in row {row}; a key must not be null",
+                            i + 1
+                        ));
+                    };
+                    if texts.contains(&k) {
+                        return Err(duplicate(k, Some(row)));
+                    }
+                    texts.push(k);
+                }
+                for j in jsonval::java_hashmap_order(&texts) {
+                    let i = present[j];
+                    emit(&jsonval::quote(texts[j]), values[i][row].as_deref(), &mut s);
+                }
+            }
         }
         s.push('}');
         out.push(Some(s));
     }
     Ok(out)
+}
+
+fn duplicate(key: &str, row: Option<usize>) -> String {
+    let at = row.map(|r| format!(" (row {r})")).unwrap_or_default();
+    format!(
+        "cannot construct a JSON object with duplicate key {key:?}{at}; Starburst refuses \
+         it too"
+    )
 }
 
 /// `[v,...]` per row from rendered element columns.
@@ -750,13 +927,6 @@ fn is_text(t: &DataType) -> bool {
     matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
 }
 
-fn describe(field: &Field) -> String {
-    match marker_of(field) {
-        Some(Marker::Typed) => "json".into(),
-        _ => field.data_type().to_string(),
-    }
-}
-
 // ---------------------------------------------------------------------------------------
 // Rendering: one Arrow column to JSON text per row
 // ---------------------------------------------------------------------------------------
@@ -770,6 +940,42 @@ enum Mode {
     /// `CAST(.. AS JSON)`, and everything nested inside one: JSON-typed text is embedded,
     /// arrays and rows recurse.
     Cast,
+}
+
+/// Trino's JSON-to-varchar cast of a JSON-typed column: a string loses its quotes, a
+/// number keeps its digits (a float through the double-to-varchar spelling), a boolean is
+/// its word, a JSON null is SQL NULL, and a container is an error.
+fn json_to_varchar(array: &ArrayRef, who: &str) -> DFResult<Vec<Option<String>>> {
+    let bad = |msg: String| DataFusionError::Execution(format!("{who}: {msg}"));
+    let text = as_text(array).map_err(bad)?;
+    let mut out = Vec::with_capacity(text.len());
+    for i in 0..text.len() {
+        if text.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let doc = jsonval::parse(text.value(i))
+            .map_err(|e| bad(format!("row {i}: not valid JSON: {e}")))?;
+        out.push(match doc {
+            Json::Null => None,
+            Json::Bool(b) => Some(b.to_string()),
+            Json::String(s) => Some(s),
+            Json::Number(n) => Some(json_number_as_varchar(&n)),
+            Json::Array(_) | Json::Object(_) => {
+                let what = if doc.as_array().is_some() {
+                    "array"
+                } else {
+                    "object"
+                };
+                return Err(bad(format!(
+                    "a JSON-typed {what} cannot be cast to varchar, in Starburst either. \
+                     Write json_format(<value>) to get its text, and json_format(<value>) \
+                     FORMAT JSON to embed it in a constructor."
+                )));
+            }
+        });
+    }
+    Ok(out)
 }
 
 /// Render every row of `array` as JSON text. `None` is a SQL NULL, for the caller to
@@ -854,53 +1060,36 @@ fn render(
         }
 
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-            let text = as_text(array).map_err(bad)?;
-            let mut out = Vec::with_capacity(n);
-            for i in 0..n {
-                if text.is_null(i) {
-                    out.push(None);
-                    continue;
+            match (marker_of(field), mode) {
+                // A JSON-typed member: Starburst casts it to varchar first, and quotes what
+                // that gives — a scalar; that cast has no answer for a container.
+                (Some(Marker::Typed), Mode::Member) => json_to_varchar(array, who)
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "{e} (member #{position} is JSON-typed)"
+                        ))
+                    })?
+                    .into_iter()
+                    .map(|v| v.map(|s| jsonval::quote(&s)))
+                    .collect(),
+                (marker, _) => {
+                    let text = as_text(array).map_err(bad)?;
+                    // Plain text is a string; read by FORMAT JSON, or a JSON value under a
+                    // cast, it is embedded.
+                    let embed = marker.is_some();
+                    (0..n)
+                        .map(|i| {
+                            (!text.is_null(i)).then(|| {
+                                if embed {
+                                    text.value(i).to_string()
+                                } else {
+                                    jsonval::quote(text.value(i))
+                                }
+                            })
+                        })
+                        .collect()
                 }
-                let s = text.value(i);
-                out.push(match (marker_of(field), mode) {
-                    // Plain text is a string.
-                    (None, _) => Some(jsonval::quote(s)),
-                    // Read by FORMAT JSON, or a JSON value under a cast: embedded.
-                    (Some(Marker::Formatted), _) | (Some(Marker::Typed), Mode::Cast) => {
-                        Some(s.to_string())
-                    }
-                    // A JSON-typed member: Starburst casts it to varchar first, and that
-                    // cast has no answer for a container.
-                    (Some(Marker::Typed), Mode::Member) => {
-                        let doc = jsonval::parse(s).map_err(|e| {
-                            bad(format!(
-                                "row {i}: member #{position} is not valid JSON: {e}"
-                            ))
-                        })?;
-                        match doc {
-                            Json::Null => None,
-                            Json::Bool(b) => Some(jsonval::quote(&b.to_string())),
-                            Json::String(inner) => Some(jsonval::quote(&inner)),
-                            Json::Number(num) => {
-                                Some(jsonval::quote(&json_number_as_varchar(&num)))
-                            }
-                            Json::Array(_) | Json::Object(_) => {
-                                return Err(bad(format!(
-                                    "member #{position} is a JSON-typed {}, which Starburst \
-                                     casts to varchar here and cannot. Write \
-                                     json_format(<value>) FORMAT JSON to embed it as JSON.",
-                                    if doc.as_array().is_some() {
-                                        "array"
-                                    } else {
-                                        "object"
-                                    }
-                                )))
-                            }
-                        }
-                    }
-                });
             }
-            out
         }
 
         DataType::Timestamp(unit, tz) => {
@@ -1063,13 +1252,18 @@ fn double_json(java: String) -> String {
 }
 
 /// A JSON number cast to varchar, as Trino does it: an integer keeps its digits, a float
-/// goes through the double-to-varchar cast, which always writes an exponent (`1.5E0`).
+/// goes through the double-to-varchar cast, which always writes an exponent (`1.5E0`),
+/// and spells zero `0E0`.
 fn json_number_as_varchar(text: &str) -> String {
     if !text.contains(['.', 'e', 'E']) {
         return text.to_string();
     }
     match text.parse::<f64>() {
         Ok(v) if v.is_finite() => {
+            let sign = if v.is_sign_negative() { "-" } else { "" };
+            if v == 0.0 {
+                return format!("{sign}0E0");
+            }
             let sci = format!("{:e}", v.abs());
             let (mantissa, exponent) = sci.split_once('e').expect("{:e} always has an exponent");
             let mantissa = if mantissa.contains('.') {
@@ -1077,7 +1271,7 @@ fn json_number_as_varchar(text: &str) -> String {
             } else {
                 format!("{mantissa}.0")
             };
-            format!("{}{mantissa}E{exponent}", if v < 0.0 { "-" } else { "" })
+            format!("{sign}{mantissa}E{exponent}")
         }
         _ => text.to_string(),
     }
@@ -1165,7 +1359,9 @@ mod tests {
                         .with_timezone("UTC"),
                 ),
                 Arc::new(StringArray::from(vec![
-                    Some(r#"{"lines":[{"sku":"A","qty":2},{"sku":"B","qty":1.10}],"note":null}"#),
+                    Some(
+                        r#"{"lines":[{"sku":"A","qty":2},{"sku":"B","qty":1.10}],"tags":["x","y"],"note":null,"z":0.0}"#,
+                    ),
                     Some(r#"{"lines":[]}"#),
                 ])),
             ],
@@ -1195,6 +1391,15 @@ mod tests {
             .next()
             .unwrap()
             .expect("not null")
+    }
+
+    /// Over the first row alone, for expressions the second row would rightly refuse.
+    async fn one(expr: &str) -> String {
+        let out = SqlTransform::new(format!("SELECT {expr} AS v FROM source"))
+            .apply(vec![batch().slice(0, 1)])
+            .await
+            .unwrap_or_else(|e| panic!("{expr} failed: {e}"));
+        out[0].column(0).as_string::<i32>().value(0).to_string()
     }
 
     async fn fails(sql: &str) -> String {
@@ -1232,25 +1437,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_absent_member_is_absent_from_the_duplicate_check_and_the_order() {
+        // Trino never inserts it, so it neither repeats a key nor grows the table.
+        assert_eq!(
+            first("json_object('a' VALUE CAST(NULL AS VARCHAR), 'a' VALUE id ABSENT ON NULL)")
+                .await,
+            r#"{"a":7}"#
+        );
+        // Both present, both inserted: the repeat is an error, as it is there.
+        let e =
+            fails("SELECT json_object('a' VALUE id, 'a' VALUE id ABSENT ON NULL) AS v FROM source")
+                .await;
+        assert!(e.contains("duplicate key"), "got: {e}");
+        // Thirteen members, one absent in the second row: a 16-slot table there, not 32.
+        let got = rows(
+            "json_object('id' VALUE 1, 'type' VALUE 2, 'sku' VALUE 3, 'qty' VALUE 4, \
+             'price' VALUE 5, 'currency' VALUE 6, 'customer' VALUE 7, 'country' VALUE 8, \
+             'status' VALUE 9, 'note' VALUE name, 'created' VALUE 10, 'updated' VALUE 11, \
+             'version' VALUE 12 ABSENT ON NULL)",
+        )
+        .await;
+        assert_eq!(
+            got[0].as_deref(),
+            Some(
+                r#"{"country":8,"note":"O\"Brien \\ 😀","created":10,"type":2,"version":12,"price":5,"qty":4,"currency":6,"id":1,"sku":3,"updated":11,"customer":7,"status":9}"#
+            ),
+            "thirteen keys: a 32-slot table"
+        );
+        assert_eq!(
+            got[1].as_deref(),
+            Some(
+                r#"{"country":8,"price":5,"created":10,"qty":4,"currency":6,"id":1,"type":2,"sku":3,"updated":11,"version":12,"customer":7,"status":9}"#
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn an_empty_object_and_array_are_themselves() {
         assert_eq!(first("json_object()").await, "{}");
         assert_eq!(first("json_array()").await, "[]");
     }
 
     #[tokio::test]
-    async fn a_directly_nested_constructor_is_embedded_as_json() {
-        // The implicit FORMAT JSON Trino's analyzer applies to a nested constructor.
+    async fn a_directly_nested_constructor_is_embedded_as_it_was_built() {
+        // The implicit FORMAT JSON Trino's analyzer applies to a nested constructor — and
+        // it keeps the inner value as built, so a decimal keeps its scale.
         assert_eq!(
-            first("json_object('data' VALUE json_object('id' VALUE id))").await,
-            r#"{"data":{"id":7}}"#
+            first("json_object('data' VALUE json_object('id' VALUE id, 'amount' VALUE amount))")
+                .await,
+            r#"{"data":{"amount":12.3400,"id":7}}"#
         );
         assert_eq!(
-            first("json_array(json_object('id' VALUE id), json_array(1, 2))").await,
-            r#"[{"id":7},[1,2]]"#
+            first("json_array(json_object('id' VALUE id), json_array(1, amount))").await,
+            r#"[{"id":7},[1,12.3400]]"#
         );
         assert_eq!(
-            first("json_object('q' VALUE json_query(data, '$.lines[0]'))").await,
-            r#"{"q":{"sku":"A","qty":2}}"#
+            first("json_object('q' VALUE json_query(data, '$.lines[1]'))").await,
+            r#"{"q":{"sku":"B","qty":1.1}}"#
         );
     }
 
@@ -1262,14 +1505,14 @@ mod tests {
                 .await,
             r#"{"d":"{\"id\":7}"}"#
         );
-        // And FORMAT JSON is how the model says otherwise.
+        // And FORMAT JSON is how the model says otherwise: the text is re-read as a tree.
         assert_eq!(
             first(
-                "json_object('d' VALUE CASE WHEN paid THEN json_object('id' VALUE id) END \
-                 FORMAT JSON)"
+                "json_object('d' VALUE CASE WHEN paid THEN json_object('id' VALUE id, \
+                 'amount' VALUE amount) END FORMAT JSON)"
             )
             .await,
-            r#"{"d":{"id":7}}"#
+            r#"{"d":{"amount":12.34,"id":7}}"#
         );
         let out = SqlTransform::new(
             "WITH built AS (SELECT id, json_object('id' VALUE id) AS payload FROM source) \
@@ -1306,27 +1549,78 @@ mod tests {
         assert_eq!(
             first(
                 "json_object('n' VALUE json_extract(data, '$.lines[0].qty'), \
-                   's' VALUE json_extract(data, '$.lines[0].sku'), \
-                   'f' VALUE json_extract(data, '$.lines[1].qty'), \
-                   'none' VALUE json_extract(data, '$.note'))"
+                 's' VALUE json_extract(data, '$.lines[0].sku'), \
+                 'f' VALUE json_extract(data, '$.lines[1].qty'), \
+                 'z' VALUE json_extract(data, '$.z'), \
+                 'none' VALUE json_extract(data, '$.note'))"
             )
             .await,
-            r#"{"s":"A","f":"1.1E0","none":null,"n":"2"}"#
+            r#"{"s":"A","f":"1.1E0","z":"0E0","none":null,"n":"2"}"#
         );
         let e =
             fails("SELECT json_object('l' VALUE json_extract(data, '$.lines')) AS v FROM source")
                 .await;
         assert!(e.contains("JSON-typed array"), "got: {e}");
-        assert!(
-            e.contains("json_format(<value>) FORMAT JSON"),
-            "names the fix: {e}"
-        );
+        assert!(e.contains("FORMAT JSON"), "names the fix: {e}");
         // The spelling that works there works here, and keeps the source order.
         assert_eq!(
             first("json_object('l' VALUE json_format(json_extract(data, '$.lines')) FORMAT JSON)")
                 .await,
             r#"{"l":[{"sku":"A","qty":2},{"sku":"B","qty":1.1}]}"#
         );
+    }
+
+    #[tokio::test]
+    async fn the_json_type_is_kept_through_a_case_a_coalesce_and_an_unnest() {
+        // DataFusion drops the marker at these; Trino's type system does not.
+        assert_eq!(
+            first(
+                "json_object('sku' VALUE CASE WHEN paid THEN json_extract(data, '$.lines[0].sku') END, \
+                 'c' VALUE coalesce(json_extract(data, '$.nope'), json_extract(data, '$.lines[0].qty')))"
+            )
+            .await,
+            r#"{"c":"2","sku":"A"}"#
+        );
+        let out = SqlTransform::new(
+            "SELECT json_object('tag' VALUE tag) AS v FROM source o \
+             CROSS JOIN UNNEST(CAST(json_extract(o.data, '$.tags') AS ARRAY(JSON))) AS t(tag)",
+        )
+        .apply(vec![batch()])
+        .await
+        .unwrap();
+        let c = out[0].column(0).as_string::<i32>();
+        assert_eq!(c.value(0), r#"{"tag":"x"}"#);
+        assert_eq!(c.value(1), r#"{"tag":"y"}"#);
+        // A CASE over a JSON-typed value is JSON-typed, so FORMAT JSON on it is refused as
+        // Starburst refuses it.
+        let e = crate::transform::validate::validate_sql(
+            "SELECT json_object('l' VALUE CASE WHEN paid THEN json_extract(data, '$.lines') END \
+             FORMAT JSON) AS v FROM source",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("FORMAT JSON on a CASE or coalesce"), "got: {e}");
+    }
+
+    #[tokio::test]
+    async fn cast_of_a_json_typed_value_to_varchar_is_trinos_cast() {
+        // A JSON string loses its quotes; the result is text, so it may be a key or a
+        // FORMAT JSON operand where the uncast value could not.
+        assert_eq!(
+            one(
+                "json_object(CAST(json_extract(data, '$.lines[0].sku') AS VARCHAR) VALUE 1, \
+                 'q' VALUE CAST(json_extract(data, '$.lines[0].qty') AS VARCHAR))"
+            )
+            .await,
+            r#"{"A":1,"q":"2"}"#
+        );
+        assert_eq!(
+            one("CAST(json_extract(data, '$.lines[0].sku') AS VARCHAR)").await,
+            "A"
+        );
+        let e =
+            fails("SELECT CAST(json_extract(data, '$.lines') AS VARCHAR) AS v FROM source").await;
+        assert!(e.contains("cannot be cast to varchar"), "got: {e}");
     }
 
     #[test]
@@ -1350,22 +1644,43 @@ mod tests {
         assert!(e.contains("FORMAT JSON on a JSON-typed value"), "got: {e}");
     }
 
+    #[test]
+    fn returning_json_is_refused_with_the_spelling_that_works() {
+        let e = crate::transform::validate::validate_sql(
+            "SELECT json_object('id' VALUE id RETURNING JSON) AS v FROM source",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("json_object(.. RETURNING JSON)"), "got: {e}");
+        assert!(e.contains("json_parse("), "names the fix: {e}");
+    }
+
     #[tokio::test]
-    async fn a_nested_constructor_returning_json_is_embedded_too() {
+    async fn returning_varchar_is_the_default_said_out_loud() {
         assert_eq!(
-            first("json_object('d' VALUE json_object('id' VALUE id RETURNING JSON))").await,
+            first("json_object('a' VALUE id RETURNING VARCHAR)").await,
+            r#"{"a":7}"#
+        );
+        assert_eq!(
+            first("json_object('d' VALUE json_object('id' VALUE id RETURNING VARCHAR(100)))").await,
             r#"{"d":{"id":7}}"#
+        );
+        assert_eq!(
+            first("json_array(id RETURNING VARCHAR FORMAT JSON)").await,
+            "[7]"
         );
     }
 
     #[tokio::test]
-    async fn returning_json_makes_the_result_json_typed() {
-        // Cast to JSON, a JSON-typed value is embedded verbatim.
+    async fn json_parse_of_a_constructor_is_the_json_typed_value() {
+        // The spelling for an array of objects built in a lambda: JSON-typed, canonical.
         assert_eq!(
-            first("json_format(CAST(json_object('id' VALUE id RETURNING JSON) AS JSON))").await,
-            r#"{"id":7}"#
+            first(
+                "json_format(CAST(json_parse(json_object('id' VALUE id, 'amount' VALUE amount)) AS JSON))"
+            )
+            .await,
+            r#"{"amount":12.3400,"id":7}"#
         );
-        // Text is a string.
         assert_eq!(
             first("json_format(CAST(json_object('id' VALUE id) AS JSON))").await,
             r#""{\"id\":7}""#
@@ -1388,7 +1703,7 @@ mod tests {
         );
         assert_eq!(
             first("CAST(CAST(json_extract(data, '$.lines') AS ARRAY(JSON)) AS JSON)").await,
-            r#"[{"sku":"A","qty":2},{"sku":"B","qty":1.10}]"#
+            r#"[{"sku":"A","qty":2},{"sku":"B","qty":1.1}]"#
         );
         // A NULL is a NULL, not the text `null`.
         assert_eq!(rows("CAST(name AS JSON)").await[1], None);
@@ -1407,6 +1722,10 @@ mod tests {
             r#"["2024-03-31 22:30:00.123456","2024-03-31 22:30:00.123 UTC"]"#
         );
         assert_eq!(first("json_array(ratio / 0.0)").await, r#"["Infinity"]"#);
+        assert_eq!(
+            first("json_array(name, chr(27))").await,
+            "[\"O\\\"Brien \\\\ 😀\",\"\\u001B\"]"
+        );
     }
 
     #[tokio::test]
@@ -1415,6 +1734,11 @@ mod tests {
         assert!(e.contains("duplicate key"), "got: {e}");
         let e = fails("SELECT json_object(name VALUE id) AS v FROM source").await;
         assert!(e.contains("must not be null"), "got: {e}");
+        // A key that is a column: checked per row, and ordered per row.
+        assert_eq!(
+            one("json_object(name VALUE id, 'x' VALUE 1)").await,
+            r#"{"O\"Brien \\ 😀":7,"x":1}"#
+        );
     }
 
     #[tokio::test]
@@ -1438,7 +1762,7 @@ mod tests {
     #[tokio::test]
     async fn the_output_carries_no_marker() {
         let out = SqlTransform::new(
-            "SELECT json_object('id' VALUE id RETURNING JSON) AS v, CAST(id AS JSON) AS w FROM source",
+            "SELECT json_parse(json_object('id' VALUE id)) AS v, CAST(id AS JSON) AS w FROM source",
         )
         .apply(vec![batch()])
         .await
@@ -1463,15 +1787,17 @@ mod tests {
     fn the_rewrite_is_what_runs() {
         let got = crate::transform::validate::normalise_sql(
             "SELECT json_object(KEY 'a' VALUE x, 'b' VALUE y FORMAT JSON, \
-             'c' VALUE json_array(z) ABSENT ON NULL RETURNING JSON) AS j, \
-             json_array(x, y) AS k, CAST(x AS JSON) AS c FROM source",
+             'c' VALUE json_array(z) ABSENT ON NULL) AS j, \
+             json_array(x, y) AS k, CAST(x AS JSON) AS c, \
+             CAST(json_extract(x, '$.a') AS VARCHAR) AS t FROM source",
         )
         .unwrap();
         assert_eq!(
             got,
-            "SELECT ddi_json_object('absent,json', 'a', x, 'b', ddi_format_json(y), 'c', \
-             ddi_embed_json(ddi_json_array('absent,varchar', z))) AS j, \
-             ddi_json_array('absent,varchar', x, y) AS k, ddi_to_json(x) AS c FROM source"
+            "SELECT ddi_json_object('absent', 'a', x, 'b', ddi_format_json(y), 'c', \
+             ddi_embed_json(ddi_json_array('absent', z))) AS j, \
+             ddi_json_array('absent', x, y) AS k, ddi_to_json(x) AS c, \
+             ddi_text(json_extract(x, '$.a')) AS t FROM source"
         );
     }
 }
