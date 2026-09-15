@@ -137,6 +137,8 @@ directory*. Every accepted feature preserves it.
 | cast / rename / filter | no | yes | **supported** |
 | unnest / explode | no | yes | **supported**, in Trino's spelling or DataFusion's |
 | intra-row array agg | no | yes | **supported** (`array_sum` etc.) |
+| `transform` / `filter` over one row's array | no | yes | **supported**, in Trino's lambda spelling |
+| `json_object` / `json_array` / `CAST(.. AS JSON)` | no | yes | **supported**, with Trino's rules |
 | upsert on a key | no (the *target* holds it) | no | **supported**, opt-in — see [Upserting](#upserting) |
 | pinned Delta lookup via `LEFT JOIN` | no | yes | **supported**, declared and version-pinned per source commit |
 | `GROUP BY` aggregation | **yes** | **no** | **rejected — different product** |
@@ -236,6 +238,50 @@ FROM source
 
 Also `array_min` and `array_avg`. For real Rust, implement the `Transform` trait — an escape
 hatch that does not require forking.
+
+### Row-local array transforms
+
+`transform` and `filter` are admissible for the same reason `array_sum` is: the lambda is
+evaluated once per element of one row's own array and sees nothing else, so no batch split
+can change the answer. Written the way Trino writes them:
+
+```sql
+SELECT o.order_id,
+       transform(o.line_items, li -> li.price * li.qty)              AS line_totals,
+       filter(o.line_items, li -> li.qty > 1)                        AS multi_lines,
+       transform(CAST(json_extract(o.data, '$.lines') AS ARRAY(JSON)),
+                 li -> CAST(json_extract_scalar(li, '$.qty') AS INTEGER) * fx.rate) AS qtys
+FROM source o
+LEFT JOIN fx_rates fx ON fx.currency = o.currency
+```
+
+The body may use anything the `SELECT` list may: `json_extract_scalar`, `json_array_get`,
+`CASE`, `CAST`, `coalesce`, arithmetic, comparison, and the parameter's fields when the
+elements are structs. It may also reference columns of the current row — `fx.rate` above —
+including those a pinned lookup joined in; each is captured as a value. It is planned by
+the engine's own expression planner, so it means the same thing inside the lambda as it
+does outside. Semantics follow Trino: a NULL array is NULL, an empty one is `[]`, neither
+drops the row; `transform` evaluates the body on a NULL element; `filter` keeps an element
+only where the body is `true`, so NULL drops it.
+
+Internally the call becomes `ddi_transform(<array>, 'li', '<body>', <captures>...)` before
+validation, and the body is checked first, so the rejections below are reported at config
+load with the construct named:
+
+| | |
+|---|---|
+| a subquery inside the body | The body reads no relation, not even the source batch. Compute the value in the `SELECT` list and reference it. |
+| an aggregate or window function inside the body | Cross-row, as everywhere else. |
+| a lambda with two parameters | The element's position is not something a row-local function knows. |
+| `reduce`, `any_match`, `array_sort` with a comparator, or any other lambda-taking function | Only `transform` and `filter` are implemented; say so rather than fail on the first batch. |
+
+`GROUP BY` and window functions stay refused around a lambda as they are anywhere else. The
+alternative — `CROSS JOIN UNNEST` to item grain, then `array_agg .. GROUP BY` the order key —
+cannot be made safe: `ddi` cannot prove a group is one source row, and a redelivered key
+landing in two batches would emit two partial messages. A lambda has no such gap; the array
+never leaves its row. (`array_sum` and friends are not Trino functions; a model that uses
+them streams but cannot be described or rebuilt by Starburst, which spells the reduction
+`reduce(arr, 0, (s, x) -> s + x, s -> s)`. `reduce` is not implemented.)
 
 ### Pinned Delta lookups
 
@@ -907,6 +953,79 @@ quietly returning one of several matches. A missing path is NULL, and so is a co
 under `json_extract_scalar` — that is Trino's rule, and it is what stops `{"id":42}`
 landing in a column somebody casts to a number. Malformed JSON stops the pipeline: input
 is a typed column, not arbitrary text.
+
+The text these produce is what Starburst produces, byte for byte: `json_extract` copies a
+value in its source order with its source digits (`1.10` stays `1.10`), and `json_parse`
+stores the canonical form Trino stores — keys sorted, whitespace gone, floats spelt the way
+`BigDecimal` spells them — so `json_format(json_parse(x))` agrees between the two engines.
+
+#### Building JSON: `json_object`, `json_array`, `CAST(.. AS JSON)`
+
+An outbox model wants the opposite of the readers above: one message per source row,
+carrying that row's own child array. Trino's constructors are implemented, in Trino's
+spelling — `'key' VALUE expr`, the optional `KEY`, `FORMAT JSON`, `NULL ON NULL` /
+`ABSENT ON NULL`, `RETURNING JSON` / `VARCHAR` — and with Trino's rules, including the ones
+nobody would design that way, because a model has to produce the same bytes in both engines:
+
+- **A constructor returns text**, not JSON, unless told `RETURNING JSON`. A constructor
+  nested *directly* inside another is embedded as JSON anyway (the analyzer treats the
+  nesting as an implicit `FORMAT JSON`); one that arrives any other way — through a `CASE`,
+  a `coalesce`, a CTE column — is text, embedded as an escaped string unless you write
+  `FORMAT JSON` after it.
+- **A JSON-typed value** — `json_extract`, `json_array_get`, `json_parse`, `CAST(.. AS
+  JSON)` — used as a member without `FORMAT JSON` is cast to varchar first. A scalar survives
+  that as a string; an object or array fails, in Starburst at run time and here with the
+  spelling that works: `json_format(<value>) FORMAT JSON`. `FORMAT JSON` directly on a
+  JSON-typed value is an analysis error there and a config-load error here.
+- **Keys come out in `java.util.HashMap` order** — neither as written nor sorted; Trino's own
+  test expects `key_1, key_2` to come out `key_2, key_1`. It is reproduced here so the two
+  engines agree. A repeated key is an error, as it is there.
+- **`json_object` defaults to `NULL ON NULL`, `json_array` to `ABSENT ON NULL`.** Text is
+  escaped, numbers are numbers, decimals keep their scale (`12.3400`), doubles are spelt as
+  `Double.toString` spells them, timestamps as `2024-03-31 22:30:00.123 UTC`. An array or
+  row as a member is refused with the fix named, because Starburst would cast it to varchar
+  text, which is never what a message wants.
+
+Put together, this is the message-per-order model from the issue that asked for it, in the
+form that runs in both engines. The item objects are built `RETURNING JSON` so the array of
+them is an array of JSON rather than of text, and that array goes in as
+`json_format(..) FORMAT JSON`:
+
+```sql
+WITH orders AS (
+    SELECT o.messageid AS message_id,
+           o.kafka_timestamp,
+           json_extract_scalar(o.data, '$.webshopOrderId')                 AS order_code,
+           CAST(json_extract(o.data, '$.orderEntries') AS ARRAY(JSON))     AS entries
+    FROM source AS o
+)
+SELECT orders.message_id,
+       json_object(
+           'messageId'   VALUE orders.message_id,
+           'messageTime' VALUE orders.kafka_timestamp,
+           'data'        VALUE json_object(
+               'orderCode' VALUE orders.order_code,
+               'currency'  VALUE 'EUR',
+               'items'     VALUE json_format(CAST(transform(
+                   filter(orders.entries,
+                          e -> json_extract_scalar(e, '$.product.fulfillmentModel') <> 'CP_SOLD_CP_FULFILLED'),
+                   e -> json_object(
+                       'productVariantId'      VALUE json_extract_scalar(e, '$.product.variantArticleId'),
+                       'quantity'              VALUE CAST(json_extract_scalar(e, '$.quantity') AS INTEGER),
+                       'nmvBeforeCancellation' VALUE CAST(json_extract_scalar(e, '$.price') AS DECIMAL(30, 4))
+                       RETURNING JSON)
+               ) AS JSON)) FORMAT JSON
+           )
+       ) AS json_message
+FROM orders
+```
+
+Two things to know before comparing bytes with Starburst. `FORMAT JSON` re-reads the text
+it is given the way Jackson does: order kept, a repeated key resolved to its last value,
+whitespace dropped, and floats re-spelt as doubles — so a `DECIMAL(30,4)` that passes
+through it comes out `2.75`, not `2.7500`, in both engines. And a zoned timestamp is
+rendered at millisecond precision, which is how Starburst reads a Delta `timestamp`; cast to
+`VARCHAR` in the model if you need something else.
 
 ### Ordering, when using a watermark table
 

@@ -23,6 +23,8 @@ rows, because it could not be correct across batch boundaries:
 | unnest an array to child grain | yes — `CROSS JOIN UNNEST`, as your warehouse writes it |
 | unnest an array out of a JSON blob | yes — `UNNEST(CAST(json_extract(data,'$.p') AS ARRAY(JSON)))` |
 | `array_sum` / `array_length` etc. within a row | yes |
+| `transform` / `filter` over one row's own array | yes — Trino's `x -> expr` lambdas, planned by the same engine as the `SELECT` list |
+| build a JSON message per row | yes — `json_object`, `json_array`, `CAST(.. AS JSON)`, with Trino's rules |
 | `GROUP BY`, aggregates | **no** |
 | `JOIN`, or reading a second table | **no** |
 | window functions (`OVER`) | **no** |
@@ -133,6 +135,27 @@ Paths support `$`, `.field`, `["field"]` and `[0]`. Following Trino,
 `json_extract_scalar` returns **NULL for an object or array** — only `json_extract`
 returns those. A missing path is NULL; malformed JSON stops the pipeline, because the
 input is a typed column rather than arbitrary text.
+
+### Building JSON, and lambdas over arrays
+
+`json_object` · `json_array` · `CAST(.. AS JSON)` · `transform` · `filter`
+
+One message per source row, carrying that row's own child array, is a row-local
+transformation and streams. Three rules from Starburst decide what the bytes look like,
+and `ddi` follows them so the two engines agree:
+
+1. `json_object(...)` returns **text** unless it says `RETURNING JSON`. Nested *directly*
+   inside another constructor it is embedded as JSON; reached any other way it is a string.
+2. A JSON-typed value (`json_extract`, `CAST(.. AS JSON)`, an element of `ARRAY(JSON)`) goes
+   in as `json_format(<value>) FORMAT JSON`. Without that, an object or array fails — there
+   at run time, here with the fix named.
+3. Keys come out in Java's `HashMap` order, not as written. Yes, really; it is reproduced.
+
+So an array of item objects is `transform(items, e -> json_object(... RETURNING JSON))`,
+cast to JSON, and embedded with `json_format(..) FORMAT JSON`. The full model is in the
+README under *Building JSON*. A lambda body may use the same functions as the `SELECT` list
+and may reference columns of the current row, a pinned lookup's included; a subquery, an
+aggregate or a window function inside it is refused at config load, by name.
 
 ---
 

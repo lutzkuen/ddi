@@ -107,6 +107,45 @@ SELECT order_id, li.sku, li.qty, CAST(li.price AS DECIMAL(18,4)) AS price
 FROM (SELECT order_id, unnest(line_items) AS li FROM source)
 """
 
+# Outbox grain: one message per source row, carrying that row's own child array.
+#
+# Row-local, so it streams: the array is a function of the one row and nothing else.
+# Written in Trino's spelling — `'key' VALUE expr`, `x -> expr` lambdas, `FORMAT JSON` —
+# and with Trino's rules, so Starburst can DESCRIBE the same model and rebuild it in batch
+# to the same bytes. The item objects are built `RETURNING JSON` so the array of them is an
+# array of JSON rather than of text; a JSON-typed value is embedded with
+# `json_format(..) FORMAT JSON`, the one way Starburst accepts it as a member.
+[[pipeline]]
+name       = "order_created_outbox"
+app_id     = "ddi.order_created_outbox"
+source_uri = "abfss://lake@acct.dfs.core.windows.net/bronze/webshop_order_created"
+target_uri = "abfss://lake@acct.dfs.core.windows.net/outbox/webshop_order_nmv_calculated"
+transform_sql = """
+WITH orders AS (
+    SELECT o.messageid AS message_id,
+           o.kafka_timestamp,
+           json_extract_scalar(o.data, '$.webshopOrderId')             AS order_code,
+           CAST(json_extract(o.data, '$.orderEntries') AS ARRAY(JSON)) AS entries
+    FROM source AS o
+)
+SELECT orders.message_id,
+       json_object(
+           'messageId'   VALUE orders.message_id,
+           'messageTime' VALUE orders.kafka_timestamp,
+           'data'        VALUE json_object(
+               'orderCode' VALUE orders.order_code,
+               'items'     VALUE json_format(CAST(transform(
+                   filter(orders.entries, e -> json_extract_scalar(e, '$.product.fulfillmentModel') <> 'CP_SOLD_CP_FULFILLED'),
+                   e -> json_object(
+                       'productVariantId' VALUE json_extract_scalar(e, '$.product.variantArticleId'),
+                       'quantity'         VALUE CAST(json_extract_scalar(e, '$.quantity') AS INTEGER)
+                       RETURNING JSON)
+               ) AS JSON)) FORMAT JSON
+           )
+       ) AS json_message
+FROM orders
+"""
+
 # ---------------------------------------------------------------------------
 # Realtime publication (optional).
 #

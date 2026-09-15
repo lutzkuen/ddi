@@ -10,7 +10,11 @@ use deltalake::arrow::array::RecordBatch;
 use crate::error::Result;
 use crate::lookup::LookupSnapshot;
 
+pub mod dialect;
 pub mod json;
+pub mod json_build;
+pub mod jsonval;
+pub mod lambda;
 pub mod sql;
 pub mod udf;
 pub mod unnest;

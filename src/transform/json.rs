@@ -19,9 +19,13 @@
 //! - `json_size` counts members of an object or elements of an array, and is 0 for a
 //!   scalar.
 //!
-//! Since `ddi` has no distinct JSON type, `json` and `varchar` are both text here.
-//! `json_parse` therefore validates rather than converting, and `json_format` is identity
-//! — which is exactly how they compose in a model that has to survive both engines.
+//! Since `ddi` has no distinct JSON type, `json` and `varchar` are both text here. What
+//! Trino's type system knows — that `json_extract` returns JSON and `json_extract_scalar`
+//! returns text — rides on a field marker instead, see [`JSON_MARKER`]; it is what lets
+//! `json_object` embed one and quote the other, as Starburst does. `json_format` is
+//! identity, and `json_parse` stores what Trino stores: the value re-serialised with its
+//! keys sorted and its floats spelt by `BigDecimal` — see [`crate::transform::jsonval`],
+//! which reads and writes JSON the way Jackson does so the two engines agree to the byte.
 //!
 //! DuckDB's `json_extract_string` and Spark's `get_json_object` are registered as aliases
 //! of `json_extract_scalar`, so a model written against either streams unchanged.
@@ -29,15 +33,18 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use deltalake::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray};
-use deltalake::arrow::datatypes::DataType;
+use deltalake::arrow::array::{
+    Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray,
+};
+use deltalake::arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use deltalake::datafusion::common::Result as DFResult;
 use deltalake::datafusion::error::DataFusionError;
 use deltalake::datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use deltalake::datafusion::prelude::SessionContext;
-use serde_json::Value;
+
+use crate::transform::jsonval::{self, Json, Members, Numbers};
 
 /// One step of a JSON path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,27 +139,21 @@ fn wildcard(path: &str) -> String {
     )
 }
 
-fn resolve<'a>(doc: &'a Value, steps: &[Step]) -> Option<&'a Value> {
+fn resolve<'a>(doc: &'a Json, steps: &[Step]) -> Option<&'a Json> {
     let mut cur = doc;
     for s in steps {
         cur = match s {
             Step::Field(f) => cur.get(f)?,
-            Step::Index(n) => cur.get(*n)?,
+            Step::Index(n) => cur.index(*n)?,
         };
     }
     Some(cur)
 }
 
-/// Trino's scalar rendering: a string loses its quotes, other scalars print themselves,
-/// and containers are **not** scalars.
-fn as_scalar_text(v: &Value) -> Option<String> {
-    match v {
-        Value::Null => None,
-        Value::String(s) => Some(s.clone()),
-        Value::Bool(b) => Some(b.to_string()),
-        Value::Number(n) => Some(n.to_string()),
-        Value::Array(_) | Value::Object(_) => None,
-    }
+/// A value copied out as JSON text: as it was written, order and digits included, which
+/// is what Trino's streaming extractor does.
+fn extract_text(v: &Json) -> String {
+    jsonval::to_string(v, Members::Verbatim, Numbers::Verbatim)
 }
 
 /// Every function this module provides.
@@ -162,6 +163,12 @@ enum Kind {
     Extract,
     /// `json_extract_scalar(json, path) -> varchar`
     ExtractScalar,
+    /// `json_query(json, path) -> varchar`
+    ///
+    /// The same lookup as `json_extract`, but the SQL/JSON standard function returns
+    /// *text* in Trino unless told `RETURNING json` — which is why it may be nested in a
+    /// `json_object` without `FORMAT JSON` while `json_extract` may not.
+    Query,
     /// `json_size(json, path) -> bigint`
     Size,
     /// `json_array_length(json) -> bigint`
@@ -213,12 +220,96 @@ impl Kind {
 ///
 /// Named and shaped in one place because the declared return type and the array actually
 /// built have to agree exactly, or DataFusion rejects the result rather than the data.
-fn element_field() -> deltalake::arrow::datatypes::FieldRef {
-    Arc::new(deltalake::arrow::datatypes::Field::new(
-        "item",
-        DataType::Utf8,
-        true,
-    ))
+pub(crate) fn element_field() -> FieldRef {
+    Arc::new(json_field("item", true))
+}
+
+/// The field metadata key that says what a text column is, in Trino's type system.
+///
+/// `ddi` has no JSON *type*: `json` and `varchar` are both `Utf8`. What Trino keeps in
+/// its type system — that `json_extract` returns JSON while `json_extract_scalar` returns
+/// text — is kept here as a marker on the Arrow field. DataFusion carries field metadata
+/// through column references, aliases, CTEs and function results, so a value extracted
+/// two CTEs up is still known to be JSON where `json_object` decides how to embed it, and
+/// decides it the way Starburst does. The marker never leaves a transform — see
+/// [`strip_json_marker`] — so nothing that writes, compares or publishes a batch sees it.
+pub(crate) const JSON_MARKER: &str = "ddi:json";
+
+/// What the marker says a text field is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Marker {
+    /// Trino's JSON type: the result of `json_extract`, `json_array_get`, `json_parse`,
+    /// `CAST(.. AS JSON)`, an element of `CAST(.. AS ARRAY(JSON))`, or a constructor told
+    /// `RETURNING JSON`. Embedded in a constructor only after `json_format(..) FORMAT
+    /// JSON`, exactly as Starburst requires.
+    Typed,
+    /// Text that `FORMAT JSON` has read: embedded as JSON, and nowhere else meaningful.
+    Formatted,
+}
+
+impl Marker {
+    fn value(self) -> &'static str {
+        match self {
+            Marker::Typed => "typed",
+            Marker::Formatted => "formatted",
+        }
+    }
+}
+
+/// Mark a field.
+pub(crate) fn mark(field: Field, marker: Marker) -> Field {
+    let mut metadata = field.metadata().clone();
+    metadata.insert(JSON_MARKER.to_string(), marker.value().to_string());
+    field.with_metadata(metadata)
+}
+
+/// A `Utf8` field of Trino's JSON type.
+pub(crate) fn json_field(name: &str, nullable: bool) -> Field {
+    mark(Field::new(name, DataType::Utf8, nullable), Marker::Typed)
+}
+
+/// What the field's marker says, if it has one.
+pub(crate) fn marker_of(field: &Field) -> Option<Marker> {
+    match field.metadata().get(JSON_MARKER).map(String::as_str) {
+        Some("typed") => Some(Marker::Typed),
+        Some("formatted") => Some(Marker::Formatted),
+        _ => None,
+    }
+}
+
+/// Does this field carry a marker at all?
+pub(crate) fn is_json_field(field: &Field) -> bool {
+    marker_of(field).is_some()
+}
+
+/// Remove the JSON marker from the top-level fields of a transform's output.
+///
+/// The marker is an implementation detail of expression evaluation. Once the rows are
+/// out of the transform they are text like any other, and the sink, the grain check, the
+/// staged-upsert merge and the publisher all compare schemas — a stray metadata entry
+/// would read as a mismatch to code that has never heard of it.
+pub(crate) fn strip_json_marker(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            let schema = batch.schema();
+            if !schema.fields().iter().any(|f| is_json_field(f)) {
+                return batch;
+            }
+            let fields: Vec<FieldRef> = schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    let mut metadata = f.metadata().clone();
+                    metadata.remove(JSON_MARKER);
+                    Arc::new(f.as_ref().clone().with_metadata(metadata))
+                })
+                .collect();
+            let stripped = Schema::new_with_metadata(fields, schema.metadata().clone());
+            let columns = batch.columns().to_vec();
+            RecordBatch::try_new(Arc::new(stripped), columns).unwrap_or(batch)
+        })
+        .collect()
 }
 
 /// Name → behaviour. Several names share one implementation, which is the point: the same
@@ -236,7 +327,7 @@ const FUNCTIONS: &[(&str, Kind)] = &[
     ("is_json_scalar", Kind::IsScalar),
     // SQL/JSON standard spellings, which Trino also accepts
     ("json_value", Kind::ExtractScalar),
-    ("json_query", Kind::Extract),
+    ("json_query", Kind::Query),
     ("json_exists", Kind::Exists),
     // Postgres/DuckDB lineage. Written directly it is not portable to Trino, which is why
     // the documented spelling is `CAST(<json> AS ARRAY(JSON))` — rewritten to this.
@@ -296,6 +387,19 @@ impl ScalarUDFImpl for JsonFn {
         Ok(self.kind.return_type())
     }
 
+    /// The same types as [`Self::return_type`], plus the JSON marker on the functions that
+    /// return JSON in Trino — `json_extract`, `json_array_get`, `json_parse` and the
+    /// elements of `json_array_elements`. `json_extract_scalar`, `json_value`, `json_query`
+    /// and `json_format` return text there, so they return plain text here.
+    fn return_field_from_args(&self, _args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        let field = match self.kind {
+            Kind::Extract | Kind::ArrayGet | Kind::Parse => json_field(self.name, true),
+            Kind::ArrayElements => Field::new(self.name, DataType::List(element_field()), true),
+            other => Field::new(self.name, other.return_type(), true),
+        };
+        Ok(Arc::new(field))
+    }
+
     fn invoke_with_args(
         &self,
         args: deltalake::datafusion::logical_expr::ScalarFunctionArgs,
@@ -328,12 +432,19 @@ impl ScalarUDFImpl for JsonFn {
             }
             let raw = docs.value(i);
 
-            // json_parse validates; json_format passes through. Both need the parse.
-            let doc: Value = serde_json::from_str(raw).map_err(|e| self.bad_json(i, e))?;
+            // json_parse converts; json_format passes through. Both need the parse.
+            let doc: Json = jsonval::parse(raw).map_err(|e| self.bad_json(i, e))?;
 
             match self.kind {
-                Kind::Parse | Kind::Format => text.push(Some(raw.to_string())),
-                Kind::IsScalar => bools.push(Some(!doc.is_object() && !doc.is_array())),
+                // What Trino stores for its JSON type: keys sorted, whitespace gone, and
+                // floats re-spelt by `BigDecimal` — `json_format(json_parse(x))` is that.
+                Kind::Parse => text.push(Some(jsonval::to_string(
+                    &doc,
+                    Members::Sorted,
+                    Numbers::BigDecimal,
+                ))),
+                Kind::Format => text.push(Some(raw.to_string())),
+                Kind::IsScalar => bools.push(Some(!doc.is_container())),
                 Kind::ArrayLength => nums.push(doc.as_array().map(|a| a.len() as i64)),
                 // Each element back as JSON text, which is what `ARRAY(JSON)` means: the
                 // shape is not decided here, it is decided by whatever reads the elements.
@@ -341,16 +452,19 @@ impl ScalarUDFImpl for JsonFn {
                 // lookup in this module; malformed JSON already errored above.
                 Kind::ArrayElements => lists.push(doc.as_array().map(|a| {
                     a.iter()
-                        .map(|v| (!v.is_null()).then(|| v.to_string()))
+                        .map(|v| (!v.is_null()).then(|| extract_text(v)))
                         .collect()
                 })),
                 Kind::ArrayContains => {
                     let needle = arg2.expect("arity 2").1;
                     // Trino compares against a typed value; from SQL text, the honest
                     // reading is "as JSON if it parses, else as a string".
-                    let want: Value = serde_json::from_str(needle)
-                        .unwrap_or_else(|_| Value::String(needle.to_string()));
-                    bools.push(doc.as_array().map(|a| a.contains(&want)));
+                    let want: Json =
+                        jsonval::parse(needle).unwrap_or_else(|_| Json::String(needle.to_string()));
+                    bools.push(
+                        doc.as_array()
+                            .map(|a| a.iter().any(|v| v.same_value(&want))),
+                    );
                 }
                 Kind::ArrayGet => {
                     let idx = arg2.expect("arity 2").1;
@@ -363,9 +477,9 @@ impl ScalarUDFImpl for JsonFn {
                         }
                         _ => None,
                     };
-                    text.push(got.filter(|v| !v.is_null()).map(|v| v.to_string()));
+                    text.push(got.filter(|v| !v.is_null()).map(extract_text));
                 }
-                Kind::Extract | Kind::ExtractScalar | Kind::Size | Kind::Exists => {
+                Kind::Extract | Kind::Query | Kind::ExtractScalar | Kind::Size | Kind::Exists => {
                     let path = arg2.expect("arity 2").1;
                     let steps = parse_path(path).map_err(DataFusionError::Execution)?;
                     let found = resolve(&doc, &steps);
@@ -373,15 +487,11 @@ impl ScalarUDFImpl for JsonFn {
                         // JSON in, JSON out: a string keeps its quotes, so the result
                         // composes with the other json_* functions. Unwrapping it here is
                         // what `json_extract_scalar` is for.
-                        Kind::Extract => {
-                            text.push(found.filter(|v| !v.is_null()).map(|v| v.to_string()))
+                        Kind::Extract | Kind::Query => {
+                            text.push(found.filter(|v| !v.is_null()).map(extract_text))
                         }
-                        Kind::ExtractScalar => text.push(found.and_then(as_scalar_text)),
-                        Kind::Size => nums.push(found.map(|v| match v {
-                            Value::Array(a) => a.len() as i64,
-                            Value::Object(o) => o.len() as i64,
-                            _ => 0,
-                        })),
+                        Kind::ExtractScalar => text.push(found.and_then(Json::scalar_text)),
+                        Kind::Size => nums.push(found.map(|v| v.size() as i64)),
                         Kind::Exists => bools.push(Some(found.is_some())),
                         _ => unreachable!(),
                     }
@@ -489,11 +599,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extract_returns_containers_as_json() {
+    async fn extract_returns_containers_as_json_in_source_order() {
+        // Trino's extractor copies the structure as it streams past, so the keys come out
+        // in the order the payload wrote them, and a number keeps its digits.
         assert_eq!(
             one("json_extract(data, '$.customer')").await,
-            Some(r#"{"country":"DE","id":42}"#.into())
+            Some(r#"{"id":42,"country":"DE"}"#.into())
         );
+        assert_eq!(
+            one("json_extract(data, '$.lines[0]')").await,
+            Some(r#"{"sku":"A","qty":2}"#.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_stores_the_canonical_form_trino_stores() {
+        // `json_parse` sorts keys and re-spells floats through BigDecimal; that is what
+        // `json_format(json_parse(x))` returns in Starburst, byte for byte.
+        let out = SqlTransform::new("SELECT json_format(json_parse(data)) AS v FROM source")
+            .apply(vec![batch(&[
+                r#"{"b": 1.10, "a": [1e2, {"y": 1, "x": null}], "b": 2}"#,
+            ])])
+            .await
+            .unwrap();
+        let c = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(c.value(0), r#"{"a":[1E+2,{"x":null,"y":1}],"b":2}"#);
+    }
+
+    #[tokio::test]
+    async fn a_scalar_keeps_its_digits() {
+        let out = SqlTransform::new("SELECT json_extract_scalar(data, '$.p') AS v FROM source")
+            .apply(vec![batch(&[r#"{"p":1.10}"#])])
+            .await
+            .unwrap();
+        let c = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(c.value(0), "1.10");
     }
 
     #[tokio::test]
@@ -580,7 +728,7 @@ mod tests {
         );
         assert_eq!(
             one("json_query(data, '$.customer')").await,
-            Some(r#"{"country":"DE","id":42}"#.into())
+            Some(r#"{"id":42,"country":"DE"}"#.into())
         );
     }
 

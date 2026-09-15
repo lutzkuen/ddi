@@ -897,6 +897,51 @@ mod tests {
     }
 
     #[test]
+    fn an_outbox_model_with_lambdas_and_json_constructors_is_streamable() {
+        // The shape issue #9 asked for: one message per source row, carrying that row's
+        // own child array. Trino's spelling throughout, so Starburst can DESCRIBE it too.
+        let v = verdict(
+            "with orders as (\n\
+                 select o.messageid as message_id, \n\
+                        cast(json_extract(o.data, '$.orderEntries') as array(json)) as entries \n\
+                 from bronze.orders as o) \n\
+             select json_object(\n\
+                 KEY 'messageId' VALUE orders.message_id, \n\
+                 'items' value json_format(cast(transform(\n\
+                     filter(orders.entries, e -> json_extract_scalar(e, '$.model') <> 'X'), \n\
+                     e -> json_object('qty' value cast(json_extract_scalar(e, '$.qty') as integer) \n\
+                                      returning json)) as json)) format json) as json_message \n\
+             from orders",
+        );
+        let Verdict::Streamable(s) = v else {
+            panic!("expected streamable, got {v:?}");
+        };
+        // The verdict keeps the model's own spelling, relations rewritten; the resolved
+        // pipeline is what carries the executable text. It has to survive the round trip.
+        let sql = s.transform_sql.unwrap();
+        assert!(!sql.contains("bronze"), "{sql}");
+        let executable = crate::transform::validate::normalise_sql(&sql).unwrap();
+        assert!(executable.contains("ddi_transform("), "{executable}");
+        assert!(executable.contains("ddi_json_object("), "{executable}");
+        assert!(!executable.contains("->"), "{executable}");
+    }
+
+    #[test]
+    fn a_lambda_that_reaches_across_rows_is_rejected_with_the_construct_named() {
+        let v = verdict(
+            "SELECT transform(xs, x -> x + (SELECT max(y) FROM bronze.orders)) AS t \
+             FROM bronze.orders",
+        );
+        let Verdict::Rejected { reason, .. } = v else {
+            panic!("a subquery in a lambda must not be streamable: {v:?}");
+        };
+        assert!(
+            reason.contains("subquery inside a transform() lambda"),
+            "got: {reason}"
+        );
+    }
+
+    #[test]
     fn a_group_by_model_is_rejected_with_the_validators_reason() {
         let v =
             verdict("SELECT customer_id, sum(total) AS t FROM bronze.orders GROUP BY customer_id");

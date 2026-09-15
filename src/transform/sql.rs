@@ -140,7 +140,9 @@ impl SqlTransform {
             .collect()
             .await
             .map_err(|e| crate::spill::classify(e, "transform_sql failed to execute"))?;
-        Ok(out)
+        // The JSON marker is how expressions inside this query know text from JSON. Outside
+        // it the rows are text like any other, and nothing downstream should have to know.
+        Ok(crate::transform::json::strip_json_marker(out))
     }
 }
 
