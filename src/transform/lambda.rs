@@ -29,7 +29,9 @@
 //! JSON function included, and means the same thing there as it does here. At execution the
 //! elements of the whole batch are flattened into one column, the captures repeated per
 //! element, the body evaluated once over all of them, and the results folded back into a
-//! list per row. Planning happens once per lambda per process.
+//! list per row. Planning happens once per lambda per process — unless the body calls a
+//! function that is not immutable (`now()`, `random()`), which is planned per batch so it
+//! means what it would mean at the top of the query.
 //!
 //! # What is refused, at config load
 //!
@@ -315,6 +317,30 @@ fn check_folded(f: &Function, name: &str) -> Result<()> {
         })?;
     check_body(&parsed, spelling)?;
 
+    // A folded call inside the text is held to the same rules, all the way down.
+    struct Nested(Option<Error>);
+    impl VisitorMut for Nested {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            if let Expr::Function(inner) = expr {
+                let name = bare_name(&inner.name);
+                if name == TRANSFORM || name == FILTER {
+                    if let Err(e) = check_folded(inner, &name) {
+                        self.0 = Some(e);
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut nested = Nested(None);
+    let mut copy = parsed.clone();
+    let _ = copy.visit(&mut nested);
+    if let Some(e) = nested.0 {
+        return Err(e);
+    }
+
     // Every capture the body names must be an argument that follows it.
     let captures = list.args.len().saturating_sub(3);
     struct Refs(Vec<usize>);
@@ -570,22 +596,32 @@ fn reencoded(f: &Function) -> Expr {
 }
 
 /// Re-encode the text arguments of every folded call in `query` — see [`literal`] — so
-/// that a query that was parsed renders correctly. Run before rendering.
+/// that a query that was parsed renders correctly. Run once, right before rendering.
 pub(crate) fn reencode(query: &mut Query) {
-    struct V;
-    impl VisitorMut for V {
-        type Break = ();
-        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
-            if let Expr::Function(f) = expr {
-                let name = bare_name(&f.name);
-                if name == TRANSFORM || name == FILTER {
-                    *expr = reencoded(f);
-                }
+    let _ = query.visit(&mut Reencode);
+}
+
+/// Render an expression that was parsed, folded calls included. What any rewrite that
+/// renders part of a query and reads it back has to use instead of `to_string()`.
+pub(crate) fn render_expr(expr: &Expr) -> String {
+    let mut copy = expr.clone();
+    let _ = copy.visit(&mut Reencode);
+    copy.to_string()
+}
+
+struct Reencode;
+
+impl VisitorMut for Reencode {
+    type Break = ();
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        if let Expr::Function(f) = expr {
+            let name = bare_name(&f.name);
+            if name == TRANSFORM || name == FILTER {
+                *expr = reencoded(f);
             }
-            ControlFlow::Continue(())
         }
+        ControlFlow::Continue(())
     }
-    let _ = query.visit(&mut V);
 }
 
 fn bare_name(name: &ObjectName) -> String {
@@ -620,10 +656,18 @@ fn cache() -> &'static Mutex<HashMap<String, Arc<Compiled>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// How many bodies are planned and kept. For tests.
+/// Is this body planned and kept? For tests: the cache is one per process, shared with
+/// every other test in the binary, so a count would say nothing.
 #[cfg(test)]
-pub(crate) fn cached_bodies() -> usize {
-    cache().lock().expect("lambda cache").len()
+fn is_cached(
+    kind: Kind,
+    param: &str,
+    body: &str,
+    element: &FieldRef,
+    captures: &[FieldRef],
+) -> bool {
+    let (key, _) = cache_key(kind, param, body, element, captures);
+    cache().lock().expect("lambda cache").contains_key(&key)
 }
 
 /// A field as the body is planned against it: only the JSON marker survives from the
@@ -667,13 +711,14 @@ fn canonical_type(dt: &DataType) -> String {
     }
 }
 
-fn compile(
+/// The schema a body is planned against, and the key it is cached under.
+fn cache_key(
     kind: Kind,
     param: &str,
     body: &str,
     element: &FieldRef,
     captures: &[FieldRef],
-) -> DFResult<Arc<Compiled>> {
+) -> (String, SchemaRef) {
     let mut fields = vec![planning_field(param, element)];
     for (n, c) in captures.iter().enumerate() {
         fields.push(planning_field(&capture_name(n), c));
@@ -696,6 +741,17 @@ fn compile(
         kind.name(),
         rendered.join("|")
     );
+    (key, schema)
+}
+
+fn compile(
+    kind: Kind,
+    param: &str,
+    body: &str,
+    element: &FieldRef,
+    captures: &[FieldRef],
+) -> DFResult<Arc<Compiled>> {
+    let (key, schema) = cache_key(kind, param, body, element, captures);
     if let Some(hit) = cache().lock().expect("lambda cache").get(&key) {
         return Ok(Arc::clone(hit));
     }
@@ -1180,6 +1236,15 @@ mod tests {
                 "SELECT ddi_transform(xs, 'x', 'x + __capture_3', a) AS t FROM source",
                 "naming __capture_3",
             ),
+            (
+                "SELECT ddi_transform(xs, 'x', 'ddi_filter(x, ''y'', ''sum(y)'')') AS t FROM source",
+                "aggregate function sum() inside a filter() lambda",
+            ),
+            (
+                "SELECT ddi_transform(xs, 'x', 'ddi_filter(x, ''y'', ''y > __capture_9'')') AS t \
+                 FROM source",
+                "naming __capture_9",
+            ),
         ] {
             let e = validate_sql(sql).unwrap_err().to_string();
             assert!(e.contains(want), "{sql}: {e}");
@@ -1199,26 +1264,55 @@ mod tests {
             Arc::new(Field::new("rate", DataType::Float64, true).with_metadata(md))
         };
         let body = "CAST(x AS DOUBLE) * __capture_0 + 0.5";
-        compile(
+        let (first, _) = cache_key(
             Kind::Transform,
             "x",
             body,
             &element,
             &[capture(["a", "b", "c"])],
-        )
-        .unwrap();
-        let after_first = cached_bodies();
+        );
         for _ in 0..25 {
-            compile(
+            let (again, _) = cache_key(
                 Kind::Transform,
                 "x",
                 body,
                 &element,
                 &[capture(["c", "a", "b"])],
-            )
-            .unwrap();
+            );
+            assert_eq!(again, first);
         }
-        assert_eq!(cached_bodies(), after_first, "one body, one entry");
+        compile(
+            Kind::Transform,
+            "x",
+            body,
+            &element,
+            &[capture(["b", "c", "a"])],
+        )
+        .unwrap();
+        assert!(is_cached(
+            Kind::Transform,
+            "x",
+            body,
+            &element,
+            &[capture(["a", "b", "c"])]
+        ));
+    }
+
+    #[test]
+    fn a_body_that_is_not_immutable_is_planned_every_time() {
+        let element = Arc::new(Field::new("item", DataType::Int64, true));
+        for body in [
+            "x + CAST(random() * 10 AS BIGINT)",
+            "CAST(now() AS BIGINT) + x",
+        ] {
+            compile(Kind::Transform, "x", body, &element, &[]).unwrap();
+            assert!(
+                !is_cached(Kind::Transform, "x", body, &element, &[]),
+                "{body} was kept"
+            );
+        }
+        compile(Kind::Transform, "x", "x + 1", &element, &[]).unwrap();
+        assert!(is_cached(Kind::Transform, "x", "x + 1", &element, &[]));
     }
 
     #[test]

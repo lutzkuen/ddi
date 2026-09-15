@@ -439,10 +439,12 @@ fn the_example_config_validates_and_its_outbox_model_is_a_lambda() {
 
 #[tokio::test]
 async fn null_elements_are_evaluated_and_a_null_predicate_drops_the_element() {
-    // As in Trino: transform binds a NULL element and filter keeps only TRUE.
+    // As in Trino: a JSON null element of ARRAY(JSON) is the JSON value `null`, not a NULL
+    // slot — `json_extract_scalar` on it is NULL — and filter keeps only TRUE.
     let out = run(
-        "SELECT json_format(CAST(transform(CAST('[1,null,3]' AS ARRAY(JSON)), e -> e IS NULL) AS JSON)) AS nulls, \
-                json_format(CAST(filter(CAST('[1,null,3]' AS ARRAY(JSON)), e -> CAST(e AS INTEGER) > 1) AS JSON)) AS big, \
+        "SELECT json_format(CAST(transform(CAST('[1,null,3]' AS ARRAY(JSON)), e -> e IS NULL) AS JSON)) AS slots, \
+                json_format(CAST(transform(CAST('[1,null,3]' AS ARRAY(JSON)), e -> json_extract_scalar(e, '$') IS NULL) AS JSON)) AS nulls, \
+                json_format(CAST(filter(CAST('[1,null,3]' AS ARRAY(JSON)), e -> CAST(json_extract_scalar(e, '$') AS INTEGER) > 1) AS JSON)) AS big, \
                 json_format(CAST(transform(CAST(NULL AS ARRAY(JSON)), e -> e) AS JSON)) AS none, \
                 json_format(CAST(transform(CAST('[]' AS ARRAY(JSON)), e -> e) AS JSON)) AS empty \
          FROM source",
@@ -450,12 +452,34 @@ async fn null_elements_are_evaluated_and_a_null_predicate_drops_the_element() {
     )
     .await;
     assert_eq!(
+        texts(&out, "slots"),
+        vec![Some("[false,false,false]".into())]
+    );
+    assert_eq!(
         texts(&out, "nulls"),
         vec![Some("[false,true,false]".into())]
     );
     assert_eq!(texts(&out, "big"), vec![Some("[3]".into())]);
     assert_eq!(texts(&out, "none"), vec![None]);
     assert_eq!(texts(&out, "empty"), vec![Some("[]".into())]);
+}
+
+#[tokio::test]
+async fn a_lambda_with_an_empty_string_literal_survives_the_unnest_rewrite() {
+    // The UNNEST rewrite renders the array expression and reads it back; a folded body
+    // holding '' has to come through that with its escaping intact.
+    let out = run(
+        "SELECT o.messageid, json_extract_scalar(li, '$.product.variantArticleId') AS v \
+         FROM source o \
+         CROSS JOIN UNNEST(filter(CAST(json_extract(o.data, '$.orderEntries') AS ARRAY(JSON)), \
+                                  li -> coalesce(json_extract_scalar(li, '$.product.fulfillmentModel'), '') <> '')) AS t(li)",
+        vec![deliveries()],
+    )
+    .await;
+    assert_eq!(
+        texts(&out, "v"),
+        vec![Some("V1".into()), Some("V2".into()), Some("V3".into())]
+    );
 }
 
 #[tokio::test]

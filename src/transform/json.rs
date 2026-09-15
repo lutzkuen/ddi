@@ -250,9 +250,10 @@ pub(crate) const JSON_MARKER: &str = "ddi:json";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Marker {
     /// Trino's JSON type: the result of `json_extract`, `json_array_get`, `json_parse`,
-    /// `CAST(.. AS JSON)`, an element of `CAST(.. AS ARRAY(JSON))`, or a constructor told
-    /// `RETURNING JSON`. Embedded in a constructor only after `json_format(..) FORMAT
-    /// JSON`, exactly as Starburst requires.
+    /// `CAST(.. AS JSON)` or an element of `CAST(.. AS ARRAY(JSON))`, and what
+    /// `ddi_as_json` puts back where DataFusion dropped it. A constructor's result becomes
+    /// JSON-typed only through `json_parse(..)`. Embedded in a constructor only after
+    /// `json_format(..) FORMAT JSON`, exactly as Starburst requires.
     Typed,
     /// Text that `FORMAT JSON` has read: embedded as JSON, and nowhere else meaningful.
     Formatted,
@@ -459,13 +460,13 @@ impl ScalarUDFImpl for JsonFn {
                 Kind::ArrayLength => nums.push(doc.as_array().map(|a| a.len() as i64)),
                 // Each element back as JSON text, which is what `ARRAY(JSON)` means: the
                 // shape is not decided here, it is decided by whatever reads the elements.
-                // A non-array is NULL rather than an error, matching every other path
-                // lookup in this module; malformed JSON already errored above.
-                Kind::ArrayElements => lists.push(doc.as_array().map(|a| {
-                    a.iter()
-                        .map(|v| (!v.is_null()).then(|| tree_text(v)))
-                        .collect()
-                })),
+                // A JSON null element is the JSON value `null`, not a NULL slot — Trino's
+                // cast keeps it — and a non-array is NULL rather than an error, matching
+                // every other path lookup in this module; malformed JSON already errored.
+                Kind::ArrayElements => lists.push(
+                    doc.as_array()
+                        .map(|a| a.iter().map(|v| Some(tree_text(v))).collect()),
+                ),
                 Kind::ArrayContains => {
                     let needle = arg2.expect("arity 2").1;
                     // Trino compares against a typed value; from SQL text, the honest

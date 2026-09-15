@@ -189,11 +189,16 @@ pub(crate) fn prepare_trino_text(sql: &str) -> String {
             }
             Token::Word(w) if w.quote_style.is_none() => {
                 // `'k' VALUE v`: the value expression starts after the member's VALUE. A
-                // second VALUE word in the same member is a column called `value`.
+                // second VALUE word in the same member is a column called `value`, and so
+                // is one that opens the member — `json_object(value VALUE 1)`.
                 if w.keyword == Keyword::VALUE {
+                    let opens_member = matches!(
+                        previous_significant(&out),
+                        Some(Token::LParen) | Some(Token::Comma)
+                    );
                     out.push(tok.to_string());
                     if let Some(frame) = stack.last_mut() {
-                        if frame.call == Call::JsonObject && !frame.seen_value {
+                        if frame.call == Call::JsonObject && !frame.seen_value && !opens_member {
                             frame.value_start = out.len();
                             frame.seen_value = true;
                         }
@@ -455,6 +460,28 @@ mod tests {
             got,
             "SELECT json_object('k' VALUE key, 'v' VALUE (value)::JSON, \
              'w' VALUE (t.value + value)::JSON) AS msg FROM source"
+        );
+    }
+
+    #[test]
+    fn a_column_called_value_used_as_the_key_is_the_key() {
+        assert_eq!(
+            prepare_trino_text("SELECT json_object(value VALUE x FORMAT JSON, value : 1) FROM t"),
+            "SELECT json_object(value VALUE (x)::JSON, value VALUE 1) FROM t"
+        );
+    }
+
+    #[test]
+    fn a_unicode_string_literal_survives_the_fallback_parse() {
+        // Only the fallback dialect reads `'k' VALUE v`; it must read `U&'..'` too.
+        let got = crate::transform::validate::normalise_sql(
+            "SELECT json_object(upper(k) VALUE U&'caf\\00e9') AS j FROM source",
+        )
+        .unwrap();
+        let lower = got.to_ascii_lowercase();
+        assert!(
+            lower.contains("café") || lower.contains("u&'caf\\00e9'"),
+            "got: {got}"
         );
     }
 

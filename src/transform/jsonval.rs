@@ -2,9 +2,11 @@
 //!
 //! Trino's JSON functions are Jackson underneath, and Jackson has opinions that a generic
 //! JSON library does not share: `json_parse` sorts object keys and re-spells floats through
-//! `BigDecimal`, `json_extract` keeps the source order and the source digits, `FORMAT JSON`
-//! keeps the order but re-spells floats through `Double.toString`, and `json_object` emits
-//! its keys in the order a `java.util.HashMap` iterates them. A model has to produce the
+//! `BigDecimal`; `json_extract` keeps the source order and its repeats but re-spells floats
+//! through `Double.toString`, as Jackson's structure copy does; `FORMAT JSON`, `json_query`
+//! and `json_array_get` read a tree, which keeps the order, resolves a repeated key to its
+//! last value and re-spells floats the same way; and `json_object` emits its keys in the
+//! order a `java.util.HashMap` iterates them. A model has to produce the
 //! same bytes here as in the warehouse, so these are reproduced rather than approximated:
 //! this module is a small strict parser that keeps every number as the text it was, plus
 //! the writers and the two Java number spellings.
@@ -27,10 +29,6 @@ pub(crate) enum Json {
 }
 
 impl Json {
-    pub(crate) fn is_null(&self) -> bool {
-        matches!(self, Json::Null)
-    }
-
     pub(crate) fn is_container(&self) -> bool {
         matches!(self, Json::Array(_) | Json::Object(_))
     }
@@ -617,25 +615,52 @@ fn java_string_hash(s: &str) -> i32 {
 /// The order a `java.util.HashMap` built from `keys`, in this order, iterates them.
 ///
 /// This is how Trino's `json_object` orders its members — neither as written nor sorted
-/// (its own test expects `key_1, key_2` to come out `key_2, key_1`). Buckets ascend;
-/// within a bucket, insertion order. The table starts at 16 slots and doubles whenever the
-/// count exceeds three quarters of it. Returns indexes into `keys`.
+/// (its own test expects `key_1, key_2` to come out `key_2, key_1`). The map is built the
+/// way Java builds it: 16 slots; a key goes to slot `(h ^ (h >>> 16)) & (slots - 1)` at the
+/// end of that slot's chain; the table doubles when the count exceeds three quarters of it,
+/// and also when a chain reaches nine while the table is under 64 slots (Java would
+/// otherwise turn the chain into a tree); doubling re-slots every key, chains keeping their
+/// order. Iteration is slot by slot, chain order within a slot. A genuine tree bin — nine
+/// keys in one slot of a table of 64 or more — is not modelled; its chain order is used.
+/// Returns indexes into `keys`.
 pub(crate) fn java_hashmap_order(keys: &[&str]) -> Vec<usize> {
-    let mut capacity = 16usize;
-    while keys.len() > capacity * 3 / 4 {
-        capacity *= 2;
-    }
-    let mut slots: Vec<(usize, usize)> = keys
+    const TREEIFY_THRESHOLD: usize = 8;
+    const MIN_TREEIFY_CAPACITY: usize = 64;
+
+    let spread: Vec<u32> = keys
         .iter()
-        .enumerate()
-        .map(|(i, k)| {
+        .map(|k| {
             let h = java_string_hash(k) as u32;
-            let spread = h ^ (h >> 16);
-            ((spread as usize) & (capacity - 1), i)
+            h ^ (h >> 16)
         })
         .collect();
-    slots.sort();
-    slots.into_iter().map(|(_, i)| i).collect()
+    let mut capacity = 16usize;
+    let mut slots: Vec<Vec<usize>> = vec![Vec::new(); capacity];
+    let resize = |slots: &mut Vec<Vec<usize>>, capacity: &mut usize, spread: &[u32]| {
+        *capacity *= 2;
+        let mut next: Vec<Vec<usize>> = vec![Vec::new(); *capacity];
+        for chain in slots.iter() {
+            for &i in chain {
+                next[(spread[i] as usize) & (*capacity - 1)].push(i);
+            }
+        }
+        *slots = next;
+    };
+    for i in 0..keys.len() {
+        let slot = (spread[i] as usize) & (capacity - 1);
+        let chain_before = slots[slot].len();
+        slots[slot].push(i);
+        // `putVal`: a chain that has just grown past the treeify threshold is treeified,
+        // and `treeifyBin` resizes instead while the table is small.
+        if chain_before >= TREEIFY_THRESHOLD && capacity < MIN_TREEIFY_CAPACITY {
+            resize(&mut slots, &mut capacity, &spread);
+        }
+        // `++size > threshold`.
+        if i + 1 > capacity * 3 / 4 {
+            resize(&mut slots, &mut capacity, &spread);
+        }
+    }
+    slots.into_iter().flatten().collect()
 }
 
 #[cfg(test)]

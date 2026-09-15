@@ -58,10 +58,13 @@
 //! DataFusion drops field metadata — and with it the JSON marker — at a `CASE`, a
 //! `coalesce`, a `nullif` and an `UNNEST`. Trino's type system does not: a `CASE` over
 //! `json_extract` is JSON. So the rewrite here wraps such an expression in `ddi_as_json`
-//! wherever the marker matters, and [`crate::transform::unnest`] does the same for the
-//! elements of `CAST(.. AS ARRAY(JSON))`. In the other direction DataFusion *keeps* the
-//! marker through a cast, where Trino's type changes; `CAST(<json> AS VARCHAR)` becomes
-//! `ddi_text`, which is Trino's JSON-to-varchar cast.
+//! wherever it is projected or consumed — a branch that is JSON by shape makes it JSON
+//! outright, a branch that is a name makes it JSON when that name is, which the planner
+//! decides from the name's own marker — and [`crate::transform::unnest`] does the same for
+//! the elements of `CAST(.. AS ARRAY(JSON))`. In the other direction DataFusion *keeps* the
+//! marker through a cast, where Trino's type changes; `CAST(<anything that may be json> AS
+//! VARCHAR)` becomes `ddi_text`, Trino's JSON-to-varchar cast on a JSON-typed input and the
+//! plain cast on any other.
 
 use std::any::Any;
 use std::ops::ControlFlow;
@@ -150,10 +153,11 @@ pub(crate) fn rewrite_constructors(query: &mut Query) -> Result<()> {
     }
     let mut v = V(None);
     let _ = query.visit(&mut v);
-    match v.0 {
-        Some(e) => Err(e),
-        None => Ok(()),
+    if let Some(e) = v.0 {
+        return Err(e);
     }
+    mark_projections(query);
+    Ok(())
 }
 
 fn replacement(expr: &Expr) -> Result<Option<Expr>> {
@@ -177,6 +181,11 @@ fn replacement(expr: &Expr) -> Result<Option<Expr>> {
                 // `crate::transform::dialect` — and reads text as JSON.
                 CastKind::DoubleColon => {
                     let inner = unparenthesised(inner);
+                    // On a constructor the clause only says out loud what nesting implies:
+                    // the value is embedded as built.
+                    if is_nested_constructor(inner) {
+                        return Ok(Some(call(EMBED_JSON, vec![inner.clone()])));
+                    }
                     if let Some(what) = json_typed_name(inner) {
                         return Err(reject(
                             &format!("FORMAT JSON on {what}, which is a JSON-typed value"),
@@ -185,7 +194,7 @@ fn replacement(expr: &Expr) -> Result<Option<Expr>> {
                             "write json_format(<value>) FORMAT JSON.",
                         ));
                     }
-                    Ok(Some(call(FORMAT_JSON, vec![inner.clone()])))
+                    Ok(Some(call(FORMAT_JSON, vec![with_json_type(inner.clone())])))
                 }
                 // `CAST(x AS JSON)` converts a value: text becomes a JSON *string*.
                 CastKind::Cast => Ok(Some(call(TO_JSON, vec![with_json_type((**inner).clone())]))),
@@ -197,14 +206,17 @@ fn replacement(expr: &Expr) -> Result<Option<Expr>> {
                 )),
             }
         }
-        // `CAST(<json> AS VARCHAR)`: Trino's type changes, so the value does too.
+        // `CAST(<json> AS VARCHAR)`: Trino's type changes, so the value does too. Whether
+        // the operand *is* JSON is often known only at plan time — a CTE column, an UNNEST
+        // element, a lambda parameter — so anything that may be goes through `ddi_text`,
+        // which is the plain cast on anything that turns out not to be.
         Expr::Cast {
             kind: CastKind::Cast,
             expr: inner,
             data_type,
             ..
-        } if is_text_type(data_type) && is_json_typed(inner) => {
-            Ok(Some(call(TEXT, vec![(**inner).clone()])))
+        } if is_text_type(data_type) && may_be_json_typed(inner) => {
+            Ok(Some(call(TEXT, vec![with_json_type((**inner).clone())])))
         }
         Expr::Function(f) => match bare_name(&f.name).as_str() {
             "json_object" => rewrite_object(f).map(Some),
@@ -292,13 +304,119 @@ fn json_typed_by_branches(e: &Expr) -> bool {
     }
 }
 
-/// `e`, with the JSON type put back where DataFusion would drop it.
+/// A name whose type is known only at plan time: a column, an UNNEST element, a lambda
+/// parameter.
+fn is_name(e: &Expr) -> bool {
+    matches!(
+        unparenthesised(e),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::CompoundFieldAccess { .. }
+    )
+}
+
+/// The branches of a `CASE`, `coalesce`, `nullif`, `ifnull`, `nvl` or `if`.
+fn branches(e: &Expr) -> Vec<&Expr> {
+    match unparenthesised(e) {
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => conditions
+            .iter()
+            .map(|c| &c.result)
+            .chain(else_result.as_deref())
+            .collect(),
+        Expr::Function(f) => {
+            let FunctionArguments::List(list) = &f.args else {
+                return vec![];
+            };
+            let values: Vec<&Expr> = list
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                    _ => None,
+                })
+                .collect();
+            match bare_name(&f.name).as_str() {
+                "coalesce" | "nullif" | "ifnull" | "nvl" => values,
+                "if" if values.len() == 3 => values[1..].to_vec(),
+                _ => vec![],
+            }
+        }
+        _ => vec![],
+    }
+}
+
+/// Might `e` be a value of Trino's JSON type? Yes when it is one by shape, when it is a
+/// name, or when a branch of it is either.
+fn may_be_json_typed(e: &Expr) -> bool {
+    is_json_typed(e) || is_name(e) || branches(e).iter().any(|b| may_be_json_typed(b))
+}
+
+/// `e`, with the JSON type put back where DataFusion would drop it: at a branch.
+///
+/// A branch that is JSON by shape makes the whole thing JSON, and `ddi_as_json(e)` says
+/// so. A branch that is a name is JSON exactly when that name is, which only the planner
+/// knows; the names are passed along as witnesses — `ddi_as_json(e, name, ...)` — and the
+/// result is JSON-typed when any of them is. A name costs nothing to evaluate twice.
 fn with_json_type(e: Expr) -> Expr {
     if json_typed_by_branches(&e) {
-        call(AS_JSON, vec![e])
-    } else {
-        e
+        return call(AS_JSON, vec![e]);
     }
+    let witnesses: Vec<Expr> = branches(&e)
+        .into_iter()
+        .filter(|b| is_name(b))
+        .map(|b| unparenthesised(b).clone())
+        .collect();
+    if witnesses.is_empty() {
+        return e;
+    }
+    let mut args = vec![e];
+    args.extend(witnesses);
+    call(AS_JSON, args)
+}
+
+/// Put the JSON type back on every projected expression, so a branch over JSON-typed
+/// values keeps its type through an alias, a CTE or a derived table, as it does in Trino.
+fn mark_projections(query: &mut Query) {
+    use deltalake::datafusion::sql::sqlparser::ast::{SelectItem, SetExpr, TableFactor};
+
+    fn in_set_expr(body: &mut SetExpr) {
+        match body {
+            SetExpr::Select(select) => {
+                for item in select.projection.iter_mut() {
+                    match item {
+                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                            let taken = std::mem::replace(e, Expr::Value(Value::Null.into()));
+                            *e = with_json_type(taken);
+                        }
+                        _ => {}
+                    }
+                }
+                for twj in select.from.iter_mut() {
+                    if let TableFactor::Derived { subquery, .. } = &mut twj.relation {
+                        mark_projections(subquery);
+                    }
+                    for join in twj.joins.iter_mut() {
+                        if let TableFactor::Derived { subquery, .. } = &mut join.relation {
+                            mark_projections(subquery);
+                        }
+                    }
+                }
+            }
+            SetExpr::Query(q) => mark_projections(q),
+            SetExpr::SetOperation { left, right, .. } => {
+                in_set_expr(left);
+                in_set_expr(right);
+            }
+            _ => {}
+        }
+    }
+
+    for cte in query.with.iter_mut().flat_map(|w| w.cte_tables.iter_mut()) {
+        mark_projections(&mut cte.query);
+    }
+    in_set_expr(&mut query.body);
 }
 
 /// A constructor nested directly in another: Trino embeds it as JSON without being told.
@@ -449,6 +567,14 @@ fn rewrite_object(f: &Function) -> Result<Expr> {
                 ));
             }
         };
+        if let Some(what) = json_typed_name(&key) {
+            return Err(reject(
+                &format!("json_object with {what} as a key"),
+                "a key must be a character string, and Starburst refuses a JSON-typed one at \
+                 analysis.",
+                "write CAST(<key> AS VARCHAR).",
+            ));
+        }
         args.push(with_json_type(key));
         args.push(member(value));
     }
@@ -537,7 +663,9 @@ struct BuildFn {
 impl BuildFn {
     fn new(kind: Build) -> Self {
         let signature = match kind {
-            Build::Object | Build::Array => Signature::variadic_any(Volatility::Immutable),
+            Build::Object | Build::Array | Build::AsJson => {
+                Signature::variadic_any(Volatility::Immutable)
+            }
             _ => Signature::any(1, Volatility::Immutable),
         };
         Self { kind, signature }
@@ -592,6 +720,13 @@ impl ScalarUDFImpl for BuildFn {
                                 key.data_type()
                             )));
                         }
+                        if marker_of(key) == Some(Marker::Typed) {
+                            return Err(DataFusionError::Plan(format!(
+                                "json_object: key #{} is JSON-typed; a key must be varchar, and \
+                                 Starburst refuses this too. Write CAST(<key> AS VARCHAR).",
+                                n + 1
+                            )));
+                        }
                     }
                 }
                 Field::new(self.name(), DataType::Utf8, false)
@@ -628,6 +763,16 @@ impl ScalarUDFImpl for BuildFn {
                 let Some(input) = input else {
                     return Err(self.err("missing its argument"));
                 };
+                // With witnesses, the value is JSON exactly when one of them is; without,
+                // it is JSON by shape.
+                let witnesses = &args.arg_fields[1..];
+                let typed = witnesses.is_empty()
+                    || witnesses
+                        .iter()
+                        .any(|w| marker_of(w) == Some(Marker::Typed) || is_json_list(w));
+                if !typed {
+                    return Ok(Arc::new(input.as_ref().clone().with_name(self.name())));
+                }
                 if !is_text(input.data_type()) && input.data_type() != &DataType::Null {
                     return Err(DataFusionError::Plan(format!(
                         "{} is internal and takes text, got {}",
@@ -757,8 +902,7 @@ impl KeyColumn {
     }
 }
 
-/// The raw text of a key column. A JSON-typed key is what Trino's varchar cast makes of
-/// it, so `CAST(json_extract(..) AS VARCHAR)` keys as it does there.
+/// The raw text of a key column.
 fn key_column(
     value: &ColumnarValue,
     field: &Field,
@@ -766,16 +910,12 @@ fn key_column(
     position: usize,
 ) -> DFResult<KeyColumn> {
     let bad = |msg: String| DataFusionError::Execution(format!("{who}: {msg}"));
+    let _ = field;
     let raw = |array: &ArrayRef| -> DFResult<Vec<Option<String>>> {
-        match marker_of(field) {
-            Some(_) => json_to_varchar(array, who),
-            None => {
-                let text = as_text(array).map_err(bad)?;
-                Ok((0..array.len())
-                    .map(|i| (!text.is_null(i)).then(|| text.value(i).to_string()))
-                    .collect())
-            }
-        }
+        let text = as_text(array).map_err(bad)?;
+        Ok((0..array.len())
+            .map(|i| (!text.is_null(i)).then(|| text.value(i).to_string()))
+            .collect())
     };
     match value {
         ColumnarValue::Scalar(s) => {
@@ -925,6 +1065,15 @@ fn to_array(v: &ColumnarValue, rows: usize) -> DFResult<ArrayRef> {
 
 fn is_text(t: &DataType) -> bool {
     matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
+}
+
+/// A list whose elements are JSON-typed: what a witness that is an array column looks
+/// like when the branch is over its elements.
+fn is_json_list(field: &Field) -> bool {
+    match field.data_type() {
+        DataType::List(f) | DataType::LargeList(f) => marker_of(f) == Some(Marker::Typed),
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1252,8 +1401,8 @@ fn double_json(java: String) -> String {
 }
 
 /// A JSON number cast to varchar, as Trino does it: an integer keeps its digits, a float
-/// goes through the double-to-varchar cast, which always writes an exponent (`1.5E0`),
-/// and spells zero `0E0`.
+/// goes through the double-to-varchar cast, which always writes an exponent and no more
+/// digits than round-trip (`1.5E0`, `2E0`, `5E-1`, `1.23456789E7`), and spells zero `0E0`.
 fn json_number_as_varchar(text: &str) -> String {
     if !text.contains(['.', 'e', 'E']) {
         return text.to_string();
@@ -1266,11 +1415,6 @@ fn json_number_as_varchar(text: &str) -> String {
             }
             let sci = format!("{:e}", v.abs());
             let (mantissa, exponent) = sci.split_once('e').expect("{:e} always has an exponent");
-            let mantissa = if mantissa.contains('.') {
-                mantissa.to_string()
-            } else {
-                format!("{mantissa}.0")
-            };
             format!("{sign}{mantissa}E{exponent}")
         }
         _ => text.to_string(),
@@ -1799,5 +1943,140 @@ mod tests {
              ddi_json_array('absent', x, y) AS k, ddi_to_json(x) AS c, \
              ddi_text(json_extract(x, '$.a')) AS t FROM source"
         );
+    }
+    /// A query over the first row alone, first column.
+    async fn query_one(sql: &str) -> String {
+        let out = SqlTransform::new(sql)
+            .apply(vec![batch().slice(0, 1)])
+            .await
+            .unwrap_or_else(|e| panic!("{sql} failed: {e}"));
+        out[0].column(0).as_string::<i32>().value(0).to_string()
+    }
+
+    #[tokio::test]
+    async fn the_json_type_follows_a_branch_over_a_column_and_through_a_projection() {
+        // A CASE over a JSON-typed *column* is JSON-typed, which only the planner can know:
+        // the column is passed along as the witness.
+        assert_eq!(
+            query_one(
+                "WITH j AS (SELECT json_extract(data, '$.lines[0].sku') AS s, paid FROM source) \
+                 SELECT json_object('s' VALUE CASE WHEN paid THEN s END) AS v FROM j"
+            )
+            .await,
+            r#"{"s":"A"}"#
+        );
+        // And a branch projected under an alias keeps its type into the next query.
+        assert_eq!(
+            query_one(
+                "WITH j AS (SELECT paid, CASE WHEN paid THEN json_extract(data, '$.lines[0].sku') \
+                 END AS s FROM source) SELECT json_object('s' VALUE s) AS v FROM j"
+            )
+            .await,
+            r#"{"s":"A"}"#
+        );
+        // So FORMAT JSON on it is refused as Starburst refuses it, before any row.
+        let e = SqlTransform::new(
+            "WITH j AS (SELECT json_extract(data, '$.lines') AS l, paid FROM source) \
+             SELECT json_object('l' VALUE CASE WHEN paid THEN l END FORMAT JSON) AS v FROM j",
+        )
+        .apply(vec![batch().slice(0, 0)])
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("FORMAT JSON on a JSON-typed value"), "got: {e}");
+        // A branch over plain text stays text.
+        assert_eq!(
+            query_one(
+                "SELECT json_object('n' VALUE CASE WHEN paid THEN name END) AS v FROM source"
+            )
+            .await,
+            r#"{"n":"O\"Brien \\ 😀"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn cast_to_varchar_is_trinos_cast_wherever_the_value_may_be_json() {
+        assert_eq!(
+            one("CAST(coalesce(json_extract(data, '$.nope'), json_extract(data, '$.lines[0].sku')) AS VARCHAR)")
+                .await,
+            "A"
+        );
+        assert_eq!(
+            query_one(
+                "WITH j AS (SELECT json_extract(data, '$.lines[0].sku') AS s FROM source) \
+                 SELECT CAST(s AS VARCHAR) AS v FROM j"
+            )
+            .await,
+            "A"
+        );
+        assert_eq!(
+            query_one(
+                "SELECT CAST(tag AS VARCHAR) || '!' AS v FROM source o \
+                 CROSS JOIN UNNEST(CAST(json_extract(o.data, '$.tags') AS ARRAY(JSON))) AS t(tag)"
+            )
+            .await,
+            "x!"
+        );
+        // Plain text is the plain cast.
+        assert_eq!(one("CAST(id AS VARCHAR)").await, "7");
+    }
+
+    #[test]
+    fn a_json_typed_key_is_refused_as_starburst_refuses_it() {
+        let e = crate::transform::validate::validate_sql(
+            "SELECT json_object(json_extract(data, '$.k') VALUE 1) AS v FROM source",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("as a key"), "got: {e}");
+        assert!(e.contains("CAST(<key> AS VARCHAR)"), "got: {e}");
+    }
+
+    #[tokio::test]
+    async fn a_json_typed_column_as_a_key_is_refused_before_any_row() {
+        let e = SqlTransform::new(
+            "WITH j AS (SELECT json_extract(data, '$.lines[0].sku') AS s FROM source) \
+             SELECT json_object(s VALUE 1) AS v FROM j",
+        )
+        .apply(vec![batch().slice(0, 0)])
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("key #1 is JSON-typed"), "got: {e}");
+    }
+
+    #[tokio::test]
+    async fn explicit_format_json_on_a_nested_constructor_embeds_it_as_built() {
+        assert_eq!(
+            first("json_object('d' VALUE json_object('amount' VALUE amount) FORMAT JSON)").await,
+            r#"{"d":{"amount":12.3400}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn a_json_typed_float_casts_to_varchar_the_way_trino_spells_a_double() {
+        assert_eq!(
+            first(
+                "json_array(json_parse('2.0'), json_parse('0.5'), json_parse('100.0'), \
+                 json_parse('12345678.9'), json_parse('-0.0'))"
+            )
+            .await,
+            r#"["2E0","5E-1","1E2","1.23456789E7","0E0"]"#
+        );
+    }
+
+    #[tokio::test]
+    async fn an_element_of_a_filtered_json_array_is_still_json_typed_after_unnest() {
+        let out = SqlTransform::new(
+            "SELECT json_object('t' VALUE tag) AS v FROM source o \
+             CROSS JOIN UNNEST(filter(CAST(json_extract(o.data, '$.tags') AS ARRAY(JSON)), \
+                                      e -> e <> '\"y\"')) AS t(tag)",
+        )
+        .apply(vec![batch()])
+        .await
+        .unwrap();
+        let c = out[0].column(0).as_string::<i32>();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.value(0), r#"{"t":"x"}"#);
     }
 }

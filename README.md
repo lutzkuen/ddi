@@ -214,7 +214,8 @@ internally. Two consequences worth knowing:
 - A row whose path is missing, or is not an array, contributes **no rows** rather than
   failing — a NULL array expands to nothing, as in Trino. Malformed JSON still stops the
   pipeline, because the input is a typed column rather than arbitrary text.
-- A JSON `null` element becomes a SQL NULL element.
+- A JSON `null` element is the JSON value `null`, as it is in Trino — a row, not a NULL
+  one; `json_extract_scalar` on it is NULL.
 
 Not supported, and refused at config load rather than on the first batch:
 
@@ -934,7 +935,7 @@ too — a model has to mean the same thing in the warehouse and in `ddi`:
 | `json_array_get(json, index)` | negative indexes count from the end |
 | `json_exists(json, path)` | |
 | `json_parse` / `json_format` / `is_json_scalar` | |
-| `json_value` / `json_query` | the SQL/JSON spellings of scalar / extract |
+| `json_value` / `json_query` | the SQL/JSON spellings; `json_query` reads a tree (a repeated key keeps its last value) and returns text, where `json_extract` streams and returns JSON |
 
 `json_extract_string` (DuckDB) and `get_json_object` (Spark) are aliases of
 `json_extract_scalar`, so a model written against either streams unchanged.
@@ -959,7 +960,8 @@ value in its source order, integers as written and floats re-spelt as doubles (`
 becomes `1.1`, as Jackson's copy does); `json_parse` stores the canonical form Trino stores
 — keys sorted, whitespace gone, floats spelt the way `BigDecimal` spells them — so
 `json_format(json_parse(x))` agrees between the two engines; `json_array_get` returns a
-string element without its quotes, as its Trino documentation warns.
+string element without its quotes, as its Trino documentation warns; a JSON `null` at a
+path is the value `null`, only a missing path is SQL NULL.
 
 #### Building JSON: `json_object`, `json_array`, `CAST(.. AS JSON)`
 
