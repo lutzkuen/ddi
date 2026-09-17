@@ -19,10 +19,24 @@
 //! Neither layer changes what a query *means*: the text handed on is what Trino would have
 //! read, said in a way this parser accepts, and [`crate::transform::validate::validate_sql`]
 //! proves the result parses natively before anything runs.
+//!
+//! The first layer is one-way, and that matters for SQL that leaves this engine. A statement
+//! parsed here and rendered again says `(x)::JSON`, which Trino has no grammar for, so
+//! [`render_for_trino`] puts each of those back as the `FORMAT JSON` it was. Not its
+//! `ENCODING`, which the rewrite drops: Trino reads an encoding only from varbinary, and this
+//! engine reads JSON only from text, so no model both run can carry one. The other rewrites
+//! need nothing putting back: `KEY` and the unique-keys clause are optional in Trino (a
+//! repeated key is an error there either way), `'k' VALUE v` is one of its two member
+//! spellings, and `ARRAY<JSON>` is its legacy array type.
 
+use deltalake::datafusion::sql::sqlparser::ast::{
+    CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+    ObjectNamePart, Statement, VisitMut, VisitorMut,
+};
 use deltalake::datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect};
 use deltalake::datafusion::sql::sqlparser::keywords::Keyword;
 use deltalake::datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer, Word};
+use std::ops::ControlFlow;
 
 /// The dialect the fallback parse uses: Trino's spellings that are gated behind flags.
 ///
@@ -339,6 +353,104 @@ pub(crate) fn prepare_trino_text(sql: &str) -> String {
     }
 }
 
+/// The calls [`prepare_trino_text`] reads `FORMAT JSON` in, and so the ones it is put back in.
+const FORMAT_JSON_CALLS: [&str; 5] = [
+    "json_object",
+    "json_array",
+    "json_value",
+    "json_query",
+    "json_exists",
+];
+
+/// Render a statement for Trino as well as for this engine.
+///
+/// A statement read through [`prepare_trino_text`] holds `x FORMAT JSON` as the cast
+/// `(x)::JSON`, and rendering it as it stands says exactly that. This engine reads either
+/// spelling the same way, but Trino rejects the `::` at parse time, so text that another
+/// engine may be handed as well — the `transform_sql` that `ddi dbt convert` writes — has
+/// every such cast put back as the clause it was made from.
+///
+/// Only a cast that is a whole argument of one of [`FORMAT_JSON_CALLS`] is put back: that is
+/// the only place the rewrite makes one, and the only place Trino has a clause to say it
+/// with. The one pair of parentheses around the value is the rewrite's own and is dropped;
+/// the analyst's are kept. A `::` anywhere else was written as such and is left alone.
+///
+/// Consumes the statement. The clause has no node in this parser's tree, so it is written
+/// into the tree as text, and the tree is fit for nothing but rendering afterwards.
+pub(crate) fn render_for_trino(mut statement: Statement) -> String {
+    struct PutBackFormatJson;
+
+    impl VisitorMut for PutBackFormatJson {
+        type Break = ();
+
+        // After the arguments have been visited, so a nested call has already had its own
+        // casts put back by the time this one renders its values into text.
+        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+            let Expr::Function(f) = expr else {
+                return ControlFlow::Continue(());
+            };
+            if !takes_format_json(&f.name.0) {
+                return ControlFlow::Continue(());
+            }
+            let FunctionArguments::List(list) = &mut f.args else {
+                return ControlFlow::Continue(());
+            };
+            for arg in &mut list.args {
+                let (FunctionArg::Named { arg, .. }
+                | FunctionArg::ExprNamed { arg, .. }
+                | FunctionArg::Unnamed(arg)) = arg;
+                if let FunctionArgExpr::Expr(value) = arg {
+                    if let Some(text) = format_json_clause(value) {
+                        // An unquoted identifier renders its value verbatim.
+                        *value = Expr::Identifier(Ident::new(text));
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let _ = statement.visit(&mut PutBackFormatJson);
+    statement.to_string()
+}
+
+/// Is this call one of [`FORMAT_JSON_CALLS`], named the way [`prepare_trino_text`] recognises
+/// it: one unquoted part?
+fn takes_format_json(name: &[ObjectNamePart]) -> bool {
+    match name {
+        [ObjectNamePart::Identifier(ident)] => {
+            ident.quote_style.is_none()
+                && FORMAT_JSON_CALLS
+                    .iter()
+                    .any(|call| ident.value.eq_ignore_ascii_case(call))
+        }
+        _ => false,
+    }
+}
+
+/// `value FORMAT JSON`, when `value` is the `(value)::JSON` that clause was read as.
+fn format_json_clause(expr: &Expr) -> Option<String> {
+    let Expr::Cast {
+        kind: CastKind::DoubleColon,
+        expr: value,
+        data_type,
+        array: false,
+        format: None,
+    } = expr
+    else {
+        return None;
+    };
+    if !(matches!(data_type, DataType::JSON) || data_type.to_string().eq_ignore_ascii_case("JSON"))
+    {
+        return None;
+    }
+    let value = match value.as_ref() {
+        Expr::Nested(inner) => inner.as_ref(),
+        other => other,
+    };
+    Some(format!("{value} FORMAT JSON"))
+}
+
 fn is_bare_word(tok: &Token, name: &str) -> bool {
     matches!(tok, Token::Word(Word { value, quote_style: None, .. }) if value.eq_ignore_ascii_case(name))
 }
@@ -579,5 +691,105 @@ mod tests {
     fn a_lambda_body_is_left_for_the_parser() {
         let sql = "SELECT transform(xs, x -> json_object('v' VALUE x)) FROM source";
         assert_eq!(prepare_trino_text(sql), sql);
+    }
+
+    /// Read `sql` the way `ddi dbt convert` does, and render it for Trino.
+    fn rendered(sql: &str) -> String {
+        use deltalake::datafusion::sql::parser::Statement as DfStatement;
+        let mut statements =
+            crate::transform::validate::parse_permissively(sql, "the test SQL").unwrap();
+        let Some(DfStatement::Statement(inner)) = statements.pop_front() else {
+            panic!("not a statement: {sql}");
+        };
+        render_for_trino(*inner)
+    }
+
+    /// `FORMAT JSON` in every place [`prepare_trino_text`] reads it, each in a query this
+    /// engine runs.
+    const FORMAT_JSON_EVERYWHERE: &[&str] = &[
+        "SELECT json_object('a' VALUE x || y FORMAT JSON, 'b' VALUE 1) AS j FROM source",
+        "SELECT json_array(x FORMAT JSON ENCODING UTF8) AS j FROM source",
+        "SELECT json_array(a, b FORMAT JSON, c) AS j FROM source",
+        "SELECT json_object('data' VALUE json_object('k' VALUE v) FORMAT JSON) AS j FROM source",
+        "SELECT json_object('k' VALUE key, 'v' VALUE value FORMAT JSON) AS j FROM source",
+        "SELECT json_object(value VALUE x FORMAT JSON, value : 1) AS j FROM source",
+        "SELECT json_object(KEY 'a' : x FORMAT JSON WITHOUT UNIQUE KEYS) AS j FROM source",
+        "SELECT json_value(data FORMAT JSON, 'lax $.a') AS v, \
+         json_query(data FORMAT JSON, 'lax $.b') AS q, \
+         json_exists(data FORMAT JSON, 'lax $.c') AS e FROM source",
+        "SELECT json_object('d' VALUE json_array(x FORMAT JSON) FORMAT JSON) AS j FROM source",
+        "SELECT json_object('it''s' VALUE 'FORMAT JSON' FORMAT JSON) AS j FROM source",
+        "SELECT json_object('a' VALUE CASE WHEN b THEN json_format(CAST(c AS JSON)) \
+         ELSE '[]' END FORMAT JSON) AS j FROM source",
+        "SELECT json_object('a' VALUE (x) FORMAT JSON) AS j FROM source",
+        "SELECT transform(xs, x -> json_object('v' VALUE x FORMAT JSON)) AS j FROM source",
+        "select json_object('a' value json_format(cast(xs as json)) format json, \
+         'b' value json_array(1, json_format(cast(ys as json)) format json)) as j from source",
+        "SELECT json_object(\n  'items' VALUE json_format(\n    CAST(xs AS JSON)\n  )\n  \
+         FORMAT\n  JSON\n) AS j FROM source",
+    ];
+
+    #[test]
+    fn format_json_is_rendered_as_the_clause_it_was_read_from() {
+        assert_eq!(
+            rendered(
+                "select json_object('items' value json_format(cast(transform(xs, x -> x + 1) \
+                 as json)) format json) as j from source"
+            ),
+            "SELECT json_object('items' VALUE json_format(CAST(transform(xs, x -> x + 1) AS JSON)) \
+             FORMAT JSON) AS j FROM source"
+        );
+        // Inside out: the inner call's value is put back before the outer one is rendered.
+        let nested = "SELECT json_object('d' VALUE json_array(x FORMAT JSON) FORMAT JSON) AS j \
+                      FROM source";
+        assert_eq!(rendered(nested), nested);
+        // The rewrite's own parentheses go; the analyst's stay.
+        assert_eq!(
+            rendered("SELECT json_array(a || b FORMAT JSON, (c) FORMAT JSON) AS j FROM source"),
+            "SELECT json_array(a || b FORMAT JSON, (c) FORMAT JSON) AS j FROM source"
+        );
+    }
+
+    #[test]
+    fn rendered_text_says_no_cast_trino_cannot_read_and_means_the_same_here() {
+        for sql in FORMAT_JSON_EVERYWHERE {
+            let out = rendered(sql);
+            assert!(!out.contains("::"), "{sql}\nrendered as\n{out}");
+            assert!(out.contains("FORMAT JSON"), "{sql}\nrendered as\n{out}");
+            // Read back through the same front door, it renders to itself ...
+            assert_eq!(rendered(&out), out, "{sql}");
+            // ... and this engine runs it exactly as it runs what the analyst wrote.
+            let normalise = crate::transform::validate::normalise_sql;
+            assert_eq!(
+                normalise(&out).unwrap_or_else(|e| panic!("{out}: {e}")),
+                normalise(sql).unwrap_or_else(|e| panic!("{sql}: {e}")),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_calls_put_back_are_the_calls_rewritten() {
+        // Two lists of the same five names, one per direction; this keeps them one list.
+        for call in FORMAT_JSON_CALLS {
+            let trino = format!("SELECT {call}(x FORMAT JSON) AS j FROM source");
+            assert_eq!(
+                prepare_trino_text(&trino),
+                format!("SELECT {call}((x)::JSON) AS j FROM source")
+            );
+            assert_eq!(rendered(&trino), trino);
+        }
+    }
+
+    #[test]
+    fn a_json_cast_written_as_one_is_left_as_written() {
+        // No rewrite made these, and no clause says them: part of a larger value, outside
+        // any JSON call, or in a call that is not the one this module knows by that name.
+        let sql = "SELECT json_object('a' VALUE x || y::JSON) AS j, z::JSON AS k, \
+                   \"json_array\"((w)::JSON) AS l FROM source";
+        let out = rendered(sql);
+        for kept in ["x || y::JSON", "z::JSON AS k", "\"json_array\"((w)::JSON)"] {
+            assert!(out.contains(kept), "{kept} not in {out}");
+        }
     }
 }

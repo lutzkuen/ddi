@@ -762,7 +762,9 @@ fn rewrite_relations(
     };
     let _ = inner.visit(&mut v);
     Ok(RewrittenSql {
-        sql: inner.to_string(),
+        // Not `inner.to_string()`: this text is what `ddi dbt convert` writes out, and the
+        // parse above spelt every `FORMAT JSON` as a `::JSON` cast Trino cannot read.
+        sql: crate::transform::dialect::render_for_trino(inner),
         unknown: v.unknown,
     })
 }
@@ -920,10 +922,38 @@ mod tests {
         // pipeline is what carries the executable text. It has to survive the round trip.
         let sql = s.transform_sql.unwrap();
         assert!(!sql.contains("bronze"), "{sql}");
+        assert!(!sql.contains("::"), "{sql}");
+        assert!(sql.contains(") FORMAT JSON)"), "{sql}");
         let executable = crate::transform::validate::normalise_sql(&sql).unwrap();
         assert!(executable.contains("ddi_transform("), "{executable}");
         assert!(executable.contains("ddi_json_object("), "{executable}");
         assert!(!executable.contains("->"), "{executable}");
+    }
+
+    #[test]
+    fn the_transform_sql_says_format_json_as_trino_does() {
+        // transform_sql is text another engine may be handed too, and Trino cannot parse a
+        // `::`. This is what used to come out as `VALUE (json_format(..))::JSON`.
+        let model = "select o.id, json_object('items' value json_format(cast( \
+                         transform(o.xs, x -> x + 1) as json)) format json, \
+                         'tags' value json_array(o.a, o.b format json)) as j \
+                     from bronze.orders as o";
+        let Verdict::Streamable(s) = verdict(model) else {
+            panic!("expected streamable");
+        };
+        let sql = s.transform_sql.unwrap();
+        assert_eq!(
+            sql,
+            "SELECT o.id, json_object('items' VALUE json_format(CAST(transform(o.xs, x -> x + 1) \
+             AS JSON)) FORMAT JSON, 'tags' VALUE json_array(o.a, o.b FORMAT JSON)) AS j \
+             FROM source AS o"
+        );
+        // And this engine still runs it as the model it came from.
+        let normalise = crate::transform::validate::normalise_sql;
+        assert_eq!(
+            normalise(&sql).unwrap(),
+            normalise(&model.replace("bronze.orders", "source")).unwrap()
+        );
     }
 
     #[test]

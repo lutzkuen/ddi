@@ -427,6 +427,11 @@ ddi run                   # every streamable model in the project
 ddi dbt convert           # print what it derived, without running
 ```
 
+The `transform_sql` that `convert` prints is the model rendered again with its relations
+renamed: layout and comments are gone, and a few optional spellings are normalised (`KEY`
+dropped, `'k' : v` written `'k' VALUE v`). Everything in it is still Trino's spelling,
+`FORMAT JSON` included, so Trino parses the same text `ddi` runs.
+
 Locations come from dbt wherever dbt knows them — `location_root`, a source's
 `delta_table_path`, `meta.ddi_location`. `uri_template` is only a fallback for warehouses
 that name relations without locating them; `{database}`, `{schema}` and `{name}` expand per
