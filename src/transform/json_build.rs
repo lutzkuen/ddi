@@ -366,7 +366,9 @@ fn may_be_json_typed(e: &Expr) -> bool {
 /// A branch that is JSON by shape makes the whole thing JSON, and `ddi_as_json(e)` says
 /// so. A branch that is a name is JSON exactly when that name is, which only the planner
 /// knows; the names are passed along as witnesses — `ddi_as_json(e, name, ...)` — and the
-/// result is JSON-typed when any of them is. A name costs nothing to evaluate twice.
+/// result is JSON-typed when any of them is. A name costs nothing to evaluate twice. When
+/// none is, the call is the identity, in the input's own type: `coalesce(amount, 0)` over a
+/// BIGINT stays a BIGINT.
 fn with_json_type(e: Expr) -> Expr {
     if json_typed_by_branches(&e) {
         return call(AS_JSON, vec![e]);
@@ -771,14 +773,7 @@ impl ScalarUDFImpl for BuildFn {
                 let Some(input) = input else {
                     return Err(self.err("missing its argument"));
                 };
-                // With witnesses, the value is JSON exactly when one of them is; without,
-                // it is JSON by shape.
-                let witnesses = &args.arg_fields[1..];
-                let typed = witnesses.is_empty()
-                    || witnesses
-                        .iter()
-                        .any(|w| marker_of(w) == Some(Marker::Typed) || is_json_list(w));
-                if !typed {
+                if !as_json_typed(&args.arg_fields[1..]) {
                     return Ok(Arc::new(input.as_ref().clone().with_name(self.name())));
                 }
                 if !is_text(input.data_type()) && input.data_type() != &DataType::Null {
@@ -800,6 +795,14 @@ impl ScalarUDFImpl for BuildFn {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        // Not JSON after all, so the planner was promised the input's own field above, and
+        // that is what has to come back. Rendering it as text here handed a BIGINT column a
+        // string array: an internal error in a debug build, and in a release build a batch
+        // whose columns do not match its schema — on every batch, for every
+        // `coalesce(amount, 0)`.
+        if self.kind == Build::AsJson && !as_json_typed(&args.arg_fields[1..]) {
+            return Ok(args.args[0].clone());
+        }
         let rows = args.number_rows;
         let who = self.kind.spelling();
 
@@ -888,6 +891,15 @@ impl ScalarUDFImpl for BuildFn {
             Arc::new(StringArray::from(out)) as ArrayRef
         ))
     }
+}
+
+/// Whether `ddi_as_json(e, witnesses..)` is JSON-typed. With witnesses, the value is JSON
+/// exactly when one of them is; without, it is JSON by shape.
+fn as_json_typed(witnesses: &[FieldRef]) -> bool {
+    witnesses.is_empty()
+        || witnesses
+            .iter()
+            .any(|w| marker_of(w) == Some(Marker::Typed) || is_json_list(w))
 }
 
 fn scalar_of(v: &ColumnarValue) -> Option<&ScalarValue> {
@@ -2010,6 +2022,44 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("{sql} failed: {e}"));
         out[0].column(0).as_string::<i32>().value(0).to_string()
+    }
+
+    #[tokio::test]
+    async fn a_branch_over_names_that_are_not_json_keeps_its_own_type() {
+        // A projected branch over a name is wrapped as `ddi_as_json(e, name)` in case the
+        // name is JSON. When it is not, the planner is promised the input's own type, and
+        // the value has to arrive in it: rendered as text, it failed every batch.
+        let out = SqlTransform::new(
+            "SELECT coalesce(id, 0) AS x, CASE WHEN id > 7 THEN id END AS y, \
+             nullif(id, 7) AS z, CASE WHEN paid THEN zts END AS w FROM source",
+        )
+        .apply(vec![batch()])
+        .await
+        .unwrap_or_else(|e| panic!("a branch over non-JSON names must run: {e}"));
+        let b = &out[0];
+        let ints = |i: usize| {
+            let c = b.column(i).as_primitive::<Int64Type>();
+            (0..c.len())
+                .map(|r| c.is_valid(r).then(|| c.value(r)))
+                .collect::<Vec<_>>()
+        };
+        for i in 0..3 {
+            assert_eq!(b.schema().field(i).data_type(), &DataType::Int64);
+        }
+        assert_eq!(ints(0), vec![Some(7), Some(8)]);
+        assert_eq!(ints(1), vec![None, Some(8)]);
+        assert_eq!(ints(2), vec![None, Some(8)]);
+        assert_eq!(
+            b.schema().field(3).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        let w = b
+            .column(3)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>();
+        let w = w.expect("a timestamp, not its text");
+        assert_eq!(w.value(0), 1_711_924_200_123_456);
+        assert!(w.is_null(1));
     }
 
     #[tokio::test]
