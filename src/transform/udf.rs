@@ -1,11 +1,15 @@
-//! Scalar UDFs for intra-row aggregation.
+//! Scalar UDFs for intra-row aggregation, and one correction to a built-in.
 //!
-//! These are the sanctioned alternative to `GROUP BY`: they aggregate *within* a single
-//! row's array column and are row-local by construction, so they cannot reach across rows
-//! and cannot be affected by how input is split into batches.
+//! The aggregates are the sanctioned alternative to `GROUP BY`: they aggregate *within* a
+//! single row's array column and are row-local by construction, so they cannot reach across
+//! rows and cannot be affected by how input is split into batches.
 //!
 //! `array_sum(line_items, 'price * qty')` is the headline case — summing an expression
 //! over an array of structs, which is what order line items actually look like.
+//!
+//! The correction is [`CheckedDateTrunc`]: DataFusion's own `date_trunc`, refusing the values
+//! it would otherwise truncate to a wrong date without a word. Registering a function under
+//! a built-in's name replaces the built-in in that session, as `array_length` already does.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -13,16 +17,20 @@ use std::sync::Arc;
 use deltalake::arrow::array::{
     Array, ArrayRef, AsArray, Float64Array, Float64Builder, Int64Array, ListArray,
 };
-use deltalake::arrow::datatypes::{DataType, Field, Float64Type, Int64Type};
+use deltalake::arrow::datatypes::{DataType, Field, FieldRef, Float64Type, Int64Type, TimeUnit};
 use deltalake::datafusion::common::{DataFusionError, Result as DFResult, ScalarValue};
+use deltalake::datafusion::functions::datetime::date_trunc::DateTruncFunc;
+use deltalake::datafusion::logical_expr::sort_properties::{ExprProperties, SortProperties};
 use deltalake::datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, Documentation, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, TypeSignature, Volatility,
 };
 use deltalake::datafusion::prelude::SessionContext;
 
 /// Register every intra-row UDF on a session.
 pub fn register_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(ArrayLength::new()));
+    ctx.register_udf(ScalarUDF::from(CheckedDateTrunc::default()));
     for op in [Reduce::Sum, Reduce::Min, Reduce::Max, Reduce::Avg] {
         ctx.register_udf(ScalarUDF::from(ArrayReduce::new(op)));
     }
@@ -59,10 +67,7 @@ impl ScalarUDFImpl for ArrayLength {
         Ok(DataType::Int64)
     }
 
-    fn invoke_with_args(
-        &self,
-        args: deltalake::datafusion::logical_expr::ScalarFunctionArgs,
-    ) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let arr = to_array(&args.args[0], args.number_rows)?;
         let list = as_list(&arr)?;
         // Explicit choice (plan §3): an empty array yields 0, a NULL array yields NULL.
@@ -77,6 +82,126 @@ impl ScalarUDFImpl for ArrayLength {
             })
             .collect();
         Ok(ColumnarValue::Array(Arc::new(out)))
+    }
+}
+
+/// DataFusion's `date_trunc`, refusing a value it would truncate to a wrong date.
+///
+/// DataFusion truncates by converting the value to nanoseconds first, as `scale * value`
+/// with no check — so a timestamp past 2262-04-11 or before 1677-09-21 wraps round to an
+/// unrelated date, silently in a release build. It takes that path for every scalar, and
+/// for an array at `hour` or coarser, except `hour` and `day` on an unzoned value. Delta's
+/// `timestamp` is zoned microseconds, and so is `from_unixtime`, which reaches the 24th
+/// century as Trino does, so this is a date a model can meet.
+///
+/// Trino truncates such a value correctly. This engine refuses it instead, with an error
+/// about the value rather than the model, so the row is what fails and never a wrong date in
+/// the target. Everything else is DataFusion's own function, and the paths the check
+/// mirrors are its private logic in 53.1 — which is why a test compares the two in range.
+#[derive(Debug, Default, PartialEq, Eq, Hash)]
+struct CheckedDateTrunc {
+    inner: DateTruncFunc,
+}
+
+impl CheckedDateTrunc {
+    /// Refuse the call when DataFusion would scale a value past what nanoseconds hold.
+    fn guard(args: &ScalarFunctionArgs) -> DFResult<()> {
+        // A granularity DataFusion does not know, or one that is not a literal, is its own
+        // error to report.
+        let (Some(granularity), Some(value)) = (args.args.first(), args.args.get(1)) else {
+            return Ok(());
+        };
+        let granularity = match granularity {
+            ColumnarValue::Scalar(
+                ScalarValue::Utf8(Some(g))
+                | ScalarValue::Utf8View(Some(g))
+                | ScalarValue::LargeUtf8(Some(g)),
+            ) => g.to_lowercase(),
+            _ => return Ok(()),
+        };
+        let fine = matches!(
+            granularity.as_str(),
+            "microsecond" | "millisecond" | "second" | "minute"
+        );
+        let coarse = matches!(
+            granularity.as_str(),
+            "hour" | "day" | "week" | "month" | "quarter" | "year"
+        );
+        if !fine && !coarse {
+            return Ok(());
+        }
+        let DataType::Timestamp(unit, zone) = value.data_type() else {
+            return Ok(());
+        };
+        let scale: i64 = match unit {
+            TimeUnit::Second => 1_000_000_000,
+            TimeUnit::Millisecond => 1_000_000,
+            TimeUnit::Microsecond => 1_000,
+            TimeUnit::Nanosecond => return Ok(()),
+        };
+        let values = match value {
+            // The arithmetic fast path, which never scales: `date_trunc.rs` in 53.1.
+            ColumnarValue::Array(_)
+                if fine || (zone.is_none() && matches!(granularity.as_str(), "hour" | "day")) =>
+            {
+                return Ok(())
+            }
+            ColumnarValue::Array(a) => a.clone(),
+            ColumnarValue::Scalar(s) => s.to_array()?,
+        };
+        let values = deltalake::arrow::compute::cast(&values, &DataType::Int64)?;
+        let Some(v) = values
+            .as_primitive::<Int64Type>()
+            .iter()
+            .flatten()
+            .find(|v| v.checked_mul(scale).is_none())
+        else {
+            return Ok(());
+        };
+        let when = match unit {
+            TimeUnit::Second => chrono::DateTime::from_timestamp(v, 0),
+            TimeUnit::Millisecond => chrono::DateTime::from_timestamp_millis(v),
+            _ => chrono::DateTime::from_timestamp_micros(v),
+        }
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| format!("{v} ({unit:?}s since 1970)"));
+        Err(DataFusionError::Execution(format!(
+            "date_trunc('{granularity}') cannot truncate {when}: DataFusion truncates in \
+             nanoseconds, which end at 2262-04-11 and begin at 1677-09-21, and beyond them \
+             it would return a wrong date rather than fail. Trino returns the right one; \
+             this engine refuses the value instead."
+        )))
+    }
+}
+
+impl ScalarUDFImpl for CheckedDateTrunc {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn signature(&self) -> &Signature {
+        self.inner.signature()
+    }
+    fn return_type(&self, args: &[DataType]) -> DFResult<DataType> {
+        self.inner.return_type(args)
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        self.inner.return_field_from_args(args)
+    }
+    fn aliases(&self) -> &[String] {
+        self.inner.aliases()
+    }
+    fn output_ordering(&self, input: &[ExprProperties]) -> DFResult<SortProperties> {
+        self.inner.output_ordering(input)
+    }
+    fn documentation(&self) -> Option<&Documentation> {
+        self.inner.documentation()
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        Self::guard(&args)?;
+        self.inner.invoke_with_args(args)
     }
 }
 
@@ -148,10 +273,7 @@ impl ScalarUDFImpl for ArrayReduce {
         Ok(DataType::Float64)
     }
 
-    fn invoke_with_args(
-        &self,
-        args: deltalake::datafusion::logical_expr::ScalarFunctionArgs,
-    ) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let arr = to_array(&args.args[0], args.number_rows)?;
         let list = as_list(&arr)?;
 

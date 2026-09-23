@@ -447,6 +447,99 @@ mod tests {
         assert!(!t.is_null(0));
     }
 
+    /// `date_trunc(g, from_unixtime(a, 'Europe/Amsterdam'))` over `a`, as epoch microseconds.
+    async fn truncated(granularity: &str, a: &[i64]) -> Result<Vec<i64>> {
+        let out = SqlTransform::new(format!(
+            "SELECT date_trunc('{granularity}', from_unixtime(a, 'Europe/Amsterdam')) AS t \
+             FROM source"
+        ))
+        .apply(vec![epochs(a)])
+        .await?;
+        Ok(micros(&out).values().to_vec())
+    }
+
+    #[tokio::test]
+    async fn date_trunc_past_2262_is_refused_rather_than_wrapped() {
+        // DataFusion truncates these in nanoseconds, unchecked: the 2376 value would come
+        // back as a date in the 18th century, or panic a debug build.
+        for granularity in ["day", "hour", "month"] {
+            let e = truncated(granularity, &[1_711_924_200, IN_2376])
+                .await
+                .expect_err("must not wrap")
+                .to_string();
+            assert!(e.contains("date_trunc('"), "names the function: {e}");
+            assert!(e.contains("2262"), "and the limit: {e}");
+        }
+        // Seconds are truncated without the conversion, so the value is fine there.
+        assert_eq!(
+            truncated("second", &[IN_2376]).await.unwrap(),
+            vec![IN_2376 * 1_000_000]
+        );
+        // A Delta timestamp column holding the same instant took the same wrong path.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(
+                TimestampMicrosecondArray::from(vec![IN_2376 * 1_000_000]).with_timezone("UTC"),
+            ) as ArrayRef],
+        )
+        .unwrap();
+        let e = SqlTransform::new("SELECT date_trunc('day', t) AS d FROM source")
+            .apply(vec![batch])
+            .await
+            .expect_err("must not wrap")
+            .to_string();
+        assert!(e.contains("2262"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn date_trunc_in_range_is_unchanged_by_the_guard() {
+        let a = [1_711_924_200];
+        // 2024-04-01 00:30 in Amsterdam: both truncate to local midnight, 22:00 UTC.
+        assert_eq!(
+            truncated("day", &a).await.unwrap(),
+            vec![1_711_922_400_000_000]
+        );
+        assert_eq!(
+            truncated("hour", &a).await.unwrap(),
+            vec![1_711_922_400_000_000]
+        );
+
+        // Everything else is DataFusion's own function: the same answer as its built-in,
+        // run in a session that does not have the override.
+        for granularity in ["week", "month", "quarter", "year", "minute"] {
+            for name in ["date_trunc", "datetrunc"] {
+                let sql = crate::transform::validate::normalise_sql(&format!(
+                    "SELECT {name}('{granularity}', from_unixtime(a, 'Europe/Amsterdam')) AS t \
+                     FROM source"
+                ))
+                .unwrap();
+                let checked = SqlTransform::new(sql.as_str())
+                    .apply(vec![epochs(&a)])
+                    .await
+                    .unwrap();
+                let builtin = SessionContext::new();
+                let batch = epochs(&a);
+                builtin
+                    .register_table(
+                        SOURCE_TABLE,
+                        Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap()),
+                    )
+                    .unwrap();
+                let builtin = builtin.sql(&sql).await.unwrap().collect().await.unwrap();
+                assert_eq!(
+                    micros(&checked).values(),
+                    micros(&builtin).values(),
+                    "{name}('{granularity}')"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn empty_input_yields_empty_output() {
         let out = SqlTransform::new("SELECT 1 AS x FROM source")

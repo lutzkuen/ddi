@@ -313,6 +313,10 @@ Instants agree with Trino. Wall clocks can differ:
   instant's local time is an hour off Trino's;
 - `NaN` fails where Trino returns 1970, and an epoch between about 71,000 and 292,000 years
   converts here where Trino refuses it;
+- `date_trunc` to the hour or coarser fails on a value past 2262 where Trino truncates it.
+  DataFusion truncates in nanoseconds, and beyond their range it would return a wrong date
+  without a word, so `ddi` replaces its `date_trunc` with one that refuses such a value —
+  which also covers a Delta `timestamp` column holding one;
 - the one-argument form is UTC whatever a Trino session's zone is.
 
 `CAST(from_unixtime(..) AS DATE)`, or an explicit `'UTC'`, sidesteps all of them.
