@@ -458,6 +458,11 @@ impl Publisher {
     /// "an aggregate is small by construction" is a convention, and nothing stops a model
     /// grouping by a high-cardinality column. The writer is fed batch by batch so the check
     /// bounds the allocation as it grows rather than after it has already happened.
+    ///
+    /// arrow-json spells each double with the shortest digits that round-trip, and that text
+    /// is read back into a `serde_json::Value`. The read is exact only because serde_json is
+    /// built with `float_roundtrip`: without it a double that needs 17 digits reached the
+    /// client one ULP away from what the model computed (issue #12).
     fn rows_to_json(&self, batches: &[RecordBatch]) -> Result<serde_json::Value> {
         use deltalake::arrow::json::writer::{ArrayWriter, WriterBuilder};
 
@@ -722,6 +727,54 @@ mod tests {
             .find(|r| r["country"] == "NL")
             .expect("NL is present");
         assert_eq!(nl["sales_delta"], 40);
+    }
+
+    #[tokio::test]
+    async fn a_double_is_published_as_the_double_the_model_computed() {
+        // Issue #12. The model's CAST was exact all along; it was the round trip through
+        // serde_json that moved these, to 0.4998, 0.9017, 0.4590999999999999 and
+        // 0.4038000000000001, because its default parser reads 17 digits one ULP off.
+        const TEXTS: [&str; 4] = [
+            "0.49979999999999997",
+            "0.9017000000000001",
+            "0.45909999999999995",
+            "0.40380000000000005",
+        ];
+        let sink = Recorder::new(false);
+        let p = Publisher::with_sink(
+            &pipeline_cfg(),
+            &model("SELECT CAST(json_extract_scalar(doc, '$.x') AS DOUBLE) AS v FROM source"),
+            sink.clone(),
+            900_000,
+            2,
+            Duration::from_secs(30),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("doc", DataType::Utf8, true)]));
+        let docs: Vec<String> = TEXTS.iter().map(|t| format!("{{\"x\":{t}}}")).collect();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(docs))]).unwrap();
+        let rendered = p
+            .render(schema, vec![batch])
+            .await
+            .expect("the cast is valid");
+        assert!(p.send(Some(rendered), None, 1, 1, Some(1)).await.sent);
+
+        let body = String::from_utf8(sink.sent.lock().unwrap()[0].1.clone()).unwrap();
+        assert!(
+            body.contains(
+                r#""rows":[{"v":0.49979999999999997},{"v":0.9017000000000001},{"v":0.45909999999999995},{"v":0.40380000000000005}]"#
+            ),
+            "the payload must carry the model's doubles, spelt to round-trip: {body}"
+        );
+        let e = &sink.envelopes()[0];
+        for (i, text) in TEXTS.iter().enumerate() {
+            let got = e.rows[i]["v"].as_f64().unwrap();
+            assert_eq!(
+                got.to_bits(),
+                text.parse::<f64>().unwrap().to_bits(),
+                "row {i}: {text} arrived as {got:?}"
+            );
+        }
     }
 
     #[tokio::test]

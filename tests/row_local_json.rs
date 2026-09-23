@@ -5,6 +5,8 @@
 //! object per order with one array element per item. No cross-row state; the array is a
 //! function of that single row and nothing else, so batch boundaries cannot change it.
 
+mod common;
+
 use std::sync::Arc;
 
 use delta_delta_ingest::transform::{SqlTransform, Transform};
@@ -604,4 +606,56 @@ async fn a_lookup_column_is_captured_inside_the_lambda() {
         ],
         "quantities 2,1 | none | no list | 3 — each doubled by the USD rate"
     );
+}
+
+#[tokio::test]
+async fn a_json_number_casts_to_the_nearest_double() {
+    // Issue #12 named this CAST, and it was exact all along: the number's text goes straight
+    // into Arrow's correctly rounded parser, as Trino's Double.parseDouble reads it. Pinned
+    // here in every spelling a model reaches a JSON number by, so it stays that way.
+    let texts = common::SEVENTEEN_DIGIT_DOUBLES;
+    let docs: Vec<String> = texts
+        .iter()
+        .map(|t| format!(r#"{{"x":{t},"a":[{t}],"s":"{t}"}}"#))
+        .collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("doc", DataType::Utf8, false)])),
+        vec![Arc::new(StringArray::from(docs)) as ArrayRef],
+    )
+    .unwrap();
+    let sql = "SELECT CAST(json_extract_scalar(doc, '$.x') AS DOUBLE) AS scalar, \
+                      TRY_CAST(json_extract_scalar(doc, '$.x') AS DOUBLE) AS try_scalar, \
+                      CAST(json_value(doc, '$.x') AS DOUBLE) AS value, \
+                      CAST(json_extract_scalar(doc, '$.s') AS DOUBLE) AS text, \
+                      CAST(json_extract(doc, '$.x') AS DOUBLE) AS json, \
+                      CAST(json_array_get(json_extract(doc, '$.a'), 0) AS DOUBLE) AS element, \
+                      transform(CAST(json_extract(doc, '$.a') AS ARRAY(JSON)), \
+                                e -> CAST(e AS DOUBLE))[1] AS lambda, \
+                      CAST(json_extract_scalar(doc, '$.x') AS REAL) AS real \
+               FROM source";
+    let out = run(sql, vec![batch.clone()]).await;
+    for name in [
+        "scalar",
+        "try_scalar",
+        "value",
+        "text",
+        "json",
+        "element",
+        "lambda",
+    ] {
+        common::assert_nearest_doubles(&common::column_of(&out, name), &texts);
+    }
+    common::assert_nearest_reals(&common::column_of(&out, "real"), &texts);
+
+    // And a literal, bare or typed, which reaches the same parser.
+    for text in texts {
+        let out = run(
+            &format!("SELECT {text} AS bare, DOUBLE '{text}' AS typed FROM source"),
+            vec![batch.clone()],
+        )
+        .await;
+        for name in ["bare", "typed"] {
+            common::assert_nearest_doubles(&common::column_of(&out, name), &[text; 4]);
+        }
+    }
 }

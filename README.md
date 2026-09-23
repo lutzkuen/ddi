@@ -813,6 +813,19 @@ default), a writer that recorded none, a type that will not line up — the wind
 whole target. Slow, and correct. Truncated string statistics are handled rather than trusted:
 a `maxValues` of `"ord"` may stand for `"ordz"`, so it never rules a file out.
 
+Numeric statistics are read as the number that was written. A DOUBLE key or sequence reads
+back as exactly its double: `0.40380000000000005` stays that, not its neighbour. `ddi` 0.3.1
+and earlier read some 17-digit values one ULP off, which could put `<lo>` above the row it
+came from and insert a key a second time. A DECIMAL cannot be read exactly, because it is
+compared as a double and writers disagree about which one: delta-rs divides in floating point,
+Spark writes the exact decimal, and a checkpoint may have truncated it to the scale. Two
+decimals can even share one double. So a DECIMAL's statistics are widened by one unit of its
+scale plus 16 ULPs on each side before anything is ruled out, and `<lo>` is rounded down to
+the scale rather than to the nearest unit. The cost is a window that much wider. In `ddi`
+0.3.1 and earlier a DECIMAL sequence could skip the file holding its key and insert the key
+again, and a rescan after a rebuild could skip a commit whose maximum shared the watermark's
+double.
+
 ### `upsert_lookback`
 
 A floor: the window will not open below `min(batch timestamp) - upsert_lookback` however far
@@ -981,6 +994,12 @@ spelt, and `json_format` returns its input as it is, so
 each of these; `ddi` 0.3.1 and earlier wrote the character everywhere, so a target written
 by both holds both spellings until a full refresh. One difference is left: Jackson accepts
 a `\u` escape of half a surrogate pair on its own, and `ddi` refuses it as malformed JSON.
+
+A number cast out of JSON, `CAST(json_extract_scalar(data, '$.rate') AS DOUBLE)` or `AS
+REAL`, is read from its text straight into the nearest double or real, as Trino's
+`Double.parseDouble` and `Float.parseFloat` read it. So is one reached through `json_value`,
+`json_extract`, `json_array_get` or a lambda over `CAST(.. AS ARRAY(JSON))`: a 17-digit
+`0.49979999999999997` stays `0.49979999999999997`.
 
 #### Building JSON: `json_object`, `json_array`, `CAST(.. AS JSON)`
 
@@ -1461,6 +1480,11 @@ of their averages — and the refused set is asked of the query engine's own reg
 than written out by hand, so an alias like `mean` cannot slip past it. That narrowing is also what keeps the useful duality: over one batch the
 model is the delta, over the whole table it is the running total, so **the same view is the
 baseline a client reloads after a gap**.
+
+A DOUBLE in the payload is the double the model computed, bit for bit: it is spelt with the
+shortest digits that read back as the same double. `ddi` 0.3.1 and earlier re-read that text
+with a parser that is one ULP off for some 17-digit values, and sent `0.4998` where the model
+said `0.49979999999999997`.
 
 Delta stays authoritative and the realtime path cannot touch it:
 

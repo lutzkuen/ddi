@@ -45,7 +45,7 @@ use tracing::debug;
 
 use crate::error::{Error, Result};
 use crate::source::Version;
-use crate::stats::{bound_of_scalar, bound_of_stat, Bound};
+use crate::stats::{bound_of_scalar, bound_of_stat, Bound, Slack};
 
 /// The default timestamp column, matching the convention this tool assumes tables follow.
 pub const DEFAULT_TIMESTAMP_COLUMN: &str = "_timestamp";
@@ -362,6 +362,13 @@ pub async fn bounded_rescan_start(
     let Some(mark) = bound_of_scalar(watermark) else {
         return Ok(fallback);
     };
+    // A commit counts as covered only when even the highest value its statistic could stand
+    // for sits below the lowest value the watermark could. A DECIMAL is compared as a double,
+    // and two decimals can share one, so `<=` on the doubles alone would take a newer commit
+    // for one already written. Re-reading the boundary commit costs nothing: the dedup
+    // filter drops what the target already holds. See `crate::stats` on decimals.
+    let slack = Slack::of(watermark.data_type());
+    let covered_to = slack.map_or_else(|| mark.clone(), |s| s.below(&mark));
     let Some(head) = source.version() else {
         return Ok(fallback);
     };
@@ -404,6 +411,10 @@ pub async fn bounded_rescan_start(
             let Some(b) = bound_of_stat(stat, &mark) else {
                 return Ok(fallback);
             };
+            let b = match slack {
+                Some(s) => s.above(&b),
+                None => b,
+            };
             commit_max = Some(match commit_max {
                 Some(cur) if cur > b => cur,
                 _ => b,
@@ -414,7 +425,7 @@ pub async fn bounded_rescan_start(
             if let Some(cmax) = commit_max {
                 // Everything this commit added is already in the target, so everything
                 // before it is too.
-                if cmax <= mark {
+                if cmax <= covered_to {
                     return Ok(v.saturating_add(1));
                 }
             }

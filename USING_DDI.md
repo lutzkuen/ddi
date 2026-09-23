@@ -443,6 +443,12 @@ turns it off for a whole process.
 }
 ```
 
+`rows` holds the model's values. A DOUBLE is spelt with the shortest digits that round-trip,
+so `JSON.parse` recovers exactly the double the model computed: `0.49979999999999997`
+arrives as that, where `ddi` 0.3.1 and earlier sent `0.4998`. A DECIMAL is sent as a JSON
+number too, so it reads as the nearest double; cast it to VARCHAR in the model where every
+digit matters.
+
 Because delivery is best-effort, every message says where it sits in the sequence so a
 client can tell when it has missed one:
 

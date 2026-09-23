@@ -36,7 +36,13 @@ futures = "0.3"
 async-trait = "0.1"
 
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip`: without it serde_json reads a number as `significand as f64 / 10^k`,
+# which is one ULP off for the 16- and 17-digit spellings a double is written with whenever
+# it needs them. ddi reads its own doubles back through serde_json — the publish payload
+# (`Publisher::rows_to_json`) and Delta statistics (`stats::bound_of_stat`) — so the default
+# sent a dashboard the wrong double and could draw an upsert window one ULP above its row.
+# The feature applies to the whole tree, and only makes parsing more correct.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.8"
 
 clap = { version = "4", features = ["derive", "env"] }

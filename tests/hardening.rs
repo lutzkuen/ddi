@@ -661,3 +661,62 @@ async fn an_unbounded_rescan_is_still_correct_when_statistics_are_missing() {
     .unwrap();
     assert_eq!(start, 0, "no usable statistics must mean a full rescan");
 }
+
+#[tokio::test]
+async fn a_rescan_does_not_skip_a_commit_whose_decimal_max_shares_the_watermarks_double() {
+    // A DECIMAL is compared as a double, and two decimals can share one: DECIMAL(38,18)
+    // 0.403800000000000050 and …051 both become 0x3fd9d7dbf487fcba. A commit whose maximum
+    // is …051 is newer than a watermark of …050, and has to be re-read; taking the equal
+    // doubles for "already covered" would skip it and lose its row.
+    use delta_delta_ingest::dedup::bounded_rescan_start;
+    use deltalake::arrow::array::Decimal128Array;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("raw")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "seq",
+        DataType::Decimal128(38, 18),
+        false,
+    )]));
+    create(&path, schema.clone()).await;
+    let dec = |unscaled: i128| {
+        Arc::new(
+            Decimal128Array::from(vec![unscaled])
+                .with_precision_and_scale(38, 18)
+                .unwrap(),
+        ) as ArrayRef
+    };
+    for unscaled in [
+        100000000000000000i128,
+        403800000000000050,
+        403800000000000051,
+    ] {
+        let batch = RecordBatch::try_new(schema.clone(), vec![dec(unscaled)]).unwrap();
+        open_table(ensure_table_uri(&path).unwrap())
+            .await
+            .unwrap()
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        (403800000000000050i128 as f64 / 1e18).to_bits(),
+        (403800000000000051i128 as f64 / 1e18).to_bits(),
+        "the premise: both decimals are the same double"
+    );
+
+    let source = open_table(ensure_table_uri(&path).unwrap()).await.unwrap();
+    let start = bounded_rescan_start(&source, "seq", &dec(403800000000000050), 0, 10_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        start, 2,
+        "only the commit of 0.1 is provably covered; the next two must be re-read"
+    );
+}
