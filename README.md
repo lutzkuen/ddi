@@ -1001,6 +1001,15 @@ REAL`, is read from its text straight into the nearest double or real, as Trino'
 `json_extract`, `json_array_get` or a lambda over `CAST(.. AS ARRAY(JSON))`: a 17-digit
 `0.49979999999999997` stays `0.49979999999999997`.
 
+A DECIMAL cast to DOUBLE or REAL is correctly rounded too, as Trino's `DecimalConversions`
+does it, where Arrow's own cast divides in floating point and can land one ULP off. That
+covers `CAST` and `TRY_CAST`, the casts DataFusion's coercion inserts (`dec * 1e0`), lambda
+bodies, a list of decimals cast to a list of doubles, a DECIMAL column landing in a DOUBLE or
+REAL target, and the `array_*` aggregates over decimals. It does not yet cover `log` and
+`power` over a DECIMAL, which DataFusion computes on the decimal itself and not as Trino
+does; a decimal inside a ROW or MAP being cast; or `arrow_cast`. Those keep Arrow's
+arithmetic.
+
 #### Building JSON: `json_object`, `json_array`, `CAST(.. AS JSON)`
 
 An outbox model wants the opposite of the readers above: one message per source row,

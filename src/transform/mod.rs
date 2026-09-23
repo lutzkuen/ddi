@@ -10,6 +10,7 @@ use deltalake::arrow::array::RecordBatch;
 use crate::error::Result;
 use crate::lookup::LookupSnapshot;
 
+pub mod decimal;
 pub mod dialect;
 pub mod json;
 pub mod json_build;

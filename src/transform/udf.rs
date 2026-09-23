@@ -228,9 +228,10 @@ fn numeric_values(elems: &ArrayRef) -> DFResult<Vec<f64>> {
             }
         }
         other => {
-            // Cast anything else numeric via arrow rather than enumerating every type.
+            // Cast anything else numeric via arrow rather than enumerating every type; a
+            // decimal to its nearest double, as Trino converts it.
             let casted =
-                deltalake::arrow::compute::cast(elems, &DataType::Float64).map_err(|e| {
+                crate::transform::decimal::cast(elems, &DataType::Float64).map_err(|e| {
                     DataFusionError::Execution(format!(
                         "array elements of type {other} are not numeric: {e}"
                     ))
@@ -356,7 +357,7 @@ fn struct_expr_values(elems: &ArrayRef, expr: &FieldExpr, fname: &str) -> DFResu
                 ))
             })?;
         let col = sa.column(idx);
-        let casted = deltalake::arrow::compute::cast(col, &DataType::Float64).map_err(|e| {
+        let casted = crate::transform::decimal::cast(col, &DataType::Float64).map_err(|e| {
             DataFusionError::Execution(format!("{fname}: field {name:?} is not numeric: {e}"))
         })?;
         resolved.push((name, casted.as_primitive::<Float64Type>().clone()));

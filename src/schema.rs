@@ -24,6 +24,7 @@ use deltalake::arrow::compute::{cast_with_options, filter, filter_record_batch, 
 use deltalake::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::{Error, Result};
+use crate::transform::decimal;
 
 /// Casts batches to a fixed target schema.
 #[derive(Clone, Debug)]
@@ -77,11 +78,13 @@ impl SchemaCoercer {
                         col.clone()
                     } else {
                         // safe: false => a value that does not fit becomes an error, not NULL.
+                        // A DECIMAL landing in a DOUBLE or REAL column becomes the nearest
+                        // one, as in Trino, not Arrow's double-rounded division.
                         let opts = CastOptions {
                             safe: false,
                             ..Default::default()
                         };
-                        cast_with_options(col, field.data_type(), &opts).map_err(|e| {
+                        decimal::cast_with_options(col, field.data_type(), &opts).map_err(|e| {
                             Error::Schema(format!(
                                 "column {:?}: cannot cast {} -> {} without loss: {e}. Fix the \
                                  transform_sql to produce the target type explicitly, or change \
@@ -176,7 +179,7 @@ impl SchemaCoercer {
                             safe: !nested,
                             ..Default::default()
                         };
-                        cast_with_options(col, field.data_type(), &opts).map_err(|e| {
+                        decimal::cast_with_options(col, field.data_type(), &opts).map_err(|e| {
                             Error::Schema(format!(
                                 "column {:?}: cannot cast {} -> {} without loss: {e}. Fix the \
                                  transform_sql to produce the target type explicitly, or \
@@ -1015,6 +1018,94 @@ mod tests {
         let b = batch(src, vec![Arc::new(Int32Array::from(vec![1, 2]))]);
         let out = SchemaCoercer::new(tgt).coerce(&b).unwrap();
         assert_eq!(out.column(0).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn a_decimal_lands_in_a_double_column_as_the_nearest_double() {
+        // A DECIMAL(38,17) column into a DOUBLE or REAL target: the value Trino would store,
+        // not Arrow's double-rounded division. Through both paths, and inside a list.
+        use deltalake::arrow::array::{AsArray, Decimal128Array, ListArray};
+        use deltalake::arrow::buffer::OffsetBuffer;
+        use deltalake::arrow::datatypes::{Float32Type, Float64Type};
+
+        let texts = [
+            "0.49979999999999997",
+            "0.9017000000000001",
+            "0.45909999999999995",
+            "0.40380000000000005",
+        ];
+        let decimals = || {
+            Decimal128Array::from(vec![
+                49979999999999997i128,
+                90170000000000010,
+                45909999999999995,
+                40380000000000005,
+            ])
+            .with_precision_and_scale(38, 17)
+            .unwrap()
+        };
+        let src = schema(vec![Field::new("v", DataType::Decimal128(38, 17), false)]);
+        let b = batch(src, vec![Arc::new(decimals())]);
+
+        let doubles = schema(vec![Field::new("v", DataType::Float64, false)]);
+        let strict = SchemaCoercer::new(doubles.clone()).coerce(&b).unwrap();
+        let lenient = SchemaCoercer::new(doubles).coerce_quarantining(&b).unwrap();
+        assert!(
+            lenient.bad.is_none(),
+            "nothing is lost, so nothing is set aside"
+        );
+        for out in [&strict, &lenient.good] {
+            let got = out.column(0).as_primitive::<Float64Type>();
+            for (i, text) in texts.iter().enumerate() {
+                assert_eq!(
+                    got.value(i).to_bits(),
+                    text.parse::<f64>().unwrap().to_bits(),
+                    "{text} became {:?}",
+                    got.value(i)
+                );
+            }
+        }
+
+        let reals = schema(vec![Field::new("v", DataType::Float32, false)]);
+        let out = SchemaCoercer::new(reals).coerce(&b).unwrap();
+        let got = out.column(0).as_primitive::<Float32Type>();
+        for (i, text) in texts.iter().enumerate() {
+            assert_eq!(
+                got.value(i).to_bits(),
+                text.parse::<f32>().unwrap().to_bits(),
+                "{text} became {:?}",
+                got.value(i)
+            );
+        }
+
+        let item = |t: DataType| Arc::new(Field::new("item", t, true));
+        let list = ListArray::new(
+            item(DataType::Decimal128(38, 17)),
+            OffsetBuffer::new(vec![0, 4].into()),
+            Arc::new(decimals()),
+            None,
+        );
+        let src = schema(vec![Field::new(
+            "v",
+            DataType::List(item(DataType::Decimal128(38, 17))),
+            false,
+        )]);
+        let tgt = schema(vec![Field::new(
+            "v",
+            DataType::List(item(DataType::Float64)),
+            false,
+        )]);
+        let out = SchemaCoercer::new(tgt)
+            .coerce(&batch(src, vec![Arc::new(list)]))
+            .unwrap();
+        let got = out.column(0).as_list::<i32>().value(0);
+        let got = got.as_primitive::<Float64Type>();
+        for (i, text) in texts.iter().enumerate() {
+            assert_eq!(
+                got.value(i).to_bits(),
+                text.parse::<f64>().unwrap().to_bits()
+            );
+        }
     }
 
     #[test]

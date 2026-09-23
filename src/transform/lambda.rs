@@ -777,9 +777,10 @@ fn compile(
                 if f.func.signature().volatility != Volatility::Immutable
         ))
     })?;
-    // What the top of the query gets: coercion, then simplification — which is where
-    // `now()`, `current_date` and `arrow_cast` are turned into what they mean — then the
-    // function rewrites `create_physical_expr` applies.
+    // What the top of the query gets: coercion, then the correctly rounded DECIMAL casts the
+    // top's analyzer applies after it (a body is planned here, never analyzed), then
+    // simplification — which is where `now()`, `current_date` and `arrow_cast` are turned
+    // into what they mean — then the function rewrites `create_physical_expr` applies.
     let simplifier = ExprSimplifier::new(
         SimplifyContext::default()
             .with_schema(Arc::new(df_schema.clone()))
@@ -788,6 +789,7 @@ fn compile(
     );
     let simplified = simplifier
         .coerce(logical, &df_schema)
+        .and_then(|e| crate::transform::decimal::rewrite_expr(e, &df_schema).map(|t| t.data))
         .and_then(|e| simplifier.simplify(e))
         .map_err(|e| {
             DataFusionError::Plan(format!(
@@ -1313,6 +1315,52 @@ mod tests {
         }
         compile(Kind::Transform, "x", "x + 1", &element, &[]).unwrap();
         assert!(is_cached(Kind::Transform, "x", "x + 1", &element, &[]));
+    }
+
+    #[test]
+    fn a_decimal_cast_inside_a_lambda_is_correctly_rounded() {
+        // A body is planned in a session of its own and never meets the analyzer, so the
+        // rewrite the top of the query gets has to be applied here too — to the cast written
+        // out and to the one coercion inserts for `x * DOUBLE`.
+        use deltalake::arrow::array::{AsArray, Decimal128Array, RecordBatch};
+        use deltalake::arrow::datatypes::Float64Type;
+
+        let texts = [
+            "0.49979999999999997",
+            "0.9017000000000001",
+            "0.45909999999999995",
+            "0.40380000000000005",
+        ];
+        let unscaled: Vec<i128> = vec![
+            49979999999999997,
+            90170000000000010,
+            45909999999999995,
+            40380000000000005,
+        ];
+        let element = Arc::new(Field::new("item", DataType::Decimal128(38, 17), true));
+        for body in ["CAST(x AS DOUBLE)", "x * CAST(1 AS DOUBLE)"] {
+            let compiled = compile(Kind::Transform, "x", body, &element, &[]).unwrap();
+            let values = Decimal128Array::from(unscaled.clone())
+                .with_precision_and_scale(38, 17)
+                .unwrap();
+            let batch =
+                RecordBatch::try_new(Arc::clone(&compiled.schema), vec![Arc::new(values)]).unwrap();
+            let got = compiled
+                .expr
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            let got = got.as_primitive::<Float64Type>();
+            for (i, text) in texts.iter().enumerate() {
+                assert_eq!(
+                    got.value(i).to_bits(),
+                    text.parse::<f64>().unwrap().to_bits(),
+                    "{body}: {text} became {:?}",
+                    got.value(i)
+                );
+            }
+        }
     }
 
     #[test]

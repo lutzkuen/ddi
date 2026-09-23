@@ -107,6 +107,12 @@ impl SqlTransform {
                 .with_config(config)
                 .with_runtime_env(crate::budget::runtime()?)
                 .with_default_features()
+                // After DataFusion's own coercion, so the casts it inserts are covered too:
+                // a DECIMAL becomes the nearest DOUBLE or REAL, as in Trino, rather than
+                // Arrow's double-rounded division. See `crate::transform::decimal`.
+                .with_analyzer_rule(Arc::new(
+                    crate::transform::decimal::CorrectlyRoundedDecimalCasts,
+                ))
                 .build(),
         );
         register_udfs(&ctx);
