@@ -451,7 +451,7 @@ fn bare_name(name: &ObjectName) -> String {
 }
 
 /// Build a plain call to one of this engine's functions.
-fn call(name: &str, args: Vec<Expr>) -> Expr {
+pub(crate) fn call(name: &str, args: Vec<Expr>) -> Expr {
     Expr::Function(Function {
         name: ObjectName::from(vec![Ident::new(name)]),
         uses_odbc_syntax: false,
@@ -471,7 +471,8 @@ fn call(name: &str, args: Vec<Expr>) -> Expr {
     })
 }
 
-fn literal(text: &str) -> Expr {
+/// A string literal.
+pub(crate) fn literal(text: &str) -> Expr {
     Expr::Value(Value::SingleQuotedString(text.to_string()).into())
 }
 
@@ -2031,7 +2032,8 @@ mod tests {
         // the value has to arrive in it: rendered as text, it failed every batch.
         let out = SqlTransform::new(
             "SELECT coalesce(id, 0) AS x, CASE WHEN id > 7 THEN id END AS y, \
-             nullif(id, 7) AS z, CASE WHEN paid THEN zts END AS w FROM source",
+             nullif(id, 7) AS z, CASE WHEN paid THEN zts END AS w, \
+             coalesce(zts, from_unixtime(id, 'UTC')) AS f FROM source",
         )
         .apply(vec![batch()])
         .await
@@ -2060,6 +2062,21 @@ mod tests {
         let w = w.expect("a timestamp, not its text");
         assert_eq!(w.value(0), 1_711_924_200_123_456);
         assert!(w.is_null(1));
+        assert_eq!(
+            b.schema().field(4).data_type(),
+            b.schema().field(3).data_type()
+        );
+        let f = b
+            .column(4)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>();
+        let f = f.expect("a timestamp, not its text");
+        assert_eq!(f.value(0), 1_711_924_200_123_456);
+        assert_eq!(
+            f.value(1),
+            8_000_000,
+            "the second row falls back to the epoch"
+        );
     }
 
     #[tokio::test]

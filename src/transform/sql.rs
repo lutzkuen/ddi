@@ -182,8 +182,11 @@ impl Transform for SqlTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deltalake::arrow::array::{ArrayRef, Date32Array, Int32Array, Int64Array, StringArray};
-    use deltalake::arrow::datatypes::{DataType, Field, Schema};
+    use deltalake::arrow::array::{
+        Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array,
+        StringArray, TimestampMicrosecondArray,
+    };
+    use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     fn simple_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -264,6 +267,184 @@ mod tests {
             .downcast_ref::<Date32Array>()
             .expect("CAST(... AS DATE) returns Arrow Date32");
         assert_eq!(dates.value(0), 19_814, "2024-04-01 in Date32 days");
+    }
+
+    /// A batch of epoch seconds in a BIGINT column `a`, one row per value.
+    fn epochs(values: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(values.to_vec())) as ArrayRef],
+        )
+        .unwrap()
+    }
+
+    async fn run_over(sql: &str, batch: RecordBatch) -> Vec<RecordBatch> {
+        SqlTransform::new(sql)
+            .apply(vec![batch])
+            .await
+            .unwrap_or_else(|e| panic!("{sql} failed: {e}"))
+    }
+
+    async fn dates(sql: &str, batch: RecordBatch) -> Vec<i32> {
+        let out = run_over(sql, batch).await;
+        let d = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .expect("CAST(... AS DATE) returns Arrow Date32");
+        d.values().to_vec()
+    }
+
+    fn micros(out: &[RecordBatch]) -> &TimestampMicrosecondArray {
+        out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("from_unixtime is a microsecond timestamp")
+    }
+
+    /// 2376-07-12 00:00:00 UTC: past the last instant an i64 of nanoseconds can hold.
+    const IN_2376: i64 = 12_828_758_400;
+
+    #[tokio::test]
+    async fn from_unixtime_past_2262_gives_trinos_24th_century_date() {
+        // The value in the issue. Trino returns a date for it; this failed the batch with
+        // "Overflow happened on: 12828758400 * 1000000000".
+        for sql in [
+            "SELECT CAST(from_unixtime(a, 'Europe/Amsterdam') AS DATE) AS d FROM source",
+            "SELECT CAST(from_unixtime(a) AS DATE) AS d FROM source",
+        ] {
+            assert_eq!(dates(sql, epochs(&[IN_2376])).await, vec![148_481], "{sql}");
+        }
+        assert_eq!(
+            dates(
+                "SELECT CAST(from_unixtime(a, -5, -30) AS DATE) AS d FROM source",
+                epochs(&[IN_2376])
+            )
+            .await,
+            vec![148_480],
+            "midnight UTC is still the day before at -05:30"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_unixtime_is_a_microsecond_timestamp_with_its_zone() {
+        let out = run_over(
+            "SELECT from_unixtime(a, 'Europe/Amsterdam') AS t FROM source",
+            epochs(&[1_711_924_200]),
+        )
+        .await;
+        assert_eq!(
+            out[0].schema().field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("Europe/Amsterdam".into()))
+        );
+        assert_eq!(micros(&out).value(0), 1_711_924_200_000_000);
+    }
+
+    #[tokio::test]
+    async fn from_unixtime_rounds_fractional_seconds_as_trino_does() {
+        // Java's Math.round: half toward positive infinity, at the millisecond.
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Float64Array::from(vec![1.5, -0.0005, 0.0015])) as ArrayRef],
+        )
+        .unwrap();
+        let out = run_over("SELECT from_unixtime(f, 'UTC') AS t FROM source", batch).await;
+        assert_eq!(
+            out[0].schema().field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(micros(&out).values().to_vec(), vec![1_500_000, 0, 2_000]);
+    }
+
+    #[tokio::test]
+    async fn from_unixtime_compares_with_a_delta_timestamp_at_microsecond_precision() {
+        // DataFusion compares mixed units at the coarser one. A millisecond value would
+        // drop the column's last 500 µs and call the two equal; Trino does not.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "t",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("a", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![1_711_924_200_000_500])
+                        .with_timezone("UTC"),
+                ) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1_711_924_200])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let out = run_over(
+            "SELECT t > from_unixtime(a, 'UTC') AS gt, t = from_unixtime(a, 'UTC') AS eq \
+             FROM source",
+            batch,
+        )
+        .await;
+        let flag = |i: usize| {
+            out[0]
+                .column(i)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(0)
+        };
+        assert!(flag(0), "t is later by 500 µs");
+        assert!(!flag(1), "so it is not equal");
+    }
+
+    #[tokio::test]
+    async fn a_fixed_offset_moves_the_calendar_date() {
+        // 2024-03-31 22:30 UTC: April 1 in Amsterdam, still March 31 at -05:30.
+        assert_eq!(
+            dates(
+                "SELECT CAST(from_unixtime(a, -5, -30) AS DATE) AS d FROM source",
+                epochs(&[1_711_924_200])
+            )
+            .await,
+            vec![19_813]
+        );
+        assert_eq!(
+            dates(
+                "SELECT CAST(from_unixtime(a, 'Europe/Amsterdam') AS DATE) AS d FROM source",
+                epochs(&[1_711_924_200])
+            )
+            .await,
+            vec![19_814]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_from_unixtime_value_is_exactly_a_delta_timestamp() {
+        // A Delta `timestamp` column is microseconds in UTC, so landing the value there only
+        // relabels its zone — in the 24th century too.
+        let out = run_over(
+            "SELECT from_unixtime(a, 'Europe/Amsterdam') AS t FROM source",
+            epochs(&[IN_2376]),
+        )
+        .await;
+        let target = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]));
+        let landed = crate::schema::SchemaCoercer::new(target)
+            .coerce(&out[0])
+            .unwrap();
+        let t = landed
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(t.value(0), IN_2376 * 1_000_000);
+        assert!(!t.is_null(0));
     }
 
     #[tokio::test]

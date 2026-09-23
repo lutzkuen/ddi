@@ -1894,6 +1894,21 @@ transform_sql = "SELECT customer_id, sum(total) FROM source GROUP BY customer_id
     }
 
     #[test]
+    fn a_from_unixtime_zone_that_does_not_exist_refuses_the_pipeline_at_load() {
+        let toml = r#"
+[[pipeline]]
+name = "x"
+app_id = "ddi.x"
+source_uri = "/tmp/a"
+target_uri = "/tmp/b"
+transform_sql = "SELECT from_unixtime(epoch, 'Mars/Olympus') AS t FROM source"
+"#;
+        let e = Config::from_toml_str(toml).unwrap().resolve().unwrap_err();
+        assert!(matches!(e, Error::Config(_)), "got: {e}");
+        assert!(e.to_string().contains("Mars/Olympus"), "got: {e}");
+    }
+
+    #[test]
     fn source_equal_to_target_is_rejected() {
         let toml = r#"
 [[pipeline]]

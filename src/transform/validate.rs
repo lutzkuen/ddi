@@ -19,23 +19,17 @@
 
 use deltalake::datafusion::sql::parser::{DFParser, Statement};
 use deltalake::datafusion::sql::sqlparser::ast::{
-    BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    Ident, Join, JoinConstraint, JoinOperator, ObjectName, Query, Select, SetExpr,
-    Statement as SqlStatement, TableFactor, Value, VisitMut, VisitorMut,
+    BinaryOperator, CastKind, DataType as SqlDataType, DuplicateTreatment, ExactNumberInfo, Expr,
+    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Join, JoinConstraint, JoinOperator,
+    ObjectName, Query, Select, SetExpr, Statement as SqlStatement, TableFactor, UnaryOperator,
+    Value, VisitMut, VisitorMut,
 };
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 use crate::error::{Error, Result};
+use crate::transform::json_build::{call, literal};
 use crate::transform::sql::SOURCE_TABLE;
-
-/// The only named-zone `from_unixtime` spelling currently used by our Trino models.
-///
-/// Keeping this explicit is important: a Unix epoch is an instant, whereas a timestamp
-/// without a timezone is a wall-clock value. The rewrite below first labels the epoch UTC,
-/// then changes its display/calendar timezone to this zone. It therefore has no dependency on
-/// the DataFusion session's otherwise-global timezone setting.
-const TRINO_FROM_UNIXTIME_TIME_ZONE: &str = "Europe/Amsterdam";
 
 /// A rejected construct, with the alternative spelled out.
 pub(crate) fn reject(what: &str, why: &str, instead: &str) -> Error {
@@ -258,7 +252,7 @@ fn validate_sql_with_grain(
 /// Validate `sql` and return the text the engine should actually run.
 ///
 /// Identical to what was written, except where a dialect spelling had to be rewritten into
-/// one this engine executes -- Trino's `CROSS JOIN UNNEST`, named-zone `from_unixtime`,
+/// one this engine executes -- Trino's `CROSS JOIN UNNEST`, `from_unixtime`,
 /// the JSON constructors and lambdas; see [`crate::transform::unnest`],
 /// [`rewrite_trino_from_unixtime`], [`crate::transform::json_build`] and
 /// [`crate::transform::lambda`].
@@ -277,20 +271,75 @@ pub fn normalise_sql_with_lookups(sql: &str, lookups: &BTreeSet<String>) -> Resu
     }
 }
 
-/// Replace Trino's `from_unixtime(<seconds>, 'Europe/Amsterdam')` with the DataFusion
-/// equivalent.
+/// Replace Trino's `from_unixtime` with the instant it means, in the zone it names.
 ///
-/// `to_timestamp_seconds` converts its numeric input into a timestamp, but without a session
-/// timezone it is an unzoned timestamp. Casting that directly to Amsterdam would interpret the
-/// epoch as Amsterdam wall time, shifting the instant. The intermediate `AT TIME ZONE 'UTC'`
-/// gives the epoch its correct origin first; the second conversion changes only its named
-/// timezone. This preserves local dates across daylight-saving changes without changing the
-/// session timezone for unrelated expressions in the same transform.
+/// Trino's value is a `timestamp(3) with time zone`: `Math.round(seconds * 1000)`
+/// milliseconds, labelled with the zone. It comes out here as
+///
+/// ```sql
+/// arrow_cast(arrow_cast(CAST(floor(CAST(x AS DOUBLE) * 1000 + 0.5) AS BIGINT),
+///                       'Timestamp(ms, "<zone>")'), 'Timestamp(us, "<zone>")')
+/// ```
+///
+/// Every piece of that is load-bearing:
+///
+/// - **`DOUBLE`**, because Trino's three signatures all take one, so a fractional epoch keeps
+///   its fraction; and `floor(.. + 0.5)`, because that is Java's `Math.round` — half toward
+///   positive infinity — where DataFusion's `round` goes away from zero.
+/// - **An integer, relabelled rather than converted.** Arrow reads a `BIGINT` cast to a
+///   timestamp as epoch units and attaches the zone without moving the instant, so the
+///   session's time zone never enters into it. The millisecond value is not multiplied in
+///   SQL, because DataFusion's integer arithmetic wraps where Trino's raises.
+/// - **Microseconds, never nanoseconds.** `AT TIME ZONE` — this rewrite's first spelling —
+///   casts to nanoseconds whatever the input, and an `i64` of nanoseconds ends at
+///   2262-04-11, so an epoch in the 24th century failed the batch where Trino returns a date.
+///   Microseconds reach ±292,000 years, and the widening from milliseconds is a checked
+///   multiply, so what does not fit fails rather than wrapping.
+///   Milliseconds would be enough for the value, but DataFusion compares mixed units at the
+///   *coarser* one, and a Delta `timestamp` column is microseconds: `ts > from_unixtime(..)`
+///   would then drop the column's sub-millisecond part, where Trino keeps it.
+///
+/// The zone is any spelling Trino accepts, read the way it reads one — see [`trino_zone`] —
+/// and checked here, at config load. It has to be a literal, as do the hours and minutes of
+/// the three-argument form: an Arrow timestamp carries its zone in its type, so one column
+/// cannot hold a different zone on each row. The one-argument form is read as UTC; Trino
+/// reads it in its session's zone. `from_unixtime(..) AT TIME ZONE '<zone>'` is folded into
+/// the zone argument, which is exact because both keep the instant, and which keeps the
+/// nanosecond cast out of that spelling too.
+///
+/// What still differs from Trino, nearly all of it about wall clocks rather than instants:
+///
+/// - A `TIMESTAMP` literal compared with the value is read in the value's zone; Trino reads
+///   it in the session's.
+/// - `CAST(.. AS TIMESTAMP)`, and a `timestamp_ntz` target column, get the UTC wall clock
+///   where Trino gives the local one — and that cast is to nanoseconds, so past 2262 it
+///   fails.
+/// - As text, the value reads `2024-04-01T00:30:00+02:00` where Trino writes
+///   `2024-04-01 00:30:00.000 Europe/Amsterdam`; inside `json_object` it is written in UTC.
+/// - The zone database here tabulates daylight saving only up to 2099, so after that a
+///   summer instant's local time is an hour off Trino's. `CAST(.. AS DATE)` differs only
+///   within that hour of local midnight.
+/// - `NaN` fails, where Trino returns 1970; an epoch between about 71,000 and 292,000 years
+///   converts here and fails there.
+///
+/// `CAST(from_unixtime(..) AS DATE)`, or an explicit `'UTC'`, avoids all of them.
 fn rewrite_trino_from_unixtime(query: &mut Query) -> Result<()> {
     struct V(Option<Error>);
 
     impl VisitorMut for V {
         type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            match fold_at_time_zone(expr) {
+                Ok(Some(folded)) => *expr = folded,
+                Ok(None) => {}
+                Err(e) => {
+                    self.0 = Some(e);
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        }
 
         fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
             let replacement = match from_unixtime_replacement(expr) {
@@ -315,47 +364,86 @@ fn rewrite_trino_from_unixtime(query: &mut Query) -> Result<()> {
     }
 }
 
+fn is_from_unixtime(function: &Function) -> bool {
+    function
+        .name
+        .to_string()
+        .eq_ignore_ascii_case("from_unixtime")
+}
+
+/// `from_unixtime(x, ..) AT TIME ZONE '<zone>'` as `from_unixtime(x, '<zone>')`.
+///
+/// Exact: Trino's `AT TIME ZONE` on a `timestamp with time zone` keeps the instant and
+/// changes the zone, which is what the zone argument does. Left alone, DataFusion would plan
+/// it as a cast to nanoseconds and bring back the 2262 limit. The call it folds is checked
+/// first, so a form refused on its own is refused here too. Every other `AT TIME ZONE` is
+/// left as it is.
+fn fold_at_time_zone(expr: &Expr) -> Result<Option<Expr>> {
+    let Expr::AtTimeZone {
+        timestamp,
+        time_zone,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    let Expr::Value(zone) = time_zone.as_ref() else {
+        return Ok(None);
+    };
+    let Value::SingleQuotedString(zone) = &zone.value else {
+        return Ok(None);
+    };
+    let mut call = timestamp.as_ref();
+    while let Expr::Nested(inner) = call {
+        call = inner;
+    }
+    let Expr::Function(function) = call else {
+        return Ok(None);
+    };
+    if !is_from_unixtime(function) {
+        return Ok(None);
+    }
+    from_unixtime_replacement(call)?;
+    let mut folded = function.clone();
+    let FunctionArguments::List(arguments) = &mut folded.args else {
+        unreachable!("from_unixtime_replacement accepted the argument list");
+    };
+    arguments.args.truncate(1);
+    arguments
+        .args
+        .push(FunctionArg::Unnamed(FunctionArgExpr::Expr(literal(zone))));
+    Ok(Some(Expr::Function(folded)))
+}
+
 /// Return a replacement for one `from_unixtime` call, or `None` for every other function.
 fn from_unixtime_replacement(expr: &Expr) -> Result<Option<Expr>> {
     let Expr::Function(function) = expr else {
         return Ok(None);
     };
-    if !function
-        .name
-        .to_string()
-        .eq_ignore_ascii_case("from_unixtime")
-    {
+    if !is_from_unixtime(function) {
         return Ok(None);
     }
 
     let unsupported = || {
         reject(
-            "from_unixtime",
-            "this runtime supports only Trino's from_unixtime(<unix seconds>, \
-             'Europe/Amsterdam') form.",
-            "use that exact form, or express an explicit DataFusion timestamp conversion.",
+            "this form of from_unixtime",
+            "Trino's from_unixtime takes (unix seconds), (unix seconds, zone) or (unix \
+             seconds, hours, minutes), as plain arguments.",
+            "write from_unixtime(<seconds>), from_unixtime(<seconds>, '<zone>') or \
+             from_unixtime(<seconds>, <hours>, <minutes>).",
+        )
+    };
+    let per_row = |what: &str, instead: &str| {
+        reject(
+            &format!("from_unixtime with {what} that is not a literal"),
+            "an Arrow timestamp carries its zone in its type, so one column cannot hold a \
+             different zone on each row.",
+            instead,
         )
     };
 
     let FunctionArguments::List(arguments) = &function.args else {
         return Err(unsupported());
     };
-    let [seconds, timezone] = arguments.args.as_slice() else {
-        return Err(unsupported());
-    };
-    let (
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(_)),
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(timezone))),
-    ) = (seconds, timezone)
-    else {
-        return Err(unsupported());
-    };
-    if !matches!(
-        &timezone.value,
-        Value::SingleQuotedString(zone) if zone == TRINO_FROM_UNIXTIME_TIME_ZONE
-    ) {
-        return Err(unsupported());
-    }
     if function.uses_odbc_syntax
         || !matches!(&function.parameters, FunctionArguments::None)
         || arguments.duplicate_treatment.is_some()
@@ -367,27 +455,258 @@ fn from_unixtime_replacement(expr: &Expr) -> Result<Option<Expr>> {
     {
         return Err(unsupported());
     }
+    let args = arguments
+        .args
+        .iter()
+        .map(|a| match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+            _ => Err(unsupported()),
+        })
+        .collect::<Result<Vec<&Expr>>>()?;
 
-    let mut converted = function.clone();
-    converted.name = ObjectName::from(Ident::new("to_timestamp_seconds"));
-    let FunctionArguments::List(arguments) = &mut converted.args else {
-        unreachable!("checked the function argument form above");
+    let zone = match args.as_slice() {
+        [_] => "UTC".to_string(),
+        [_, Expr::Value(zone)] if matches!(zone.value, Value::SingleQuotedString(_)) => {
+            let Value::SingleQuotedString(zone) = &zone.value else {
+                unreachable!("matched above");
+            };
+            trino_zone(zone).map_err(|why| {
+                reject(
+                    &format!("the time zone {zone:?} in from_unixtime"),
+                    &why,
+                    "spell the zone exactly as the IANA time zone database does, or as an \
+                     offset such as '+05:30'.",
+                )
+            })?
+        }
+        [_, _] => {
+            return Err(per_row(
+                "a zone",
+                "write the zone as a string literal, such as from_unixtime(x, \
+                 'Europe/Amsterdam'), or convert downstream.",
+            ))
+        }
+        [_, hours, minutes] => {
+            let (Some(hours), Some(minutes)) = (integer_literal(hours), integer_literal(minutes))
+            else {
+                return Err(per_row(
+                    "hours or minutes",
+                    "write them as integer literals, such as from_unixtime(x, 5, 30), or \
+                     convert downstream.",
+                ));
+            };
+            hours
+                .checked_mul(60)
+                .and_then(|h| h.checked_add(minutes))
+                .ok_or_else(|| TRINO_OFFSET_RANGE.to_string())
+                .and_then(offset_zone)
+                .map_err(|why| {
+                    reject(
+                        &format!(
+                            "the offset of {hours} hours and {minutes} minutes in from_unixtime"
+                        ),
+                        &why,
+                        "use an offset within ±14:00.",
+                    )
+                })?
+        }
+        _ => return Err(unsupported()),
     };
-    arguments.args.truncate(1);
-
-    let timestamp = Expr::Function(converted);
-    let as_utc = Expr::AtTimeZone {
-        timestamp: Box::new(timestamp),
-        time_zone: Box::new(timezone_literal("UTC")),
-    };
-    Ok(Some(Expr::AtTimeZone {
-        timestamp: Box::new(as_utc),
-        time_zone: Box::new(timezone_literal(TRINO_FROM_UNIXTIME_TIME_ZONE)),
-    }))
+    Ok(Some(instant_in_zone(args[0].clone(), &zone)))
 }
 
-fn timezone_literal(value: &str) -> Expr {
-    Expr::Value(Value::SingleQuotedString(value.to_owned()).into())
+/// Trino's millisecond instant for `seconds`, carried as microseconds in `zone`. See
+/// [`rewrite_trino_from_unixtime`] for why each step is there.
+fn instant_in_zone(seconds: Expr, zone: &str) -> Expr {
+    let cast = |expr: Expr, data_type: SqlDataType| Expr::Cast {
+        kind: CastKind::Cast,
+        expr: Box::new(expr),
+        data_type,
+        array: false,
+        format: None,
+    };
+    let number = |n: &str| Expr::Value(Value::Number(n.to_string(), false).into());
+    let millis = Expr::BinaryOp {
+        left: Box::new(Expr::BinaryOp {
+            left: Box::new(cast(seconds, SqlDataType::Double(ExactNumberInfo::None))),
+            op: BinaryOperator::Multiply,
+            right: Box::new(number("1000")),
+        }),
+        op: BinaryOperator::Plus,
+        right: Box::new(number("0.5")),
+    };
+    let millis = cast(call("floor", vec![millis]), SqlDataType::BigInt(None));
+    let millis = call(
+        "arrow_cast",
+        vec![millis, literal(&format!("Timestamp(ms, \"{zone}\")"))],
+    );
+    call(
+        "arrow_cast",
+        vec![millis, literal(&format!("Timestamp(us, \"{zone}\")"))],
+    )
+}
+
+/// An integer literal, with its sign.
+fn integer_literal(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Nested(inner) => integer_literal(inner),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => integer_literal(expr).and_then(i64::checked_neg),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => integer_literal(expr),
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, false) => n.parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The spellings Trino 480 reads as UTC itself (`TimeZoneKey.UTC_EQUIVALENTS`).
+const TRINO_UTC_EQUIVALENTS: &[&str] = &[
+    "GMT",
+    "GMT0",
+    "GMT+0",
+    "GMT-0",
+    "Etc/GMT",
+    "Etc/GMT0",
+    "Etc/GMT+0",
+    "Etc/GMT-0",
+    "UT",
+    "UT+0",
+    "UT-0",
+    "Etc/UT",
+    "Etc/UT+0",
+    "Etc/UT-0",
+    "UTC",
+    "UTC+0",
+    "UTC-0",
+    "Etc/UTC",
+    "Etc/UTC+0",
+    "Etc/UTC-0",
+    "+0000",
+    "+00:00",
+    "-0000",
+    "-00:00",
+    "Z",
+    "Zulu",
+    "UCT",
+    "Greenwich",
+    "Universal",
+    "Etc/Universal",
+    "Etc/UCT",
+];
+
+/// The prefixes Trino reads an offset after, in the order it tries them.
+const TRINO_OFFSET_PREFIXES: &[&str] = &["Etc/GMT", "Etc/UTC", "Etc/UT", "GMT", "UTC", "UT"];
+
+const TRINO_OFFSET_RANGE: &str = "Trino has time zones only for whole-minute offsets within \
+                                  ±14:00.";
+
+/// A zone as Trino 480's `TimeZoneKey.getTimeZoneKey` reads it, spelt the way this engine's
+/// timestamps carry it — or why Trino would refuse it.
+///
+/// UTC by any of its names is `UTC`. An offset, bare (`+5`, `+0530`, `+05:30`) or after a
+/// prefix (`GMT+5`, `UTC-03:30`), is `+HH:MM`, and `Etc/GMT+5` is five hours *behind*, as it
+/// is in Trino and in the zone database. Any other id has to name a zone the database here
+/// knows, spelt exactly: the lookup is case-sensitive, as Trino's is. The two databases are
+/// not the same list, so an id this one lacks is refused even where Trino would take it.
+pub(crate) fn trino_zone(zone: &str) -> std::result::Result<String, String> {
+    if zone.is_empty() {
+        return Err("a zone id cannot be empty.".into());
+    }
+    if TRINO_UTC_EQUIVALENTS.contains(&zone) {
+        return Ok("UTC".into());
+    }
+    let unknown = || {
+        "it is not a zone id this engine knows. Zone ids are case-sensitive, as in Trino: an \
+         IANA name such as 'Europe/Amsterdam', 'UTC', or an offset within ±14:00 such as \
+         '+05:30'."
+            .to_string()
+    };
+    let digits = |s: &str, max: usize| {
+        (!s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<i64>().ok())
+            .flatten()
+    };
+
+    for prefix in TRINO_OFFSET_PREFIXES {
+        let Some(tail) = zone.strip_prefix(prefix) else {
+            continue;
+        };
+        let negative = match tail.as_bytes().first() {
+            Some(b'+') => false,
+            Some(b'-') => true,
+            _ => return Err(unknown()),
+        };
+        let (hours, minutes) = match tail[1..].split_once(':') {
+            Some((h, m)) => (digits(h, 2), digits(m, 2)),
+            None => (digits(&tail[1..], 2), Some(0)),
+        };
+        let (Some(hours), Some(minutes)) = (hours, minutes) else {
+            return Err(unknown());
+        };
+        if minutes > 59 {
+            return Err(TRINO_OFFSET_RANGE.into());
+        }
+        // Trino takes the sign from the hours alone, and turns it round for `Etc/GMT`,
+        // whose ids count the other way: `Etc/GMT+5` is UTC-05:00.
+        let hours = if negative { -hours } else { hours };
+        let hours = if *prefix == "Etc/GMT" { -hours } else { hours };
+        let offset = if hours < 0 {
+            hours * 60 - minutes
+        } else {
+            hours * 60 + minutes
+        };
+        return offset_zone(offset);
+    }
+
+    if let Some(tail) = zone.strip_prefix(['+', '-']) {
+        // What `java.time.ZoneOffset.of` reads: ±H, ±HH, ±HHMM, ±HH:MM.
+        let (hours, minutes) = match (tail.len(), tail.split_once(':')) {
+            (5, Some((h, m))) if h.len() == 2 => (digits(h, 2), digits(m, 2)),
+            (1 | 2, None) => (digits(tail, 2), Some(0)),
+            (4, None) => (digits(&tail[..2], 2), digits(&tail[2..], 2)),
+            _ => (None, None),
+        };
+        let (Some(hours), Some(minutes)) = (hours, minutes) else {
+            return Err(unknown());
+        };
+        if minutes > 59 {
+            return Err(TRINO_OFFSET_RANGE.into());
+        }
+        let offset = hours * 60 + minutes;
+        return offset_zone(if zone.starts_with('-') {
+            -offset
+        } else {
+            offset
+        });
+    }
+
+    // The parser the timestamp kernels themselves use, so a zone accepted here is one they
+    // can read on every batch.
+    match zone.parse::<deltalake::arrow::array::timezone::Tz>() {
+        Ok(_) => Ok(zone.to_string()),
+        Err(_) => Err(unknown()),
+    }
+}
+
+/// A fixed offset of `minutes`, as Trino's `getTimeZoneKeyForOffset` has it: UTC at zero,
+/// `+HH:MM` otherwise, and nothing beyond ±14:00.
+fn offset_zone(minutes: i64) -> std::result::Result<String, String> {
+    if minutes == 0 {
+        return Ok("UTC".into());
+    }
+    if minutes.abs() > 14 * 60 {
+        return Err(TRINO_OFFSET_RANGE.into());
+    }
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let minutes = minutes.abs();
+    Ok(format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60))
 }
 
 /// Check one query, given the CTE names already in scope from enclosing queries.
@@ -1135,8 +1454,37 @@ mod tests {
         assert!(got.contains("json_array_elements(data)"), "got: {got}");
     }
 
+    /// The zone `from_unixtime(..)` in `sql` was normalised into, asserting the whole shape.
+    fn from_unixtime_zone(sql: &str) -> String {
+        let got = normalise_sql(sql).unwrap_or_else(|e| panic!("{sql} was refused: {e}"));
+        let zone = got
+            .split("'Timestamp(us, \"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("no microsecond timestamp in {got}"))
+            .to_string();
+        assert!(
+            got.contains(&format!("'Timestamp(ms, \"{zone}\")'")),
+            "rounded to milliseconds in the same zone first: {got}"
+        );
+        assert!(!got.contains("AT TIME ZONE"), "no nanosecond cast: {got}");
+        assert!(
+            !got.to_ascii_lowercase().contains("from_unixtime"),
+            "the call was fully replaced: {got}"
+        );
+        zone
+    }
+
+    fn from_unixtime_err(sql: &str) -> String {
+        let e = normalise_sql(sql)
+            .expect_err("leaving it for first-batch planning is unsafe")
+            .to_string();
+        assert!(e.contains("from_unixtime"), "names the function: {e}");
+        e
+    }
+
     #[test]
-    fn named_trino_from_unixtime_is_normalised_with_an_explicit_timezone() {
+    fn from_unixtime_with_a_zone_is_normalised_to_microseconds_in_that_zone() {
         let got = normalise_sql(
             "SELECT CAST(from_unixtime(event_epoch / 1000, 'Europe/Amsterdam') AS DATE) \
              AS local_date FROM source",
@@ -1144,28 +1492,155 @@ mod tests {
         .expect("the model's Trino spelling should be executable by DataFusion");
 
         assert!(
-            got.contains("to_timestamp_seconds(event_epoch / 1000)"),
-            "the epoch conversion was retained: {got}"
+            got.contains("CAST(FLOOR(CAST(event_epoch / 1000 AS DOUBLE) * 1000 + 0.5) AS BIGINT)"),
+            "Trino's millisecond rounding of the epoch it was given: {got}"
         );
         assert!(
-            got.contains("AT TIME ZONE 'UTC'"),
-            "the epoch has an explicit UTC origin: {got}"
+            got.contains("arrow_cast(arrow_cast("),
+            "relabelled, not converted: {got}"
         );
         assert!(
-            got.contains("AT TIME ZONE 'Europe/Amsterdam'"),
-            "the calendar timezone remains Amsterdam: {got}"
+            got.contains("'Timestamp(ms, \"Europe/Amsterdam\")'"),
+            "{got}"
         );
         assert!(
-            !got.to_ascii_lowercase().contains("from_unixtime"),
-            "the unsupported function was fully removed: {got}"
+            got.contains("'Timestamp(us, \"Europe/Amsterdam\")'"),
+            "{got}"
+        );
+        for gone in ["AT TIME ZONE", "to_timestamp_seconds", "from_unixtime"] {
+            assert!(!got.contains(gone), "{gone} is gone: {got}");
+        }
+    }
+
+    #[test]
+    fn a_zone_that_does_not_exist_is_rejected_at_config_load_by_name() {
+        for zone in ["Europe/Amsterdm", "Mars/Olympus", "europe/amsterdam", ""] {
+            let e = from_unixtime_err(&format!(
+                "SELECT from_unixtime(event_epoch, '{zone}') FROM source"
+            ));
+            assert!(e.contains(&format!("{zone:?}")), "names the zone: {e}");
+        }
+        let e = from_unixtime_err("SELECT from_unixtime(e, 'europe/amsterdam') FROM source");
+        assert!(e.contains("case-sensitive"), "says why: {e}");
+    }
+
+    #[test]
+    fn trinos_zone_spellings_are_canonicalised() {
+        let zone =
+            |z: &str| from_unixtime_zone(&format!("SELECT from_unixtime(e, '{z}') FROM source"));
+        for utc in [
+            "UTC", "Z", "Zulu", "GMT", "Etc/UTC", "UCT", "+00:00", "GMT+0", "-0",
+        ] {
+            assert_eq!(zone(utc), "UTC", "{utc}");
+        }
+        assert_eq!(zone("UTC+05:30"), "+05:30");
+        assert_eq!(zone("GMT+5"), "+05:00");
+        assert_eq!(zone("GMT-3:30"), "-03:30");
+        assert_eq!(zone("Etc/GMT+5"), "-05:00", "Etc/GMT counts the other way");
+        assert_eq!(zone("+5"), "+05:00");
+        assert_eq!(zone("+0530"), "+05:30");
+        assert_eq!(zone("-08:00"), "-08:00");
+        for region in ["America/New_York", "Asia/Kolkata", "Australia/Lord_Howe"] {
+            assert_eq!(zone(region), region, "a region is carried verbatim");
+        }
+        for malformed in ["GMT+0530", "GMT7", "+5:30", "+05:30:00", "+123"] {
+            from_unixtime_err(&format!(
+                "SELECT from_unixtime(e, '{malformed}') FROM source"
+            ));
+        }
+    }
+
+    #[test]
+    fn offsets_beyond_fourteen_hours_are_rejected_as_in_trino() {
+        for zone in ["+15:00", "-14:01", "+23:59", "GMT+15"] {
+            let e = from_unixtime_err(&format!("SELECT from_unixtime(e, '{zone}') FROM source"));
+            assert!(e.contains("14:00"), "{e}");
+        }
+        from_unixtime_err("SELECT from_unixtime(e, 15, 0) FROM source");
+        assert_eq!(
+            from_unixtime_zone("SELECT from_unixtime(e, '+14:00') FROM source"),
+            "+14:00"
+        );
+        assert_eq!(
+            from_unixtime_zone("SELECT from_unixtime(e, '-14:00') FROM source"),
+            "-14:00"
+        );
+        assert_eq!(
+            from_unixtime_zone("SELECT from_unixtime(e, 14, 0) FROM source"),
+            "+14:00"
         );
     }
 
     #[test]
-    fn unsupported_trino_from_unixtime_variant_is_rejected_at_config_load() {
-        let err = normalise_sql("SELECT from_unixtime(event_epoch, 'UTC') FROM source")
-            .expect_err("leaving an unsupported function for first-batch planning is unsafe");
-        assert!(err.to_string().contains("from_unixtime"), "got: {err}");
+    fn the_one_argument_form_is_read_as_utc() {
+        assert_eq!(
+            from_unixtime_zone("SELECT from_unixtime(e) AS t FROM source"),
+            "UTC"
+        );
+    }
+
+    #[test]
+    fn the_three_argument_form_becomes_a_fixed_offset() {
+        let zone = |h: &str, m: &str| {
+            from_unixtime_zone(&format!("SELECT from_unixtime(e, {h}, {m}) FROM source"))
+        };
+        assert_eq!(zone("5", "30"), "+05:30");
+        assert_eq!(zone("-5", "-30"), "-05:30");
+        assert_eq!(
+            zone("-5", "30"),
+            "-04:30",
+            "hours * 60 + minutes, as Trino adds them"
+        );
+        assert_eq!(zone("0", "0"), "UTC");
+        from_unixtime_err("SELECT from_unixtime(e, h_col, 0) FROM source");
+    }
+
+    #[test]
+    fn a_zone_that_is_not_a_literal_is_rejected_by_name() {
+        for sql in [
+            "SELECT from_unixtime(e, tz_col) FROM source",
+            "SELECT from_unixtime(e, NULL) FROM source",
+            "SELECT from_unixtime(e, 'UTC', 1) FROM source",
+            "SELECT from_unixtime() FROM source",
+        ] {
+            from_unixtime_err(sql);
+        }
+    }
+
+    #[test]
+    fn normalising_from_unixtime_twice_changes_nothing() {
+        for sql in [
+            "SELECT from_unixtime(e) AS t FROM source",
+            "SELECT from_unixtime(e, 'Europe/Amsterdam') AS t FROM source",
+            "SELECT from_unixtime(e, -5, 30) AS t FROM source",
+            "SELECT from_unixtime(e) AT TIME ZONE 'Asia/Kolkata' AS t FROM source",
+        ] {
+            let once = normalise_sql(sql).unwrap();
+            assert_eq!(normalise_sql(&once).unwrap(), once, "{sql}");
+        }
+    }
+
+    #[test]
+    fn from_unixtime_at_time_zone_is_folded_into_the_zone_argument() {
+        assert_eq!(
+            from_unixtime_zone(
+                "SELECT from_unixtime(e) AT TIME ZONE 'America/New_York' AS t FROM source"
+            ),
+            "America/New_York"
+        );
+        assert_eq!(
+            from_unixtime_zone(
+                "SELECT (from_unixtime(e, 5, 30)) AT TIME ZONE 'UTC' AS t FROM source"
+            ),
+            "UTC"
+        );
+        let plain = normalise_sql("SELECT ts AT TIME ZONE 'UTC' AS t FROM source").unwrap();
+        assert!(
+            plain.contains("ts AT TIME ZONE 'UTC'"),
+            "any other AT TIME ZONE is left alone: {plain}"
+        );
+        from_unixtime_err("SELECT from_unixtime(e) AT TIME ZONE 'Mars/Olympus' FROM source");
+        from_unixtime_err("SELECT from_unixtime(e, tz_col) AT TIME ZONE 'UTC' FROM source");
     }
 
     #[test]

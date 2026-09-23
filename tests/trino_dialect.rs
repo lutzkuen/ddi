@@ -16,7 +16,9 @@
 //! has two writers and Trino uses both: one that writes bytes and escapes an emoji as its
 //! UTF-16 surrogate pair, and one that writes a Java `String` and keeps it. Which function
 //! goes through which is read from Trino's source; `json_text_spells_an_emoji_as_trino_does`
-//! asks Trino itself, and compares its bytes with this engine's.
+//! asks Trino itself, and compares its bytes with this engine's. In the same way,
+//! `from_unixtime_falls_on_the_date_trino_gives` asks it which day an epoch falls on in a
+//! zone, in each form of `from_unixtime` this engine rewrites.
 //!
 //! Ignored by default because it needs a Trino listening. CI starts one and runs this with
 //! `--ignored`. To run it locally:
@@ -81,6 +83,11 @@ const MODELS: &[&str] = &[
      CAST(o.amount AS DECIMAL(18, 4)) AS amount, o.xs[1] AS first_x, \
      o.a IS DISTINCT FROM o.b AS changed, coalesce(o.c, 'x') || 'y' AS label \
      FROM bronze.orders o WHERE o.id IS NOT NULL",
+    // Every from_unixtime form this engine accepts: each is rewritten before it runs here,
+    // and the converted text keeps the model's own spelling.
+    "SELECT from_unixtime(o.ts) AS a, from_unixtime(o.ts, 'UTC') AS b, \
+     from_unixtime(o.ts, 5, 30) AS c, from_unixtime(o.ts) AT TIME ZONE 'UTC' AS d \
+     FROM bronze.orders o",
     "SELECT o.ts AT TIME ZONE 'UTC' AS utc_ts, o.d + INTERVAL '1' DAY AS next_day, \
      TIMESTAMP '2024-01-01 00:00:00' AS epoch_ts, DATE '2024-01-01' AS epoch_day FROM bronze.orders o",
     "SELECT TRY_CAST(o.a AS BIGINT) AS a, CAST(o.r AS ROW(x INTEGER, y VARCHAR)) AS r, \
@@ -260,4 +267,49 @@ async fn json_text_spells_an_emoji_as_trino_does() {
         "JSON text differs:\n{}",
         differ.join("\n")
     );
+}
+
+/// `from_unixtime` in each form it is accepted in, as the calendar date it falls on: where
+/// the zone decides the answer, and past 2262, where the nanosecond range ends and Trino's
+/// does not.
+const FROM_UNIXTIME: &[&str] = &[
+    "from_unixtime(1711924200, 'Europe/Amsterdam')",
+    "from_unixtime(12828758400, 'Europe/Amsterdam')",
+    "from_unixtime(12828758400)",
+    "from_unixtime(12828758400, -5, -30)",
+    "from_unixtime(1711924200, 'Etc/GMT+5')",
+    "from_unixtime(1711924200, 'UTC+05:30')",
+    "from_unixtime(1711924200) AT TIME ZONE 'Asia/Kolkata'",
+    // Rounded to the millisecond as Java rounds, across local midnight.
+    "from_unixtime(1711922399.9996, 'Europe/Amsterdam')",
+];
+
+#[tokio::test]
+#[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
+async fn from_unixtime_falls_on_the_date_trino_gives() {
+    let trino = trino();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)])),
+        vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1]))],
+    )
+    .unwrap();
+    let mut differ = Vec::new();
+    for expr in FROM_UNIXTIME {
+        let date = format!("CAST(CAST({expr} AS DATE) AS VARCHAR)");
+        let theirs = trino
+            .query(&format!("SELECT {date} AS v"))
+            .await
+            .unwrap_or_else(|e| panic!("Trino refused {expr}: {e}"))
+            .scalar();
+        let out = SqlTransform::new(format!("SELECT {date} AS v FROM source"))
+            .apply(vec![batch.clone()])
+            .await
+            .unwrap_or_else(|e| panic!("{expr} failed here: {e}"));
+        let ours = deltalake::arrow::compute::cast(out[0].column(0), &DataType::Utf8).unwrap();
+        let ours = ours.as_string::<i32>().value(0).to_string();
+        if theirs.as_deref() != Some(ours.as_str()) {
+            differ.push(format!("{expr}\n  Trino: {theirs:?}\n  ddi:   {ours:?}"));
+        }
+    }
+    assert!(differ.is_empty(), "dates differ:\n{}", differ.join("\n"));
 }

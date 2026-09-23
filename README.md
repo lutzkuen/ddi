@@ -139,6 +139,7 @@ directory*. Every accepted feature preserves it.
 | intra-row array agg | no | yes | **supported** (`array_sum` etc.) |
 | `transform` / `filter` over one row's array | no | yes | **supported**, in Trino's lambda spelling |
 | `json_object` / `json_array` / `CAST(.. AS JSON)` | no | yes | **supported**, with Trino's rules |
+| `from_unixtime` | no | yes | **supported**, in any zone Trino accepts — see [Epoch seconds](#epoch-seconds-from_unixtime) |
 | upsert on a key | no (the *target* holds it) | no | **supported**, opt-in — see [Upserting](#upserting) |
 | pinned Delta lookup via `LEFT JOIN` | no | yes | **supported**, declared and version-pinned per source commit |
 | `GROUP BY` aggregation | **yes** | **no** | **rejected — different product** |
@@ -283,6 +284,38 @@ landing in two batches would emit two partial messages. A lambda has no such gap
 never leaves its row. (`array_sum` and friends are not Trino functions; a model that uses
 them streams but cannot be described or rebuilt by Starburst, which spells the reduction
 `reduce(arr, 0, (s, x) -> s + x, s -> s)`. `reduce` is not implemented.)
+
+### Epoch seconds: `from_unixtime`
+
+`from_unixtime(seconds)`, `from_unixtime(seconds, 'zone')` and `from_unixtime(seconds,
+hours, minutes)` return Trino's value: the instant rounded to the millisecond as Trino's
+`Math.round` rounds it, labelled with the zone. The zone is any id Trino accepts — an IANA
+name, `UTC` by any of Trino's names, an offset such as `'+05:30'` or `'GMT-3'` within
+±14:00 — spelt exactly, because the lookup is case-sensitive in Trino too. It is checked at
+config load, and it has to be a literal, as do the hours and minutes: an Arrow timestamp
+carries its zone in its type, so one column cannot hold a different zone on each row. The
+one-argument form is UTC. `from_unixtime(..) AT TIME ZONE 'zone'` means the same as passing
+the zone.
+
+The value is carried in microseconds, the unit of a Delta `timestamp`, so an epoch in the
+24th century converts as it does in Trino rather than overflowing the nanosecond range at
+2262, and landing it in a `timestamp` column changes nothing but the zone label.
+
+Instants agree with Trino. Wall clocks can differ:
+
+- a `TIMESTAMP` literal compared with the value is read in the value's zone, where Trino
+  reads it in the session's;
+- `CAST(.. AS TIMESTAMP)`, and a `timestamp_ntz` target column, get the UTC wall clock where
+  Trino gives the local one — and that cast is to nanoseconds, so past 2262 it fails;
+- as text the value reads `2024-04-01T00:30:00+02:00`, where Trino writes
+  `2024-04-01 00:30:00.000 Europe/Amsterdam`;
+- the zone database here tabulates daylight saving only up to 2099, so after that a summer
+  instant's local time is an hour off Trino's;
+- `NaN` fails where Trino returns 1970, and an epoch between about 71,000 and 292,000 years
+  converts here where Trino refuses it;
+- the one-argument form is UTC whatever a Trino session's zone is.
+
+`CAST(from_unixtime(..) AS DATE)`, or an explicit `'UTC'`, sidesteps all of them.
 
 ### Pinned Delta lookups
 
