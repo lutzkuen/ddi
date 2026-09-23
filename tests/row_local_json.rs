@@ -31,6 +31,12 @@ fn deliveries() -> RecordBatch {
     let d4 = r#"{"webshopOrderId":"D4","orderEntries":[
         {"quantity":3,"product":{"variantArticleId":"V3","fulfillmentModel":"3P"},"price":{"amount":[1,44]}}
     ]}"#;
+    delivered(&[("m1", a1), ("m2", b2), ("m3", c3), ("m4", d4)])
+}
+
+/// Deliveries as the raw layer carries them, one per `(message id, payload)`.
+fn delivered(rows: &[(&str, &str)]) -> RecordBatch {
+    let (ids, payloads): (Vec<&str>, Vec<&str>) = rows.iter().copied().unzip();
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("messageid", DataType::Utf8, false),
@@ -42,12 +48,12 @@ fn deliveries() -> RecordBatch {
             Field::new("data", DataType::Utf8, true),
         ])),
         vec![
-            Arc::new(StringArray::from(vec!["m1", "m2", "m3", "m4"])) as ArrayRef,
+            Arc::new(StringArray::from(ids)) as ArrayRef,
             Arc::new(
-                TimestampMicrosecondArray::from(vec![1_711_924_200_123_456i64; 4])
+                TimestampMicrosecondArray::from(vec![1_711_924_200_123_456i64; rows.len()])
                     .with_timezone("UTC"),
             ),
-            Arc::new(StringArray::from(vec![a1, b2, c3, d4])),
+            Arc::new(StringArray::from(payloads)),
         ],
     )
     .unwrap()
@@ -159,6 +165,24 @@ async fn one_message_per_order_with_that_orders_own_items() {
                     .to_string()
             ),
         ]
+    );
+}
+
+#[tokio::test]
+async fn an_emoji_in_the_payload_comes_out_as_starburst_writes_it() {
+    // One spelt as the character, one as a lower-case escape: both come out as the
+    // surrogate pair Jackson's UTF-8 generator writes, upper-case, wherever the message
+    // holds them — through ARRAY(JSON), json_extract_scalar, json_parse and FORMAT JSON.
+    let e5 = r#"{"webshopOrderId":"E😊","orderEntries":[
+        {"quantity":1,"product":{"variantArticleId":"V\ud83d\ude0a","fulfillmentModel":"3P"},"price":{"amount":[0,250]}}
+    ]}"#;
+    let out = run(OUTBOX, vec![delivered(&[("m5", e5)])]).await;
+    assert_eq!(
+        texts(&out, "json_message"),
+        vec![Some(
+            r#"{"messageTime":"2024-03-31 22:30:00.123 UTC","data":{"orderCode":"E\uD83D\uDE0A","currency":"EUR","items":[{"nmvBeforeCancellation":2.75,"productVariantId":"V\uD83D\uDE0A","quantity":1}]},"messageId":"m5"}"#
+                .to_string()
+        )]
     );
 }
 

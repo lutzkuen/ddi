@@ -40,10 +40,10 @@
 //!
 //! | value | as a member | under `CAST(.. AS JSON)` |
 //! |---|---|---|
-//! | text | string, escaped | string, escaped |
-//! | text after `FORMAT JSON` | embedded, re-read as Jackson's tree reader would | — |
+//! | text | string, escaped; an emoji as its surrogate pair, `\uD83D\uDE0A` | same |
+//! | text after `FORMAT JSON` | embedded, re-read as Jackson's tree reader would and written back escaped | — |
 //! | a nested constructor | embedded as built | — |
-//! | JSON-typed text | scalar as a string; object or array is an error | embedded verbatim |
+//! | JSON-typed text | scalar as a string; object or array is an error | embedded verbatim, spelt as it already is |
 //! | integers | number | number |
 //! | decimals | number at the declared scale, `12.3400`, as `BigDecimal` spells it | same |
 //! | doubles | as `Double.toString` spells it: `1.0`, `1.0E7`; `NaN` becomes the string `"NaN"` | same |
@@ -52,6 +52,14 @@
 //! | timestamp | `"2024-03-31 22:30:00.123456"`; zoned values render in UTC at millisecond precision with ` UTC` appended, the way Starburst reads a Delta `timestamp` | naive only; zoned is not castable there either |
 //! | array, row | an error naming the fix: Starburst would cast it to varchar text | array / object, recursively |
 //! | NULL | `null`, or absent | SQL NULL; `null` inside a container |
+//!
+//! Everything this module writes, it writes as Jackson's UTF-8 generator does in Trino, so a
+//! character outside the Basic Multilingual Plane is its two UTF-16 halves. A JSON-typed
+//! value under `CAST(.. AS JSON)` is the exception, because it is not written but copied as
+//! it is spelt — Trino copies it with `writeRawValue`. An element straight from `CAST(.. AS
+//! ARRAY(JSON))`, or a `json_array_get` container, holds the emoji itself, since Trino
+//! writes those through a Java `String`; one built by `json_parse`, `json_extract` or
+//! `json_query` holds the escape.
 //!
 //! # Where the JSON type is put back
 //!
@@ -92,7 +100,7 @@ use deltalake::datafusion::sql::sqlparser::ast::{
 
 use crate::error::{Error, Result};
 use crate::transform::json::{json_field, mark, marker_of, Marker};
-use crate::transform::jsonval::{self, Json, Members, Numbers};
+use crate::transform::jsonval::{self, Generator, Json, Members, Numbers};
 use crate::transform::validate::reject;
 
 /// `ddi_json_object(<nulls>, key, value, key, value, ...)` — what `json_object(...)` becomes.
@@ -817,11 +825,14 @@ impl ScalarUDFImpl for BuildFn {
                         ))
                     })?;
                     // What Jackson's tree reader hands back: the order kept, a repeated key
-                    // resolved to its last value, whitespace gone, floats as doubles.
+                    // resolved to its last value, whitespace gone, floats as doubles. It is
+                    // written out with the rest of the constructor by `$json_to_varchar`,
+                    // which writes bytes, so an emoji comes out as its surrogate pair.
                     out.push(Some(jsonval::to_string(
                         &doc,
                         Members::LastWins,
                         Numbers::JavaDouble,
+                        Generator::Utf8,
                     )));
                 }
                 out
@@ -1559,7 +1570,7 @@ mod tests {
         // Trino's own test: key_1, key_2 come out the other way round.
         assert_eq!(
             first("json_object('key_1' VALUE id, 'key_2' VALUE name)").await,
-            r#"{"key_2":"O\"Brien \\ 😀","key_1":7}"#
+            r#"{"key_2":"O\"Brien \\ \uD83D\uDE00","key_1":7}"#
         );
         assert_eq!(
             first("json_object('id' VALUE id, 'paid' VALUE paid, 'amount' VALUE amount)").await,
@@ -1604,7 +1615,7 @@ mod tests {
         assert_eq!(
             got[0].as_deref(),
             Some(
-                r#"{"country":8,"note":"O\"Brien \\ 😀","created":10,"type":2,"version":12,"price":5,"qty":4,"currency":6,"id":1,"sku":3,"updated":11,"customer":7,"status":9}"#
+                r#"{"country":8,"note":"O\"Brien \\ \uD83D\uDE00","created":10,"type":2,"version":12,"price":5,"qty":4,"currency":6,"id":1,"sku":3,"updated":11,"customer":7,"status":9}"#
             ),
             "thirteen keys: a 32-slot table"
         );
@@ -1833,7 +1844,10 @@ mod tests {
 
     #[tokio::test]
     async fn cast_to_json_follows_trinos_rules() {
-        assert_eq!(first("CAST(name AS JSON)").await, r#""O\"Brien \\ 😀""#);
+        assert_eq!(
+            first("CAST(name AS JSON)").await,
+            r#""O\"Brien \\ \uD83D\uDE00""#
+        );
         assert_eq!(first("CAST(id AS JSON)").await, "7");
         assert_eq!(first("CAST(amount AS JSON)").await, "12.3400");
         assert_eq!(first("CAST(ratio AS JSON)").await, "0.25");
@@ -1868,7 +1882,52 @@ mod tests {
         assert_eq!(first("json_array(ratio / 0.0)").await, r#"["Infinity"]"#);
         assert_eq!(
             first("json_array(name, chr(27))").await,
-            "[\"O\\\"Brien \\\\ 😀\",\"\\u001B\"]"
+            "[\"O\\\"Brien \\\\ \\uD83D\\uDE00\",\"\\u001B\"]"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_emoji_is_its_surrogate_pair_in_every_key_member_and_cast() {
+        assert_eq!(
+            first("json_object('naïve' VALUE 1, '😀' VALUE 2, 'a' VALUE 3, '日本' VALUE 4, 'b' VALUE 5)")
+                .await,
+            r#"{"a":3,"b":5,"naïve":1,"\uD83D\uDE00":2,"日本":4}"#
+        );
+        assert_eq!(
+            first("json_object('raw' VALUE '[\"😀\", \"\\ud83d\\ude00\"]' FORMAT JSON)").await,
+            r#"{"raw":["\uD83D\uDE00","\uD83D\uDE00"]}"#
+        );
+        assert_eq!(
+            first("json_object('s' VALUE CAST(name AS JSON))").await,
+            r#"{"s":"O\"Brien \\ \uD83D\uDE00"}"#
+        );
+        assert_eq!(
+            first("json_format(CAST(CAST(json_parse(json_array(name)) AS ARRAY(JSON)) AS JSON))")
+                .await,
+            r#"["O\"Brien \\ 😀"]"#
+        );
+        assert_eq!(
+            first(
+                "json_object('l' VALUE json_format(CAST(CAST(json_parse(json_array(name)) \
+                 AS ARRAY(JSON)) AS JSON)) FORMAT JSON)"
+            )
+            .await,
+            r#"{"l":["O\"Brien \\ \uD83D\uDE00"]}"#
+        );
+        // A json_query nested in a constructor is embedded as json_query wrote it, and
+        // Trino writes json_query as bytes: escaped, whether the emoji came in raw or not.
+        assert_eq!(
+            first("json_object('q' VALUE json_query('{\"s\":[\"😀\"]}', '$.s'))").await,
+            r#"{"q":["\uD83D\uDE00"]}"#
+        );
+        assert_eq!(
+            first("json_array(json_query(json_array(name), '$'))").await,
+            r#"[["O\"Brien \\ \uD83D\uDE00"]]"#
+        );
+        // An array of text under CAST: each element is text, and escaped.
+        assert_eq!(
+            first("CAST(ARRAY[name, 'x'] AS JSON)").await,
+            r#"["O\"Brien \\ \uD83D\uDE00","x"]"#
         );
     }
 
@@ -1881,7 +1940,7 @@ mod tests {
         // A key that is a column: checked per row, and ordered per row.
         assert_eq!(
             one("json_object(name VALUE id, 'x' VALUE 1)").await,
-            r#"{"O\"Brien \\ 😀":7,"x":1}"#
+            r#"{"O\"Brien \\ \uD83D\uDE00":7,"x":1}"#
         );
     }
 
@@ -1990,7 +2049,7 @@ mod tests {
                 "SELECT json_object('n' VALUE CASE WHEN paid THEN name END) AS v FROM source"
             )
             .await,
-            r#"{"n":"O\"Brien \\ 😀"}"#
+            r#"{"n":"O\"Brien \\ \uD83D\uDE00"}"#
         );
     }
 

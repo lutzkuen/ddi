@@ -12,6 +12,12 @@
 //! refusal is what proves the parser accepted it. Any other refusal fails the test, since a
 //! Trino still starting up refuses everything before parsing anything.
 //!
+//! One more question only a real Trino settles is what its JSON functions write. Jackson
+//! has two writers and Trino uses both: one that writes bytes and escapes an emoji as its
+//! UTF-16 surrogate pair, and one that writes a Java `String` and keeps it. Which function
+//! goes through which is read from Trino's source; `json_text_spells_an_emoji_as_trino_does`
+//! asks Trino itself, and compares its bytes with this engine's.
+//!
 //! Ignored by default because it needs a Trino listening. CI starts one and runs this with
 //! `--ignored`. To run it locally:
 //!
@@ -20,9 +26,14 @@
 //! DDI_TEST_TRINO=http://127.0.0.1:8080 cargo test --test trino_dialect -- --ignored
 //! ```
 
+use std::sync::Arc;
+
 use delta_delta_ingest::dbt::analyze::{analyze, Verdict};
 use delta_delta_ingest::dbt::Manifest;
+use delta_delta_ingest::transform::{SqlTransform, Transform};
 use delta_delta_ingest::trino::{TrinoClient, TrinoConnection};
+use deltalake::arrow::array::{AsArray, RecordBatch, StringArray};
+use deltalake::arrow::datatypes::{DataType, Field, Schema};
 
 /// Streamable models in Trino's spelling: `FORMAT JSON` in every position this engine reads
 /// it, and other constructs a converted model is rendered from its parse tree with.
@@ -187,5 +198,66 @@ async fn converted_transform_sql_parses_in_trino() {
         failures.is_empty(),
         "converted SQL Trino cannot parse:\n{}",
         failures.join("\n")
+    );
+}
+
+/// A document with an emoji in a key, in a string, in a container and as an array element,
+/// spelt as the character and as a lower-case escape.
+const EMOJI_DOC: &str = r#"{"！":1,"😊":["😊"],"s":"😊","e":"\ud83d\ude00","l":[{"a":"😊"},"😊"]}"#;
+
+/// The JSON functions and the ways a value reaches a constructor or a cast, over
+/// [`EMOJI_DOC`]. `json_query` and `json_value` are missing because no spelling of them
+/// runs in both engines yet: Trino requires a `lax` or `strict` mode on their path, and
+/// this engine does not read one.
+const EMOJI_JSON: &[&str] = &[
+    // Written as bytes: the surrogate pair, upper case.
+    "json_format(json_parse(data))",
+    "json_format(json_extract(data, '$'))",
+    "json_format(json_extract(data, '$.e'))",
+    "json_object('k' VALUE json_extract_scalar(data, '$.s'), 'n' VALUE json_array(1, 'x😊'))",
+    "json_array(json_extract_scalar(data, '$.e'), 'x')",
+    "json_format(CAST(json_extract_scalar(data, '$.s') AS JSON))",
+    "json_object('l' VALUE json_format(CAST(CAST(json_extract(data, '$.l') AS ARRAY(JSON)) \
+     AS JSON)) FORMAT JSON)",
+    // Written as a Java string, or copied as spelt: the character.
+    "json_format(json_array_get(json_extract(data, '$.l'), 0))",
+    "json_format(CAST(json_array_get(json_extract(data, '$.l'), 0) AS JSON))",
+    "json_format(CAST(CAST(json_extract(data, '$.l') AS ARRAY(JSON)) AS JSON))",
+    // Not JSON at all: the character.
+    "json_extract_scalar(data, '$.s')",
+    "json_extract_scalar(data, '$.e')",
+];
+
+#[tokio::test]
+#[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
+async fn json_text_spells_an_emoji_as_trino_does() {
+    let trino = trino();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, true)])),
+        vec![Arc::new(StringArray::from(vec![EMOJI_DOC]))],
+    )
+    .unwrap();
+    let mut differ = Vec::new();
+    for expr in EMOJI_JSON {
+        let theirs = trino
+            .query(&format!(
+                "SELECT {expr} AS v FROM (VALUES '{EMOJI_DOC}') AS source(data)"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("Trino refused {expr}: {e}"))
+            .scalar();
+        let out = SqlTransform::new(format!("SELECT {expr} AS v FROM source"))
+            .apply(vec![batch.clone()])
+            .await
+            .unwrap_or_else(|e| panic!("{expr} failed here: {e}"));
+        let ours = out[0].column(0).as_string::<i32>().value(0).to_string();
+        if theirs.as_deref() != Some(ours.as_str()) {
+            differ.push(format!("{expr}\n  Trino: {theirs:?}\n  ddi:   {ours:?}"));
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "JSON text differs:\n{}",
+        differ.join("\n")
     );
 }

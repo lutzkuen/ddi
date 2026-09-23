@@ -968,6 +968,20 @@ becomes `1.1`, as Jackson's copy does); `json_parse` stores the canonical form T
 string element without its quotes, as its Trino documentation warns; a JSON `null` at a
 path is the value `null`, only a missing path is SQL NULL.
 
+An emoji, or any other character outside the Basic Multilingual Plane, is where Jackson's
+two writers part ways, and Starburst uses both. Where it writes JSON as bytes —
+`json_parse`, `json_extract`, `json_query`, `json_object`, `json_array`, and `CAST(.. AS
+JSON)` of text — the character goes out as its UTF-16 surrogate pair in upper-case hex:
+`json_format(json_parse('"😊"'))` is `"\uD83D\uDE0A"`. Where it writes through a Java
+string — a container from `json_array_get`, each element of `CAST(.. AS ARRAY(JSON))` — the
+character stays as it is. `CAST(.. AS JSON)` copies a value that is already JSON as it is
+spelt, and `json_format` returns its input as it is, so
+`json_format(CAST(CAST(x AS ARRAY(JSON)) AS JSON))` holds the character too.
+`json_extract_scalar` and `json_value` always return the character itself. `ddi` follows
+each of these; `ddi` 0.3.1 and earlier wrote the character everywhere, so a target written
+by both holds both spellings until a full refresh. One difference is left: Jackson accepts
+a `\u` escape of half a surrogate pair on its own, and `ddi` refuses it as malformed JSON.
+
 #### Building JSON: `json_object`, `json_array`, `CAST(.. AS JSON)`
 
 An outbox model wants the opposite of the readers above: one message per source row,
@@ -998,8 +1012,9 @@ nobody would design that way, because a model has to produce the same bytes in b
   engines agree. A repeated key is an error, as it is there.
 - **`json_object` defaults to `NULL ON NULL`, `json_array` to `ABSENT ON NULL`**, and an
   absent member takes no part in the duplicate check or the ordering. Text is escaped as
-  Jackson escapes it, numbers are numbers, decimals keep their scale (`12.3400`), doubles
-  are spelt as `Double.toString` spells them, timestamps as `2024-03-31 22:30:00.123 UTC`.
+  Jackson escapes it (an emoji as its surrogate pair, `\uD83D\uDE0A`), numbers are
+  numbers, decimals keep their scale (`12.3400`), doubles are spelt as `Double.toString`
+  spells them, timestamps as `2024-03-31 22:30:00.123 UTC`.
   An array or row as a member is refused with the fix named, because Starburst would cast
   it to varchar text, which is never what a message wants.
 

@@ -136,6 +136,15 @@ Paths support `$`, `.field`, `["field"]` and `[0]`. Following Trino,
 returns those. A missing path is NULL; malformed JSON stops the pipeline, because the
 input is a typed column rather than arbitrary text.
 
+The JSON text they write matches Starburst's byte for byte, down to how an emoji is spelt.
+`json_parse`, `json_extract`, `json_query`, the constructors below and `CAST(<text> AS
+JSON)` write it as its escaped surrogate pair, `\uD83D\uDE0A`. A container from
+`json_array_get` and each element of `CAST(.. AS ARRAY(JSON))` keep the character, and
+`CAST(.. AS JSON)` and `json_format` keep the spelling of a value that is already JSON.
+`json_extract_scalar` and `json_value` return the character. `ddi` 0.3.1 and earlier wrote
+the character everywhere, so a target written by both versions holds both spellings until
+a full refresh.
+
 ### Building JSON, and lambdas over arrays
 
 `json_object` · `json_array` · `CAST(.. AS JSON)` · `transform` · `filter`

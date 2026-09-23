@@ -11,6 +11,12 @@
 //! this module is a small strict parser that keeps every number as the text it was, plus
 //! the writers and the two Java number spellings.
 //!
+//! Strings differ by writer too, in one place: a character outside the Basic Multilingual
+//! Plane — an emoji. Java holds it as two UTF-16 units, and Jackson's UTF-8 generator, which
+//! is what Trino writes bytes with, escapes each of them: `😊` goes out as `\uD83D\uDE0A`.
+//! Where Trino writes through a Java `String` instead, the character stays as it is. So a
+//! writer here says which of the two it stands for; see [`Generator`].
+//!
 //! Nothing here knows about Arrow or DataFusion; it is the text layer under
 //! [`crate::transform::json`] and [`crate::transform::json_build`].
 
@@ -264,6 +270,11 @@ impl Parser<'_> {
                         'n' => out.push('\n'),
                         'r' => out.push('\r'),
                         't' => out.push('\t'),
+                        // Half a surrogate pair on its own is refused, where Jackson
+                        // takes it: Trino's `json_parse` writes it back as `\uD83D`, and
+                        // `json_extract_scalar` returns `?` for it. A Rust `String` cannot
+                        // hold half a character, so ddi stops on it rather than guessing —
+                        // a known difference, loud instead of a silent one.
                         'u' => {
                             let unit = self.hex4(at)?;
                             let ch = if (0xD800..0xDC00).contains(&unit) {
@@ -387,20 +398,42 @@ pub(crate) enum Members {
     Sorted,
 }
 
+/// Which of Jackson's two generators writes the text. They escape alike, except for a
+/// character outside the Basic Multilingual Plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Generator {
+    /// `UTF8JsonGenerator`: what Jackson writes bytes with, and so what `json_parse`,
+    /// `json_extract`, `json_query`, the constructors and `CAST(.. AS JSON)` write with. It
+    /// escapes each UTF-16 half of an astral character on its own, upper-case hex — `😊`
+    /// is `\uD83D\uDE0A` — because Trino leaves `COMBINE_UNICODE_SURROGATES_IN_UTF8` off.
+    Utf8,
+    /// `WriterBasedJsonGenerator`: what Jackson writes a Java `String` with —
+    /// `writeValueAsString` and `JsonNode.toString()`, which is how Trino writes a container
+    /// from `json_array_get` and each element of `CAST(.. AS ARRAY(JSON))`. It writes chars,
+    /// and leaves an astral character as it is.
+    Chars,
+}
+
 /// Render `json` compactly.
-pub(crate) fn write(json: &Json, members: Members, numbers: Numbers, out: &mut String) {
+pub(crate) fn write(
+    json: &Json,
+    members: Members,
+    numbers: Numbers,
+    generator: Generator,
+    out: &mut String,
+) {
     match json {
         Json::Null => out.push_str("null"),
         Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Json::Number(n) => out.push_str(&number_text(n, numbers)),
-        Json::String(s) => out.push_str(&quote(s)),
+        Json::String(s) => push_quoted(s, generator, out),
         Json::Array(items) => {
             out.push('[');
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
-                write(item, members, numbers, out);
+                write(item, members, numbers, generator, out);
             }
             out.push(']');
         }
@@ -428,26 +461,40 @@ pub(crate) fn write(json: &Json, members: Members, numbers: Numbers, out: &mut S
                 if i > 0 {
                     out.push(',');
                 }
-                out.push_str(&quote(k));
+                push_quoted(k, generator, out);
                 out.push(':');
-                write(v, members, numbers, out);
+                write(v, members, numbers, generator, out);
             }
             out.push('}');
         }
     }
 }
 
-pub(crate) fn to_string(json: &Json, members: Members, numbers: Numbers) -> String {
+pub(crate) fn to_string(
+    json: &Json,
+    members: Members,
+    numbers: Numbers,
+    generator: Generator,
+) -> String {
     let mut out = String::new();
-    write(json, members, numbers, &mut out);
+    write(json, members, numbers, generator, &mut out);
     out
 }
 
-/// A JSON string: quoted and escaped the way Jackson does it — `"`, `\` and control
-/// characters escaped (the short forms where they exist, `\u00XX` with upper-case hex
-/// otherwise), everything else, `/` and non-ASCII included, left alone.
+/// A JSON string as Jackson's UTF-8 generator writes it — `"`, `\` and control characters
+/// escaped (the short forms where they exist, `\u00XX` with upper-case hex otherwise), a
+/// character above U+FFFF as its two UTF-16 halves, `\uD83D\uDE0A`, and everything else,
+/// `/` and the rest of non-ASCII included, left alone. Every string the constructors and
+/// `CAST(.. AS JSON)` make out of text is spelt this way; a JSON value they embed keeps the
+/// spelling it already has.
 pub(crate) fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
+    push_quoted(s, Generator::Utf8, &mut out);
+    out
+}
+
+fn push_quoted(s: &str, generator: Generator, out: &mut String) {
+    use std::fmt::Write as _;
     out.push('"');
     for c in s.chars() {
         match c {
@@ -458,12 +505,20 @@ pub(crate) fn quote(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            // Java holds it as two UTF-16 units, and the UTF-8 generator escapes each.
+            c if (c as u32) > 0xFFFF && generator == Generator::Utf8 => {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    let _ = write!(out, "\\u{unit:04X}");
+                }
+            }
             c => out.push(c),
         }
     }
     out.push('"');
-    out
 }
 
 fn number_text(n: &str, numbers: Numbers) -> String {
@@ -668,7 +723,7 @@ mod tests {
     use super::*;
 
     fn roundtrip(text: &str, members: Members, numbers: Numbers) -> String {
-        to_string(&parse(text).unwrap(), members, numbers)
+        to_string(&parse(text).unwrap(), members, numbers, Generator::Utf8)
     }
 
     #[test]
@@ -712,8 +767,8 @@ mod tests {
     fn strings_are_escaped_like_jackson() {
         let j = parse(r#""q\" bs\\ nl\n tab\t ctl\u0001 slash\/ é \ud83d\ude00""#).unwrap();
         assert_eq!(
-            to_string(&j, Members::Verbatim, Numbers::JavaDouble),
-            r#""q\" bs\\ nl\n tab\t ctl\u0001 slash/ é 😀""#
+            to_string(&j, Members::Verbatim, Numbers::JavaDouble, Generator::Utf8),
+            r#""q\" bs\\ nl\n tab\t ctl\u0001 slash/ é \uD83D\uDE00""#
         );
         // Jackson spells the hex digits of a `\u` escape in upper case, and leaves DEL alone.
         assert_eq!(quote("a\u{1b}b"), "\"a\\u001Bb\"");
@@ -734,12 +789,78 @@ mod tests {
             "tru",
             "{\"a\":1} x",
             "\"\\ud83d\"",
+            "\"\\ude0a\"",
+            "\"\\ud83d\\u0041\"",
+            "\"\\ud83d\\n\"",
             "[1] [2]",
             "NaN",
         ] {
             assert!(parse(bad).is_err(), "{bad:?} should not parse");
         }
         assert_eq!(parse(" -0.5e+3 ").unwrap(), Json::Number("-0.5e+3".into()));
+    }
+
+    #[test]
+    fn an_astral_character_is_its_surrogate_pair_from_the_utf8_generator_only() {
+        assert_eq!(quote("😊"), r#""\uD83D\uDE0A""#);
+        assert_eq!(quote("\u{FFFF}"), "\"\u{FFFF}\"");
+        assert_eq!(quote("\u{10000}"), r#""\uD800\uDC00""#);
+        assert_eq!(quote("\u{10FFFF}"), r#""\uDBFF\uDFFF""#);
+        assert_eq!(quote("é日"), "\"é日\"");
+        let doc = parse(r#"{"😊":["😊","a\"b"]}"#).unwrap();
+        assert_eq!(
+            to_string(
+                &doc,
+                Members::Verbatim,
+                Numbers::JavaDouble,
+                Generator::Utf8
+            ),
+            r#"{"\uD83D\uDE0A":["\uD83D\uDE0A","a\"b"]}"#
+        );
+        assert_eq!(
+            to_string(
+                &doc,
+                Members::Verbatim,
+                Numbers::JavaDouble,
+                Generator::Chars
+            ),
+            r#"{"😊":["😊","a\"b"]}"#
+        );
+        assert_eq!(
+            to_string(
+                &Json::String("\u{1}😊".into()),
+                Members::Verbatim,
+                Numbers::JavaDouble,
+                Generator::Chars
+            ),
+            "\"\\u0001😊\""
+        );
+    }
+
+    #[test]
+    fn an_escaped_surrogate_pair_reads_back_as_one_character() {
+        for text in [r#""\uD83D\uDE0A""#, r#""\ud83d\ude0a""#, "\"😊\""] {
+            let j = parse(text).unwrap();
+            assert_eq!(j, Json::String("😊".into()), "{text}");
+            assert_eq!(j.scalar_text().as_deref(), Some("😊"));
+        }
+        let doc = parse(r#"{"k😊":["x😊y",{"😊":null}]}"#).unwrap();
+        for g in [Generator::Utf8, Generator::Chars] {
+            let text = to_string(&doc, Members::Verbatim, Numbers::JavaDouble, g);
+            assert_eq!(parse(&text).unwrap(), doc, "{text}");
+        }
+    }
+
+    #[test]
+    fn parse_sorts_astral_keys_by_utf16_code_unit() {
+        assert_eq!(
+            roundtrip(
+                r#"{"！":1,"😊":2,"s":3}"#,
+                Members::Sorted,
+                Numbers::BigDecimal
+            ),
+            r#"{"s":3,"\uD83D\uDE0A":2,"！":1}"#
+        );
     }
 
     #[test]
