@@ -74,6 +74,30 @@ pub enum StepOutcome {
     },
 }
 
+impl StepOutcome {
+    /// Whether this batch is the shape an upstream type change takes: rows went to the
+    /// data-quality table, and none reached the target or were dropped as already covered.
+    ///
+    /// Covered rows count against it because a coverage window can drop all but one row of a
+    /// batch: that one being bad is a bad row, not a schema change, and inside a rescan it
+    /// would otherwise say so on every batch that re-reads it. Counted in
+    /// `ddi_batches_fully_rejected_total`.
+    pub fn fully_rejected(&self) -> bool {
+        match *self {
+            Self::CaughtUp => false,
+            Self::Progressed {
+                rows,
+                rejected,
+                covered,
+                ..
+            } => rejected > 0 && rows == 0 && covered == 0,
+            Self::Skipped {
+                rejected, covered, ..
+            } => rejected > 0 && covered == 0,
+        }
+    }
+}
+
 /// Lookup snapshots selected for one source batch, plus table-id migrations that become true
 /// only if that batch's target transaction commits. Keeping the transition with the batch is
 /// important: a failure after lookup selection must retry with the same `use_current` decision
@@ -380,12 +404,20 @@ impl Pipeline {
                 "rows the target will not take will be written here instead of stopping the \
                  pipeline"
             ),
+            // A row the transform cannot evaluate is promised to the table only where it
+            // would be set aside there: see the lines below for the two ways it would not be.
             None => info!(
                 pipeline = %cfg.name,
                 dq_uri = %dq_uri,
-                "no data-quality table; a row the target will not take, or the transform \
-                 cannot evaluate, stops this pipeline (which then retries). Create the table \
-                 to have such rows set aside instead."
+                "no data-quality table; a row the target will not take{} stops this pipeline \
+                 (which then retries). Create the table to have such rows set aside instead.",
+                match cfg.transform_sql.is_some()
+                    && transform.cross_row().is_none()
+                    && cfg.max_evaluation_rejects_per_batch > 0
+                {
+                    true => ", or the transform cannot evaluate,",
+                    false => "",
+                }
             ),
         }
         // And whether a row the transform cannot evaluate joins them, which depends on the
@@ -548,8 +580,12 @@ impl Pipeline {
             .await
         {
             Ok(isolated) => isolated,
+            // Only where the table would take the row: a row-local transform, and a cap the
+            // configuration has not set to zero.
             Err(Error::Evaluation(m))
-                if self.dq.is_none() && self.transform.cross_row().is_none() =>
+                if self.dq.is_none()
+                    && self.transform.cross_row().is_none()
+                    && self.cfg.max_evaluation_rejects_per_batch > 0 =>
             {
                 return Err(Error::Evaluation(format!(
                     "{m}. If a row's value caused this, creating the data-quality table at {} \
@@ -720,10 +756,11 @@ impl Pipeline {
         // is already there. See `crate::dq`.
         if rejected_rows > 0 {
             let written = self.write_rejects(&rejects, txn_version).await?;
-            if in_rows > 0 && out_rows == 0 {
+            if in_rows > 0 && out_rows == 0 && covered == 0 {
                 // Every row failed. That is far more likely to be an upstream type change
                 // than a batch of uniformly bad data, and it is invisible in the target —
-                // which simply stops growing — so it is said out loud here.
+                // which simply stops growing — so it is said out loud here. Not when a
+                // coverage window dropped the rest: see `StepOutcome::fully_rejected`.
                 warn!(
                     pipeline = %self.cfg.name,
                     through_version = through,
@@ -1691,9 +1728,9 @@ fn adjust_for_replaced_source(
 /// describe rows that no longer exist: `txn` actions survive an overwrite, so after a nightly
 /// rebuild we would resume past everything we streamed while dbt was reading, and those rows
 /// would never come back. When the target has been rewritten since our last append, dbt's
-/// watermark is the authority instead — or, with `dedup_timestamp`, a rescan whose cut-off is
-/// handed back with the position, for [`coverage_cutoff`] to hold until the rescan has caught
-/// up with what the rebuild covered.
+/// watermark is the authority instead, where it recorded one — and otherwise, with
+/// `dedup_timestamp`, a rescan whose cut-off is handed back with the position, for
+/// [`coverage_cutoff`] to hold until the rescan has caught up with what the rebuild covered.
 ///
 /// See [`crate::dbt::watermark`] for the full argument.
 async fn resume_cursor(
@@ -1719,6 +1756,7 @@ async fn resume_cursor(
             cursor: own,
             bootstrapping,
             rebuilt: None,
+            from_watermark: false,
         });
     }
 
@@ -1728,97 +1766,116 @@ async fn resume_cursor(
             cursor: own,
             bootstrapping,
             rebuilt: None,
+            from_watermark: false,
         });
     };
 
-    // dedup_key needs no cooperation from the rebuilding writer, so it is tried first: the
-    // rows to emit are those beyond the highest key the rebuild left behind, and the scan
-    // has to start early enough to reach them. Our own offset is not early enough --- it
-    // may already be past what the rebuild covered, which is the whole hazard --- so the
-    // scan restarts and the key filter suppresses everything already present.
-    if let Some(ts) = cfg.dedup_timestamp.as_deref() {
-        // How far back the rescan has to reach is a question the source's own file
-        // statistics can answer, so ask rather than re-reading history every night.
-        let dedup = Dedup::read(target, ts, cfg.dedup_key.as_deref()).await?;
-        let from = match dedup.watermark() {
-            Some(w) => StreamCursor::at_version(
-                dedup::bounded_rescan_start(
-                    source,
-                    ts,
-                    w,
-                    cfg.starting_version,
-                    watermark::DEFAULT_MAX_SCAN,
-                )
-                .await?,
+    // A watermark the rebuild recorded is tried first, because it is exact: it names the
+    // source version the rebuild read, whatever order that version's rows arrived in, so
+    // nothing has to be inferred from the target and nothing is skipped by timestamp. The
+    // rescan below is exact only while the timestamp follows arrival order, which a table
+    // written from a multi-partition Kafka topic does not. Every dbt model and every upsert
+    // has `dedup_timestamp`, so trying the rescan first would leave `watermark_uri` unread
+    // for exactly the pipelines it is documented for.
+    if let Some(uri) = cfg.watermark_uri.as_deref() {
+        let store = watermark::WatermarkStore::new(uri).with_storage(cfg.storage.clone());
+        match store.last(&cfg.app_id).await? {
+            Some(w) => {
+                let reset = StreamCursor::at_version(w + 1);
+                warn!(
+                    pipeline = %cfg.name,
+                    overwritten_at_target_version = at,
+                    own_offset = %own,
+                    watermark = w,
+                    resume_from = %reset,
+                    "target was rebuilt by dbt; resuming from dbt's watermark rather than our \
+                     own offset, and skipping nothing by timestamp"
+                );
+                // Same argument as the rescan below: dbt's watermark is an assertion about what
+                // the target already covers, so this position is not a bootstrap even when no
+                // txn action of ours survives the rebuild.
+                return Ok(Resume {
+                    cursor: reset,
+                    bootstrapping: false,
+                    rebuilt: None,
+                    from_watermark: true,
+                });
+            }
+            // Refusing is the whole point. Continuing from our own offset would drop every
+            // row we streamed after dbt started reading, silently and for good.
+            None if cfg.dedup_timestamp.is_none() => {
+                return Err(Error::Config(format!(
+                    "pipeline {:?}: target {:?} was rewritten at version {at} by another \
+                     writer (a dbt rebuild), but the watermark table {uri:?} holds no \
+                     source_version for app_id {:?}. Resuming from this pipeline's own offset \
+                     would silently drop every row streamed while dbt was reading. Either have \
+                     the rebuild record the source version it consumed, or set \
+                     dedup_timestamp to a column that increases with arrival order so the \
+                     overlap can be skipped without its cooperation.",
+                    cfg.name, cfg.target_uri, cfg.app_id
+                )));
+            }
+            None => warn!(
+                pipeline = %cfg.name,
+                overwritten_at_target_version = at,
+                watermark_uri = uri,
+                app_id = %cfg.app_id,
+                "target was rebuilt, but the watermark table holds no source_version for this \
+                 app_id; falling back to the dedup_timestamp rescan"
             ),
-            None => StreamCursor::at_version(cfg.starting_version),
-        };
-        warn!(
-            pipeline = %cfg.name,
-            overwritten_at_target_version = at,
-            own_offset = %own,
-            dedup_timestamp = ts,
-            rescan_from = %from,
-            bounded = (from.version > cfg.starting_version),
-            // Source versions between our own offset and the rescan's start, which the file
-            // statistics say the rebuild covered. Where another writer repaired the target
-            // with timestamps newer than rows not yet delivered, this is how many versions of
-            // them are never read — and the cut-off, which counts only what it reads, never
-            // sees them.
-            versions_not_reread = from.version.saturating_sub(own.version),
-            "target was rebuilt by another writer; rescanning and skipping rows the target \
-             already covers"
-        );
-        // Not a bootstrap, whatever the txn action says. Another writer has rewritten this
-        // target and the position above was derived from what that rewrite left behind, so
-        // there is coverage here to lose — which is exactly what the bootstrap recovery is
-        // allowed to assume there is not. A cursor that then turns out to be unreadable has
-        // to read as the refusal it is, not as an invitation to move `starting_version`.
-        return Ok(Resume {
-            cursor: from,
-            bootstrapping: false,
-            rebuilt: Some(dedup),
-        });
+        }
     }
 
-    let uri = cfg
-        .watermark_uri
+    // dedup_key needs no cooperation from the rebuilding writer: the rows to emit are those
+    // beyond the highest key the rebuild left behind, and the scan has to start early enough
+    // to reach them. Our own offset is not early enough --- it may already be past what the
+    // rebuild covered, which is the whole hazard --- so the scan restarts and the key filter
+    // suppresses everything already present.
+    let ts = cfg
+        .dedup_timestamp
         .as_deref()
-        .expect("checked above: one of watermark_uri or dedup_timestamp is set");
-    let store = watermark::WatermarkStore::new(uri).with_storage(cfg.storage.clone());
-    let Some(w) = store.last(&cfg.app_id).await? else {
-        // Refusing is the whole point. Continuing from our own offset would drop every
-        // row we streamed after dbt started reading, silently and for good.
-        return Err(Error::Config(format!(
-            "pipeline {:?}: target {:?} was rewritten at version {at} by another writer \
-             (a dbt rebuild), but the watermark table {uri:?} holds no source_version for \
-             app_id {:?}. Resuming from this pipeline's own offset would silently drop \
-             every row streamed while dbt was reading. Either have the rebuild record the \
-             source version it consumed, or set dedup_timestamp to a column that increases \
-             with arrival order so the overlap can be skipped without its cooperation.",
-            cfg.name, cfg.target_uri, cfg.app_id
-        )));
+        .expect("checked above: a watermark_uri with no row and no dedup_timestamp refused");
+    // How far back the rescan has to reach is a question the source's own file statistics
+    // can answer, so ask rather than re-reading history every night.
+    let dedup = Dedup::read(target, ts, cfg.dedup_key.as_deref()).await?;
+    let from = match dedup.watermark() {
+        Some(w) => StreamCursor::at_version(
+            dedup::bounded_rescan_start(
+                source,
+                ts,
+                w,
+                cfg.starting_version,
+                watermark::DEFAULT_MAX_SCAN,
+            )
+            .await?,
+        ),
+        None => StreamCursor::at_version(cfg.starting_version),
     };
-
-    let reset = StreamCursor::at_version(w + 1);
-    if reset != own {
-        warn!(
-            pipeline = %cfg.name,
-            overwritten_at_target_version = at,
-            own_offset = %own,
-            watermark = w,
-            resume_from = %reset,
-            "target was rebuilt by dbt; resuming from dbt's watermark rather than our own \
-             offset"
-        );
-    }
-    // Same argument as the dedup branch: dbt's watermark is an assertion about what the
-    // target already covers, so this position is not a bootstrap even when no txn action of
-    // ours survives the rebuild.
+    warn!(
+        pipeline = %cfg.name,
+        overwritten_at_target_version = at,
+        own_offset = %own,
+        dedup_timestamp = ts,
+        rescan_from = %from,
+        bounded = (from.version > cfg.starting_version),
+        // Source versions between our own offset and the rescan's start, which the file
+        // statistics say the rebuild covered. Where another writer repaired the target with
+        // timestamps newer than rows not yet delivered, this is how many versions of them are
+        // never read — and the cut-off, which counts only what it reads, never sees them.
+        versions_not_reread = from.version.saturating_sub(own.version),
+        "target was rebuilt by another writer; rescanning and skipping rows the target \
+         already covers"
+    );
+    // Not a bootstrap, whatever the txn action says. Another writer has rewritten this target
+    // and the position above was derived from what that rewrite left behind, so there is
+    // coverage here to lose — which is exactly what the bootstrap recovery is allowed to
+    // assume there is not. A cursor that then turns out to be unreadable has to read as the
+    // refusal it is, not as an invitation to move `starting_version`.
     Ok(Resume {
-        cursor: reset,
+        cursor: from,
         bootstrapping: false,
-        rebuilt: None,
+        rebuilt: Some(dedup),
+        from_watermark: false,
     })
 }
 
@@ -1844,6 +1901,11 @@ struct Resume {
     /// start. Handed on rather than read again, because it is the same question of the same
     /// target, and the answer is what the rescan has to be filtered by.
     rebuilt: Option<Dedup>,
+    /// True when `cursor` follows the source version a rebuild recorded in `watermark_uri`.
+    /// The rebuild has then said what the target holds, so no window is inferred from its
+    /// data — not even one our last commit recorded, which described the target as it was
+    /// before that rebuild.
+    from_watermark: bool,
 }
 
 /// The coverage window this open starts in, if the target's coverage has to be inferred.
@@ -1857,6 +1919,9 @@ struct Resume {
 /// | The target was rebuilt | the one the rescan was bounded by | a newer row, or head `H` |
 /// | First start, target populated | read now | a newer row, or head `H` |
 /// | Our last commit recorded an open window | read now | a newer row, or its `H` |
+///
+/// A rebuild that recorded its source version in `watermark_uri` is not "rebuilt" here, and
+/// opens none: the position it gave is exact on its own, as our offset is.
 ///
 /// `H` is the source version this open loaded, which is read before the target, so a rebuild
 /// visible in the target read the source no later than `H`. It can be a little low, never
@@ -1899,6 +1964,8 @@ async fn coverage_cutoff(
             None => Dedup::read(target, ts, key).await?,
         };
         (CoverageReason::SourceReplaced, None, false, dedup)
+    } else if resume.from_watermark {
+        return Ok(None);
     } else if let Some(dedup) = resume.rebuilt {
         (CoverageReason::Rebuilt, head, false, dedup)
     } else if resume.bootstrapping {

@@ -288,7 +288,9 @@ pipeline: `ddi_pipeline_up`, `ddi_rows_written_total`, `ddi_source_lag_versions`
 `ddi_last_source_version`, `ddi_errors_total`, and others. Two of them concern §7:
 `ddi_coverage_cutoff_active` is 1 while a pipeline is dropping rows because the target is
 taken to hold them already, and `ddi_rows_skipped_as_covered_total` counts the rows it
-dropped. Outside a rebuild handover both stay at zero.
+dropped. Outside such a window the gauge is 0 and the counter does not move, but it keeps
+what earlier windows dropped until the process restarts: alert on its `increase(..)`, not on
+its value.
 
 Alert on `ddi_pipeline_up == 0` for a down stream, `ddi_source_lag_versions` for backlog and `increase(ddi_errors_total[5m])` for a
 stopped pipeline. A bad row need not stop one: with a data-quality table beside the target
@@ -333,24 +335,33 @@ middle carries on with it. An ordinary restart, deploy or crash resumes from `dd
 offset, which is exact on its own, and skips nothing by timestamp. Watch
 `ddi_coverage_cutoff_active` and `ddi_rows_skipped_as_covered_total` (§6) to see it at work.
 
+`ddi` 0.3.1 and earlier did not record the cut-off in their commits, so a pipeline upgraded
+from one part-way through a rescan or a first start's catch-up resumes without it, and writes
+again the rows it would have dropped. Let that finish — `ddi_source_lag_versions` at 0 —
+before upgrading.
+
 **The one requirement**, and only while that cut-off is in use: the timestamp must never go
 backwards relative to arrival order. A late row bearing an older timestamp is
 indistinguishable from one the rebuild already wrote, and will be dropped. Append-only is not
 enough: a table written from a multi-partition Kafka topic (kafka-delta-ingest and similar)
 orders timestamps only within each partition, so a lagging partition's rows routinely land
 after newer ones from another. For such a source, have the rebuild record the source version
-it read in a watermark table and point `watermark_uri` at it instead — that is exact whatever
-order rows arrive in; the README's
+it read in a watermark table and point `watermark_uri` at it. After a rebuild that recorded
+one, `ddi` resumes from that version and skips nothing by timestamp, which is exact whatever
+order rows arrive in; `_timestamp` is then only the fallback, for a rebuild that recorded
+nothing. The README's
 [handover section](README.md#the-handover-and-why-it-needs-a-watermark) shows the one
-`INSERT` it takes. A watermark per Kafka partition would be exact too; `ddi` does not offer
-one yet.
+`INSERT` it takes. The cut-off still applies on a first start against a table that already
+has rows and after the source was replaced, and to a staged upsert, whose merge reads `ddi`'s
+own staging table rather than the source the watermark counts versions of. A watermark per
+Kafka partition would be exact there too; `ddi` does not offer one yet.
 
 ### What else can happen to a shared table
 
 | Event | What `ddi` does |
 |---|---|
 | Restart, redeploy, crash | Resumes from its own offset; nothing is skipped by timestamp |
-| dbt full-refresh | Rescans from the batch's high-water mark; no gaps, no duplicates |
+| dbt full-refresh | Resumes from the source version it recorded in `watermark_uri`, or else rescans from its high-water mark; no gaps, no duplicates |
 | Rows arrive while dbt runs | Re-emitted afterwards, by timestamp |
 | Another writer appends to the target | Not taken as coverage; nothing is skipped because of it |
 | Another writer updates, deletes or merges in the target | Treated as a rebuild. Timestamps it writes newer than rows `ddi` has not delivered yet make it skip the source versions holding them (logged as `versions_not_reread`) |

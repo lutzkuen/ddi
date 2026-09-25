@@ -299,6 +299,81 @@ async fn the_watermark_store_reads_the_highest_version_for_its_own_app_id() {
     );
 }
 
+#[tokio::test]
+async fn a_recorded_watermark_wins_over_the_timestamp_rescan() {
+    // Both set, as every dbt model has them: `ddi_timestamp` defaults to `_timestamp`. The
+    // watermark is exact however rows arrive, and the rescan is not: here 3 is a lagging
+    // Kafka partition's row, landing after 5, so under the target's max(_timestamp) of 5 it
+    // reads as already covered, and its commit is not even re-read.
+    let lake = lake().await;
+    for i in [1, 5, 3] {
+        append(&lake.f.source, &[i]).await; // versions 1, 2, 3
+    }
+
+    let mut cfg = cfg_with_watermark(&lake, "copy");
+    cfg.dedup_timestamp = Some("id".into());
+    cfg.dedup_key = Some("id".into());
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(read_ids(&lake.f.target).await, vec![1, 3, 5]);
+
+    // dbt rebuilds from source version 2, and records that. Row 3 is gone.
+    dbt_rebuild(&lake.f.target, &[1, 5]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 2).await;
+    append(&lake.f.source, &[4]).await; // older than 5 too
+
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    assert_eq!(
+        p.coverage(),
+        None,
+        "the rebuild said what the target holds, so nothing is inferred from its data"
+    );
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        vec![1, 3, 4, 5],
+        "3 re-streamed from dbt's watermark and 4 after it, neither dropped for being older \
+         than 5"
+    );
+}
+
+#[tokio::test]
+async fn a_rebuild_that_recorded_no_watermark_falls_back_to_the_timestamp() {
+    // The same pair of settings, and a rebuild that wrote nothing to the watermark table —
+    // a first night, or a post-hook that has not run yet. With a timestamp to fall back on,
+    // that is no reason to refuse.
+    let lake = lake().await;
+    for i in 1..=3 {
+        append(&lake.f.source, &[i]).await;
+    }
+
+    let mut cfg = cfg_with_watermark(&lake, "copy");
+    cfg.dedup_timestamp = Some("id".into());
+    cfg.dedup_key = Some("id".into());
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+
+    dbt_rebuild(&lake.f.target, &[1, 2]).await; // ... and no watermark written
+    append(&lake.f.source, &[4]).await;
+
+    Pipeline::open(cfg)
+        .await
+        .expect("the rescan needs no watermark")
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    let got = read_ids(&lake.f.target).await;
+    assert_eq!(got, vec![1, 2, 3, 4], "row 3 recovered by the rescan");
+}
+
 // ------------------------------------------------------- zero-cooperation dedup
 
 /// The mode where the rebuilding writer knows nothing about `ddi`: no watermark table,

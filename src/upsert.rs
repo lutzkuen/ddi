@@ -62,7 +62,8 @@
 //! `delta.dataSkippingNumIndexedCols`, or one excluded by `delta.dataSkippingStatsColumns`
 //! — makes the whole question unanswerable, and the window opens to the entire target.
 //! Truncated string statistics are handled rather than trusted; see
-//! [`crate::stats::ranges_can_overlap`].
+//! [`crate::stats::ranges_can_overlap`]. So is a timestamp key's maximum, which a writer may
+//! truncate to the millisecond: it is raised by [`crate::stats::Slack`] first.
 //!
 //! A DECIMAL key or sequence is compared as a double, and its statistics are only near the
 //! value they stand for: writers disagree about which double a decimal is, and two decimals
@@ -257,8 +258,9 @@ impl Window {
             };
 
             // A DECIMAL's statistics are loosened to every value they could stand for, since
-            // neither they nor the batch's own bounds are the exact decimal. See
-            // `crate::stats` on decimals; for every other type the slack is `None`.
+            // neither they nor the batch's own bounds are the exact decimal, and a timestamp's
+            // maximum to the millisecond a writer may have truncated away. See `crate::stats`;
+            // for every other type the slack is `None`.
             let keys =
                 column_stats(&parsed, key_column, &bounds.keys[0]).loosened(bounds.key_slack);
             let (Some(kmin), Some(kmax)) = (keys.min, keys.max) else {
@@ -485,7 +487,7 @@ pub struct BatchBounds {
     /// asked nothing more of it.
     pub sequence_min: Bound,
     /// How far the key's statistics may be from the values they stand for. `Some` only for
-    /// a DECIMAL key.
+    /// a DECIMAL or timestamp key.
     pub key_slack: Option<Slack>,
     /// The same, for the sequence column.
     pub sequence_slack: Option<Slack>,

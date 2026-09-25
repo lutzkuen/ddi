@@ -152,6 +152,21 @@ async fn create(path: &str, schema: SchemaRef) {
         .unwrap();
 }
 
+/// What `CREATE OR REPLACE TABLE` does at `path`: the same log, carrying on with a commit that
+/// removes every file and gives the table a new id.
+async fn replace_in_place(path: &str, schema: SchemaRef) {
+    let delta: StructType = schema.as_ref().try_into_kernel().unwrap();
+    let url = ensure_table_uri(path).unwrap();
+    DeltaTable::try_from_url(url)
+        .await
+        .unwrap()
+        .create()
+        .with_columns(delta.fields().cloned().collect::<Vec<_>>())
+        .with_save_mode(SaveMode::Overwrite)
+        .await
+        .unwrap();
+}
+
 impl Lake {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -627,6 +642,41 @@ async fn a_recreated_bronze_that_is_already_ahead_does_not_skip_its_early_commit
 }
 
 #[tokio::test]
+async fn bronze_replaced_in_place_is_read_on_as_one_table() {
+    // `CREATE OR REPLACE` keeps the log and changes the id inside it, so bronze's versions
+    // before that commit carry one id and those after it another. Neither a pipeline reading
+    // across the commit nor one reading bronze's history from the start may take that for a
+    // table dropped and recreated: a reopen would meet the same batch again, and never move.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=3)).await;
+    lake.arrive(&orders(4..=6)).await;
+    // One commit per batch, so that batches end on both sides of the replacement.
+    let mut cfg = lake.cfg();
+    cfg.max_files_per_batch = 1;
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+
+    // Skipped as a change commit: it removes every file.
+    replace_in_place(&lake.raw, raw_schema()).await;
+    lake.arrive(&orders(7..=9)).await;
+    p.run_until_caught_up()
+        .await
+        .expect("reading across the replacement");
+    lake.assert_exactly(&orders(1..=9)).await;
+
+    // The reopen finds the new id where its commits recorded the old one, and starts over
+    // from `starting_version` under the cut-off — through versions that carry the old id.
+    drop(p);
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    p.run_until_caught_up()
+        .await
+        .expect("reading the history before the replacement");
+    lake.arrive(&orders(10..=12)).await;
+    p.run_until_caught_up().await.unwrap();
+    lake.assert_exactly(&orders(1..=12)).await;
+}
+
+#[tokio::test]
 async fn without_a_dedup_timestamp_a_replaced_source_stops_rather_than_duplicating() {
     // Starting over is only safe because the filter suppresses what is already there.
     // With no timestamp to filter on, it would append the whole table a second time.
@@ -727,10 +777,14 @@ async fn the_rescan_after_a_rebuild_is_bounded_by_file_statistics() {
     .await
     .unwrap();
 
-    // Orders 1..=18 landed in commits 1..=18, so everything needed is at 19 and beyond.
+    // Orders 1..=18 landed in commits 1..=18, so everything needed is at 19 and beyond. The
+    // rescan starts at 18 all the same: that commit's maximum is the watermark itself, a
+    // whole millisecond, which a writer that truncates to the millisecond would also record
+    // for a row up to 999 us later. Re-reading it costs nothing — the cut-off drops what the
+    // target holds.
     assert_eq!(
-        start, 19,
-        "the rescan should start just past the last commit the rebuild covered, not at 0"
+        start, 18,
+        "the rescan should start at the last commit the rebuild covered, not at 0"
     );
 
     // And the pipeline built on it still gets the right answer.
@@ -770,6 +824,56 @@ async fn an_unbounded_rescan_is_still_correct_when_statistics_are_missing() {
     .await
     .unwrap();
     assert_eq!(start, 0, "no usable statistics must mean a full rescan");
+}
+
+/// Rewrite the `maxValues` of `column` in commit `version`'s adds the way Spark writes them:
+/// truncated to the millisecond, which the protocol allows. delta-rs keeps every digit.
+fn truncate_timestamp_max_to_millis(table_path: &str, version: u64, column: &str) {
+    let commit = format!("{table_path}/_delta_log/{version:020}.json");
+    let mut lines = Vec::new();
+    for line in std::fs::read_to_string(&commit).unwrap().lines() {
+        let mut action: serde_json::Value = serde_json::from_str(line).unwrap();
+        if let Some(add) = action.get_mut("add") {
+            let mut stats: serde_json::Value =
+                serde_json::from_str(add["stats"].as_str().unwrap()).unwrap();
+            let max = stats["maxValues"][column].as_str().unwrap().to_string();
+            let (whole, fraction) = max.split_once('.').unwrap();
+            stats["maxValues"][column] = serde_json::json!(format!("{whole}.{}Z", &fraction[..3]));
+            add["stats"] = serde_json::json!(stats.to_string());
+        }
+        lines.push(action.to_string());
+    }
+    std::fs::write(&commit, lines.join("\n") + "\n").unwrap();
+}
+
+#[tokio::test]
+async fn a_rescan_does_not_skip_a_commit_whose_timestamp_max_was_truncated_to_the_millisecond() {
+    // Spark records a timestamp's maximum to the millisecond, so a commit whose newest row is
+    // 10:00:00.000900 says 10:00:00.000. Taken at its word against a watermark of
+    // 10:00:00.000200, that commit is covered, the rescan starts after it, and its row newer
+    // than the watermark is never read again.
+    use delta_delta_ingest::dedup::bounded_rescan_start;
+
+    const W: i64 = 1_790_330_400_000_200; // 2026-09-25T10:00:00.000200Z
+    let lake = Lake::new().await;
+    for (id, ts) in [(1, W - 3_600_000_000), (2, W), (3, W + 700)] {
+        lake.arrive(&[Order { id, ts }]).await; // versions 1, 2, 3
+    }
+    truncate_timestamp_max_to_millis(&lake.raw, 3, DEFAULT_TIMESTAMP_COLUMN);
+
+    let source = open_table(ensure_table_uri(&lake.raw).unwrap())
+        .await
+        .unwrap();
+    let watermark: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![W]));
+    let start = bounded_rescan_start(&source, DEFAULT_TIMESTAMP_COLUMN, &watermark, 0, 10_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        start, 3,
+        "the commit whose maximum was truncated to a whole millisecond could hold rows up to \
+         999 us past it, so it is read again; the watermark's own, recorded to the \
+         microsecond, is covered"
+    );
 }
 
 #[tokio::test]

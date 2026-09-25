@@ -139,6 +139,32 @@ impl Lake {
             .unwrap();
     }
 
+    /// What a batch job that filled silver before this pipeline ever started leaves there.
+    async fn fill_silver(&self, rows: &[(i64, i64, i64)]) {
+        let batch = RecordBatch::try_new(
+            stg_schema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        open_table(ensure_table_uri(&self.stg).unwrap())
+            .await
+            .unwrap()
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+    }
+
     fn cfg(&self) -> ResolvedPipeline {
         // No transform: the coercer is what casts text to number, which is the code under
         // test. A CAST in transform_sql would fail in DataFusion instead.
@@ -332,6 +358,7 @@ async fn the_offset_advances_past_a_batch_whose_rows_were_all_rejected() {
         panic!("expected a skipped step that consumed the batch, got {first:?}");
     };
     assert_eq!(rejected, 2);
+    assert!(first.fully_rejected(), "the shape an alert is raised on");
 
     assert_eq!(
         p.step().await.unwrap(),
@@ -345,6 +372,47 @@ async fn the_offset_advances_past_a_batch_whose_rows_were_all_rejected() {
         "and a fresh pipeline must agree, or this loops forever"
     );
     assert_eq!(lake.rejects().await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_bad_row_among_covered_ones_is_not_a_fully_rejected_batch() {
+    // Inside a coverage window every good row of a batch can be one the target already holds.
+    // The bad row left over is one bad row, not the upstream type change a batch whose every
+    // row failed is taken for — and a rescan would otherwise raise that alarm on every batch
+    // that re-reads it.
+    let lake = Lake::new().await;
+    lake.create_dq().await;
+    lake.arrive(&[
+        (1, Some("100"), 10),
+        (2, Some("n/a"), 11),
+        (3, Some("300"), 12),
+    ])
+    .await;
+    // Filled by the batch job before this pipeline first started.
+    lake.fill_silver(&[(1, 100, 10), (3, 300, 12)]).await;
+
+    let mut cfg = lake.cfg();
+    cfg.dedup_timestamp = Some(DEFAULT_TIMESTAMP_COLUMN.into());
+    cfg.dedup_key = Some("order_id".into());
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    assert!(
+        p.coverage().is_some(),
+        "a first start against a populated target"
+    );
+
+    let step = p.step().await.unwrap();
+    let StepOutcome::Skipped {
+        rejected, covered, ..
+    } = step.clone()
+    else {
+        panic!("expected a skipped step, got {step:?}");
+    };
+    assert_eq!((rejected, covered), (1, 2));
+    assert!(
+        !step.fully_rejected(),
+        "one bad row, with the rest already in the target"
+    );
+    assert_eq!(lake.rejects().await.len(), 1);
 }
 
 #[tokio::test]
@@ -545,6 +613,20 @@ async fn without_a_data_quality_table_a_row_the_transform_cannot_evaluate_still_
         "says which table would set it aside: {m}"
     );
     assert!(lake.silver().await.is_empty());
+
+    // With isolation turned off, creating the table would change nothing, so the error must
+    // not say it would.
+    let mut cfg = lake.casting_cfg();
+    cfg.max_evaluation_rejects_per_batch = 0;
+    let m = Pipeline::open(cfg)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .expect_err("isolation is off")
+        .to_string();
+    assert!(m.contains("transform_sql failed to execute"), "{m}");
+    assert!(!m.contains(&lake.dq), "promises nothing: {m}");
 }
 
 #[tokio::test]

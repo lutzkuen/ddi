@@ -949,6 +949,12 @@ async fn attempt(
         // Every step, like the cursor: a window can close on a step that commits nothing.
         m.coverage_cutoff_active
             .store(pipeline.coverage().is_some() as i64, Ordering::Relaxed);
+        // Nothing reached the target and everything was rejected — the shape an upstream type
+        // change takes. Counted separately because the target simply stops growing, which no
+        // other metric would show.
+        if matches!(&outcome, Ok(o) if o.fully_rejected()) {
+            m.batches_fully_rejected.fetch_add(1, Ordering::Relaxed);
+        }
 
         match outcome {
             Ok(StepOutcome::CaughtUp) => {
@@ -985,9 +991,6 @@ async fn attempt(
                     .fetch_add(reevaluations as u64, Ordering::Relaxed);
                 m.rows_skipped_as_covered
                     .fetch_add(covered as u64, Ordering::Relaxed);
-                if rejected > 0 && rows == 0 {
-                    m.batches_fully_rejected.fetch_add(1, Ordering::Relaxed);
-                }
                 m.batches_committed.fetch_add(1, Ordering::Relaxed);
                 m.rows_written.fetch_add(rows as u64, Ordering::Relaxed);
                 m.files_read.fetch_add(files as u64, Ordering::Relaxed);
@@ -1034,12 +1037,6 @@ async fn attempt(
                     .fetch_add(reevaluations as u64, Ordering::Relaxed);
                 m.rows_skipped_as_covered
                     .fetch_add(covered as u64, Ordering::Relaxed);
-                if rejected > 0 {
-                    // Nothing reached the target and everything was rejected — the shape an
-                    // upstream type change takes. Counted separately because the target
-                    // simply stops growing, which no other metric would show.
-                    m.batches_fully_rejected.fetch_add(1, Ordering::Relaxed);
-                }
                 m.commits_skipped.fetch_add(1, Ordering::Relaxed);
                 m.last_source_version
                     .store(through_version as i64, Ordering::Relaxed);

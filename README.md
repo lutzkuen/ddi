@@ -506,8 +506,10 @@ Plain SQL on purpose — an `INSERT` any adapter can run, rather than a `txn` ac
 Spark writer can produce.
 
 `ddi` walks the target's log backwards on startup. If the most recent commit that touched
-data is not its own, the target was rebuilt, and dbt's watermark takes over. A target
-rebuilt with *no* watermark recorded is a hard error, not a guess:
+data is not its own, the target was rebuilt, and dbt's watermark takes over — also when
+`dedup_timestamp` (below) is set, as it always is for a dbt model, because the watermark is
+exact however rows arrive. A target rebuilt with *no* watermark recorded falls back to that
+timestamp where one is set, and is otherwise a hard error, not a guess:
 
 ```
 pipeline "orders_header": target "..." was rewritten at version 41 by another writer
@@ -569,8 +571,11 @@ read, because nothing committed after that can have been covered. A first start 
 assumes the target was filled from this source: one loaded from elsewhere while this source is
 still being backfilled gets what arrives after the open a second time. While a window is open
 each commit records it (`ddi.cutoff.reason` in the commit's info), so a restart in the middle
-carries on where it left off. `ddi_coverage_cutoff_active` is 1 while one is open, and every
-row it drops is logged and counted in `ddi_rows_skipped_as_covered_total`.
+carries on where it left off. `ddi` 0.3.1 and earlier recorded nothing, so a pipeline upgraded
+from one part-way through a rebuild's rescan or a first start's catch-up resumes without the
+cut-off and writes again what it would have dropped; let that finish before upgrading.
+`ddi_coverage_cutoff_active` is 1 while one is open, and every row it drops is logged and
+counted in `ddi_rows_skipped_as_covered_total`.
 
 Inside a window the timestamp **must be non-decreasing in the order rows reach the source** —
 a late row bearing an older timestamp is indistinguishable from one the rebuild already wrote,
@@ -579,9 +584,13 @@ topic (kafka-delta-ingest and its like) orders timestamps only within a partitio
 ingester commit carries a slice of every partition's backlog, so a later commit routinely
 holds a lagging partition's rows that are older than rows already delivered. Inside a window
 those are dropped with the covered ones — counted, but dropped — and the rescan bound below
-can start past them. Use `watermark_uri` for exact coverage on such sources. A watermark per
-value of a partition column — the newest timestamp or offset per Kafka partition — would be
-exact too; it is a possible future option, not something `ddi` does today.
+can start past them. For such sources have the rebuild record its source version in
+`watermark_uri`: a rebuild that recorded one opens no window at all, even with
+`dedup_timestamp` set. A first start against a populated target, a replaced source and a
+staged upsert's merge, which reads the stage rather than the source, still use the cut-off. A
+watermark per value of a partition column — the newest timestamp or offset per Kafka
+partition — would be exact there too; it is a possible future option, not something `ddi`
+does today.
 
 The rescan is bounded by the source's own file statistics. Delta records `maxValues` per
 file, so the log itself says how far back the rebuild's contents reach: walking backwards
@@ -592,7 +601,7 @@ will not line up, it falls back to a full rescan — being slow is a cost, being
 not an option.
 
 `watermark_uri` remains the better choice where you can set it: exact, no rescan, and no
-ordering requirement on any column.
+ordering requirement on any column. With both set, a recorded watermark wins.
 
 ### What the watermark costs to read
 
@@ -797,7 +806,7 @@ Because the process no longer exits when a stream dies, metrics stop being optio
 | `ddi_rows_rejected_total` | Rows sent to the data-quality table. |
 | `ddi_rows_rejected_by_transform_total` | Of those, rows the transform could not evaluate. |
 | `ddi_transform_reevaluations_total` | Extra runs of the transform spent finding them. |
-| `ddi_batches_fully_rejected_total` | Batches where *every* row was rejected. |
+| `ddi_batches_fully_rejected_total` | Batches where *every* row was rejected. A batch whose other rows a coverage window dropped is not counted. |
 | `ddi_coverage_cutoff_active` | 1 while a coverage window is dropping rows the target is taken to hold already. |
 | `ddi_rows_skipped_as_covered_total` | Rows it dropped. They reach neither the target nor the data-quality table. |
 
@@ -1767,7 +1776,7 @@ correctness still holds (the `txn` action prevents double-apply) — it just was
 | `ddi_rows_rejected_total` | counter | Rows written to the data-quality table. |
 | `ddi_rows_rejected_by_transform_total` | counter | Of those, rows the transform could not evaluate. Also in `ddi_rows_rejected_total`. |
 | `ddi_transform_reevaluations_total` | counter | Runs of a transform beyond the first, spent finding the rows it could not evaluate. Each re-plans the query and re-scans the lookups it joins. |
-| `ddi_batches_fully_rejected_total` | counter | Batches where every row was rejected. |
+| `ddi_batches_fully_rejected_total` | counter | Batches where every row was rejected, and none dropped as covered. |
 | `ddi_rows_skipped_as_covered_total` | counter | Rows dropped because the target was taken to hold them already, while a rebuild, a first start against a populated target, or a replaced source was being caught up. Never moves on an ordinary restart. |
 | `ddi_coverage_cutoff_active` | gauge | 1 while this pipeline is dropping rows the target is taken to hold already; 0 otherwise. See [When the rebuild cannot be changed at all](#when-the-rebuild-cannot-be-changed-at-all). |
 

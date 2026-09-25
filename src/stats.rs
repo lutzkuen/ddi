@@ -20,6 +20,10 @@
 //! comparison that can exclude data therefore goes through [`Bound::provably_below`],
 //! which answers only when the answer is provable. See [`ranges_can_overlap`].
 //!
+//! Timestamps are truncated too, to the millisecond, which the protocol allows and Spark
+//! does: a maximum of `10:00:00.000` can stand for a row at `10:00:00.000900`. That one is a
+//! number rather than a prefix, so it is allowed for by [`Slack`], as a DECIMAL's is.
+//!
 //! # Decimals
 //!
 //! A DECIMAL reaches a [`Bound`] only as a nearby double, and on both sides of the
@@ -119,16 +123,26 @@ pub fn range_touches_any(file_min: &Bound, file_max: &Bound, wanted: &[Bound]) -
     }
 }
 
-/// How far a DECIMAL bound may lie from the value it stands for. See the module's
-/// "Decimals" section.
+/// How far a bound may lie from the value it stands for.
 ///
-/// Only DECIMAL columns get one. Integers, clocks and text compare exactly, text's truncation
-/// aside, which [`Bound::provably_below`] already handles; a DOUBLE is written and read back
-/// as exactly the double it is.
+/// Two kinds of column get one. A DECIMAL, whose bounds are only near their value on either
+/// side — see the module's "Decimals" section. And a timestamp, whose statistics the protocol
+/// lets a writer truncate to the millisecond, and Spark does: a recorded maximum that is a
+/// whole millisecond can be up to 999 µs below the newest row it covers. One with digits
+/// below the millisecond was not truncated, and is exact. Truncation only ever lowers a
+/// timestamp, so its minimum is still a lower bound and needs nothing.
+///
+/// Integers, dates and text compare exactly, text's truncation aside, which
+/// [`Bound::provably_below`] already handles; a DOUBLE is written and read back as exactly the
+/// double it is.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Slack {
-    /// One unit of the column's scale: `0.01` for DECIMAL(10,2).
-    unit: f64,
+pub enum Slack {
+    /// A DECIMAL: one unit of the column's scale — `0.01` for DECIMAL(10,2) — and
+    /// [`Slack::ULPS`] doubles beyond it, each way.
+    Decimal { unit: f64 },
+    /// A timestamp: a maximum that is a whole millisecond stands for up to
+    /// [`Slack::TRUNCATED_MICROS`] more.
+    Millisecond,
 }
 
 impl Slack {
@@ -138,36 +152,43 @@ impl Slack {
     /// correctly rounded float parser add one each. Sixteen covers all of it with room.
     pub const ULPS: u32 = 16;
 
-    /// `Some` for a DECIMAL column, `None` for every type whose bounds are exact.
+    /// What a timestamp statistic truncated to the millisecond can have lost.
+    pub const TRUNCATED_MICROS: i64 = 999;
+
+    /// `Some` for a DECIMAL or timestamp column, `None` for every type whose bounds are exact.
     pub fn of(dtype: &DataType) -> Option<Self> {
         match dtype {
             DataType::Decimal32(_, s)
             | DataType::Decimal64(_, s)
             | DataType::Decimal128(_, s)
-            | DataType::Decimal256(_, s) => Some(Self {
+            | DataType::Decimal256(_, s) => Some(Self::Decimal {
                 unit: 10f64.powi(-i32::from(*s)),
             }),
+            DataType::Timestamp(_, _) => Some(Self::Millisecond),
             _ => None,
         }
     }
 
     /// The lowest value `b` could stand for.
     pub fn below(&self, b: &Bound) -> Bound {
-        match b {
-            Bound::Float(v) => {
-                Bound::Float((0..Self::ULPS).fold(v - self.unit, |x, _| next_toward(x, false)))
+        match (self, b) {
+            (Self::Decimal { unit }, Bound::Float(v)) => {
+                Bound::Float((0..Self::ULPS).fold(v - unit, |x, _| next_toward(x, false)))
             }
-            other => other.clone(),
+            (_, other) => other.clone(),
         }
     }
 
     /// The highest value `b` could stand for.
     pub fn above(&self, b: &Bound) -> Bound {
-        match b {
-            Bound::Float(v) => {
-                Bound::Float((0..Self::ULPS).fold(v + self.unit, |x, _| next_toward(x, true)))
+        match (self, b) {
+            (Self::Decimal { unit }, Bound::Float(v)) => {
+                Bound::Float((0..Self::ULPS).fold(v + unit, |x, _| next_toward(x, true)))
             }
-            other => other.clone(),
+            (Self::Millisecond, Bound::Int(us)) if us.rem_euclid(1000) == 0 => {
+                Bound::Int(us.saturating_add(Self::TRUNCATED_MICROS))
+            }
+            (_, other) => other.clone(),
         }
     }
 }
@@ -584,14 +605,14 @@ mod tests {
     }
 
     #[test]
-    fn a_slack_is_only_for_decimals_and_moves_at_least_a_unit() {
+    fn a_slack_is_only_for_decimals_and_timestamps() {
         use deltalake::arrow::datatypes::TimeUnit;
 
         for exact in [
             DataType::Int64,
             DataType::Float64,
             DataType::Float32,
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Date32,
             DataType::Utf8,
         ] {
             assert_eq!(Slack::of(&exact), None, "{exact} compares exactly");
@@ -599,6 +620,23 @@ mod tests {
         assert!(Slack::of(&DataType::Decimal128(38, 17)).is_some());
         assert!(Slack::of(&DataType::Decimal256(76, 10)).is_some());
 
+        // A timestamp maximum Spark truncated to the millisecond still reaches the row it
+        // stands for, and a minimum, which truncation only lowers, is left alone.
+        let clock = Slack::of(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap();
+        let recorded = parse_timestamp_micros("2026-09-25T10:00:00.000Z").unwrap();
+        let newest = parse_timestamp_micros("2026-09-25T10:00:00.000999").unwrap();
+        assert_eq!(clock.above(&Bound::Int(recorded)), Bound::Int(newest));
+        assert_eq!(clock.below(&Bound::Int(recorded)), Bound::Int(recorded));
+        // Before the epoch too: truncating lowers it there as well.
+        assert_eq!(clock.above(&Bound::Int(-2_000)), Bound::Int(-1_001));
+        // A maximum with digits below the millisecond was not truncated.
+        let exact = parse_timestamp_micros("2026-09-25T10:00:00.000200Z").unwrap();
+        assert_eq!(clock.above(&Bound::Int(exact)), Bound::Int(exact));
+        assert_eq!(clock.above(&t("order")), t("order"));
+    }
+
+    #[test]
+    fn a_decimal_slack_moves_at_least_a_unit() {
         let cents = Slack::of(&DataType::Decimal128(10, 2)).unwrap();
         assert!(float(Some(cents.below(&Bound::Float(12.34)))) <= 12.33);
         assert!(float(Some(cents.above(&Bound::Float(12.34)))) >= 12.35);

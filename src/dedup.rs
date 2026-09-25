@@ -35,12 +35,13 @@
 //! # When it applies
 //!
 //! Only while the pipeline has to infer from the target's data what the target already
-//! holds — a *coverage window*. One opens after a rebuild by another writer, on a first start
-//! against a target that already has rows, after the source was dropped and recreated or
-//! relocated, and on a reopen part-way through any of those. An ordinary restart opens none:
-//! the `txn` offset commits atomically with the rows it describes, so it is exact on its own,
-//! and a timestamp filter on top of it can only drop rows. Applying one on every open is what
-//! used to lose a lagging Kafka partition's late rows at every restart.
+//! holds — a *coverage window*. One opens after a rebuild by another writer that recorded no
+//! source version in `watermark_uri`, on a first start against a target that already has
+//! rows, after the source was dropped and recreated or relocated, and on a reopen part-way
+//! through any of those. An ordinary restart opens none: the `txn` offset commits atomically
+//! with the rows it describes, so it is exact on its own, and a timestamp filter on top of it
+//! can only drop rows. Applying one on every open is what used to lose a lagging Kafka
+//! partition's late rows at every restart.
 //!
 //! A window closes after the first batch that carries a row newer than the watermark.
 //! Whatever filled the target read a prefix of this source through the same model, so every
@@ -56,8 +57,8 @@
 //! inexact there. A table written from a multi-partition Kafka topic is append-only and still
 //! breaks it, because Kafka orders timestamps only within a partition: a late row at or below
 //! the watermark is dropped with the covered ones (and counted), and [`bounded_rescan_start`]
-//! can start past it. Outside a window the order does not matter at all, and `watermark_uri`
-//! is exact for such sources.
+//! can start past it. Outside a window the order does not matter at all, and a rebuild that
+//! records its source version in `watermark_uri` opens none, which is exact for such sources.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -566,8 +567,10 @@ pub async fn bounded_rescan_start(
     // A commit counts as covered only when even the highest value its statistic could stand
     // for sits below the lowest value the watermark could. A DECIMAL is compared as a double,
     // and two decimals can share one, so `<=` on the doubles alone would take a newer commit
-    // for one already written. Re-reading the boundary commit costs nothing: the dedup
-    // filter drops what the target already holds. See `crate::stats` on decimals.
+    // for one already written. A timestamp maximum may have been truncated to the
+    // millisecond, as Spark writes it, and stand for a row just past the watermark. Re-reading
+    // the boundary commit costs nothing: the dedup filter drops what the target already
+    // holds. See `crate::stats`.
     let slack = Slack::of(watermark.data_type());
     let covered_to = slack.map_or_else(|| mark.clone(), |s| s.below(&mark));
     let Some(head) = source.version() else {

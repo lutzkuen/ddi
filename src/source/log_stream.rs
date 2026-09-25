@@ -154,13 +154,13 @@ pub struct LogStreamBuilder {
     /// See [`Self::with_stop_after`]. The head is still polled and reported as it is; only
     /// what gets read stops here.
     stop_after: Option<Version>,
-    /// The Delta id of the table this stream was opened on.
+    /// The newest version this stream has loaded, and the Delta id the table had there.
     ///
     /// A table dropped and recreated at the same path keeps the path and loses the id, and
     /// nothing else about it says so. Compared whenever this stream loads a snapshot anyway,
     /// so noticing costs nothing. `None` when the table did not have one, and then nothing is
-    /// compared.
-    table_id: Option<String>,
+    /// compared. See [`Self::check_identity`] for why a version is kept with the id.
+    identity: Option<(Version, String)>,
 }
 
 impl LogStreamBuilder {
@@ -182,7 +182,7 @@ impl LogStreamBuilder {
             version_floor: table.version().unwrap_or(0),
             amplification: Arc::new(crate::budget::Amplification::default()),
             stop_after: None,
-            table_id: crate::lookup::table_id(table),
+            identity: table.version().zip(crate::lookup::table_id(table)),
         }
     }
 
@@ -349,9 +349,7 @@ impl LogStreamBuilder {
                 self.version_floor
             )));
         }
-        if let Some(detail) = self.identity_changed(&table) {
-            return Err(self.replaced(detail));
-        }
+        self.check_identity(&table).await?;
         debug!(
             stale_floor = self.version_floor,
             resolved, "source log no longer reaches the floor we held; re-resolved it"
@@ -584,9 +582,7 @@ impl LogStreamBuilder {
         table.load_version(version).await.map_err(Error::Delta)?;
         // Loaded anyway, once per version a batch ends at, so this is where a table recreated
         // at this path and grown past the cursor is noticed — before any of its rows are.
-        if let Some(detail) = self.identity_changed(&table) {
-            return Err(self.replaced(detail));
-        }
+        self.check_identity(&table).await?;
         let snapshot = table.snapshot().map_err(Error::Delta)?;
         let schema = snapshot.schema();
         // Keep the cache small; schema changes are rare and we only ever look backwards
@@ -598,13 +594,45 @@ impl LogStreamBuilder {
         Ok(schema)
     }
 
-    /// How `table` differs from the one this stream was opened on, if it is a different one.
+    /// Fail with [`Error::SourceReplaced`] if `table`, just loaded from this stream's log, is
+    /// not the table this stream has been reading. Otherwise remember it as the newest version
+    /// known to be.
+    ///
+    /// A different id alone does not settle it. A table replaced in place — `CREATE OR
+    /// REPLACE TABLE`, or delta-rs creating in overwrite mode — keeps its log and commits a new
+    /// id into it, so its versions before that commit carry the old id and those after it the
+    /// new one, and a stream opened on either side of it reads both. What a table recreated
+    /// at this path cannot do is give a version this stream has already loaded the id it had
+    /// then. So on a mismatch that version is loaded again, and only when its id has changed
+    /// too is the source a different table. Comparing against the head the stream was opened
+    /// on instead failed every batch that ended before such a commit, and the reopen, which
+    /// starts from `starting_version`, met the same batch again: a pipeline that never moved.
     ///
     /// Only when both ids are known: a table without one says nothing either way.
-    fn identity_changed(&self, table: &DeltaTable) -> Option<String> {
-        let was = self.table_id.as_deref()?;
-        let now = crate::lookup::table_id(table)?;
-        (was != now).then(|| format!("its table id changed from {was} to {now}"))
+    async fn check_identity(&mut self, table: &DeltaTable) -> Result<()> {
+        let (Some(version), Some(now)) = (table.version(), crate::lookup::table_id(table)) else {
+            return Ok(());
+        };
+        let Some((seen_at, was)) = &self.identity else {
+            return Ok(());
+        };
+        if *was != now {
+            let mut then = DeltaTable::new(self.log_store.clone(), without_files());
+            then.load_version(*seen_at).await.map_err(Error::Delta)?;
+            if crate::lookup::table_id(&then).as_deref() != Some(was.as_str()) {
+                return Err(self.replaced(format!("its table id changed from {was} to {now}")));
+            }
+            warn!(
+                source = %self.source_uri,
+                version,
+                table_id = %now,
+                seen_at,
+                was = %was,
+                "the source's log holds a table replaced in place; reading on, as one table"
+            );
+        }
+        self.identity = Some((version, now));
+        Ok(())
     }
 
     fn replaced(&self, detail: String) -> Error {
