@@ -214,6 +214,18 @@ pub enum Error {
     #[error("transform error: {0}")]
     Transform(String),
 
+    /// The transform could not evaluate a value, rather than failing for any other reason.
+    ///
+    /// The one transform failure a single row can cause: a cast that does not parse, a
+    /// division by zero, a date past what the engine represents. Its own variant because it
+    /// alone may be answered by finding that row and setting it aside — see
+    /// [`crate::transform::Transform::apply_isolating`]. A plan that does not type-check, a
+    /// full spill directory or an unreadable file are none of those, and are never blamed on a
+    /// row. Displayed exactly as [`Self::Transform`] is, because to whoever reads the log it
+    /// is still a transform that failed.
+    #[error("transform error: {0}")]
+    Evaluation(String),
+
     /// Something ran out of a resource rather than being wrong.
     ///
     /// Its own variant rather than [`Self::Transform`], because the two want opposite

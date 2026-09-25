@@ -21,8 +21,8 @@ use deltalake::datafusion::sql::parser::{DFParser, Statement};
 use deltalake::datafusion::sql::sqlparser::ast::{
     BinaryOperator, CastKind, DataType as SqlDataType, DuplicateTreatment, ExactNumberInfo, Expr,
     Function, FunctionArg, FunctionArgExpr, FunctionArguments, Join, JoinConstraint, JoinOperator,
-    ObjectName, Query, Select, SetExpr, Statement as SqlStatement, TableFactor, UnaryOperator,
-    Value, VisitMut, VisitorMut,
+    ObjectName, Query, Select, SetExpr, SetOperator, SetQuantifier, Statement as SqlStatement,
+    TableFactor, UnaryOperator, Value, VisitMut, VisitorMut,
 };
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -268,6 +268,87 @@ pub fn normalise_sql_with_lookups(sql: &str, lookups: &BTreeSet<String>) -> Resu
     match validate_sql_with_lookups(sql, lookups)? {
         Statement::Statement(inner) => Ok(inner.to_string()),
         other => Ok(other.to_string()),
+    }
+}
+
+/// The construct that makes a normalised transform depend on more than one row, if any.
+///
+/// Validation refuses whatever aggregates or windows. What it lets through, because a batch
+/// evaluated whole is still correct, are the constructs whose answer for a batch is not the
+/// answers for its rows put together: `LIMIT` and its relatives keep the first rows of
+/// whatever they are given, `UNION`, `INTERSECT` and `EXCEPT` compare rows with each other,
+/// and a subquery over `source` reads the rest of the batch. Evaluated in parts, any of them
+/// would commit a different answer, so [`crate::transform::Transform::apply_isolating`] does
+/// not split a transform this names.
+///
+/// Everything else validation accepts is row-local: `ORDER BY` only moves rows, `UNION ALL`
+/// concatenates them, an `UNNEST` fans one row out, and a lookup join adds an immutable
+/// snapshot to one source row.
+pub(crate) fn cross_row_construct(normalised: &str) -> Option<String> {
+    // Read-only, and imported here because its `visit` would clash with `VisitMut`'s.
+    use deltalake::datafusion::sql::sqlparser::ast::{Visit, Visitor};
+
+    struct V(Option<&'static str>);
+
+    impl Visitor for V {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            self.0 = if query.limit_clause.is_some() || query.fetch.is_some() {
+                Some("LIMIT/OFFSET/FETCH")
+            } else {
+                cross_row_set_expr(&query.body)
+            };
+            match self.0 {
+                Some(_) => ControlFlow::Break(()),
+                None => ControlFlow::Continue(()),
+            }
+        }
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            if matches!(
+                expr,
+                Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }
+            ) {
+                self.0 = Some("a subquery");
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let statement = match DFParser::parse_sql(normalised).map(|mut s| s.pop_front()) {
+        Ok(Some(Statement::Statement(inner))) => inner,
+        _ => return Some("SQL that could not be analysed".into()),
+    };
+    let mut v = V(None);
+    let _ = statement.visit(&mut v);
+    v.0.map(str::to_string)
+}
+
+/// The cross-row construct at the top of one query body. Nested queries are the visitor's.
+fn cross_row_set_expr(body: &SetExpr) -> Option<&'static str> {
+    match body {
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => match op {
+            SetOperator::Union
+                if matches!(
+                    set_quantifier,
+                    SetQuantifier::All | SetQuantifier::AllByName
+                ) =>
+            {
+                cross_row_set_expr(left).or_else(|| cross_row_set_expr(right))
+            }
+            SetOperator::Union => Some("UNION without ALL"),
+            SetOperator::Intersect => Some("INTERSECT"),
+            SetOperator::Except | SetOperator::Minus => Some("EXCEPT"),
+        },
+        SetExpr::Select(select) if select.top.is_some() => Some("TOP"),
+        _ => None,
     }
 }
 
@@ -2118,5 +2199,71 @@ mod tests {
         validate_publish_sql("SELECT DISTINCT country FROM source").unwrap();
         let e = err_of("SELECT DISTINCT country FROM source");
         assert!(e.contains("DISTINCT is not supported"), "got: {e}");
+    }
+
+    /// What [`cross_row_construct`] says about `sql` once it has been normalised, as it is
+    /// by the time a transform runs.
+    fn cross_row(sql: &str) -> Option<String> {
+        let normalised = normalise_sql_with_lookups(sql, &lookup_names())
+            .unwrap_or_else(|e| panic!("{sql} should validate: {e}"));
+        cross_row_construct(&normalised)
+    }
+
+    #[test]
+    fn projection_unnest_union_all_and_lookup_joins_are_row_local() {
+        // Each of these may be evaluated in parts, so one bad row can be set aside.
+        for sql in [
+            "SELECT id, CASE WHEN a > 0 THEN CAST(b AS BIGINT) END AS b FROM source \
+             WHERE status <> 'DRAFT'",
+            "SELECT o.order_id, li.sku FROM source o CROSS JOIN UNNEST(o.line_items) AS t(li)",
+            "SELECT id FROM source WHERE a > 0 UNION ALL SELECT id FROM source WHERE a < 0",
+            "SELECT id FROM source ORDER BY id",
+            "WITH base AS (SELECT id, a FROM source) SELECT id FROM base",
+            "SELECT o.id, fx_rates.exchange_rate FROM source AS o \
+             LEFT JOIN fx_rates ON fx_rates.currency = o.currency",
+            "SELECT transform(xs, x -> x + 1) AS ys, json_object('id': id) AS j FROM source",
+            "SELECT CAST(from_unixtime(a, 'Europe/Amsterdam') AS DATE) AS d FROM source",
+        ] {
+            assert_eq!(cross_row(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn limit_set_operations_and_subqueries_are_cross_row() {
+        // Their answer for a batch is not the answers for its rows put together, so a batch
+        // evaluated in parts would commit a different one.
+        for (sql, construct) in [
+            ("SELECT id FROM source LIMIT 10", "LIMIT"),
+            ("SELECT id FROM source OFFSET 5", "OFFSET"),
+            ("SELECT id FROM source UNION SELECT id FROM source", "UNION"),
+            (
+                "SELECT id FROM source INTERSECT SELECT id FROM source",
+                "INTERSECT",
+            ),
+            (
+                "SELECT id FROM source EXCEPT SELECT id FROM source",
+                "EXCEPT",
+            ),
+            (
+                "SELECT id FROM source WHERE id IN (SELECT id FROM source WHERE a > 0)",
+                "subquery",
+            ),
+            (
+                "SELECT id FROM source s WHERE EXISTS (SELECT 1 FROM source t WHERE t.a > s.a)",
+                "subquery",
+            ),
+            (
+                "SELECT id, (SELECT t.a FROM source t WHERE t.id = s.id) AS a2 FROM source s",
+                "subquery",
+            ),
+            (
+                "SELECT id FROM (SELECT id FROM source LIMIT 10) AS d",
+                "LIMIT",
+            ),
+        ] {
+            let why = cross_row(sql).unwrap_or_else(|| panic!("{sql} is not row-local"));
+            assert!(why.contains(construct), "{sql}: {why}");
+        }
+        assert!(cross_row_construct("not sql at all").is_some());
     }
 }

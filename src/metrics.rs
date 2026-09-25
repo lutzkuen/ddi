@@ -69,6 +69,16 @@ pub struct PipelineMetrics {
     pub restarts: AtomicU64,
     /// Rows the target would not take, written to the data-quality table instead.
     pub rows_rejected: AtomicU64,
+    /// Of those, rows the transform could not evaluate at all. Separate because the cure is
+    /// different: a coercion reject is a value that does not fit the target, and this one is
+    /// a value the model cannot handle — usually worth a change to the model.
+    pub rows_rejected_by_transform: AtomicU64,
+    /// Runs of a transform beyond the first, spent finding the rows it could not evaluate.
+    ///
+    /// The cost of those rows. Each run re-plans the query and re-scans any lookup it joins,
+    /// so a rate that climbs against `ddi_batches_committed_total` is time the pipeline is
+    /// spending on bad rows rather than on new ones.
+    pub transform_reevaluations: AtomicU64,
     /// Batches where *every* row was rejected. Far more likely an upstream schema change
     /// than data going bad, and otherwise invisible: the target just stops growing.
     pub batches_fully_rejected: AtomicU64,
@@ -317,7 +327,7 @@ impl Metrics {
         let map = self.pipelines.read().unwrap();
         let mut s = String::new();
 
-        let metrics: [MetricSpec; 34] = [
+        let metrics: [MetricSpec; 36] = [
             (
                 "ddi_batches_committed_total",
                 "counter",
@@ -421,6 +431,20 @@ impl Metrics {
                 "counter",
                 "Rows the target would not take, written to the data-quality table instead.",
                 |m| m.rows_rejected.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_rows_rejected_by_transform_total",
+                "counter",
+                "Rows the transform could not evaluate, written to the data-quality table \
+                 instead. Also counted in ddi_rows_rejected_total.",
+                |m| m.rows_rejected_by_transform.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_transform_reevaluations_total",
+                "counter",
+                "Runs of a transform beyond the first, spent finding the rows it could not \
+                 evaluate.",
+                |m| m.transform_reevaluations.load(Ordering::Relaxed) as i64,
             ),
             (
                 "ddi_batches_fully_rejected_total",
@@ -772,6 +796,26 @@ mod tests {
             rendered.contains("ddi_publish_configured{pipeline=\"orders\"} 1"),
             "got:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn the_evaluation_series_are_rendered() {
+        let m = Metrics::new();
+        let p = m.pipeline("orders");
+        let rendered = m.render();
+        assert!(
+            rendered.contains("ddi_rows_rejected_by_transform_total{pipeline=\"orders\"} 0"),
+            "got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("ddi_transform_reevaluations_total{pipeline=\"orders\"} 0"),
+            "got:\n{rendered}"
+        );
+        p.rows_rejected_by_transform.fetch_add(3, Ordering::Relaxed);
+        p.transform_reevaluations.fetch_add(40, Ordering::Relaxed);
+        let rendered = m.render();
+        assert!(rendered.contains("ddi_rows_rejected_by_transform_total{pipeline=\"orders\"} 3"));
+        assert!(rendered.contains("ddi_transform_reevaluations_total{pipeline=\"orders\"} 40"));
     }
 
     #[test]

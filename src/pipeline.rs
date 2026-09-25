@@ -37,6 +37,11 @@ pub enum StepOutcome {
         upsert: Option<UpsertStats>,
         /// Rows the target would not take, written to the data-quality table instead.
         rejected: usize,
+        /// Of `rejected`, the rows the transform could not evaluate at all.
+        unevaluable: usize,
+        /// Runs of the transform it took to find them, after the first. Zero for a batch
+        /// the transform evaluated whole.
+        reevaluations: usize,
         /// What the realtime publisher did, when this pipeline has one. `None` otherwise.
         ///
         /// Reported rather than acted on: by the time this is set the commit is durable, so
@@ -52,6 +57,10 @@ pub enum StepOutcome {
         /// Rows the target would not take. Non-zero here is the loud case: the batch had
         /// rows and *none* of them made it, which is usually a schema change upstream.
         rejected: usize,
+        /// Of `rejected`, the rows the transform could not evaluate at all.
+        unevaluable: usize,
+        /// Runs of the transform it took to find them, after the first.
+        reevaluations: usize,
         /// What the realtime publisher did. A zero-row batch still publishes: the offset
         /// moved, and staying silent would make the next message look like one the client
         /// lost.
@@ -274,9 +283,32 @@ impl Pipeline {
             None => info!(
                 pipeline = %cfg.name,
                 dq_uri = %dq_uri,
-                "no data-quality table; a row the target will not take stops this pipeline \
-                 (which then retries). Create the table to have such rows set aside instead."
+                "no data-quality table; a row the target will not take, or the transform \
+                 cannot evaluate, stops this pipeline (which then retries). Create the table \
+                 to have such rows set aside instead."
             ),
+        }
+        // And whether a row the transform cannot evaluate joins them, which depends on the
+        // transform too: only one that is row-local can be evaluated in parts.
+        if dq.is_some() && cfg.transform_sql.is_some() {
+            match (transform.cross_row(), cfg.max_evaluation_rejects_per_batch) {
+                (_, 0) => info!(
+                    pipeline = %cfg.name,
+                    "max_evaluation_rejects_per_batch = 0; a row the transform cannot evaluate \
+                     stops this pipeline"
+                ),
+                (Some(why), _) => info!(
+                    pipeline = %cfg.name,
+                    "a row the transform cannot evaluate stops this pipeline: the transform is \
+                     not row-local ({why}), so it cannot be evaluated in parts to find the row"
+                ),
+                (None, max) => info!(
+                    pipeline = %cfg.name,
+                    max_evaluation_rejects_per_batch = max,
+                    "rows the transform cannot evaluate will be written there too, up to this \
+                     many per batch"
+                ),
+            }
         }
 
         // Same reasoning as the data-quality line above: which mode this pipeline is in is
@@ -387,11 +419,50 @@ impl Pipeline {
         let decoded: u64 = input.iter().map(|b| b.get_array_memory_size() as u64).sum();
         self.amplification.observe(batch.total_bytes(), decoded);
 
-        // 3. Transform. Stateless, row-local, validated at config load.
-        let output = self
+        // 3. Transform. Stateless, row-local, validated at config load. A row it cannot
+        // evaluate is set aside like one the target will not take, and for the same reason:
+        // retrying this source version would only fail on it again. Which is why it needs the
+        // same table, and without one the batch stops here as it always has.
+        let max_rejects = match self.dq {
+            Some(_) => self.cfg.max_evaluation_rejects_per_batch,
+            None => 0,
+        };
+        let isolated = match self
             .transform
-            .apply_with_lookups(input, &lookup_batch.snapshots)
-            .await?;
+            .apply_isolating(input, &lookup_batch.snapshots, max_rejects)
+            .await
+        {
+            Ok(isolated) => isolated,
+            Err(Error::Evaluation(m))
+                if self.dq.is_none() && self.transform.cross_row().is_none() =>
+            {
+                return Err(Error::Evaluation(format!(
+                    "{m}. If a row's value caused this, creating the data-quality table at {} \
+                     sets that row aside instead of stopping this pipeline.",
+                    self.cfg.dq_uri()
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+        let output = isolated.output;
+        let reevaluations = isolated.reevaluations;
+        // Unevaluable rows go first, and in the same list as the coercion rejects below, so
+        // the data-quality table still gets one write, and one commit, per source version.
+        let mut rejects: Vec<Rejected> = Vec::new();
+        let mut unevaluable = 0;
+        if let Some(bad) = isolated.unevaluable {
+            unevaluable = bad.len();
+            warn!(
+                pipeline = %self.cfg.name,
+                through_version = through,
+                rows = unevaluable,
+                reevaluations,
+                reason = bad.reasons.first().map(String::as_str).unwrap_or("unknown"),
+                "the transform could not evaluate these rows; they go to the data-quality \
+                 table and the rest of the batch goes on"
+            );
+            rejects.push(bad);
+        }
 
         // Which target columns the transform actually produced, read *before* coercion —
         // afterwards every target column is present, because that is what coercion does,
@@ -441,7 +512,6 @@ impl Pipeline {
         // the rest goes on. Which of those happens is decided once, at open, by whether
         // there is a table to set them aside in.
         let mut coerced = Vec::with_capacity(output.len());
-        let mut rejects: Vec<Rejected> = Vec::new();
         for b in &output {
             if b.num_rows() == 0 {
                 continue;
@@ -560,6 +630,8 @@ impl Pipeline {
             return Ok(StepOutcome::Skipped {
                 through_version: through,
                 rejected: rejected_rows,
+                unevaluable,
+                reevaluations,
                 published,
             });
         }
@@ -601,6 +673,8 @@ impl Pipeline {
             target_version,
             upsert,
             rejected: rejected_rows,
+            unevaluable,
+            reevaluations,
             published,
         })
     }

@@ -269,7 +269,7 @@ impl SchemaCoercer {
                 rows: filter_record_batch(batch, &drop)
                     .map_err(|e| Error::Schema(format!("could not separate the bad rows: {e}")))?,
                 reasons,
-                columns: offending,
+                columns: offending.into_iter().map(Some).collect(),
             }),
         })
     }
@@ -285,15 +285,18 @@ pub struct Coerced {
     pub bad: Option<Rejected>,
 }
 
-/// Rows the target would not take, and why.
+/// Rows the target would not take, or the transform could not evaluate, and why.
 #[derive(Debug, Clone)]
 pub struct Rejected {
-    /// The rows as they arrived, in the transform's own schema.
+    /// The rows as they arrived where they were refused: the transform's output for a row
+    /// that would not coerce, the source row for one the transform could not evaluate —
+    /// there is no output row to show for that one.
     pub rows: RecordBatch,
     /// Why each row was rejected, one per row of `rows`.
     pub reasons: Vec<String>,
-    /// Which column did it, one per row of `rows`.
-    pub columns: Vec<String>,
+    /// Which column did it, one per row of `rows`. `None` when the transform could not
+    /// evaluate the row, because nothing says which of its expressions failed.
+    pub columns: Vec<Option<String>>,
 }
 
 impl Rejected {
@@ -602,7 +605,7 @@ mod quarantine_tests {
         assert_eq!(ids_of(&out.good), vec![1, 3]);
         let bad = out.bad.expect("row 2 must be set aside");
         assert_eq!(bad.len(), 1);
-        assert_eq!(bad.columns, vec!["amount"]);
+        assert_eq!(bad.columns, vec![Some("amount".to_string())]);
     }
 
     #[test]
@@ -625,7 +628,7 @@ mod quarantine_tests {
             .unwrap();
         assert_eq!(ids_of(&out.good), vec![1]);
         let bad = out.bad.expect("a null id cannot be stored");
-        assert_eq!(bad.columns, vec!["id"]);
+        assert_eq!(bad.columns, vec![Some("id".to_string())]);
         assert!(bad.reasons[0].contains("NOT NULL"), "{:?}", bad.reasons);
     }
 

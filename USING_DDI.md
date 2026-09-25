@@ -288,8 +288,9 @@ pipeline: `ddi_pipeline_up`, `ddi_rows_written_total`, `ddi_source_lag_versions`
 `ddi_last_source_version`, `ddi_errors_total`, and others.
 
 Alert on `ddi_pipeline_up == 0` for a down stream, `ddi_source_lag_versions` for backlog and `increase(ddi_errors_total[5m])` for a
-stopped pipeline. There is no dead-letter queue by design, so any error means a pipeline
-has stopped and needs a human.
+stopped pipeline. A bad row need not stop one: with a data-quality table beside the target
+it is set aside and the rest of the batch commits (§9). Whatever does stop a pipeline is
+retried with backoff, and one that stays down needs a human.
 
 ---
 
@@ -537,9 +538,11 @@ What it does not do, because doing it right needs a committed batch to anchor to
 * **No rebuild suppression.** The ordinary path's dedup (rows a prior rebuild already wrote)
   runs against the target; this reader never touches the target, so a rebuild can make it
   transiently republish rows the commit path goes on to suppress.
-* **No data-quality quarantine.** A row that fails to coerce to the target schema is
-  dropped from that message and logged, not written to the data-quality table — there is no
-  commit for that write to ride along with.
+* **No data-quality quarantine.** A row that fails to coerce to the target schema, or that
+  the model cannot evaluate, costs that message: it is skipped and logged, not written to
+  the data-quality table — there is no commit for that write to ride along with. The next
+  message still names the skipped one's version as its predecessor, so a client sees the gap
+  and reloads.
 * **No lookups**, for now. Refused at config load (`ddi_publish_near_time` on a model whose
   host pipeline has any `lookups` configured is a rejection, the same as the write-mode
   checks above) rather than silently running without them.
@@ -611,6 +614,26 @@ Nothing is nulled and nothing is dropped — `payload` holds the row as it arriv
 see what broke and replay it once the upstream is fixed. A *structural* problem (a column the
 model never selects, a transform that will not plan) is not quarantined: it is the same on
 every batch, so it fails the pipeline instead of leaving a target that quietly never grows.
+
+**So does a row the model itself cannot evaluate** — `CAST(amount AS BIGINT)` meeting
+`'n/a'`, a division by zero, a `date_trunc` past the year 2262. That fails in DataFusion,
+before anything reaches the target, and would fail again on every retry; with the table
+there, `ddi` evaluates the batch in halves until it has the rows that fail on their own,
+sets those aside with `column_name` NULL and the *source* row as `payload`, and commits the
+rest. A clean batch costs nothing; each bad row costs about `2·log2(rows)` extra runs of the
+model, each re-scanning any lookup it joins. `max_evaluation_rejects_per_batch` (default
+100, in `[runtime]` or per pipeline) caps it: one more bad row fails the batch, naming the
+setting, and `0` turns this off. It never applies to a failure no row causes (`1/0`, checked
+against an empty batch first — though behind a `WHERE` it is blamed on every row that
+reaches it, up to the cap), to a model that is not row-local (`LIMIT`, `UNION` without
+`ALL`, `INTERSECT`, `EXCEPT`, a subquery — the startup line says so), or to capacity,
+storage and planning errors. `ddi_rows_rejected_by_transform_total` counts these rows and
+`ddi_transform_reevaluations_total` what finding them cost.
+
+One gap is worth knowing: a replay after a crash skips the data-quality write when that
+batch's rejects are already recorded, so a model that is not deterministic (`now()`,
+`random()`, a `use_current` lookup whose head moved) can reject a different row the second
+time, and that row reaches neither table.
 
 **A pipeline that fails no longer takes the others down.** It backs off and reopens, its
 peers keep running, and `ddi_pipeline_up` says which of them are healthy. That makes metrics
@@ -814,6 +837,9 @@ column in silver, an upsert will not blank it.
 | `upserts into ... which pipeline ... reads as its source` | A downstream pipeline cannot read an upserted target unless it also upserts on the same key with `ignore_changes` |
 | `write_mode = "upsert" needs upsert_key` | Set `ddi_key` on the model (or `upsert_key` in the TOML) |
 | `adds ... and the object store no longer has that file` | The source vacuumed a file this pipeline had not read yet; restore the file, or rebuild the target and resume past that version |
+| `transform_sql failed to execute: ...` | The model could not evaluate a value. With a data-quality table that row is set aside; without one, create the table the message names, or fix the model |
+| `More than ... rows of this batch cannot be evaluated` | Too many rows failed the model to be bad data; most likely the model or the upstream schema changed. Fix that, or raise `max_evaluation_rejects_per_batch` to set them aside anyway |
+| `It fails on an empty batch too` | The model fails whatever the rows are (`1/0`, an unknown `date_trunc` unit); fix the model |
 | `out of capacity: ...` | This pipeline ran out of spill space or memory, or could not create a spill file at all (a missing or read-only `temp_directory`, or no file descriptors left). It stopped alone; nothing was written to its target |
 | `used disk space during the spilling process` | The process's spill budget is full — raise `[runtime] max_temp_directory_size`, or run fewer merges and preflights at once |
 | `is zero bytes` | A spill cap of `0` is refused: "unbounded" and "never spill" are both plausible readings and they point in opposite directions |

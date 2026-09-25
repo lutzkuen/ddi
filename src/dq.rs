@@ -14,6 +14,11 @@
 //! silently dropped. Every rejected row is in a table you can query, with the reason
 //! attached. See [`crate::schema::SchemaCoercer::coerce_quarantining`].
 //!
+//! A row the transform itself cannot evaluate — a cast that does not parse, a date past what
+//! the engine represents — comes here too, found by
+//! [`crate::transform::Transform::apply_isolating`]. It has no output row to show, so its
+//! payload is the source row and its `column_name` is NULL.
+//!
 //! # Where it lives
 //!
 //! `<target_uri>__ddi_dq`, unless `dq_uri` says otherwise. Deriving it means a fleet of
@@ -37,6 +42,13 @@
 //! under `<app_id>.dq`, holding the source version it covers. Before writing, that version
 //! is read back; if the rejects for this batch are already there, the write is skipped. It
 //! is the same trick the pipeline uses for its own offset, pointed at a second table.
+//!
+//! That skip is keyed on the version alone, so "never lose one" holds only while a replay
+//! rejects the same rows the first attempt did — which it does for a deterministic
+//! transform over pinned lookups. A model that reads `now()` or `random()` into a value that
+//! can fail, or a lookup running on `use_current` whose head moved in between, can reject a
+//! row on the replay that the first attempt did not, and that row then reaches neither
+//! table.
 
 use deltalake::arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray};
 use deltalake::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -77,9 +89,10 @@ pub fn app_id_for(app_id: &str) -> String {
 ///   pipeline        VARCHAR,
 ///   source_version  BIGINT,   -- the batch's last source version, not the row's:
 ///                             -- a batch may span several commits
-///   column_name     VARCHAR,
+///   column_name     VARCHAR,  -- NULL when the transform could not evaluate the row
 ///   reason          VARCHAR,
-///   payload         VARCHAR,
+///   payload         VARCHAR,  -- the row as JSON: the transform's output, or the source
+///                             -- row when the transform could not evaluate it
 ///   _timestamp      TIMESTAMP(6)
 /// ) WITH (location = '.../silver/orders__ddi_dq')
 /// ```

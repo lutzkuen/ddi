@@ -34,6 +34,12 @@ fn default_max_output_rows() -> usize {
     // are bounded on estimated *output* rows, not just input bytes. Plan §3.
     5_000_000
 }
+fn default_max_evaluation_rejects() -> usize {
+    // Enough for a burst of bad values; few enough that a batch where every row fails — a
+    // model or upstream-schema problem, not bad data — is given up on after a couple of
+    // hundred runs rather than evaluated one row at a time.
+    100
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +58,23 @@ pub struct Defaults {
     pub max_files_per_batch: usize,
     #[serde(default = "default_max_output_rows")]
     pub max_output_rows_per_batch: usize,
+
+    /// How many rows of one batch the transform may fail to evaluate and still commit the
+    /// rest, with those rows set aside in the data-quality table.
+    ///
+    /// A value the transform cannot evaluate — a string that will not cast, a division by
+    /// zero, a date past what the engine represents — fails the whole batch, and without
+    /// this every retry of that source version would fail the same way. With a data-quality
+    /// table, the batch is instead evaluated in halves until the rows that fail on their own
+    /// are found: nothing extra while a batch evaluates, and about `2·log2(rows)` runs of the
+    /// transform per bad row when one does not, each scanning the lookups the model joins.
+    /// One more than this many fails the batch as before, because that many is far more
+    /// likely a model or upstream-schema problem than bad data.
+    ///
+    /// `0` turns it off: a row the transform cannot evaluate stops the pipeline, as one does
+    /// wherever there is no data-quality table. See [`crate::transform::Transform::apply_isolating`].
+    #[serde(default = "default_max_evaluation_rejects")]
+    pub max_evaluation_rejects_per_batch: usize,
 
     /// How much memory the whole process may use, divided across the pipelines in it.
     ///
@@ -157,6 +180,7 @@ impl Default for Defaults {
             target_file_size: default_target_file_size(),
             max_files_per_batch: default_max_files(),
             max_output_rows_per_batch: default_max_output_rows(),
+            max_evaluation_rejects_per_batch: default_max_evaluation_rejects(),
             max_memory: None,
             max_concurrent_upsert_merges: None,
             max_concurrent_upsert_preflights: None,
@@ -311,6 +335,11 @@ pub struct PipelineConfig {
     /// failing the pipeline (which now retries rather than giving up). See [`crate::dq`].
     #[serde(default)]
     pub dq_uri: Option<String>,
+
+    /// Overrides `[runtime] max_evaluation_rejects_per_batch` for this pipeline. See
+    /// [`Defaults::max_evaluation_rejects_per_batch`].
+    #[serde(default)]
+    pub max_evaluation_rejects_per_batch: Option<usize>,
 
     /// The furthest back the merge window is allowed to reach — `"48h"`, `"90m"`, or a
     /// bare number for a numeric sequence column.
@@ -479,6 +508,10 @@ pub struct ResolvedPipeline {
     /// An explicit data-quality table, when the derived one will not do. Kept unresolved
     /// so that a target which moves takes its rejects with it — see [`Self::dq_uri`].
     pub dq_uri: Option<String>,
+    /// Rows of one batch the transform may fail to evaluate and still commit the rest, when
+    /// there is a data-quality table to set them aside in. `0` turns that off. See
+    /// [`Defaults::max_evaluation_rejects_per_batch`].
+    pub max_evaluation_rejects_per_batch: usize,
     /// How to reach object storage. The one thing a dbt project cannot tell us.
     pub storage: crate::storage::Storage,
     /// Fully qualified catalog name of the source, when there is a catalog to ask.
@@ -1687,6 +1720,9 @@ impl Config {
             upsert_grain_check: p.upsert_grain_check,
             stage_for: p.stage_for.clone(),
             dq_uri: p.dq_uri.clone(),
+            max_evaluation_rejects_per_batch: p
+                .max_evaluation_rejects_per_batch
+                .unwrap_or(d.max_evaluation_rejects_per_batch),
             storage: crate::storage::Storage::new(self.storage.options.clone()),
             source_relation: p.source_relation.clone(),
             target_relation: p.target_relation.clone(),
@@ -1971,6 +2007,28 @@ target_uri = "/tmp/d"
             r[1].max_bytes_per_batch,
             64 * 1000 * 1000,
             "falls back to defaults"
+        );
+    }
+
+    #[test]
+    fn max_evaluation_rejects_per_batch_has_a_default_a_runtime_value_and_a_pipeline_override() {
+        let resolved = |toml: &str| Config::from_toml_str(toml).unwrap().resolve().unwrap();
+        assert_eq!(resolved(BASE)[0].max_evaluation_rejects_per_batch, 100);
+        assert_eq!(
+            resolved(&format!(
+                "[runtime]\nmax_evaluation_rejects_per_batch = 7\n{BASE}"
+            ))[0]
+                .max_evaluation_rejects_per_batch,
+            7
+        );
+        assert_eq!(
+            resolved(&format!(
+                "[runtime]\nmax_evaluation_rejects_per_batch = 7\n{BASE}\
+                 max_evaluation_rejects_per_batch = 0\n"
+            ))[0]
+                .max_evaluation_rejects_per_batch,
+            0,
+            "the pipeline's own value wins, including the one that turns it off"
         );
     }
 

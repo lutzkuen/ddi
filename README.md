@@ -316,7 +316,8 @@ Instants agree with Trino. Wall clocks can differ:
 - `date_trunc` to the hour or coarser fails on a value past 2262 where Trino truncates it.
   DataFusion truncates in nanoseconds, and beyond their range it would return a wrong date
   without a word, so `ddi` replaces its `date_trunc` with one that refuses such a value —
-  which also covers a Delta `timestamp` column holding one;
+  which also covers a Delta `timestamp` column holding one. With a data-quality table that
+  row is [set aside](#a-row-the-transform-cannot-evaluate) and the rest of the batch commits;
 - the one-argument form is UTC whatever a Trino session's zone is.
 
 `CAST(from_unixtime(..) AS DATE)`, or an explicit `'UTC'`, sidesteps all of them.
@@ -639,9 +640,11 @@ CREATE TABLE silver.orders__ddi_dq (
   app_id          VARCHAR,
   pipeline        VARCHAR,
   source_version  BIGINT,   -- the batch's last source version, not the row's
-  column_name     VARCHAR,  -- the column that rejected it
+  column_name     VARCHAR,  -- the column that rejected it; NULL when the transform
+                            -- could not evaluate the row
   reason          VARCHAR,
-  payload         VARCHAR,  -- the row as it arrived, as JSON
+  payload         VARCHAR,  -- the row as it arrived, as JSON: the source row when the
+                            -- transform could not evaluate it
   _timestamp      TIMESTAMP(6)
 ) WITH (location = 'abfss://.../silver/orders__ddi_dq')
 ```
@@ -658,8 +661,9 @@ WHERE _timestamp > now() - interval '1' day GROUP BY reason
 Two things are deliberately *not* quarantined:
 
 - **A structural mismatch** — a target column the transform does not produce at all, a
-  transform that will not plan. It is identical on every batch and belongs to no row, so
-  setting rows aside would leave a target that silently never grows. It fails the pipeline.
+  transform that will not plan, or one that fails with no row to blame. It is identical on
+  every batch and belongs to no row, so setting rows aside would leave a target that silently
+  never grows. It fails the pipeline.
 - **A bad value inside a `struct`, `list` or `map`.** Arrow pushes a lenient cast down into
   the *children* and keeps the parent's null buffer, so an unconvertible element becomes a
   `NULL` inside a row that still looks valid from the outside — undetectable per row, and it
@@ -671,6 +675,59 @@ share one Delta commit, so the ordering is the guarantee: a crash in between rep
 batch, which can duplicate a reject but can never lose one. Even that is usually avoided —
 the data-quality commit carries a `txn` action of its own under `<app_id>.dq`, and a replay
 of the same batch finds it and skips.
+
+That skip is keyed on the batch alone, so "never lose one" holds while a replay rejects the
+same rows the first attempt did — which a deterministic model over pinned lookups always
+does. A model that feeds `now()` or `random()` into a value that can fail, or a lookup on
+`use_current` whose head moved in between, can reject a different row the second time, and
+that row then reaches neither table.
+
+### A row the transform cannot evaluate
+
+The cast can also be the model's: `CAST(amount AS BIGINT)` in `transform_sql` meets `"n/a"`
+inside DataFusion, before any row reaches the target. So does a division by zero, a
+`from_unixtime` of `NaN`, or a [`date_trunc` past 2262](#epoch-seconds-from_unixtime). One
+such value fails the whole batch, and retrying that source version fails it the same way —
+so with a data-quality table, `ddi` finds the row instead. The batch is evaluated in halves,
+left before right, until the rows that fail on their own are found; those go to the
+data-quality table with `column_name` NULL, the source row as `payload` (there is no output
+row to show) and the error as `reason`, and the rest of the batch commits in its original
+order:
+
+```sql
+SELECT reason, payload FROM silver.orders__ddi_dq WHERE column_name IS NULL
+```
+
+A batch that evaluates costs nothing extra, which is nearly every batch. One that does not
+costs about `2·log2(rows)` runs of the transform per bad row, and each run plans the query
+again and re-scans any lookup the model joins. That cost is what
+`max_evaluation_rejects_per_batch` bounds — 100 by default, in `[runtime]` or on a
+pipeline. One more bad row than that fails the batch as before, naming the setting, because
+that many is far more likely a model or an upstream type change than bad data. `0` turns
+isolation off.
+
+Some failures are never blamed on a row, and stop the pipeline as they always did:
+
+- **A failure that needs no row.** `1/0` in the projection, or a `date_trunc` granularity
+  that does not exist, fails on an empty batch too, and `ddi` tries one before searching.
+  Behind a `WHERE` that check sees nothing — the filter passes no rows on — so there such a
+  failure is attributed to every row that reaches it: the whole batch goes to the
+  data-quality table and counts in `ddi_batches_fully_rejected_total` while it is within the
+  limit, and fails naming the setting beyond it. The same stance coercion takes on an
+  upstream type change.
+- **A transform that is not row-local.** Evaluated in parts it would commit a different
+  answer, so `LIMIT`/`OFFSET`/`FETCH`/`TOP`, `UNION` without `ALL`, `INTERSECT`, `EXCEPT`
+  and subqueries turn isolation off for that pipeline, and its startup line says which.
+- **Anything about the machine or the query**: running out of memory or spill, a spill file
+  that cannot be created, storage and I/O errors, a query that does not plan — including a
+  constant the optimiser cannot fold, such as `CAST('x' AS BIGINT)`.
+
+A batch that fails as a whole while every part of it evaluates has no row to blame either;
+its parts' output is committed, with a warning, because under row-locality it is the batch's
+answer.
+
+In an upsert, a newer delivery the transform cannot evaluate is set aside like one that will
+not coerce: the row already stored, or an older delivery in the same batch, stands.
 
 ### A stream that cannot make progress
 
@@ -700,13 +757,18 @@ Because the process no longer exits when a stream dies, metrics stop being optio
 | `ddi_bootstrap_unreachable` | 1 while a pipeline that has never committed cannot start, because its `starting_version` has aged out of the source's log. Recoverable by setting a version the log still holds. |
 | `ddi_resume_unreachable` | 1 while a pipeline that *has* committed cannot read the version it must resume at. Not recoverable by configuration. |
 | `ddi_rows_rejected_total` | Rows sent to the data-quality table. |
+| `ddi_rows_rejected_by_transform_total` | Of those, rows the transform could not evaluate. |
+| `ddi_transform_reevaluations_total` | Extra runs of the transform spent finding them. |
 | `ddi_batches_fully_rejected_total` | Batches where *every* row was rejected. |
 
 Alert on `ddi_pipeline_up == 0 for 10m`, on `ddi_source_file_vacuumed == 1`, on
 `ddi_bootstrap_unreachable == 1` and `ddi_resume_unreachable == 1`, and on
 `increase(ddi_batches_fully_rejected_total[15m]) > 0`. The last one matters more than it
-looks: there is no bad-row threshold, so an upstream type change quarantines the whole batch
-and the target simply stops growing — no error, no lag, nothing else to notice it by.
+looks: there is no threshold on rows the target will not take, so an upstream type change
+quarantines the whole batch and the target simply stops growing — no error, no lag, nothing
+else to notice it by. `increase(ddi_rows_rejected_by_transform_total[1h]) > 0` is worth a
+ticket rather than a page: a value the model cannot handle usually wants a change to the
+model.
 `ddi_errors_total` is now a *rate* of retried attempts, not a page: a pipeline that lost one
 commit race and recovered a second later increments it.
 
@@ -1654,6 +1716,8 @@ correctness still holds (the `txn` action prevents double-apply) — it just was
 | `ddi_spill_stranded_bytes_total` | counter | Spill bytes abandoned because DataFusion left them charged after a capacity failure. Above zero means this process hit its cap and recovered. |
 | `ddi_pipeline_restarts_total` | counter | Reopens after a failure. |
 | `ddi_rows_rejected_total` | counter | Rows written to the data-quality table. |
+| `ddi_rows_rejected_by_transform_total` | counter | Of those, rows the transform could not evaluate. Also in `ddi_rows_rejected_total`. |
+| `ddi_transform_reevaluations_total` | counter | Runs of a transform beyond the first, spent finding the rows it could not evaluate. Each re-plans the query and re-scans the lookups it joins. |
 | `ddi_batches_fully_rejected_total` | counter | Batches where every row was rejected. |
 
 Upsert pipelines export five more. All stay at zero in append mode, which is the honest

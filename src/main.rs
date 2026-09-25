@@ -956,6 +956,8 @@ async fn attempt(
                 rows,
                 upsert,
                 rejected,
+                unevaluable,
+                reevaluations,
                 published,
                 ..
             }) => {
@@ -966,6 +968,10 @@ async fn attempt(
                 m.mark_progress();
                 m.rows_rejected
                     .fetch_add(rejected as u64, Ordering::Relaxed);
+                m.rows_rejected_by_transform
+                    .fetch_add(unevaluable as u64, Ordering::Relaxed);
+                m.transform_reevaluations
+                    .fetch_add(reevaluations as u64, Ordering::Relaxed);
                 if rejected > 0 && rows == 0 {
                     m.batches_fully_rejected.fetch_add(1, Ordering::Relaxed);
                 }
@@ -999,6 +1005,8 @@ async fn attempt(
             Ok(StepOutcome::Skipped {
                 through_version,
                 rejected,
+                unevaluable,
+                reevaluations,
                 published,
                 ..
             }) => {
@@ -1006,6 +1014,10 @@ async fn attempt(
                 m.mark_progress();
                 m.rows_rejected
                     .fetch_add(rejected as u64, Ordering::Relaxed);
+                m.rows_rejected_by_transform
+                    .fetch_add(unevaluable as u64, Ordering::Relaxed);
+                m.transform_reevaluations
+                    .fetch_add(reevaluations as u64, Ordering::Relaxed);
                 if rejected > 0 {
                     // Nothing reached the target and everything was rejected — the shape an
                     // upstream type change takes. Counted separately because the target
