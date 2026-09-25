@@ -814,7 +814,7 @@ column in silver, an upsert will not blank it.
 | `upserts into ... which pipeline ... reads as its source` | A downstream pipeline cannot read an upserted target unless it also upserts on the same key with `ignore_changes` |
 | `write_mode = "upsert" needs upsert_key` | Set `ddi_key` on the model (or `upsert_key` in the TOML) |
 | `adds ... and the object store no longer has that file` | The source vacuumed a file this pipeline had not read yet; restore the file, or rebuild the target and resume past that version |
-| `out of capacity: ...` | This pipeline ran out of spill space or memory. It stopped alone; nothing was written to its target |
+| `out of capacity: ...` | This pipeline ran out of spill space or memory, or could not create a spill file at all (a missing or read-only `temp_directory`, or no file descriptors left). It stopped alone; nothing was written to its target |
 | `used disk space during the spilling process` | The process's spill budget is full — raise `[runtime] max_temp_directory_size`, or run fewer merges and preflights at once |
 | `is zero bytes` | A spill cap of `0` is refused: "unbounded" and "never spill" are both plausible readings and they point in opposite directions |
 | `is not usable` | `[runtime] temp_directory` cannot be created or written to, checked with a real probe file at startup — in Kubernetes this is usually an unmounted volume |

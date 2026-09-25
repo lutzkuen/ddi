@@ -1269,7 +1269,10 @@ temporary directory, logging what was abandoned and counting it in
 Watch `ddi_spill_bytes` against `ddi_spill_limit_bytes`; a ratio near one means the next merge
 fails. `ddi_capacity_exhausted` says which pipeline it failed for — and a capacity failure
 stops that pipeline only, waits the full backoff rather than retrying every second, and leaves
-its target untouched.
+its target untouched. A spill file that cannot be created at all — the directory went away or
+read-only, or the process ran out of file descriptors — is a capacity failure too, and says
+so: DataFusion reports it as an ordinary execution error, which would otherwise have been
+retried every second like a query that is wrong.
 
 ## The startup uniqueness check
 
