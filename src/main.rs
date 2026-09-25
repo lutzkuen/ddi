@@ -727,11 +727,12 @@ impl Drop for Up {
 const RETRY_MIN: Duration = Duration::from_secs(1);
 /// The ceiling on that doubling.
 ///
-/// Generous on purpose. Reopening a pipeline is not free — it rereads the target to find its
-/// watermark — so a stream stuck on something only a human can fix must not spend the whole
-/// interval between fixes rescanning. Five minutes keeps that affordable while still
-/// recovering on its own within one poll of somebody repairing the cause. Nothing is lost by
-/// waiting, because the backoff resets the moment a step succeeds.
+/// Generous on purpose. Reopening a pipeline is not free — it walks the target's log, and
+/// inside a coverage window rereads the target to find its watermark — so a stream stuck on
+/// something only a human can fix must not spend the whole interval between fixes
+/// rescanning. Five minutes keeps that affordable while still recovering on its own within
+/// one poll of somebody repairing the cause. Nothing is lost by waiting, because the backoff
+/// resets the moment a step succeeds.
 const RETRY_MAX: Duration = Duration::from_secs(300);
 
 /// One tokio task per pipeline, supervised. No coordination between them: masterless,
@@ -819,11 +820,12 @@ async fn drive(
                 // The same argument for the two halves of a source log that no longer reaches
                 // the version this pipeline needs. Neither heals by itself — one waits for a
                 // value an operator sets, the other for a rebuild they perform — and both are
-                // raised while *opening*, which rereads the target to find its watermark. At
-                // one second that is a rescan of the target every second, for days, per stuck
-                // pipeline, for nothing. The gauges are what make the wait safe to take:
-                // `ddi_bootstrap_unreachable` and `ddi_resume_unreachable` say a human is
-                // needed, so nobody is relying on the retry to notice.
+                // raised while *opening*, which walks the target's log and, inside a coverage
+                // window, rereads the target to find its watermark. At one second that is a
+                // rescan every second, for days, per stuck pipeline, for nothing. The gauges
+                // are what make the wait safe to take: `ddi_bootstrap_unreachable` and
+                // `ddi_resume_unreachable` say a human is needed, so nobody is relying on the
+                // retry to notice.
                 if matches!(
                     e,
                     delta_delta_ingest::Error::Capacity(_)
@@ -865,10 +867,10 @@ async fn sleep_or_cancel(total: Duration, token: &CancellationToken) {
 /// Spread a retry by up to ±25%.
 ///
 /// Three hundred pipelines knocked over by one object-store outage must not come back in
-/// lockstep and cause the next one — each reopen rereads a target. Derived from the name
-/// *and the attempt number* rather than an RNG: no dependency, reproducible, and varying per
-/// attempt so two pipelines that happen to hash alike drift apart instead of staying
-/// phase-locked forever.
+/// lockstep and cause the next one — each reopen reads the target's log, and some reread the
+/// target. Derived from the name *and the attempt number* rather than an RNG: no dependency,
+/// reproducible, and varying per attempt so two pipelines that happen to hash alike drift
+/// apart instead of staying phase-locked forever.
 fn jitter(d: Duration, name: &str, attempt: u32) -> Duration {
     let seed = name.bytes().fold(attempt as u64, |a, b| {
         a.wrapping_mul(31).wrapping_add(b as u64)
@@ -900,6 +902,8 @@ async fn attempt(
     let mut pipeline = Pipeline::open(current.clone()).await?;
     m.grain_check_passes
         .store(pipeline.grain_check_passes() as u64, Ordering::Relaxed);
+    m.coverage_cutoff_active
+        .store(pipeline.coverage().is_some() as i64, Ordering::Relaxed);
     // Cleared on the way out however this returns — including an unwind — so a panicked
     // task cannot leave the fleet's health gauge claiming it is fine.
     let _up = Up::held(m);
@@ -914,7 +918,8 @@ async fn attempt(
         // storage — the old table just goes quiet — so the only way to notice is to keep
         // asking. Reopening is safe: a different location is a different table, and the
         // pipeline's own identity check restarts it with the dedup filter suppressing
-        // whatever the target already holds.
+        // whatever the target already holds, until the relocated table delivers a row newer
+        // than the target's watermark.
         let fresh = locator.refresh(&current).await;
         if locate::moved(&current, &fresh) {
             warn!(
@@ -927,6 +932,8 @@ async fn attempt(
             pipeline = Pipeline::open(current.clone()).await?;
             m.grain_check_passes
                 .store(pipeline.grain_check_passes() as u64, Ordering::Relaxed);
+            m.coverage_cutoff_active
+                .store(pipeline.coverage().is_some() as i64, Ordering::Relaxed);
         }
 
         let outcome = pipeline.step().await;
@@ -939,6 +946,9 @@ async fn attempt(
         }
         m.cursor_version
             .store(pipeline.cursor().version as i64, Ordering::Relaxed);
+        // Every step, like the cursor: a window can close on a step that commits nothing.
+        m.coverage_cutoff_active
+            .store(pipeline.coverage().is_some() as i64, Ordering::Relaxed);
 
         match outcome {
             Ok(StepOutcome::CaughtUp) => {
@@ -958,6 +968,7 @@ async fn attempt(
                 rejected,
                 unevaluable,
                 reevaluations,
+                covered,
                 published,
                 ..
             }) => {
@@ -972,6 +983,8 @@ async fn attempt(
                     .fetch_add(unevaluable as u64, Ordering::Relaxed);
                 m.transform_reevaluations
                     .fetch_add(reevaluations as u64, Ordering::Relaxed);
+                m.rows_skipped_as_covered
+                    .fetch_add(covered as u64, Ordering::Relaxed);
                 if rejected > 0 && rows == 0 {
                     m.batches_fully_rejected.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1007,6 +1020,7 @@ async fn attempt(
                 rejected,
                 unevaluable,
                 reevaluations,
+                covered,
                 published,
                 ..
             }) => {
@@ -1018,6 +1032,8 @@ async fn attempt(
                     .fetch_add(unevaluable as u64, Ordering::Relaxed);
                 m.transform_reevaluations
                     .fetch_add(reevaluations as u64, Ordering::Relaxed);
+                m.rows_skipped_as_covered
+                    .fetch_add(covered as u64, Ordering::Relaxed);
                 if rejected > 0 {
                     // Nothing reached the target and everything was rejected — the shape an
                     // upstream type change takes. Counted separately because the target

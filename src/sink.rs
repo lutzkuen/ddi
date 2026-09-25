@@ -19,6 +19,7 @@ use deltalake::protocol::SaveMode;
 use deltalake::DeltaTable;
 use tracing::debug;
 
+use crate::dedup::RecordedCutoff;
 use crate::error::{Error, Result};
 use crate::lookup::LookupSnapshot;
 use crate::upsert::MergePlan;
@@ -32,6 +33,11 @@ pub struct Sink {
     source_table_id: Option<String>,
     /// The exact lookup snapshots that enriched the source batch currently being committed.
     lookup_snapshots: Vec<LookupCommit>,
+    /// The coverage window the batch being committed was filtered in, while that window stays
+    /// open past it. Recorded so that a reopen part-way through a window carries on filtering
+    /// where this commit left off, rather than re-emitting what the target already holds.
+    /// See [`crate::dedup`].
+    cutoff: Option<RecordedCutoff>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +56,7 @@ impl Sink {
             target_file_size: NonZeroU64::new(target_file_size),
             source_table_id: None,
             lookup_snapshots: Vec::new(),
+            cutoff: None,
         }
     }
 
@@ -74,6 +81,12 @@ impl Sink {
                 used_current: snapshot.used_current,
             })
             .collect();
+    }
+
+    /// Replace the coverage window recorded with the next target commit. `None` records none,
+    /// which is what the commit that closes a window, and every commit outside one, carries.
+    pub fn set_cutoff(&mut self, cutoff: Option<RecordedCutoff>) {
+        self.cutoff = cutoff;
     }
 
     /// The commit properties every write of ours carries, whatever its shape.
@@ -115,6 +128,12 @@ impl Sink {
             if lookup.used_current {
                 metadata.push((format!("{prefix}.current"), serde_json::Value::from(true)));
             }
+        }
+        // On every shape of commit, the offset-only ones included: an empty append after a
+        // no-op merge moves the offset exactly as far as a merge would have, so a reopen after
+        // it must find the window still open just the same.
+        if let Some(cutoff) = &self.cutoff {
+            metadata.extend(cutoff.to_commit_metadata());
         }
 
         CommitProperties::default()

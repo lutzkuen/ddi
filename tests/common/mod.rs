@@ -77,6 +77,16 @@ pub async fn append(path: &str, ids: &[i64]) -> DeltaTable {
         .unwrap()
 }
 
+/// Replace the table's contents with one commit containing `ids`, as a batch job's full
+/// refresh does.
+pub async fn overwrite(path: &str, ids: &[i64]) -> DeltaTable {
+    let t = open(path).await;
+    t.write(vec![batch(ids)])
+        .with_save_mode(SaveMode::Overwrite)
+        .await
+        .unwrap()
+}
+
 /// Read every `id` currently in the table.
 pub async fn read_ids(path: &str) -> Vec<i64> {
     let t = open(path).await;

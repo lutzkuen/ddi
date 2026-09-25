@@ -11,8 +11,9 @@
 //! Moving is safe to act on because of work already in place: a different location means
 //! a different table, its Delta id will not match the one recorded in the target's own
 //! commit history, and the pipeline restarts from the beginning with the `dedup_timestamp`
-//! filter suppressing everything the target already holds. The move case reduces to the
-//! drop-and-recreate case.
+//! filter suppressing everything the target already holds — until the moved table delivers
+//! a row newer than the target's watermark. The move case reduces to the drop-and-recreate
+//! case.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

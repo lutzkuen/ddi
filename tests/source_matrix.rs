@@ -35,6 +35,41 @@ async fn pure_append_advances_the_cursor_monotonically_with_no_gaps_or_duplicate
 }
 
 #[tokio::test]
+async fn a_stream_held_at_a_version_reads_no_further_until_released() {
+    let f = Fixture::new().await;
+    append(&f.source, &[1]).await;
+    append(&f.source, &[2]).await;
+    append(&f.source, &[3]).await;
+
+    let table = open(&f.source).await;
+    let mut s = LogStreamBuilder::new(&table)
+        .with_starting_version(0)
+        .with_stop_after(Some(2));
+    let mut through = Vec::new();
+    while let Some(b) = s.next_batch().await.unwrap() {
+        through.push(b.through_version);
+    }
+    assert!(
+        through.iter().all(|v| *v <= 2) && through.last() == Some(&2),
+        "every batch ends at or before the stop, and one ends on it: {through:?}"
+    );
+    assert_eq!(
+        s.last_known_head(),
+        Some(3),
+        "while the head is still reported as it is"
+    );
+
+    s.release_stop();
+    let b = s
+        .next_batch()
+        .await
+        .unwrap()
+        .expect("version 3, once released");
+    assert_eq!(b.through_version, 3);
+    assert!(s.next_batch().await.unwrap().is_none(), "caught up");
+}
+
+#[tokio::test]
 async fn resuming_from_a_persisted_cursor_matches_an_uninterrupted_run() {
     let f = Fixture::new().await;
     for i in 0..5 {

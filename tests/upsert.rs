@@ -278,7 +278,9 @@ async fn a_redelivery_of_older_data_does_not_roll_the_target_back() {
     lake.arrive(&[ev(1, "shipped", 30)]).await;
     lake.stream().await;
 
-    // The same key arrives again bearing an older timestamp.
+    // The same key arrives again bearing an older timestamp. An ordinary reopen has no
+    // coverage to infer and filters nothing, so this reaches the merge — and it is the merge's
+    // newer-than-stored rule that refuses it.
     lake.arrive(&[ev(1, "placed", 10)]).await;
     lake.stream().await;
 
@@ -310,10 +312,11 @@ async fn a_merge_that_changes_nothing_still_advances_the_offset() {
     // action goes down with it — so without the empty-append fallback in `Sink::upsert` the
     // pipeline re-reads the same source commits forever.
     //
-    // Getting there takes a little care, because `Dedup` catches the easy version: it is
-    // read once when the pipeline opens, so a row below *that* watermark never reaches the
-    // merge at all. The row here is above the open-time watermark and still older than what
-    // the first step stored, which is precisely the gap between the two mechanisms.
+    // Getting there takes a little care, because `Dedup` catches the easy version: the seeded
+    // silver makes this open infer its coverage, so a row at or below the seed's watermark
+    // never reaches the merge at all. The first delivery is above it, which closes that
+    // window; the second is older than what the first stored, and reaches the merge as a
+    // no-op — precisely the gap between the two mechanisms.
     let lake = Lake::new().await;
     lake.seed_silver(&[(1, "placed", 10, None)], SaveMode::Append)
         .await;

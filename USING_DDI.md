@@ -285,7 +285,10 @@ its first batch.
 
 `ddi run --metrics-addr 0.0.0.0:9100` serves Prometheus text on `/metrics`, labelled by
 pipeline: `ddi_pipeline_up`, `ddi_rows_written_total`, `ddi_source_lag_versions`,
-`ddi_last_source_version`, `ddi_errors_total`, and others.
+`ddi_last_source_version`, `ddi_errors_total`, and others. Two of them concern §7:
+`ddi_coverage_cutoff_active` is 1 while a pipeline is dropping rows because the target is
+taken to hold them already, and `ddi_rows_skipped_as_covered_total` counts the rows it
+dropped. Outside a rebuild handover both stay at zero.
 
 Alert on `ddi_pipeline_up == 0` for a down stream, `ddi_source_lag_versions` for backlog and `increase(ddi_errors_total[5m])` for a
 stopped pipeline. A bad row need not stop one: with a data-quality table beside the target
@@ -321,23 +324,42 @@ schedule stops mattering, because coverage became a property of the row.
 `ddi_key` resolves rows sharing *exactly* the boundary instant, which a plain `>` would
 drop and a `>=` would duplicate. Set it.
 
-**The one requirement:** the timestamp must never go backwards relative to arrival order.
-A late row bearing an older timestamp is indistinguishable from one the rebuild already
-wrote, and will be dropped. That suits an append-only stream; it does not suit a table
-that gets backfilled.
+This cut-off is used only while `ddi` has to work out from the table's data what it already
+holds: after a rebuild, on a first start against a table that already has rows, after the
+source was dropped and recreated, and on a restart part-way through one of those. It lasts
+until a row newer than the table's `max(_timestamp)` arrives, or — after a rebuild or on a
+first start — until the source head it started against has been read, and a restart in the
+middle carries on with it. An ordinary restart, deploy or crash resumes from `ddi`'s own
+offset, which is exact on its own, and skips nothing by timestamp. Watch
+`ddi_coverage_cutoff_active` and `ddi_rows_skipped_as_covered_total` (§6) to see it at work.
+
+**The one requirement**, and only while that cut-off is in use: the timestamp must never go
+backwards relative to arrival order. A late row bearing an older timestamp is
+indistinguishable from one the rebuild already wrote, and will be dropped. Append-only is not
+enough: a table written from a multi-partition Kafka topic (kafka-delta-ingest and similar)
+orders timestamps only within each partition, so a lagging partition's rows routinely land
+after newer ones from another. For such a source, have the rebuild record the source version
+it read in a watermark table and point `watermark_uri` at it instead — that is exact whatever
+order rows arrive in; the README's
+[handover section](README.md#the-handover-and-why-it-needs-a-watermark) shows the one
+`INSERT` it takes. A watermark per Kafka partition would be exact too; `ddi` does not offer
+one yet.
 
 ### What else can happen to a shared table
 
 | Event | What `ddi` does |
 |---|---|
+| Restart, redeploy, crash | Resumes from its own offset; nothing is skipped by timestamp |
 | dbt full-refresh | Rescans from the batch's high-water mark; no gaps, no duplicates |
 | Rows arrive while dbt runs | Re-emitted afterwards, by timestamp |
+| Another writer appends to the target | Not taken as coverage; nothing is skipped because of it |
+| Another writer updates, deletes or merges in the target | Treated as a rebuild. Timestamps it writes newer than rows `ddi` has not delivered yet make it skip the source versions holding them (logged as `versions_not_reread`) |
 | `OPTIMIZE` on either table | Ignored — those commits carry `dataChange: false` |
 | `DELETE`/`UPDATE` upstream | Skipped, never propagated (see `change_policy`) |
 | `DELETE` of old rows in the target | Left deleted |
 | Same key delivered again with changes | Appended as a second row — or, under `ddi_write_mode: upsert`, replaces the stored one |
 | Target dropped and recreated | Refilled from scratch |
-| Source dropped and recreated | Starts over, emitting only what is missing |
+| Source dropped and recreated | Starts over, emitting only what is missing — including rows re-seeded after `ddi` reopened, provided they carry their original timestamps |
 
 The rescan after a rebuild is bounded by the source's own file statistics — Delta records
 `maxValues` per file — so a rebuild costs a read of the last commit or two, not the whole

@@ -15,7 +15,8 @@ mod common;
 use std::sync::Arc;
 
 use delta_delta_ingest::config::{Config, ResolvedPipeline};
-use delta_delta_ingest::pipeline::Pipeline;
+use delta_delta_ingest::dedup::CoverageReason;
+use delta_delta_ingest::pipeline::{CoverageWindow, Pipeline};
 use deltalake::arrow::array::{
     ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
@@ -384,6 +385,56 @@ async fn an_interrupted_apply_picks_up_the_rows_it_had_not_reached() {
     assert_eq!(
         lake.rows(&lake.target).await,
         vec![(1, "shipped".to_string(), 30), (2, "new".to_string(), 20)],
+    );
+}
+
+#[tokio::test]
+async fn the_apply_half_keeps_its_window_while_the_ingest_half_is_still_staging() {
+    // A staged pipeline's first start against a target loaded before it. The handover happens
+    // on the apply half, which merges into that target — but what it reads is the stage, and
+    // the stage fills at the ingest half's pace. Its head when the apply half opens says
+    // nothing about which raw rows the load covered, so only a newer row may end the window.
+    // The load left key 2 out, and it must stay out.
+    let lake = Lake::new().await;
+    open_table(ensure_table_uri(&lake.target).unwrap())
+        .await
+        .unwrap()
+        .write(vec![batch(&[(1, "seeded", 10), (3, "seeded", 30)])])
+        .with_save_mode(SaveMode::Append)
+        .await
+        .unwrap();
+    lake.arrive(&[(1, "new", 10)]).await;
+    lake.arrive(&[(2, "new", 20)]).await;
+    lake.arrive(&[(3, "new", 30)]).await;
+    lake.arrive(&[(4, "new", 40)]).await;
+    let (mut ingest, apply) = lake.halves();
+    ingest.max_files_per_batch = 1;
+
+    // One raw commit staged, three still to come.
+    let mut staging = Pipeline::open(ingest).await.unwrap();
+    staging.step().await.unwrap();
+
+    let mut applying = Pipeline::open(apply.clone()).await.unwrap();
+    assert_eq!(
+        applying.coverage(),
+        Some(CoverageWindow {
+            reason: CoverageReason::Bootstrap,
+            through: None,
+            resumed: false,
+        })
+    );
+    applying.run_until_caught_up().await.unwrap();
+
+    staging.run_until_caught_up().await.unwrap();
+    run(apply).await;
+
+    assert_eq!(
+        lake.rows(&lake.target).await,
+        vec![
+            (1, "seeded".to_string(), 10),
+            (3, "seeded".to_string(), 30),
+            (4, "new".to_string(), 40),
+        ]
     );
 }
 

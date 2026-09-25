@@ -149,6 +149,18 @@ pub struct LogStreamBuilder {
     /// that connects `max_bytes_per_batch` — a count of *compressed* bytes — to the memory
     /// the batch will actually occupy.
     amplification: Arc<crate::budget::Amplification>,
+    /// The last version this stream may read until released. `None` reads to the head.
+    ///
+    /// See [`Self::with_stop_after`]. The head is still polled and reported as it is; only
+    /// what gets read stops here.
+    stop_after: Option<Version>,
+    /// The Delta id of the table this stream was opened on.
+    ///
+    /// A table dropped and recreated at the same path keeps the path and loses the id, and
+    /// nothing else about it says so. Compared whenever this stream loads a snapshot anyway,
+    /// so noticing costs nothing. `None` when the table did not have one, and then nothing is
+    /// compared.
+    table_id: Option<String>,
 }
 
 impl LogStreamBuilder {
@@ -169,6 +181,8 @@ impl LogStreamBuilder {
             // for an unloaded one: a table with no snapshot has no later version to floor at.
             version_floor: table.version().unwrap_or(0),
             amplification: Arc::new(crate::budget::Amplification::default()),
+            stop_after: None,
+            table_id: crate::lookup::table_id(table),
         }
     }
 
@@ -246,6 +260,23 @@ impl LogStreamBuilder {
         self
     }
 
+    /// Read no further than `version` until [`Self::release_stop`] is called. `None` reads to
+    /// the head, as usual.
+    ///
+    /// For a reader whose filtering rule changes at that version. No batch may straddle it:
+    /// a batch is filtered by one rule throughout, and once its rows have been transformed
+    /// nothing can say which commit any of them came from. So the stream stops there, and
+    /// reports itself caught up, until the reader has switched rules and released it.
+    pub fn with_stop_after(mut self, version: Option<Version>) -> Self {
+        self.stop_after = version;
+        self
+    }
+
+    /// Read to the head again. See [`Self::with_stop_after`].
+    pub fn release_stop(&mut self) {
+        self.stop_after = None;
+    }
+
     pub fn cursor(&self) -> StreamCursor {
         self.cursor
     }
@@ -274,8 +305,11 @@ impl LogStreamBuilder {
     /// `InvalidVersion`: retention can reclaim the floor itself on a stream that has been
     /// idle long enough, and a source that was dropped and recreated can have a head *below*
     /// the floor. So a stale floor is re-resolved once, from the log rather than from the
-    /// stale snapshot, and the lookup retried — which covers both, and leaves
-    /// `adjust_for_replaced_source` to decide what a log that went backwards means.
+    /// stale snapshot, and the two are told apart by the answer. Retention reclaims a log's
+    /// tail and never its head, so a head below a version this stream saw exist — or a
+    /// snapshot with a different table id — is a different table, and that is
+    /// [`Error::SourceReplaced`]: carrying on would read the new table from a position that
+    /// only meant something in the old one. `Pipeline::open` decides what to do about it.
     pub async fn latest_version(&mut self) -> Result<Version> {
         let stale = match self.log_store.get_latest_version(self.version_floor).await {
             Ok(v) => {
@@ -308,6 +342,16 @@ impl LogStreamBuilder {
                 stale.unwrap_or(self.version_floor),
             )));
         };
+        if resolved < self.version_floor {
+            return Err(self.replaced(format!(
+                "its head is now version {resolved}, below version {} which this stream had \
+                 already seen",
+                self.version_floor
+            )));
+        }
+        if let Some(detail) = self.identity_changed(&table) {
+            return Err(self.replaced(detail));
+        }
         debug!(
             stale_floor = self.version_floor,
             resolved, "source log no longer reaches the floor we held; re-resolved it"
@@ -331,10 +375,12 @@ impl LogStreamBuilder {
     pub async fn next_batch(&mut self) -> Result<Option<LogBatch>> {
         let latest = self.latest_version().await?;
         self.head = Some(latest);
+        // The head is still the head, for lag; this is only how far this call may read.
+        let readable = self.stop_after.map_or(latest, |stop| stop.min(latest));
 
         // `startingVersion` beyond the current head is "caught up", not an error —
         // the source simply has not produced that commit yet.
-        if self.cursor.version > latest {
+        if self.cursor.version > readable {
             return Ok(None);
         }
 
@@ -347,7 +393,7 @@ impl LogStreamBuilder {
         let mut through: Option<Version> = None;
         let mut through_log_timestamp: Option<DateTime<Utc>> = None;
 
-        while cursor.version <= latest {
+        while cursor.version <= readable {
             let version = cursor.version;
             let Some(raw) = self.log_store.read_commit_entry(version).await? else {
                 // A gap inside the range we were asked to read means the log has been
@@ -536,6 +582,11 @@ impl LogStreamBuilder {
         }
         let mut table = DeltaTable::new(self.log_store.clone(), without_files());
         table.load_version(version).await.map_err(Error::Delta)?;
+        // Loaded anyway, once per version a batch ends at, so this is where a table recreated
+        // at this path and grown past the cursor is noticed — before any of its rows are.
+        if let Some(detail) = self.identity_changed(&table) {
+            return Err(self.replaced(detail));
+        }
         let snapshot = table.snapshot().map_err(Error::Delta)?;
         let schema = snapshot.schema();
         // Keep the cache small; schema changes are rare and we only ever look backwards
@@ -545,6 +596,22 @@ impl LogStreamBuilder {
         }
         self.schema_cache.insert(version, schema.clone());
         Ok(schema)
+    }
+
+    /// How `table` differs from the one this stream was opened on, if it is a different one.
+    ///
+    /// Only when both ids are known: a table without one says nothing either way.
+    fn identity_changed(&self, table: &DeltaTable) -> Option<String> {
+        let was = self.table_id.as_deref()?;
+        let now = crate::lookup::table_id(table)?;
+        (was != now).then(|| format!("its table id changed from {was} to {now}"))
+    }
+
+    fn replaced(&self, detail: String) -> Error {
+        Error::SourceReplaced {
+            source_uri: self.source_uri.clone(),
+            detail,
+        }
     }
 }
 

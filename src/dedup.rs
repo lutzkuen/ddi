@@ -31,17 +31,45 @@
 //! With no key configured, ties fall back to `>`, which can drop a row that arrived in
 //! the same instant as the rebuild's newest. Fine for a strictly increasing sequence,
 //! not for a second-granularity clock under load.
+//!
+//! # When it applies
+//!
+//! Only while the pipeline has to infer from the target's data what the target already
+//! holds — a *coverage window*. One opens after a rebuild by another writer, on a first start
+//! against a target that already has rows, after the source was dropped and recreated or
+//! relocated, and on a reopen part-way through any of those. An ordinary restart opens none:
+//! the `txn` offset commits atomically with the rows it describes, so it is exact on its own,
+//! and a timestamp filter on top of it can only drop rows. Applying one on every open is what
+//! used to lose a lagging Kafka partition's late rows at every restart.
+//!
+//! A window closes after the first batch that carries a row newer than the watermark.
+//! Whatever filled the target read a prefix of this source through the same model, so every
+//! row it read is at or below the watermark and a newer one lies past its read point: from
+//! there an older timestamp is a late row, not a covered one. The window of a rebuild or a
+//! first start also closes once the source head it opened against has been read, because
+//! nothing committed after that can have been covered. A replaced source's does not — its new
+//! table is usually re-seeded *after* the pipeline reopens on it — and neither does one on
+//! the apply half of a staged upsert, whose stage is filled at its own pace. While a window stays open each commit
+//! records it (see [`RecordedCutoff`]), so a reopen carries on where the last commit left off.
+//!
+//! Inside a window the ordering requirement still holds, and a source that breaks it is
+//! inexact there. A table written from a multi-partition Kafka topic is append-only and still
+//! breaks it, because Kafka orders timestamps only within a partition: a late row at or below
+//! the watermark is dropped with the covered ones (and counted), and [`bounded_rescan_start`]
+//! can start past it. Outside a window the order does not matter at all, and `watermark_uri`
+//! is exact for such sources.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use deltalake::arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, StringArray};
 use deltalake::arrow::compute::kernels::boolean::{and, or};
 use deltalake::arrow::compute::kernels::cmp::{eq, gt};
 use deltalake::arrow::compute::{cast, filter_record_batch};
-use deltalake::arrow::datatypes::DataType;
+use deltalake::arrow::datatypes::{DataType, Schema};
 use deltalake::DeltaTable;
 use futures::TryStreamExt;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
 use crate::source::Version;
@@ -65,8 +93,8 @@ pub struct Dedup {
 impl Dedup {
     /// Read the cut-off out of the target table.
     ///
-    /// One streaming pass over two of the target's columns, once per pipeline start — not
-    /// per batch, and never the whole table.
+    /// One streaming pass over two of the target's columns, once per open that has to infer
+    /// coverage — not per batch, not on an ordinary restart, and never the whole table.
     ///
     /// # What this is careful about, and why
     ///
@@ -75,7 +103,7 @@ impl Dedup {
     /// target into a `MemTable` and running `SELECT max(...)` over that, which read *every*
     /// column of every row into memory. On a silver table whose rows carry JSON blobs
     /// (product descriptions, line-item arrays, images) that is gigabytes to compute one
-    /// scalar, it is paid again on every restart, and it grows with the table — so a
+    /// scalar, it was paid again on every restart, and it grows with the table — so a
     /// pipeline that had been fine gets slower until it cannot start at all, and the
     /// crash-loop makes it worse rather than better.
     ///
@@ -101,27 +129,13 @@ impl Dedup {
             ..Default::default()
         };
 
-        // Fail on a missing column here rather than letting the scan report it, so the
-        // message still names what the table does have.
         use deltalake::delta_datafusion::DataFusionMixins;
         let schema = target
             .snapshot()
             .map_err(Error::Delta)?
             .snapshot()
             .read_schema();
-        for wanted in [Some(timestamp_column), key_column].into_iter().flatten() {
-            if schema.index_of(wanted).is_err() {
-                return Err(Error::Config(format!(
-                    "dedup column {wanted:?} is not in the target table. Columns: [{}]",
-                    schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-            }
-        }
+        require_columns(&schema, timestamp_column, key_column)?;
 
         let (_t, mut stream) = target
             .clone()
@@ -248,19 +262,23 @@ impl Dedup {
 
     /// Drop the rows the target already holds.
     pub fn apply(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        self.filter(batch).map(|f| f.kept)
+    }
+
+    /// Drop the rows the target already holds, and say how many went and how many of those
+    /// kept are past the watermark altogether.
+    pub fn filter(&self, batch: RecordBatch) -> Result<Filtered> {
         let Some(mark) = &self.watermark else {
-            return Ok(batch);
+            // Nothing is covered by a target with no rows, so everything is past it.
+            let beyond = batch.num_rows();
+            return Ok(Filtered {
+                kept: batch,
+                covered: 0,
+                beyond,
+            });
         };
 
-        let ts = column(&batch, &self.timestamp_column)?;
-        if ts.null_count() > 0 {
-            return Err(Error::Schema(format!(
-                "dedup timestamp {:?} contains {} null(s); a row with no timestamp can be \
-                 neither kept nor skipped safely",
-                self.timestamp_column,
-                ts.null_count()
-            )));
-        }
+        let ts = require_timestamps(&batch, &self.timestamp_column)?;
         let scalar = deltalake::arrow::array::Scalar::new(mark.clone());
 
         let after = gt(&ts, &scalar).map_err(|e| {
@@ -270,6 +288,10 @@ impl Dedup {
                 self.timestamp_column
             ))
         })?;
+        // Rows at the watermark are not counted, even with a key that is new: they share the
+        // instant of the newest row the target holds, so they say nothing about whether
+        // whatever filled it read past them.
+        let beyond = after.true_count();
 
         let keep = match &self.key_column {
             // Rows exactly at the watermark are decided one by one.
@@ -285,8 +307,14 @@ impl Dedup {
             None => after,
         };
 
-        filter_record_batch(&batch, &keep)
-            .map_err(|e| Error::Other(format!("dedup: filter failed: {e}")))
+        let kept = filter_record_batch(&batch, &keep)
+            .map_err(|e| Error::Other(format!("dedup: filter failed: {e}")))?;
+        let covered = batch.num_rows() - kept.num_rows();
+        Ok(Filtered {
+            kept,
+            covered,
+            beyond,
+        })
     }
 
     fn keys_not_yet_present(&self, batch: &RecordBatch, key: &str) -> Result<BooleanArray> {
@@ -297,6 +325,177 @@ impl Dedup {
         Ok((0..text.len())
             .map(|i| Some(text.is_null(i) || !self.boundary_keys.contains(text.value(i))))
             .collect())
+    }
+}
+
+/// What [`Dedup::filter`] made of one batch.
+#[derive(Debug)]
+pub struct Filtered {
+    /// The rows the target does not hold yet.
+    pub kept: RecordBatch,
+    /// Rows dropped because the target already holds them.
+    pub covered: usize,
+    /// Of `kept`, the rows strictly newer than the watermark: past anything whatever filled
+    /// the target can have read. The first of these is what ends a coverage window.
+    pub beyond: usize,
+}
+
+/// Fail unless the target has the columns the cut-off is read from.
+///
+/// Checked on every open that names a `dedup_timestamp`, not only on one that reads the
+/// cut-off: a column that is not there is a configuration mistake whichever state the target
+/// is in, and an ordinary restart is where it would otherwise go unnoticed until the next
+/// rebuild needed it. Here rather than left to the scan, so the message still names what the
+/// table does have.
+pub fn require_columns(
+    schema: &Schema,
+    timestamp_column: &str,
+    key_column: Option<&str>,
+) -> Result<()> {
+    for wanted in [Some(timestamp_column), key_column].into_iter().flatten() {
+        if schema.index_of(wanted).is_err() {
+            return Err(Error::Config(format!(
+                "dedup column {wanted:?} is not in the target table. Columns: [{}]",
+                schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The batch's `timestamp_column`, provided every row has one.
+///
+/// A row with no timestamp can be neither kept nor skipped safely by the cut-off, and outside
+/// a coverage window it would be written with nothing to recognise it by the next time the
+/// target's coverage has to be inferred — so an appending pipeline refuses it on every batch,
+/// window or not. An upserting one leaves it to `upsert::collapse`, whose message is about
+/// the merge it cannot order.
+pub fn require_timestamps(batch: &RecordBatch, timestamp_column: &str) -> Result<ArrayRef> {
+    let ts = column(batch, timestamp_column)?;
+    if ts.null_count() > 0 {
+        return Err(Error::Schema(format!(
+            "dedup timestamp {:?} contains {} null(s); a row with no timestamp can be \
+             neither kept nor skipped safely",
+            timestamp_column,
+            ts.null_count()
+        )));
+    }
+    Ok(ts)
+}
+
+// ---------------------------------------------------------------- coverage windows
+
+/// Why a pipeline had to infer from the target's data what the target already holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageReason {
+    /// Another writer rewrote the target since this pipeline's last commit.
+    Rebuilt,
+    /// The pipeline has never committed, and the target already has rows.
+    Bootstrap,
+    /// The source is not the table this pipeline last read: dropped and recreated, or moved.
+    SourceReplaced,
+}
+
+impl CoverageReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rebuilt => "rebuilt",
+            Self::Bootstrap => "bootstrap",
+            Self::SourceReplaced => "source_replaced",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "rebuilt" => Some(Self::Rebuilt),
+            "bootstrap" => Some(Self::Bootstrap),
+            "source_replaced" => Some(Self::SourceReplaced),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for CoverageReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `commitInfo` key naming why a coverage window is open.
+pub const CUTOFF_REASON_KEY: &str = "ddi.cutoff.reason";
+/// `commitInfo` key naming the source version the window closes after, when it has one.
+pub const CUTOFF_SOURCE_THROUGH_KEY: &str = "ddi.cutoff.sourceThrough";
+
+/// A coverage window, as a commit made inside it records it.
+///
+/// Recorded because a reopen cannot work it out again. Once this pipeline has committed, the
+/// target's log says the newest commit is its own, which reads exactly like an ordinary
+/// restart — so without this a restart part-way through a rebuild's rescan would stop
+/// filtering and re-emit the rest of what the rebuild wrote. Only the reason and the head are
+/// kept: the watermark itself is read from the target again, and is the same one, because a
+/// commit made inside an open window holds only rows exactly at the watermark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedCutoff {
+    pub reason: CoverageReason,
+    /// The source version the window closes after once read. `None` when only a newer row
+    /// closes it.
+    pub source_through: Option<Version>,
+}
+
+impl RecordedCutoff {
+    pub fn to_commit_metadata(&self) -> Vec<(String, serde_json::Value)> {
+        let mut out = vec![(
+            CUTOFF_REASON_KEY.to_string(),
+            serde_json::Value::from(self.reason.as_str()),
+        )];
+        if let Some(through) = self.source_through {
+            out.push((
+                CUTOFF_SOURCE_THROUGH_KEY.to_string(),
+                serde_json::Value::from(through),
+            ));
+        }
+        out
+    }
+
+    /// The window a commit recorded, if it recorded one.
+    ///
+    /// One this build cannot read is taken as no window, with a warning. That errs towards
+    /// re-emitting rows the target holds rather than dropping rows it does not.
+    pub fn from_commit_info(info: &HashMap<String, serde_json::Value>) -> Option<Self> {
+        let raw = info.get(CUTOFF_REASON_KEY)?;
+        let Some(reason) = raw.as_str().and_then(CoverageReason::parse) else {
+            warn!(
+                key = CUTOFF_REASON_KEY,
+                value = %raw,
+                "a commit of ours records a coverage window this build does not know; \
+                 resuming as though it had closed"
+            );
+            return None;
+        };
+        let source_through = match info.get(CUTOFF_SOURCE_THROUGH_KEY) {
+            None => None,
+            Some(v) => match v.as_u64() {
+                Some(through) => Some(through),
+                None => {
+                    warn!(
+                        key = CUTOFF_SOURCE_THROUGH_KEY,
+                        value = %v,
+                        "a commit of ours records a coverage window whose source version is \
+                         not a version; resuming as though it had closed"
+                    );
+                    return None;
+                }
+            },
+        };
+        Some(Self {
+            reason,
+            source_through,
+        })
     }
 }
 
@@ -345,7 +544,9 @@ fn column(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
 /// Delta records per-file `maxValues`, so the log can answer it directly. Walking
 /// backwards from the head, the first commit whose newest row is already covered by the
 /// watermark is the boundary: everything before it is covered too, because the timestamp
-/// increases with arrival — which is the same assumption the filter already rests on.
+/// increases with arrival — which is the same assumption the filter already rests on, and
+/// fails the same way. On a source that breaks it, an earlier commit can still hold a row
+/// newer than the watermark, and the rescan starts past it.
 ///
 /// Anything unexpected — statistics missing, a type that will not line up, a log that
 /// runs out — returns `fallback`. Being slow is a cost; being wrong is not an option.
@@ -548,6 +749,73 @@ mod tests {
             vec![9, 3],
             "2 is already in the target at t=20; 9 shares the instant but is new"
         );
+    }
+
+    #[test]
+    fn filter_counts_covered_and_beyond_separately() {
+        // `beyond` is what closes a coverage window, so a tie with an unseen key must be kept
+        // without counting: it shares the rebuild's newest instant and says nothing about
+        // whether the rebuild read past it.
+        let d = Dedup {
+            timestamp_column: "_timestamp".into(),
+            key_column: Some("order_id".into()),
+            watermark: Some(mark(20)),
+            boundary_keys: ["2".to_string()].into_iter().collect(),
+        };
+        let f = d
+            .filter(batch(&[(1, 10), (2, 20), (9, 20), (3, 30)]))
+            .unwrap();
+        assert_eq!(ids(&f.kept), vec![9, 3]);
+        assert_eq!(
+            f.covered, 2,
+            "1 is below the watermark and 2 is already there"
+        );
+        assert_eq!(f.beyond, 1, "only 3 is past the watermark");
+    }
+
+    #[test]
+    fn a_recorded_cutoff_round_trips_through_commit_info() {
+        let as_info = |c: &RecordedCutoff| -> HashMap<String, serde_json::Value> {
+            c.to_commit_metadata().into_iter().collect()
+        };
+        for c in [
+            RecordedCutoff {
+                reason: CoverageReason::Rebuilt,
+                source_through: Some(7),
+            },
+            RecordedCutoff {
+                reason: CoverageReason::Bootstrap,
+                source_through: Some(0),
+            },
+            RecordedCutoff {
+                reason: CoverageReason::SourceReplaced,
+                source_through: None,
+            },
+        ] {
+            assert_eq!(RecordedCutoff::from_commit_info(&as_info(&c)), Some(c));
+        }
+        assert_eq!(
+            RecordedCutoff::from_commit_info(&HashMap::new()),
+            None,
+            "a commit made outside a window records nothing"
+        );
+
+        // Anything unreadable is taken as no window, which errs towards duplicates.
+        let mut unknown = HashMap::new();
+        unknown.insert(CUTOFF_REASON_KEY.to_string(), serde_json::json!("backfill"));
+        assert_eq!(RecordedCutoff::from_commit_info(&unknown), None);
+
+        let mut not_a_version = as_info(&RecordedCutoff {
+            reason: CoverageReason::Rebuilt,
+            source_through: Some(7),
+        });
+        not_a_version.insert(
+            CUTOFF_SOURCE_THROUGH_KEY.to_string(),
+            serde_json::json!("seven"),
+        );
+        assert_eq!(RecordedCutoff::from_commit_info(&not_a_version), None);
+        not_a_version.insert(CUTOFF_SOURCE_THROUGH_KEY.to_string(), serde_json::json!(-1));
+        assert_eq!(RecordedCutoff::from_commit_info(&not_a_version), None);
     }
 
     #[test]

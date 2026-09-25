@@ -38,7 +38,8 @@ table = pa.table(
             ],
             pa.string(),
         ),
-        # Increases with arrival order — that is the whole contract.
+        # Increases with arrival order — that is what lets ddi recognise what a rebuild
+        # already covered.
         "_timestamp": pa.array(
             [EPOCH + dt.timedelta(minutes=int(r["id"])) for r in chunk],
             pa.timestamp("us"),

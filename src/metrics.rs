@@ -82,6 +82,20 @@ pub struct PipelineMetrics {
     /// Batches where *every* row was rejected. Far more likely an upstream schema change
     /// than data going bad, and otherwise invisible: the target just stops growing.
     pub batches_fully_rejected: AtomicU64,
+    /// Rows dropped because the target was taken to hold them already, while a rebuild, a
+    /// first start against a populated target or a replaced source was being caught up.
+    ///
+    /// Counted because nothing else would show them: they reach neither the target nor the
+    /// data-quality table, and the offset moves past them. Rising in step with a rebuild is
+    /// the filter doing its job; rising at any other time is rows being lost.
+    pub rows_skipped_as_covered: AtomicU64,
+    /// 1 while this pipeline is dropping rows the target is taken to hold already, 0 otherwise.
+    ///
+    /// A gauge as well as the counter, because the window that drops them need not end on its
+    /// own: after a replaced source, or on a staged upsert's apply half, only a row newer than
+    /// the target's watermark closes it. One that stays at 1 on an idle pipeline is waiting
+    /// for that row, and a watermark somebody pushed into the future would hold it there.
+    pub coverage_cutoff_active: AtomicI64,
     /// 1 when this pipeline's configuration was accepted, 0 when it was held back at load.
     ///
     /// Distinct from `up`, and the distinction matters: `up = 0` means a stream that was
@@ -327,7 +341,7 @@ impl Metrics {
         let map = self.pipelines.read().unwrap();
         let mut s = String::new();
 
-        let metrics: [MetricSpec; 36] = [
+        let metrics: [MetricSpec; 38] = [
             (
                 "ddi_batches_committed_total",
                 "counter",
@@ -451,6 +465,21 @@ impl Metrics {
                 "counter",
                 "Batches where every row was rejected; usually an upstream schema change.",
                 |m| m.batches_fully_rejected.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_rows_skipped_as_covered_total",
+                "counter",
+                "Rows dropped because the target was taken to hold them already, while a \
+                 rebuild, a first start against a populated target, or a replaced source was \
+                 being caught up.",
+                |m| m.rows_skipped_as_covered.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ddi_coverage_cutoff_active",
+                "gauge",
+                "1 while this pipeline is dropping rows the target is taken to hold already; 0 \
+                 otherwise.",
+                |m| m.coverage_cutoff_active.load(Ordering::Relaxed),
             ),
             (
                 "ddi_upsert_rows_updated_total",
@@ -816,6 +845,34 @@ mod tests {
         let rendered = m.render();
         assert!(rendered.contains("ddi_rows_rejected_by_transform_total{pipeline=\"orders\"} 3"));
         assert!(rendered.contains("ddi_transform_reevaluations_total{pipeline=\"orders\"} 40"));
+    }
+
+    #[test]
+    fn the_coverage_series_are_rendered() {
+        let m = Metrics::new();
+        let p = m.pipeline("orders");
+        let rendered = m.render();
+        assert!(
+            rendered.contains("# TYPE ddi_rows_skipped_as_covered_total counter"),
+            "got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("# TYPE ddi_coverage_cutoff_active gauge"),
+            "got:\n{rendered}"
+        );
+        assert!(rendered.contains("ddi_coverage_cutoff_active{pipeline=\"orders\"} 0"));
+
+        p.rows_skipped_as_covered.fetch_add(7, Ordering::Relaxed);
+        p.coverage_cutoff_active.store(1, Ordering::Relaxed);
+        let rendered = m.render();
+        assert!(
+            rendered.contains("ddi_rows_skipped_as_covered_total{pipeline=\"orders\"} 7"),
+            "got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("ddi_coverage_cutoff_active{pipeline=\"orders\"} 1"),
+            "got:\n{rendered}"
+        );
     }
 
     #[test]

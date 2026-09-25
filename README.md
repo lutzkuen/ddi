@@ -554,9 +554,34 @@ models:
       ddi_key: order_id
 ```
 
-The timestamp **must be non-decreasing in the order rows reach the source** — a late row
-bearing an older timestamp is indistinguishable from one the rebuild already wrote, and
-will be dropped. That suits an append-only stream, not a table that gets backfilled.
+**The cut-off is used only while `ddi` has to infer what the target already holds** — a
+*coverage window*. One opens after a rebuild, on a first start against a target that already
+has rows, after the source was replaced, and on a restart part-way through any of those. An
+ordinary restart — a deploy, an OOM kill, a reopen after a failed step — resumes from the
+pipeline's own `txn` offset, which commits atomically with the rows it describes and is exact
+on its own, and filters nothing by timestamp.
+
+A window lasts until the first batch that carries a row newer than the target's watermark.
+Whatever filled the target read a prefix of the source, so a newer row lies past its read
+point, and from there an older timestamp is a late row rather than a covered one. After a
+rebuild or on a first start it also ends once the source head it opened against has been
+read, because nothing committed after that can have been covered. A first start therefore
+assumes the target was filled from this source: one loaded from elsewhere while this source is
+still being backfilled gets what arrives after the open a second time. While a window is open
+each commit records it (`ddi.cutoff.reason` in the commit's info), so a restart in the middle
+carries on where it left off. `ddi_coverage_cutoff_active` is 1 while one is open, and every
+row it drops is logged and counted in `ddi_rows_skipped_as_covered_total`.
+
+Inside a window the timestamp **must be non-decreasing in the order rows reach the source** —
+a late row bearing an older timestamp is indistinguishable from one the rebuild already wrote,
+and will be dropped. Append-only is not enough. A table written from a multi-partition Kafka
+topic (kafka-delta-ingest and its like) orders timestamps only within a partition, and each
+ingester commit carries a slice of every partition's backlog, so a later commit routinely
+holds a lagging partition's rows that are older than rows already delivered. Inside a window
+those are dropped with the covered ones — counted, but dropped — and the rescan bound below
+can start past them. Use `watermark_uri` for exact coverage on such sources. A watermark per
+value of a partition column — the newest timestamp or offset per Kafka partition — would be
+exact too; it is a possible future option, not something `ddi` does today.
 
 The rescan is bounded by the source's own file statistics. Delta records `maxValues` per
 file, so the log itself says how far back the rebuild's contents reach: walking backwards
@@ -571,16 +596,17 @@ ordering requirement on any column.
 
 ### What the watermark costs to read
 
-Once per pipeline start, never per batch — and only two columns. The timestamp and the key
-are projected into the Delta scan, so the parquet reader never decodes the rest of the row,
-and the pass is streaming: the running answer is one timestamp plus the keys tied with it, so
-memory is bounded by that rather than by the table.
+Only on an open that has to infer coverage — an ordinary restart does not read it at all —
+and never per batch. And only two columns: the timestamp and the key are projected into the Delta scan,
+so the parquet reader never decodes the rest of the row, and the pass is streaming: the
+running answer is one timestamp plus the keys tied with it, so memory is bounded by that
+rather than by the table.
 
 This matters more than it sounds. Reading the whole row instead is gigabytes on a silver
-table whose rows carry JSON payloads, it is paid again on every restart, and it grows with
-the table — so a pipeline that had been starting fine gets slower until it cannot start at
-all, and a crash-loop makes it worse rather than better. The startup line reports
-`rows_scanned` at debug level if you want to see what a start is costing.
+table whose rows carry JSON payloads, it would be paid again on every open that needs it, and
+it grows with the table — so a pipeline that had been starting fine gets slower until it
+cannot start at all, and a crash-loop makes it worse rather than better. The startup line
+reports `rows_scanned` at debug level if you want to see what a start is costing.
 
 ### What else happens to a shared table
 
@@ -589,21 +615,25 @@ these and asserts the same invariant every time — no key missing, no key twice
 
 | Event | Behaviour |
 |---|---|
+| Restart, redeploy, reopen after a failure | Resumes from its own offset; nothing filtered by timestamp |
 | Full refresh of the target | Rescan; rows the rebuild covers are skipped |
 | Rows arrive while the batch runs | Re-emitted, by timestamp |
+| Rows appended to the target by another writer | Not treated as coverage |
+| `UPDATE`/`DELETE`/`MERGE` on the target by another writer | Treated as a rebuild. If it writes timestamps newer than rows not yet delivered, the source versions holding those rows are not re-read (logged as `versions_not_reread`) |
 | `OPTIMIZE` on either table | Ignored — `dataChange: false` |
 | `DELETE`/`UPDATE` upstream | Skipped per `change_policy`, never propagated |
 | `DELETE` behind the target's watermark | Left deleted |
 | Target dropped and recreated | Refilled from scratch |
 | Source dropped and recreated | Starts over, emitting only what is missing |
+| Source replaced while `ddi` is running | The step fails, and the reopen starts over |
 
-The last one is the trap, and not in the obvious direction. Dropping and recreating a
-table keeps its path and its name but gives it a new identity and a log that restarts at
-zero, so the carried-over offset means nothing. If the new table has *fewer* commits than
-were consumed, the pipeline waits for commits that will never arrive. If it already has
-*more* — the likelier case, and the dangerous one — the offset still lands comfortably
-inside the log, so nothing looks wrong while the new table's early commits are skipped and
-never read.
+The source being dropped and recreated is the trap, and not in the obvious direction.
+Dropping and recreating a table keeps its path and its name but gives it a new identity and
+a log that restarts at zero, so the carried-over offset means nothing. If the new table has
+*fewer* commits than were consumed, the pipeline waits for commits that will never arrive.
+If it already has *more* — the likelier case, and the dangerous one — the offset still lands
+comfortably inside the log, so nothing looks wrong while the new table's early commits are
+skipped and never read.
 
 Neither is detectable from the version alone, so `ddi` records the source's table id in
 each of its commits and compares it on restart. When the source turns out to be a
@@ -611,6 +641,14 @@ different table, it starts over from the beginning; `dedup_timestamp` then drops
 the target already holds, so only genuinely missing rows are emitted. Without a
 `dedup_timestamp` there is nothing to filter on and starting over would append the whole
 table a second time, so it stops and says so.
+
+The filter holds until the new table delivers a row newer than the target's watermark — not
+until the head it reopened against — so a re-seed that lands after `ddi` has reopened is
+still filtered, across restarts too. That is the usual order: opening fails until the new
+table exists, and the retry starts at a second. It relies on the re-seed carrying the
+original timestamps. A running pipeline notices a replacement as well — a head that went
+below a version it had read, or a snapshot with a different id — and fails the step rather
+than reading the new table from the old one's position; the reopen then does the rest.
 
 ## Bad rows, and broken streams
 
@@ -760,6 +798,8 @@ Because the process no longer exits when a stream dies, metrics stop being optio
 | `ddi_rows_rejected_by_transform_total` | Of those, rows the transform could not evaluate. |
 | `ddi_transform_reevaluations_total` | Extra runs of the transform spent finding them. |
 | `ddi_batches_fully_rejected_total` | Batches where *every* row was rejected. |
+| `ddi_coverage_cutoff_active` | 1 while a coverage window is dropping rows the target is taken to hold already. |
+| `ddi_rows_skipped_as_covered_total` | Rows it dropped. They reach neither the target nor the data-quality table. |
 
 Alert on `ddi_pipeline_up == 0 for 10m`, on `ddi_source_file_vacuumed == 1`, on
 `ddi_bootstrap_unreachable == 1` and `ddi_resume_unreachable == 1`, and on
@@ -768,7 +808,10 @@ looks: there is no threshold on rows the target will not take, so an upstream ty
 quarantines the whole batch and the target simply stops growing — no error, no lag, nothing
 else to notice it by. `increase(ddi_rows_rejected_by_transform_total[1h]) > 0` is worth a
 ticket rather than a page: a value the model cannot handle usually wants a change to the
-model.
+model. So is `ddi_coverage_cutoff_active == 1` for longer than a rebuild takes to catch up:
+after a replaced source, or on a staged apply half, only a row newer than the target's
+watermark closes the window, and one somebody pushed into the future holds it open while it
+drops everything below.
 `ddi_errors_total` is now a *rate* of retried attempts, not a page: a pipeline that lost one
 commit race and recovered a second later increments it.
 
@@ -1004,6 +1047,12 @@ that is its own.
 Read the two halves' lag separately: `ddi_source_lag_versions{pipeline="style__ingest"}` is
 how far behind the raw stream is, and `{pipeline="style__apply"}` is how much has been staged
 but not yet merged.
+
+The handover after a rebuild, or on a first start against a populated target, runs on the
+apply half, because its target is the one those touch. Its cut-off lasts until a staged row
+newer than the target's watermark arrives rather than until the stage's head, since the stage
+fills at the ingest half's pace: a raw row the rebuild covered can be staged long after the
+apply half opened.
 
 #### What it costs
 
@@ -1719,6 +1768,8 @@ correctness still holds (the `txn` action prevents double-apply) — it just was
 | `ddi_rows_rejected_by_transform_total` | counter | Of those, rows the transform could not evaluate. Also in `ddi_rows_rejected_total`. |
 | `ddi_transform_reevaluations_total` | counter | Runs of a transform beyond the first, spent finding the rows it could not evaluate. Each re-plans the query and re-scans the lookups it joins. |
 | `ddi_batches_fully_rejected_total` | counter | Batches where every row was rejected. |
+| `ddi_rows_skipped_as_covered_total` | counter | Rows dropped because the target was taken to hold them already, while a rebuild, a first start against a populated target, or a replaced source was being caught up. Never moves on an ordinary restart. |
+| `ddi_coverage_cutoff_active` | gauge | 1 while this pipeline is dropping rows the target is taken to hold already; 0 otherwise. See [When the rebuild cannot be changed at all](#when-the-rebuild-cannot-be-changed-at-all). |
 
 Upsert pipelines export five more. All stay at zero in append mode, which is the honest
 reading: it never updates a row and never reads the target back.

@@ -308,8 +308,11 @@ pub struct PipelineConfig {
     /// us where it got to, we read `max(dedup_timestamp)` out of the target and emit only
     /// rows beyond it. The batch needs to know nothing about this tool.
     ///
-    /// Must be non-decreasing in the order rows arrive in the source. See
-    /// [`crate::dedup`].
+    /// Consulted only where what the target holds has to be inferred — after a rebuild, on a
+    /// first start against a populated target, after the source was replaced — and only
+    /// there must it be non-decreasing in the order rows arrive in the source. A table
+    /// written from a multi-partition Kafka topic is append-only and still does not meet
+    /// that; `watermark_uri` is exact for it. See [`crate::dedup`].
     #[serde(default)]
     pub dedup_timestamp: Option<String>,
 
@@ -479,7 +482,8 @@ pub struct ResolvedPipeline {
     pub target_file_size: u64,
     /// Where dbt records its rebuild watermark for this target, if dbt shares it.
     pub watermark_uri: Option<String>,
-    /// Timestamp column used to skip rows a rebuild already covered.
+    /// Timestamp column used to recognise rows a rebuild, a populated target or a replaced
+    /// source already covers. Read only inside a coverage window; see [`crate::dedup`].
     pub dedup_timestamp: Option<String>,
     /// Row identity, for resolving ties at the watermark instant.
     pub dedup_key: Option<String>,
@@ -937,9 +941,12 @@ fn staged_problem(p: &PipelineConfig) -> Option<String> {
 ///   the FX rate applied to a row would depend on when the apply half happened to run.
 /// - The **merge key, timestamp and tie-breaker** belong to the apply half, which is the
 ///   only one that merges.
-/// - The **rebuild watermark** belongs to the ingest half. Rows a dbt rebuild already covers
-///   are dropped before they are staged, so applying it again downstream would be asking a
-///   question already answered.
+/// - The **rebuild handover** happens on the apply half, because its target is the one a
+///   rebuild touches. Its `dedup_timestamp` cut-off is what keeps a replay of the stage from
+///   merging rows a rebuild, or a target populated before the first start, already holds —
+///   and since the stage is filled at the ingest half's pace, that cut-off lasts until a
+///   staged row newer than the target's watermark arrives. The ingest half's only ever reads
+///   its own stage, which nothing else writes.
 fn expand_staged(pipelines: &[PipelineConfig]) -> Vec<PipelineConfig> {
     let mut out = Vec::with_capacity(pipelines.len());
     for p in pipelines {

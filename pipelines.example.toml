@@ -92,8 +92,9 @@ source_uri = "abfss://lake@acct.dfs.core.windows.net/bronze/orders"
 target_uri = "abfss://lake@acct.dfs.core.windows.net/silver/orders_current"
 # append (default) | upsert
 write_mode = "upsert"
-# Which of two rows for the same key is newer. Required for upsert, and must be
-# non-decreasing in the order rows reach the source.
+# Which of two rows for the same key is newer. Required for upsert. The merge compares it
+# row by row, so the order rows reach the source in does not matter here; that is only
+# needed to recognise what a rebuild, or a target loaded before the first start, covered.
 dedup_timestamp = "_timestamp"
 # What a row is matched on. Defaults to dedup_key.
 upsert_key      = "order_id"

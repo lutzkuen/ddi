@@ -51,6 +51,7 @@ use deltalake::DeltaTable;
 use futures::TryStreamExt;
 use tracing::warn;
 
+use crate::dedup::RecordedCutoff;
 use crate::error::{Error, Result};
 use crate::source::Version;
 
@@ -259,6 +260,10 @@ pub struct OurLastCommit {
     /// the same URI has a new id; resuming against it would silently change an old join.
     /// Empty for pre-lookup commits and for tables we have never written.
     pub lookup_table_ids: BTreeMap<String, String>,
+    /// The coverage window that commit was made inside, when the window was still open after
+    /// it. `None` outside one — and for the commit that closed one, which is what stops a
+    /// reopen from resuming a window that has already ended. See [`crate::dedup`].
+    pub cutoff: Option<RecordedCutoff>,
 }
 
 /// Walk the target log backwards for the most recent commit that carries our txn action,
@@ -311,10 +316,15 @@ pub async fn our_last_commit(
                     Some((name.to_string(), id.to_string()))
                 })
                 .collect();
+            let cutoff = actions.iter().find_map(|a| match a {
+                Action::CommitInfo(ci) => RecordedCutoff::from_commit_info(&ci.info),
+                _ => None,
+            });
             return Ok(OurLastCommit {
                 commit_version: Some(v),
                 source_table_id,
                 lookup_table_ids,
+                cutoff,
             });
         }
 

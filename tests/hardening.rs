@@ -14,9 +14,10 @@ use std::sync::Arc;
 
 use common::pipeline_cfg;
 use delta_delta_ingest::config::ResolvedPipeline;
-use delta_delta_ingest::dedup::DEFAULT_TIMESTAMP_COLUMN;
-use delta_delta_ingest::pipeline::Pipeline;
+use delta_delta_ingest::dedup::{CoverageReason, DEFAULT_TIMESTAMP_COLUMN};
+use delta_delta_ingest::pipeline::{CoverageWindow, Pipeline};
 use delta_delta_ingest::source::ChangePolicy;
+use delta_delta_ingest::Error;
 use deltalake::arrow::array::{
     Array, ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
@@ -487,6 +488,115 @@ async fn bronze_dropped_and_recreated_simply_starts_over() {
     lake.arrive(&orders(10..=12)).await;
 
     lake.stream().await;
+    lake.assert_exactly(&orders(1..=12)).await;
+}
+
+#[tokio::test]
+async fn bronze_recreated_empty_and_reseeded_after_the_reopen_is_not_duplicated() {
+    // The order a real drop-and-recreate happens in. Opening fails until the new table
+    // exists and the retry starts at a second, so the pipeline reopens on an empty table and
+    // the re-seed lands afterwards — over several commits and, here, a restart. A window
+    // that ended at the head it opened against would be over before the first re-seeded row,
+    // and let every one of them through a second time.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=5)).await;
+    lake.arrive(&orders(6..=9)).await;
+    lake.stream().await;
+
+    std::fs::remove_dir_all(&lake.raw).unwrap();
+    create(&lake.raw, raw_schema()).await;
+
+    let mut p = Pipeline::open(lake.cfg()).await.unwrap();
+    assert_eq!(
+        p.coverage(),
+        Some(CoverageWindow {
+            reason: CoverageReason::SourceReplaced,
+            through: None,
+            resumed: false,
+        })
+    );
+    assert_eq!(
+        p.run_until_caught_up().await.unwrap(),
+        0,
+        "nothing to read yet"
+    );
+
+    lake.arrive(&orders(1..=3)).await;
+    p.run_until_caught_up().await.unwrap();
+    drop(p);
+
+    let mut p = Pipeline::open(lake.cfg()).await.unwrap();
+    assert_eq!(
+        p.coverage(),
+        Some(CoverageWindow {
+            reason: CoverageReason::SourceReplaced,
+            through: None,
+            resumed: true,
+        }),
+        "the restart carries on with the window its last commit recorded"
+    );
+    lake.arrive(&orders(4..=6)).await;
+    lake.arrive(&orders(7..=9)).await;
+    lake.arrive(&orders(10..=12)).await;
+    p.run_until_caught_up().await.unwrap();
+
+    lake.assert_exactly(&orders(1..=12)).await;
+    assert_eq!(
+        p.coverage(),
+        None,
+        "closed by 10, the first order the old table never had"
+    );
+}
+
+#[tokio::test]
+async fn bronze_replaced_under_a_running_pipeline_fails_the_step_and_the_reopen_starts_over() {
+    // The same replacement with no restart to notice it. The new table has already grown past
+    // the old cursor, so its log reads as nothing more than further commits — and reading
+    // them from there would skip the ones it wrote first.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=5)).await;
+    lake.arrive(&orders(6..=9)).await;
+    let mut p = Pipeline::open(lake.cfg()).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+
+    std::fs::remove_dir_all(&lake.raw).unwrap();
+    create(&lake.raw, raw_schema()).await;
+    lake.arrive(&orders(1..=3)).await;
+    lake.arrive(&orders(4..=6)).await;
+    lake.arrive(&orders(7..=9)).await;
+    lake.arrive(&orders(10..=12)).await;
+
+    let e = p.step().await.unwrap_err();
+    assert!(matches!(e, Error::SourceReplaced { .. }), "got: {e}");
+    lake.assert_exactly(&orders(1..=9)).await;
+
+    // What the supervisor does next: back off, and reopen.
+    lake.stream().await;
+    lake.assert_exactly(&orders(1..=12)).await;
+}
+
+#[tokio::test]
+async fn bronze_recreated_shorter_under_a_running_pipeline_is_noticed() {
+    // The other shape: fewer commits than were consumed. The head is now below a version the
+    // stream has seen exist, which log retention never does — and polling on would report
+    // "caught up" until the new table happened to grow past the old cursor.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=5)).await;
+    lake.arrive(&orders(6..=9)).await;
+    let mut p = Pipeline::open(lake.cfg()).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+
+    std::fs::remove_dir_all(&lake.raw).unwrap();
+    create(&lake.raw, raw_schema()).await;
+    lake.arrive(&orders(1..=3)).await;
+
+    let e = p.step().await.unwrap_err();
+    assert!(matches!(e, Error::SourceReplaced { .. }), "got: {e}");
+
+    let mut p = Pipeline::open(lake.cfg()).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+    lake.arrive(&orders(4..=12)).await;
+    p.run_until_caught_up().await.unwrap();
     lake.assert_exactly(&orders(1..=12)).await;
 }
 
