@@ -777,7 +777,7 @@ fn compile(
                 if f.func.signature().volatility != Volatility::Immutable
         ))
     })?;
-    // What the top of the query gets: coercion, then the correctly rounded DECIMAL casts the
+    // What the top of the query gets: coercion, then Trino's DECIMAL casts, which the
     // top's analyzer applies after it (a body is planned here, never analyzed), then
     // simplification — which is where `now()`, `current_date` and `arrow_cast` are turned
     // into what they mean — then the function rewrites `create_physical_expr` applies.

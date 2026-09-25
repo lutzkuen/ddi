@@ -78,8 +78,8 @@ impl SchemaCoercer {
                         col.clone()
                     } else {
                         // safe: false => a value that does not fit becomes an error, not NULL.
-                        // A DECIMAL landing in a DOUBLE or REAL column becomes the nearest
-                        // one, as in Trino, not Arrow's double-rounded division.
+                        // A DECIMAL landing in a DOUBLE or REAL column becomes the value
+                        // Trino makes of it — see `crate::transform::decimal`.
                         let opts = CastOptions {
                             safe: false,
                             ..Default::default()

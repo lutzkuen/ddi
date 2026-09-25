@@ -351,7 +351,7 @@ fn numeric_values(elems: &ArrayRef) -> DFResult<Vec<f64>> {
         }
         other => {
             // Cast anything else numeric via arrow rather than enumerating every type; a
-            // decimal to its nearest double, as Trino converts it.
+            // decimal to the double Trino makes of it.
             let casted =
                 crate::transform::decimal::cast(elems, &DataType::Float64).map_err(|e| {
                     DataFusionError::Execution(format!(

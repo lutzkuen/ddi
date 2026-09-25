@@ -320,10 +320,11 @@ fn decimals() -> RecordBatch {
 }
 
 #[tokio::test]
-async fn a_decimal_casts_to_the_nearest_double_as_trino_does() {
+async fn a_decimal_casts_to_the_double_trino_gives() {
     // Arrow divides the unscaled integer by 10^17 in floating point, which rounds twice:
-    // 0.49979999999999997 came out as 0.4998. Trino's DecimalConversions reads it exactly,
-    // and so does every spelling here.
+    // 0.49979999999999997 came out as 0.4998. Trino's DecimalConversions reads a long
+    // decimal exactly, and so does every spelling here — except a short decimal, of 18
+    // digits or fewer, which Trino divides just as Arrow does.
     let texts = common::SEVENTEEN_DIGIT_DOUBLES;
     let sql = "SELECT CAST(dec AS DOUBLE) AS cast, \
                       TRY_CAST(dec AS DOUBLE) AS try_cast, \
@@ -336,17 +337,21 @@ async fn a_decimal_casts_to_the_nearest_double_as_trino_does() {
                       CAST(dec AS REAL) AS real \
                FROM source";
     let out = run_on(decimals(), sql).await;
-    for name in [
-        "cast",
-        "try_cast",
-        "coerced",
-        "from_json",
-        "short",
-        "element",
-    ] {
+    for name in ["cast", "try_cast", "coerced", "from_json", "element"] {
         common::assert_nearest_doubles(&common::column_of(&out, name), &texts);
     }
     common::assert_nearest_reals(&common::column_of(&out, "real"), &texts);
+    // What Trino 480 returns for `CAST(CAST(x AS DECIMAL(18,17)) AS DOUBLE)`: not the nearest
+    // double, but its own `(double) unscaled / 1e17`.
+    common::assert_nearest_doubles(
+        &common::column_of(&out, "short"),
+        &[
+            "0.4998",
+            "0.9017000000000002",
+            "0.4590999999999999",
+            "0.4038000000000001",
+        ],
+    );
 
     // Through a derived table, whose projection is planned as a node of its own.
     let out = run_on(

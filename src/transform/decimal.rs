@@ -1,4 +1,4 @@
-//! DECIMAL to DOUBLE and REAL, correctly rounded, as Trino converts them.
+//! DECIMAL to DOUBLE and REAL, as Trino converts them.
 //!
 //! Arrow's cast divides in floating point: it turns the unscaled integer into a double,
 //! divides by `10f64.powi(scale)`, and for a REAL narrows that result with `as f32`. Once the
@@ -8,13 +8,23 @@
 //! issue #12, where serde_json's default float parser does the same arithmetic. A
 //! reconciliation against the warehouse flags every one.
 //!
-//! Trino's `DecimalConversions` divides only when both operands are exact as doubles — the
+//! Trino converts a *long* decimal — more than 18 digits, held in 128 bits — with
+//! `DecimalConversions`, which divides only when both operands are exact as doubles — the
 //! integer within ±2^53 and the power of ten at most 10^22 — because one IEEE division of
-//! exact operands is correctly rounded. Anything else it reads through `BigDecimal` or
-//! `Double.parseDouble`, which are correctly rounded too. A REAL is correctly rounded to a
-//! float in the same way, never by narrowing a rounded double. This module does the same:
-//! one division where it is exact (below 2^53 and 10^22, or 2^24 and 10^10 for a REAL), and
+//! exact operands is correctly rounded. Anything else it reads through `Double.parseDouble`,
+//! which is correctly rounded too. A REAL is correctly rounded to a float in the same way,
+//! never by narrowing a rounded double. This module does the same for a long decimal: one
+//! division where it is exact (below 2^53 and 10^22, or 2^24 and 10^10 for a REAL), and
 //! otherwise the decimal's text read by Rust's float parser.
+//!
+//! A *short* decimal, of 18 digits or fewer, Trino divides as it stands: the unscaled `long`
+//! as a double over the power of ten as a double, or both as floats for a REAL. Past 2^53
+//! (2^24) that rounds twice, and the answer is not always the nearest — DECIMAL(17,17)
+//! `0.49979999999999997` is `0.4998` there too — but it is Trino's, so it is this module's.
+//! For a DOUBLE it is also Arrow's; for a REAL it is not, since Arrow divides as doubles and
+//! narrows after. Which of the two a value is follows its type's precision, so a decimal
+//! DataFusion computes can still land on the other side from Trino's: its product of two
+//! decimals has one digit more.
 //!
 //! What goes through it: a CAST or TRY_CAST in a model, including the casts DataFusion's
 //! coercion inserts (`dec * 1e0`), and the same in a lambda body; casts of a list of decimals
@@ -56,8 +66,26 @@ const POW10_F64: [f64; 23] = [
 /// 10^0 to 10^10: every power of ten a float holds exactly.
 const POW10_F32: [f32; 11] = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10];
 
-/// `unscaled × 10^-scale` as the nearest double.
-pub(crate) fn decimal_to_f64(unscaled: i128, scale: i8) -> f64 {
+/// The most digits a DECIMAL can have and still be one Trino holds in a `long`, and
+/// converts by dividing it as it stands.
+const TRINO_MAX_SHORT_PRECISION: u8 = 18;
+
+/// The power of ten a short DECIMAL(`precision`, `scale`) is divided by, as Trino divides
+/// it, or `None` for a long one. A negative scale, which Trino has no type for, is long.
+fn short_power(precision: u8, scale: i8) -> Option<f64> {
+    if precision > TRINO_MAX_SHORT_PRECISION || scale < 0 {
+        return None;
+    }
+    POW10_F64.get(usize::from(scale.unsigned_abs())).copied()
+}
+
+/// `unscaled × 10^-scale` as Trino makes a DOUBLE of a DECIMAL(`precision`, `scale`): the
+/// nearest double for a long decimal, one division for a short one.
+pub(crate) fn decimal_to_f64(unscaled: i128, precision: u8, scale: i8) -> f64 {
+    if let Some(p) = short_power(precision, scale) {
+        // `(double) unscaled / (double) 10^scale`. The power is exact up to 10^22.
+        return unscaled as f64 / p;
+    }
     if unscaled.unsigned_abs() <= 1u128 << 53 {
         let exact = unscaled as f64;
         let power = usize::from(scale.unsigned_abs());
@@ -68,8 +96,15 @@ pub(crate) fn decimal_to_f64(unscaled: i128, scale: i8) -> f64 {
     parse(unscaled, scale)
 }
 
-/// `unscaled × 10^-scale` as the nearest float, never rounded through a double first.
-pub(crate) fn decimal_to_f32(unscaled: i128, scale: i8) -> f32 {
+/// `unscaled × 10^-scale` as Trino makes a REAL of a DECIMAL(`precision`, `scale`): the
+/// nearest float for a long decimal, never rounded through a double first, and one division
+/// of floats for a short one.
+pub(crate) fn decimal_to_f32(unscaled: i128, precision: u8, scale: i8) -> f32 {
+    if let Some(p) = short_power(precision, scale) {
+        // `(float) unscaled / (float) 10^scale`: both rounded to the nearest float, as Java's
+        // `l2f` rounds them, and the power from its exact double.
+        return unscaled as f32 / p as f32;
+    }
     if unscaled.unsigned_abs() <= 1u128 << 24 {
         let exact = unscaled as f32;
         let power = usize::from(scale.unsigned_abs());
@@ -80,16 +115,16 @@ pub(crate) fn decimal_to_f32(unscaled: i128, scale: i8) -> f32 {
     parse(unscaled, scale)
 }
 
-fn wide_to_f64(unscaled: i256, scale: i8) -> f64 {
+fn wide_to_f64(unscaled: i256, precision: u8, scale: i8) -> f64 {
     match unscaled.to_i128() {
-        Some(v) => decimal_to_f64(v, scale),
+        Some(v) => decimal_to_f64(v, precision, scale),
         None => parse(unscaled, scale),
     }
 }
 
-fn wide_to_f32(unscaled: i256, scale: i8) -> f32 {
+fn wide_to_f32(unscaled: i256, precision: u8, scale: i8) -> f32 {
     match unscaled.to_i128() {
-        Some(v) => decimal_to_f32(v, scale),
+        Some(v) => decimal_to_f32(v, precision, scale),
         None => parse(unscaled, scale),
     }
 }
@@ -134,36 +169,41 @@ pub(crate) fn decimal_to_float_array(
     to: &DataType,
 ) -> Result<ArrayRef, ArrowError> {
     match (array.data_type(), to) {
-        (DataType::Decimal32(_, s), _) => {
-            let s = *s;
+        (DataType::Decimal32(p, s), _) => {
+            let (p, s) = (*p, *s);
             leaf::<Decimal32Type>(
                 array,
                 to,
-                |v| decimal_to_f64(v.into(), s),
-                |v| decimal_to_f32(v.into(), s),
+                |v| decimal_to_f64(v.into(), p, s),
+                |v| decimal_to_f32(v.into(), p, s),
             )
         }
-        (DataType::Decimal64(_, s), _) => {
-            let s = *s;
+        (DataType::Decimal64(p, s), _) => {
+            let (p, s) = (*p, *s);
             leaf::<Decimal64Type>(
                 array,
                 to,
-                |v| decimal_to_f64(v.into(), s),
-                |v| decimal_to_f32(v.into(), s),
+                |v| decimal_to_f64(v.into(), p, s),
+                |v| decimal_to_f32(v.into(), p, s),
             )
         }
-        (DataType::Decimal128(_, s), _) => {
-            let s = *s;
+        (DataType::Decimal128(p, s), _) => {
+            let (p, s) = (*p, *s);
             leaf::<Decimal128Type>(
                 array,
                 to,
-                |v| decimal_to_f64(v, s),
-                |v| decimal_to_f32(v, s),
+                |v| decimal_to_f64(v, p, s),
+                |v| decimal_to_f32(v, p, s),
             )
         }
-        (DataType::Decimal256(_, s), _) => {
-            let s = *s;
-            leaf::<Decimal256Type>(array, to, |v| wide_to_f64(v, s), |v| wide_to_f32(v, s))
+        (DataType::Decimal256(p, s), _) => {
+            let (p, s) = (*p, *s);
+            leaf::<Decimal256Type>(
+                array,
+                to,
+                |v| wide_to_f64(v, p, s),
+                |v| wide_to_f32(v, p, s),
+            )
         }
         (DataType::List(_), DataType::List(t)) => list::<i32>(array, t),
         (DataType::LargeList(_), DataType::LargeList(t)) => list::<i64>(array, t),
@@ -211,7 +251,7 @@ fn list<O: OffsetSizeTrait>(array: &dyn Array, to: &FieldRef) -> Result<ArrayRef
     )?))
 }
 
-/// Arrow's `cast_with_options`, except that decimals to DOUBLE or REAL are correctly rounded.
+/// Arrow's `cast_with_options`, except that decimals to DOUBLE or REAL convert as in Trino.
 pub(crate) fn cast_with_options(
     array: &ArrayRef,
     to: &DataType,
@@ -223,7 +263,7 @@ pub(crate) fn cast_with_options(
     deltalake::arrow::compute::cast_with_options(array, to, options)
 }
 
-/// Arrow's `cast`, except that decimals to DOUBLE or REAL are correctly rounded.
+/// Arrow's `cast`, except that decimals to DOUBLE or REAL convert as in Trino.
 pub(crate) fn cast(array: &ArrayRef, to: &DataType) -> Result<ArrayRef, ArrowError> {
     cast_with_options(array, to, &CastOptions::default())
 }
@@ -311,8 +351,8 @@ impl ScalarUDFImpl for DecimalToFloat {
     }
 }
 
-/// Replace every CAST and TRY_CAST of decimals to DOUBLE or REAL in `expr` with the
-/// correctly rounded conversion. `schema` is what `expr`'s columns resolve against.
+/// Replace every CAST and TRY_CAST of decimals to DOUBLE or REAL in `expr` with Trino's
+/// conversion. `schema` is what `expr`'s columns resolve against.
 ///
 /// Never fails on the expression's account: one whose input type cannot be worked out is
 /// left as it was, with Arrow's cast.
@@ -406,7 +446,7 @@ mod tests {
             (12345, -3, "12345000"),
             (98765432109876543, -5, "9876543210987654300000"),
         ] {
-            let got = decimal_to_f64(unscaled, scale);
+            let got = decimal_to_f64(unscaled, 38, scale);
             let want: f64 = text.parse().unwrap();
             assert_eq!(
                 got.to_bits(),
@@ -415,12 +455,54 @@ mod tests {
             );
         }
         // Zero is positive zero, as `0 / 10^s` is.
-        assert_eq!(decimal_to_f64(0, 17).to_bits(), 0f64.to_bits());
-        assert_eq!(decimal_to_f32(0, 17).to_bits(), 0f32.to_bits());
+        assert_eq!(decimal_to_f64(0, 38, 17).to_bits(), 0f64.to_bits());
+        assert_eq!(decimal_to_f32(0, 38, 17).to_bits(), 0f32.to_bits());
+        assert_eq!(decimal_to_f64(0, 17, 17).to_bits(), 0f64.to_bits());
+        assert_eq!(decimal_to_f32(0, 17, 17).to_bits(), 0f32.to_bits());
 
         // And Arrow's division really does miss, or none of this would be needed.
         let arrow = 49979999999999997i128 as f64 / 10f64.powi(17);
         assert_eq!(arrow, 0.4998, "Arrow's cast of 0.49979999999999997");
+    }
+
+    #[test]
+    fn a_short_decimal_is_divided_as_trino_divides_it() {
+        // DecimalCasts.shortDecimalToDouble is `(double) unscaled / (double) 10^scale`, and
+        // shortDecimalToReal the same in floats, for every DECIMAL of up to 18 digits. What
+        // Trino 480 returned for each of these, read back from a table it wrote.
+        for (unscaled, precision, scale, trino) in [
+            (49979999999999997i128, 17u8, 17i8, "0.4998"),
+            (45909999999999995, 17, 17, "0.4590999999999999"),
+            (22205956120782495, 17, 17, "0.22205956120782497"),
+            (40380000000000005, 18, 17, "0.4038000000000001"),
+            (59356256244421893, 18, 6, "59356256244.4219"),
+        ] {
+            let want: f64 = trino.parse().unwrap();
+            let got = decimal_to_f64(unscaled, precision, scale);
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "DECIMAL({precision},{scale}) {unscaled}: got {got:?}, Trino gives {want:?}"
+            );
+            // One digit more and it is a long decimal, which Trino rounds correctly.
+            let nearest: f64 = format!("{unscaled}e-{scale}").parse().unwrap();
+            assert_ne!(nearest.to_bits(), want.to_bits(), "the premise");
+            assert_eq!(
+                decimal_to_f64(unscaled, 19, scale).to_bits(),
+                nearest.to_bits()
+            );
+        }
+
+        // DECIMAL(9,2) 1413830.04: 141383004 is past 2^24, so it is rounded to a float before
+        // it is divided. A long decimal reads the text instead.
+        // The float 1413830.125, which is the one `1_413_830.1` names.
+        assert_eq!(decimal_to_f32(141383004, 9, 2), 1_413_830.1);
+        assert_eq!(decimal_to_f32(141383004, 19, 2), 1413830.0);
+        assert_eq!(
+            "1413830.04".parse::<f32>().unwrap(),
+            1413830.0,
+            "the nearest float"
+        );
     }
 
     #[test]
@@ -451,12 +533,12 @@ mod tests {
             let double: f64 = text.parse().unwrap();
             let real: f32 = text.parse().unwrap();
             assert_eq!(
-                decimal_to_f64(unscaled, scale).to_bits(),
+                decimal_to_f64(unscaled, 38, scale).to_bits(),
                 double.to_bits(),
                 "{text} as a double"
             );
             assert_eq!(
-                decimal_to_f32(unscaled, scale).to_bits(),
+                decimal_to_f32(unscaled, 38, scale).to_bits(),
                 real.to_bits(),
                 "{text} as a real"
             );

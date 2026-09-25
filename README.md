@@ -318,9 +318,13 @@ Instants agree with Trino. Wall clocks can differ:
   without a word, so `ddi` replaces its `date_trunc` with one that refuses such a value —
   which also covers a Delta `timestamp` column holding one. With a data-quality table that
   row is [set aside](#a-row-the-transform-cannot-evaluate) and the rest of the batch commits;
-- the one-argument form is UTC whatever a Trino session's zone is.
+- the one-argument form is UTC whatever a Trino session's zone is, so under a session in
+  another zone its local time differs, and near midnight so does its date.
 
-`CAST(from_unixtime(..) AS DATE)`, or an explicit `'UTC'`, sidesteps all of them.
+For a date, `CAST(from_unixtime(x, 'UTC') AS DATE)`, or the same with a fixed offset such as
+`'+02:00'`, gives Trino's answer wherever both convert. A zone with daylight saving can still
+differ after 2099, for an instant in the hour before local midnight, and so can the
+one-argument form.
 
 ### Pinned Delta lookups
 
@@ -1158,8 +1162,13 @@ REAL`, is read from its text straight into the nearest double or real, as Trino'
 `json_extract`, `json_array_get` or a lambda over `CAST(.. AS ARRAY(JSON))`: a 17-digit
 `0.49979999999999997` stays `0.49979999999999997`.
 
-A DECIMAL cast to DOUBLE or REAL is correctly rounded too, as Trino's `DecimalConversions`
-does it, where Arrow's own cast divides in floating point and can land one ULP off. That
+A DECIMAL of more than 18 digits cast to DOUBLE or REAL is correctly rounded too, as Trino's
+`DecimalConversions` does it, where Arrow's own cast divides in floating point and can land
+one ULP off. One of 18 digits or fewer Trino divides in floating point itself — the unscaled
+integer over the power of ten, as doubles for a DOUBLE and as floats for a REAL — so `ddi`
+does that, and DECIMAL(17,17) `0.49979999999999997` is `0.4998` in both. Which of the two a
+value is follows its type's precision, and DataFusion gives a product of two decimals one
+digit more than Trino does, so a computed decimal near that line can still differ. That
 covers `CAST` and `TRY_CAST`, the casts DataFusion's coercion inserts (`dec * 1e0`), lambda
 bodies, a list of decimals cast to a list of doubles, a DECIMAL column landing in a DOUBLE or
 REAL target, and the `array_*` aggregates over decimals. It does not yet cover `log` and

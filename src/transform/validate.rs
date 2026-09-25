@@ -402,8 +402,12 @@ fn cross_row_set_expr(body: &SetExpr) -> Option<&'static str> {
 ///   within that hour of local midnight.
 /// - `NaN` fails, where Trino returns 1970; an epoch between about 71,000 and 292,000 years
 ///   converts here and fails there.
+/// - The one-argument form's local time, and near midnight its date, is UTC's rather than the
+///   Trino session's.
 ///
-/// `CAST(from_unixtime(..) AS DATE)`, or an explicit `'UTC'`, avoids all of them.
+/// For a date, `CAST(from_unixtime(x, 'UTC') AS DATE)`, or a fixed offset in place of `'UTC'`,
+/// gives Trino's answer wherever both convert. A zone that keeps daylight saving can still
+/// differ after 2099, as above, and so can the one-argument form.
 fn rewrite_trino_from_unixtime(query: &mut Query) -> Result<()> {
     struct V(Option<Error>);
 
@@ -751,7 +755,8 @@ pub(crate) fn trino_zone(zone: &str) -> std::result::Result<String, String> {
         let (hours, minutes) = match (tail.len(), tail.split_once(':')) {
             (5, Some((h, m))) if h.len() == 2 => (digits(h, 2), digits(m, 2)),
             (1 | 2, None) => (digits(tail, 2), Some(0)),
-            (4, None) => (digits(&tail[..2], 2), digits(&tail[2..], 2)),
+            // Byte lengths, so a character of more than one byte is refused rather than cut.
+            (4, None) if tail.is_ascii() => (digits(&tail[..2], 2), digits(&tail[2..], 2)),
             _ => (None, None),
         };
         let (Some(hours), Some(minutes)) = (hours, minutes) else {
@@ -1624,7 +1629,15 @@ mod tests {
         for region in ["America/New_York", "Asia/Kolkata", "Australia/Lord_Howe"] {
             assert_eq!(zone(region), region, "a region is carried verbatim");
         }
-        for malformed in ["GMT+0530", "GMT7", "+5:30", "+05:30:00", "+123"] {
+        for malformed in [
+            "GMT+0530",
+            "GMT7",
+            "+5:30",
+            "+05:30:00",
+            "+123",
+            "+1é1",
+            "GMT+é",
+        ] {
             from_unixtime_err(&format!(
                 "SELECT from_unixtime(e, '{malformed}') FROM source"
             ));
