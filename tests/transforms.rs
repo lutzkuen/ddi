@@ -477,6 +477,115 @@ async fn an_integer_literal_beside_a_decimal_is_typed_as_trino_types_it() {
 }
 
 #[tokio::test]
+async fn a_quotient_floor_ceil_and_round_of_a_decimal_are_typed_as_trino_types_them() {
+    // Arrow gives a quotient four digits of scale more than its dividend, where Trino gives it
+    // the divisor's precision and one more; `floor`, `ceil` and `round` keep their argument's
+    // precision, or its type, where Trino narrows them; and `round(x, n)` narrows the scale,
+    // where Trino keeps it. On the way to a REAL each was divided where Trino rounds it, or the
+    // other way about — and more of them once an integer literal beside a decimal was typed as
+    // Trino's INTEGER, ten digits narrower than DataFusion's BIGINT, as was one in an
+    // `ARRAY[..]` not yet. Types and values are what Trino 480 returns.
+    use deltalake::arrow::array::{AsArray, Decimal128Array};
+    use deltalake::arrow::datatypes::Float32Type;
+
+    // DECIMAL(9,2) 1413830.04, DECIMAL(12,0) 141383007, DECIMAL(10,2) 125.00 and DECIMAL(18,2)
+    // 2000000.12: results past 2^24 unscaled, which divide to something other than the
+    // nearest float.
+    let batch = || {
+        let decimal = |v: i128, p: u8, s: i8| {
+            Arc::new(
+                Decimal128Array::from(vec![v])
+                    .with_precision_and_scale(p, s)
+                    .unwrap(),
+            ) as ArrayRef
+        };
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("r", DataType::Decimal128(9, 2), false),
+                Field::new("amount", DataType::Decimal128(12, 0), false),
+                Field::new("a", DataType::Decimal128(10, 2), false),
+                Field::new("big", DataType::Decimal128(18, 2), false),
+            ])),
+            vec![
+                decimal(141383004, 9, 2),
+                decimal(141383007, 12, 0),
+                decimal(12500, 10, 2),
+                decimal(200000012, 18, 2),
+            ],
+        )
+        .unwrap()
+    };
+
+    let out = run_on(
+        batch(),
+        "SELECT amount / 100 AS quotient, \
+                coalesce(amount, 0) / 100 AS coalesced, \
+                123456789 / a AS literal_dividend, \
+                floor(r) AS floored, \
+                floor(coalesce(r, 0)) AS floored_coalesced, \
+                ceil(r - 1) AS ceiled, \
+                round(r) AS rounded, \
+                round(big, 1) AS rounded_to_one \
+         FROM source",
+    )
+    .await;
+    let schema = out[0].schema();
+    for (name, (p, s)) in [
+        ("quotient", (23, 11)),
+        ("coalesced", (23, 11)),
+        ("literal_dividend", (23, 11)),
+        ("floored", (8, 0)),
+        ("floored_coalesced", (11, 0)),
+        ("ceiled", (12, 0)),
+        ("rounded", (8, 0)),
+        ("rounded_to_one", (19, 2)),
+    ] {
+        assert_eq!(
+            schema.field_with_name(name).unwrap().data_type(),
+            &DataType::Decimal128(p, s),
+            "{name}: Trino's decimal({p},{s})"
+        );
+    }
+
+    let out = run_on(
+        batch(),
+        "SELECT CAST(amount / 100 AS REAL) AS quotient, \
+                CAST(coalesce(amount, 0) / 100 AS REAL) AS coalesced, \
+                CAST(123456789 / a AS REAL) AS literal_dividend, \
+                CAST(floor(r) AS REAL) AS floored, \
+                CAST(floor(coalesce(r, 0)) AS REAL) AS floored_coalesced, \
+                CAST(ceil(r - 1) AS REAL) AS ceiled, \
+                CAST(round(big, 1) AS REAL) AS rounded_to_one, \
+                CAST(ARRAY[r, 0] AS ARRAY(REAL))[1] AS in_an_array, \
+                transform(ARRAY[amount], x -> CAST(coalesce(x, 0) / 100 AS REAL))[1] \
+                    AS in_lambda \
+         FROM source",
+    )
+    .await;
+    for (name, trino) in [
+        ("quotient", "1413830.125"),
+        ("coalesced", "1413830.125"),
+        ("literal_dividend", "987654.3125"),
+        ("floored", "1413830.0"),
+        ("floored_coalesced", "1413830.0"),
+        ("ceiled", "1413830.0"),
+        ("rounded_to_one", "2000000.125"),
+        ("in_an_array", "1413830.125"),
+        ("in_lambda", "1413830.125"),
+    ] {
+        let want: f32 = trino.parse().unwrap();
+        let got = common::column_of(&out, name)
+            .as_primitive::<Float32Type>()
+            .value(0);
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{name}: got {got:?}, Trino gives {want:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_sum_over_a_decimal_is_typed_as_trino_types_it() {
     // DataFusion sums a DECIMAL(p,s) to DECIMAL(p+10,s), so over 8 digits or fewer to a short
     // decimal, which Trino divides on its way to a REAL; Trino's own sum is DECIMAL(38,s)

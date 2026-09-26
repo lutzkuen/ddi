@@ -28,12 +28,16 @@
 //! wider than Trino's INTEGER — so it is typed as Trino types it first
 //! ([`retype_integer_literals`]). Nor would `sum`: DataFusion gives it ten digits more than its
 //! argument and Trino 38, so over 8 digits or fewer it would be short here and long there, and
-//! its argument is widened to 38 digits first ([`widen_decimal_sums`]). `avg` differs too,
+//! its argument is widened to 38 digits first ([`widen_decimal_sums`]). Nor would a quotient,
+//! which Arrow gives four digits of scale more than its dividend and Trino the divisor's
+//! precision and one more (DECIMAL(9,2) / DECIMAL(9,2) is DECIMAL(15,6) there and
+//! DECIMAL(21,12) in Trino), nor `floor`, `ceil` and `round`, which keep their argument's
+//! precision where Trino narrows it: each is cast to Trino's type
+//! ([`retype_decimal_results`]), a quotient computed to one digit more first, so that the cast
+//! rounds its last digit as Trino does. Past 38 digits there is no room for that digit, and a
+//! quotient's last is DataFusion's, truncated where Trino rounds it. `avg` differs too,
 //! DECIMAL(p+4, s+4) against Trino's DECIMAL(p, s), but no model can use it: a transform
-//! aggregates nothing, and a publication only what a client can add up. One computed decimal
-//! still differs: a quotient of decimals, which DataFusion computes to fewer digits
-//! (DECIMAL(9,2) / DECIMAL(9,2) is DECIMAL(15,6) there and DECIMAL(21,12) in Trino, and the
-//! digits themselves differ).
+//! aggregates nothing, and a publication only what a client can add up.
 //!
 //! What goes through it: a CAST or TRY_CAST in a model, including the casts DataFusion's
 //! coercion inserts (`dec * 1e0`), and the same in a lambda body; casts of a list of decimals
@@ -406,7 +410,8 @@ pub(crate) fn rewrite_expr(expr: Expr, schema: &DFSchema) -> DFResult<Transforme
 /// converts to DOUBLE or REAL: `coalesce(amount, 0)` over a DECIMAL(18,8) is DECIMAL(28,8) in
 /// DataFusion, correctly rounded, and DECIMAL(18,8) in Trino, divided. So a literal that fits
 /// an INTEGER becomes one in arithmetic (`+ - * / %`), in the branches of a CASE, and among the
-/// arguments of `coalesce`, `nullif`, `greatest` and `least`, wherever a decimal is beside it.
+/// arguments of `coalesce`, `nullif`, `greatest`, `least` and an `ARRAY[..]`, wherever a decimal
+/// is beside it.
 /// A literal past an INTEGER, and a BIGINT column, stay DECIMAL(20,0) where Trino's BIGINT is
 /// DECIMAL(19,0): the result is a long decimal in both, so it converts the same.
 ///
@@ -440,7 +445,10 @@ pub(crate) fn retype_integer_literals(
                 schema,
             ),
             Expr::ScalarFunction(f)
-                if matches!(f.name(), "coalesce" | "nullif" | "greatest" | "least") =>
+                if matches!(
+                    f.name(),
+                    "coalesce" | "nullif" | "greatest" | "least" | "make_array"
+                ) =>
             {
                 narrow_beside_a_decimal(f.args.iter_mut(), schema)
             }
@@ -492,8 +500,6 @@ fn narrow_beside_a_decimal<'a>(
 /// by its first branch alone. Never fails on the expression's account: an argument whose type
 /// cannot be worked out is left as it was.
 pub(crate) fn widen_decimal_sums(expr: Expr, schema: &DFSchema) -> DFResult<Transformed<Expr>> {
-    use deltalake::datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
-
     expr.transform_up(|mut e| {
         let Expr::AggregateFunction(sum) = &mut e else {
             return Ok(Transformed::no(e));
@@ -504,14 +510,9 @@ pub(crate) fn widen_decimal_sums(expr: Expr, schema: &DFSchema) -> DFResult<Tran
         let [arg] = sum.params.args.as_mut_slice() else {
             return Ok(Transformed::no(e));
         };
-        let mut coercion = TypeCoercionRewriter::new(schema);
-        let scale = match arg
-            .clone()
-            .rewrite(&mut coercion)
-            .and_then(|coerced| coerced.data.get_type(schema))
-        {
-            Ok(DataType::Decimal128(38, _)) => None,
-            Ok(
+        let scale = match coerced_type(arg, schema) {
+            Some(DataType::Decimal128(38, _)) => None,
+            Some(
                 DataType::Decimal32(_, s) | DataType::Decimal64(_, s) | DataType::Decimal128(_, s),
             ) => Some(s),
             _ => None,
@@ -527,10 +528,132 @@ pub(crate) fn widen_decimal_sums(expr: Expr, schema: &DFSchema) -> DFResult<Tran
     })
 }
 
-/// DataFusion's analyzer rules, with this module's three where they belong: Trino's integer
-/// literals and decimal sums just before `TypeCoercion`, which is what widens the one and fits
-/// the plan to the other, and Trino's DECIMAL casts at the end, after it, so that they also
-/// see the casts coercion inserts.
+/// Type every quotient of decimals, and every `floor`, `ceil` and `round` of one, in `expr` as
+/// Trino types it. `schema` is what `expr`'s columns resolve against.
+///
+/// Which way a DECIMAL converts to DOUBLE or REAL follows its type's precision, and DataFusion
+/// types these otherwise. Arrow gives a quotient four digits of scale more than its dividend,
+/// where Trino gives it `s1 + p2 + 1`, at least six, within 38 digits
+/// ([`trino_quotient`]): `coalesce(amount, 0) / 100` over a DECIMAL(12,0) is DECIMAL(16,4) in
+/// DataFusion, divided on its way to a REAL, and DECIMAL(23,11) in Trino, correctly rounded.
+/// `floor`, `ceil` and `round(x)` keep their argument's precision, where Trino's type is
+/// DECIMAL(p - s + min(s, 1), 0): over DECIMAL(9,2), `floor(r)` is DECIMAL(9,2) here and
+/// DECIMAL(8,0) there. And `round(x, n)` narrows the scale to `n`, where Trino's keeps it and
+/// adds a digit, DECIMAL(p + 1, s). So each is cast to Trino's type. A quotient's dividend is
+/// first cast to the scale that has Arrow compute one digit past Trino's, which the cast then
+/// rounds half up, as Trino rounds: Arrow truncates. A quotient of 38 digits has no room for
+/// that digit, and its last is Arrow's.
+///
+/// Before coercion, like [`widen_decimal_sums`], because this changes the type of a node, and
+/// coercion is what fits every node above it to that; and after
+/// [`retype_integer_literals`], whose INTEGER literals a quotient has to see. Never fails on the
+/// expression's account: one whose operands' types cannot be worked out is left as it was.
+pub(crate) fn retype_decimal_results(expr: Expr, schema: &DFSchema) -> DFResult<Transformed<Expr>> {
+    use deltalake::datafusion::logical_expr::Operator;
+
+    expr.transform_up(|mut e| {
+        let (p, s) = match &mut e {
+            Expr::BinaryExpr(q) if q.op == Operator::Divide => {
+                let (Some(l), Some(r)) = (
+                    as_trino_sees(&q.left, schema),
+                    as_trino_sees(&q.right, schema),
+                ) else {
+                    return Ok(Transformed::no(e));
+                };
+                if !l.decimal && !r.decimal {
+                    return Ok(Transformed::no(e));
+                }
+                let (p, s) = trino_quotient((l.precision, l.scale), (r.precision, r.scale));
+                let scale = if p < 38 { s - 3 } else { s - 4 };
+                if scale > l.scale {
+                    let precision = i16::from(l.precision) + i16::from(scale - l.scale);
+                    let dividend = std::mem::take(&mut q.left);
+                    *q.left = Expr::Cast(Cast::new(
+                        dividend,
+                        DataType::Decimal128(precision.min(38) as u8, scale),
+                    ));
+                }
+                (p, s)
+            }
+            Expr::ScalarFunction(f) if matches!(f.name(), "floor" | "ceil" | "round") => {
+                let argument = f.args.first().and_then(|a| as_trino_sees(a, schema));
+                let Some(a) = argument.filter(|a| a.decimal) else {
+                    return Ok(Transformed::no(e));
+                };
+                match (f.name(), f.args.len()) {
+                    ("round", 2) => ((a.precision + 1).min(38), a.scale),
+                    _ => (a.precision - a.scale as u8 + u8::from(a.scale > 0), 0),
+                }
+            }
+            _ => return Ok(Transformed::no(e)),
+        };
+        Ok(Transformed::yes(Expr::Cast(Cast::new(
+            Box::new(e),
+            DataType::Decimal128(p, s),
+        ))))
+    })
+}
+
+/// A decimal or integer as Trino types it beside a decimal.
+struct TrinoDecimal {
+    precision: u8,
+    scale: i8,
+    /// False for an integer, which is a decimal of scale 0 only beside one.
+    decimal: bool,
+}
+
+/// `expr` as Trino types it beside a decimal, or `None` when it is neither a decimal nor an
+/// integer. An INTEGER is DECIMAL(10,0) in both engines, and a BIGINT DECIMAL(19,0) in Trino,
+/// where DataFusion makes it DECIMAL(20,0). A negative scale, which Trino has no type for, is
+/// neither.
+fn as_trino_sees(expr: &Expr, schema: &DFSchema) -> Option<TrinoDecimal> {
+    let (precision, scale, decimal) = match coerced_type(expr, schema)? {
+        DataType::Decimal32(p, s) | DataType::Decimal64(p, s) | DataType::Decimal128(p, s)
+            if s >= 0 =>
+        {
+            (p, s, true)
+        }
+        DataType::Int8 => (3, 0, false),
+        DataType::Int16 => (5, 0, false),
+        DataType::Int32 => (10, 0, false),
+        DataType::Int64 => (19, 0, false),
+        _ => return None,
+    };
+    Some(TrinoDecimal {
+        precision,
+        scale,
+        decimal,
+    })
+}
+
+/// Trino's type for DECIMAL(`p1`,`s1`) / DECIMAL(`p2`,`s2`): the dividend's integral digits and
+/// the divisor's scale before the point, and `s1 + p2 + 1` digits after it, at least six. Past
+/// 38 digits the scale gives way, down to six, before the integral digits do.
+fn trino_quotient((p1, s1): (u8, i8), (p2, s2): (u8, i8)) -> (u8, i8) {
+    let integral = i16::from(p1) - i16::from(s1) + i16::from(s2);
+    let mut scale = (i16::from(s1) + i16::from(p2) + 1).max(6);
+    if integral + scale > 38 {
+        scale = scale.min((38 - integral).max(6));
+    }
+    ((integral + scale).min(38) as u8, scale as i8)
+}
+
+/// `expr`'s type once coercion has had it, asked of coercion itself: before it, a CASE is typed
+/// by its first branch alone. `None` when it cannot be worked out.
+fn coerced_type(expr: &Expr, schema: &DFSchema) -> Option<DataType> {
+    use deltalake::datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
+
+    let mut coercion = TypeCoercionRewriter::new(schema);
+    expr.clone()
+        .rewrite(&mut coercion)
+        .and_then(|coerced| coerced.data.get_type(schema))
+        .ok()
+}
+
+/// DataFusion's analyzer rules, with this module's four where they belong: Trino's integer
+/// literals, then its types for quotients, `floor`, `ceil` and `round`, and for sums, just
+/// before `TypeCoercion`, which is what widens the literals and fits the plan to the rest, and
+/// Trino's DECIMAL casts at the end, after it, so that they also see the casts coercion inserts.
 pub(crate) fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     use deltalake::datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
     use deltalake::datafusion::optimizer::Analyzer;
@@ -542,6 +665,7 @@ pub(crate) fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
         .position(|r| r.name() == coercion.name())
         .unwrap_or(0);
     rules.insert(at, Arc::new(TrinoDecimalSums));
+    rules.insert(at, Arc::new(TrinoDecimalResults));
     rules.insert(at, Arc::new(TrinoIntegerLiterals));
     rules.push(Arc::new(TrinoDecimalCasts));
     rules
@@ -564,8 +688,26 @@ impl AnalyzerRule for TrinoIntegerLiterals {
     }
 }
 
+/// The analyzer pass that applies [`retype_decimal_results`] to every expression of a plan and
+/// its subqueries, after [`TrinoIntegerLiterals`]. Handled node by node as
+/// [`TrinoDecimalCasts`] handles them, so an unaliased `floor(amount)` keeps its name.
+#[derive(Debug, Default)]
+pub(crate) struct TrinoDecimalResults;
+
+impl AnalyzerRule for TrinoDecimalResults {
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> DFResult<LogicalPlan> {
+        Ok(plan
+            .transform_up_with_subqueries(|p| rewrite_plan(p, retype_decimal_results))?
+            .data)
+    }
+
+    fn name(&self) -> &str {
+        "ddi_trino_decimal_results"
+    }
+}
+
 /// The analyzer pass that applies [`widen_decimal_sums`] to every expression of a plan and its
-/// subqueries, after [`TrinoIntegerLiterals`]. Handled node by node as [`TrinoDecimalCasts`]
+/// subqueries, after [`TrinoDecimalResults`]. Handled node by node as [`TrinoDecimalCasts`]
 /// handles them, so an unaliased `sum(amount)` keeps its name.
 #[derive(Debug, Default)]
 pub(crate) struct TrinoDecimalSums;
@@ -710,6 +852,40 @@ mod tests {
             1413830.0,
             "the nearest float"
         );
+    }
+
+    #[test]
+    fn a_quotient_is_typed_as_trino_types_it() {
+        // What `typeof` gives in Trino 480 for each quotient, an INTEGER being DECIMAL(10,0),
+        // a TINYINT DECIMAL(3,0) and a BIGINT DECIMAL(19,0).
+        for (dividend, divisor, trino) in [
+            ((12, 0), (10, 0), (23, 11)),
+            ((10, 0), (10, 2), (23, 11)),
+            ((9, 2), (9, 2), (21, 12)),
+            ((5, 2), (2, 1), (10, 6)),
+            ((5, 2), (1, 0), (9, 6)),
+            ((3, 3), (3, 3), (10, 7)),
+            ((1, 0), (1, 0), (7, 6)),
+            ((8, 7), (1, 0), (10, 9)),
+            ((10, 5), (10, 0), (21, 16)),
+            ((10, 5), (19, 0), (30, 25)),
+            ((10, 5), (3, 0), (14, 9)),
+            // Past 38 digits: the scale gives way first, down to six.
+            ((38, 10), (10, 2), (38, 8)),
+            ((30, 5), (20, 2), (38, 11)),
+            ((20, 0), (19, 0), (38, 18)),
+            ((38, 0), (1, 0), (38, 6)),
+            ((38, 2), (10, 2), (38, 6)),
+            ((36, 0), (5, 3), (38, 6)),
+            ((33, 0), (5, 0), (38, 6)),
+            ((10, 0), (38, 30), (38, 6)),
+        ] {
+            assert_eq!(
+                trino_quotient(dividend, divisor),
+                trino,
+                "DECIMAL{dividend:?} / DECIMAL{divisor:?}"
+            );
+        }
     }
 
     #[test]

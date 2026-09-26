@@ -1233,15 +1233,17 @@ integer over the power of ten, as doubles for a DOUBLE and as floats for a REAL 
 does that, and DECIMAL(17,17) `0.49979999999999997` is `0.4998` in both. Which of the two a
 value is follows its type's precision, so a computed decimal has to have Trino's type. An
 integer literal beside a decimal — `coalesce(amount, 0)`, `CASE .. ELSE 0 END`,
-`amount + 1` — is typed as Trino types it, an INTEGER, where DataFusion's BIGINT would make
-the result ten digits wider: `coalesce(amount, 0)` over a DECIMAL(18,8) is a DECIMAL(18,8), as
-in Trino. A `sum` over a decimal, in a publication, is a DECIMAL(38,s) as in Trino, where
+`amount + 1`, `ARRAY[amount, 0]` — is typed as Trino types it, an INTEGER, where DataFusion's
+BIGINT would make the result ten digits wider: `coalesce(amount, 0)` over a DECIMAL(18,8) is a
+DECIMAL(18,8), as in Trino. A `sum` over a decimal, in a publication, is a DECIMAL(38,s) as in Trino, where
 DataFusion's has ten digits more than its argument, and so over 8 digits or fewer would be
 divided: over DECIMAL(8,2), 1413830.04 cast to REAL is 1413830.0 in both. `min` and `max` keep
 their argument's type in both engines, and `avg`, a DECIMAL(p+4,s+4) in DataFusion and a
-DECIMAL(p,s) in Trino, is refused in every model. One computed decimal still differs: a
-quotient of decimals, which DataFusion computes to fewer digits — DECIMAL(9,2) / DECIMAL(9,2)
-is DECIMAL(15,6) there and DECIMAL(21,12) in Trino, and the digits differ too. That covers
+DECIMAL(p,s) in Trino, is refused in every model. A quotient of decimals, and `floor`, `ceil`
+and `round` of one, are cast to Trino's types: DataFusion would make DECIMAL(9,2) /
+DECIMAL(9,2) a DECIMAL(15,6), where Trino's is DECIMAL(21,12), and keep `floor` of a
+DECIMAL(9,2) one, where Trino's is DECIMAL(8,0). A quotient's last digit is rounded as Trino
+rounds it, except in one of 38 digits, where it is DataFusion's, truncated. That covers
 `CAST` and `TRY_CAST`, the casts DataFusion's coercion inserts (`dec * 1e0`), lambda bodies, a
 list of decimals cast to a list of doubles, a DECIMAL column landing in a DOUBLE or REAL
 target, and the `array_*` aggregates over decimals.
