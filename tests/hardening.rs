@@ -735,6 +735,109 @@ async fn a_restart_after_bronze_was_replaced_in_place_reads_on_from_its_own_offs
     lake.assert_exactly(&orders(1..=9)).await;
 }
 
+/// Take out of each commit of a table what ddi 0.3.1 did not record: a source version that had
+/// the source's table id.
+fn as_ddi_0_3_1_wrote_it(table_path: &str) {
+    for entry in std::fs::read_dir(format!("{table_path}/_delta_log")).unwrap() {
+        let commit = entry.unwrap().path();
+        if commit.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let mut lines = Vec::new();
+        for line in std::fs::read_to_string(&commit).unwrap().lines() {
+            let mut action: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(info) = action.get_mut("commitInfo").and_then(|i| i.as_object_mut()) {
+                info.remove("ddi.sourceTableIdVersion");
+            }
+            lines.push(action.to_string());
+        }
+        std::fs::write(&commit, lines.join("\n") + "\n").unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_restart_after_bronze_was_replaced_in_place_reads_on_from_a_commit_ddi_0_3_1_made() {
+    // ddi 0.3.1 recorded bronze's table id with no version that had it, so the upgraded ddi
+    // could not tell bronze replaced in place while it was stopped from bronze dropped and
+    // recreated: without a dedup_timestamp it refused to start, for good, as nothing would
+    // ever commit the new id. The version its own offset is at had the id, as the last one
+    // 0.3.1 read, and bronze's log still gives it that id.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=3)).await;
+    let mut cfg = lake.cfg();
+    cfg.dedup_timestamp = None;
+    cfg.dedup_key = None;
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    as_ddi_0_3_1_wrote_it(&lake.stg);
+
+    lake.arrive(&orders(4..=6)).await;
+    replace_in_place(&lake.raw, raw_schema()).await;
+    lake.arrive(&orders(7..=9)).await;
+
+    let mut p = Pipeline::open(cfg)
+        .await
+        .expect("the same log, replaced in place");
+    p.run_until_caught_up()
+        .await
+        .expect("reading on across the replacement");
+    lake.assert_exactly(&orders(1..=9)).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_version_before_bronze_was_replaced_that_cannot_be_read_stops_the_reopen() {
+    // The reopen after bronze was replaced in place loads the version its last commit
+    // recorded, to see whether bronze's log is still the one it read. A read of it that failed
+    // — a timeout, throttling, a credential gone stale — says nothing about that, and was taken
+    // for a log without that version: bronze counted as dropped and recreated, and the reopen
+    // started over from `starting_version`, for good once it committed. Here the commits
+    // before the replacement cannot be opened, while the checkpoint after it lets bronze's head
+    // load all the same; the open fails, to be retried, and the retry reads on.
+    use std::os::unix::fs::PermissionsExt;
+
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=3)).await; // version 1
+    let cfg = lake.cfg();
+    lake.stream().await;
+    replace_in_place(&lake.raw, raw_schema()).await; // version 2
+    lake.arrive(&orders(4..=6)).await; // version 3
+    let bronze = open_table(ensure_table_uri(&lake.raw).unwrap())
+        .await
+        .unwrap();
+    deltalake::checkpoints::create_checkpoint(&bronze, None)
+        .await
+        .unwrap();
+
+    let before: Vec<_> = (0..2)
+        .map(|v| format!("{}/_delta_log/{v:020}.json", lake.raw))
+        .collect();
+    for commit in &before {
+        std::fs::set_permissions(commit, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let unreadable = std::fs::File::open(&before[1]).is_err();
+    let outcome = Pipeline::open(cfg.clone()).await;
+    for commit in &before {
+        std::fs::set_permissions(commit, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    if !unreadable {
+        return; // running as root, where the mode bits do not bite. Nothing to pin.
+    }
+    let Err(e) = outcome else {
+        panic!("a version that could not be read must not be taken for one the log lacks");
+    };
+    assert!(!e.to_string().contains("recreated"), "got: {e}");
+
+    let mut p = Pipeline::open(cfg).await.expect("the retry");
+    assert_eq!(p.coverage(), None, "the offset is exact; nothing to infer");
+    p.run_until_caught_up().await.unwrap();
+    lake.assert_exactly(&orders(1..=6)).await;
+}
+
 #[tokio::test]
 async fn without_a_dedup_timestamp_a_replaced_source_stops_rather_than_duplicating() {
     // Starting over is only safe because the filter suppresses what is already there.

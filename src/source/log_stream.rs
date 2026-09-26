@@ -660,21 +660,33 @@ impl LogStreamBuilder {
 /// when the log does not have that version — a table recreated shorter, or a version retention
 /// has reclaimed — which proves nothing either way. The kernel reports a version past the head
 /// as a log segment that ends early, so the head is asked first.
+///
+/// A read that failed is an error, as it is to the running stream: a store that timed out,
+/// throttled or refused a credential has said nothing about the log, and taking it for "not
+/// there" would take a table replaced in place for one dropped and recreated, and start over
+/// from `starting_version` — for good, once the restart's first commit records the new id.
 pub(crate) async fn keeps_identity(table: &DeltaTable, version: Version, id: &str) -> Result<bool> {
+    use deltalake::logstore::object_store;
+
     if table.version().is_none_or(|head| version > head) {
         return Ok(false);
     }
     let mut then = DeltaTable::new(table.log_store(), without_files());
     match then.load_version(version).await {
         Ok(()) => Ok(crate::lookup::table_id(&then).as_deref() == Some(id)),
-        Err(
-            DeltaTableError::InvalidVersion(_)
-            | DeltaTableError::NotATable(_)
-            | DeltaTableError::KernelError(_),
-        ) => Ok(false),
+        Err(DeltaTableError::InvalidVersion(_) | DeltaTableError::NotATable(_)) => Ok(false),
         Err(DeltaTableError::ObjectStore {
-            source: deltalake::logstore::object_store::Error::NotFound { .. },
+            source: object_store::Error::NotFound { .. },
         }) => Ok(false),
+        // The kernel's error for a log without that version and for a read that failed on the
+        // way are the same one, so the version's commit is asked for directly: only a store
+        // that answers it is not there has said the log does not have it.
+        Err(e @ DeltaTableError::KernelError(_)) => {
+            match table.log_store().read_commit_entry(version).await {
+                Ok(None) => Ok(false),
+                Ok(Some(_)) | Err(_) => Err(Error::Delta(e)),
+            }
+        }
         Err(e) => Err(Error::Delta(e)),
     }
 }

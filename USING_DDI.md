@@ -386,12 +386,12 @@ partition would be exact there too; `ddi` does not offer one yet.
 | Another writer appends to the target | Not taken as coverage; nothing is skipped because of it |
 | Another writer updates, deletes or merges in the target | Treated as a rebuild. Timestamps it writes newer than rows `ddi` has not delivered yet make it skip the source versions holding them (logged as `versions_not_reread`) |
 | `OPTIMIZE` on either table | Ignored — those commits carry `dataChange: false` |
-| `DELETE`/`UPDATE` upstream | Skipped, never propagated (see `change_policy`) |
+| `DELETE`/`UPDATE` upstream | Stops the model at that commit: a model reads with `change_policy = fail`. Only a pipeline written out in TOML can skip such commits (see [Deletes and updates upstream](#deletes-and-updates-upstream)) |
 | `DELETE` of old rows in the target | Left deleted |
 | Same key delivered again with changes | Appended as a second row — or, under `ddi_write_mode: upsert`, replaces the stored one |
 | Target dropped and recreated | Refilled from scratch |
 | Source dropped and recreated | Starts over, emitting only what is missing — including rows re-seeded after `ddi` reopened, provided they carry their original timestamps |
-| Source replaced in place (`CREATE OR REPLACE`) | Read on as one table from `ddi`'s own offset, while running and after a restart: the log is the one it was reading |
+| Source replaced in place (`CREATE OR REPLACE`) | The replacing commit removes every file, so a model stops at it as at a `DELETE`. A TOML pipeline that skips such commits reads on as one table from `ddi`'s own offset, while running and after a restart: the log is the one it was reading |
 
 The rescan after a rebuild is bounded by the source's own file statistics — Delta records
 `maxValues` per file — so a rebuild costs a read of the last commit or two, not the whole
@@ -828,7 +828,9 @@ above the longest gap you intend to allow between declaring a pipeline and first
 ### Deletes and updates upstream
 
 By default a `DELETE`, `UPDATE` or `MERGE` on the source stops the pipeline rather than
-guessing. To carry on, set a policy per pipeline:
+guessing, and so does a source replaced in place, whose replacing commit removes every file.
+A dbt model has no meta key for anything else, and always runs with `fail`. To carry on, write
+the pipelines out with `ddi dbt convert` and set a policy per pipeline there:
 
 - `fail` (default) — stop on any change commit
 - `skip_change_commits` — consume and ignore those commits

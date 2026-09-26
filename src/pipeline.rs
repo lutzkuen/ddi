@@ -1684,9 +1684,11 @@ async fn adjust_for_replaced_source(
     let recorded = &ours.source_table_id;
     let current = table_id(source);
     let mut different_table = matches!((recorded, &current), (Some(a), Some(b)) if a != b);
-    if let (true, Some(was), Some(seen_at)) =
-        (different_table, recorded, ours.source_table_id_version)
-    {
+    // A commit ddi 0.3.1 made names no version that had the recorded id, so our own offset is
+    // asked about instead: 0.3.1 recorded the id its source had when it opened, and so did the
+    // version it last committed, unless it read on across a replacement before that version.
+    let seen_at = ours.source_table_id_version.or(resume.committed);
+    if let (true, Some(was), Some(seen_at)) = (different_table, recorded, seen_at) {
         if crate::source::log_stream::keeps_identity(source, seen_at, was).await? {
             warn!(
                 pipeline = %cfg.name,
@@ -1785,6 +1787,7 @@ async fn resume_cursor(
             bootstrapping,
             rebuilt: None,
             from_watermark: None,
+            committed: stored,
             source_head,
         });
     }
@@ -1796,6 +1799,7 @@ async fn resume_cursor(
             bootstrapping,
             rebuilt: None,
             from_watermark: None,
+            committed: stored,
             source_head,
         });
     };
@@ -1874,6 +1878,7 @@ async fn resume_cursor(
                         bootstrapping: false,
                         rebuilt: None,
                         from_watermark: Some(w),
+                        committed: stored,
                         source_head,
                     });
                 }
@@ -1953,6 +1958,7 @@ async fn resume_cursor(
         bootstrapping: false,
         rebuilt: Some(dedup),
         from_watermark: None,
+        committed: stored,
         source_head,
     })
 }
@@ -2074,6 +2080,8 @@ struct Resume {
     /// data — not even one our last commit recorded, which described the target as it was
     /// before that rebuild.
     from_watermark: Option<Version>,
+    /// The last source version our own `txn` offset says this pipeline committed.
+    committed: Option<Version>,
     /// The source's head: as the snapshot this open loaded it, or where the target turned out
     /// rewritten and a watermark table is set, as read again after that table, whose rows can
     /// name versions the snapshot did not have yet.

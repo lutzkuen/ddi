@@ -715,7 +715,10 @@ the replacing commit carry the old id and those after it the new one, and the lo
 the recorded version the recorded id, which a table recreated at the path cannot. So it is
 read on as one table, by a running pipeline and by a restart alike, from the pipeline's own
 offset. The replacing commit removes every file, so reading across it takes a
-`change_policy` of `skip_change_commits` or `ignore_changes`.
+`change_policy` of `skip_change_commits` or `ignore_changes`. `ddi` 0.3.1 recorded the id with
+no version, so a pipeline upgraded from it asks about the version its own offset is at: where
+0.3.1 had already read on across the replacement that version has the new id, and the upgrade
+takes the source for one dropped and recreated, as 0.3.1's own next restart would have.
 
 ## Bad rows, and broken streams
 
