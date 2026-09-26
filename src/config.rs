@@ -303,12 +303,14 @@ pub struct PipelineConfig {
     ///
     /// With `dedup_timestamp` also set, a row the rebuild recorded here wins, because it is
     /// exact however rows arrive; the timestamp rescan is the fallback for a rebuild that
-    /// recorded none. A row that may be an earlier rebuild's — no newer than what this
-    /// pipeline's last handover recorded, and not the version its own offset is at — counts as
-    /// none, and so, with a warning, does a table that is not there or not `(app_id VARCHAR,
-    /// source_version BIGINT)`; a read that fails stops the open, which is retried, and so does
-    /// a container that does not exist. Not read by a staged upsert's merge, whose source is
-    /// the stage.
+    /// recorded none. A row that may be an earlier rebuild's counts as none: one no newer than
+    /// what this pipeline's last handover recorded, or, where its last commit recorded no
+    /// handover (made by ddi 0.3.1, or before this was set), any row — either way unless it is
+    /// the version its own offset is at; a pipeline that has never committed takes the newest
+    /// row. A row past the source's head counts as none too, and so, with a warning, does a
+    /// table that is not there or not `(app_id VARCHAR, source_version BIGINT)`; a read that
+    /// fails stops the open, which is retried, and so does a container that does not exist. Not
+    /// read by a staged upsert's merge, whose source is the stage.
     #[serde(default)]
     pub watermark_uri: Option<String>,
 
