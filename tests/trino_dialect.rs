@@ -18,7 +18,12 @@
 //! goes through which is read from Trino's source; `json_text_spells_an_emoji_as_trino_does`
 //! asks Trino itself, and compares its bytes with this engine's. In the same way,
 //! `from_unixtime_falls_on_the_date_trino_gives` asks it which day an epoch falls on in a
-//! zone, in each form of `from_unixtime` this engine rewrites.
+//! zone, in each form of `from_unixtime` this engine rewrites, and
+//! `from_unixtime_reads_the_wall_clock_trino_gives` what the local clock reads. Which DOUBLE
+//! or REAL a DECIMAL converts to follows Trino's types as much as its arithmetic, and both
+//! were read from its source too; the `a_decimal_*` tests ask Trino for the value, and
+//! `a_json_number_reads_as_the_double_trino_gives` what a 17-digit JSON number reads as. A
+//! float is compared bit for bit.
 //!
 //! Ignored by default because it needs a Trino listening. CI starts one and runs this with
 //! `--ignored`. To run it locally:
@@ -28,14 +33,22 @@
 //! DDI_TEST_TRINO=http://127.0.0.1:8080 cargo test --test trino_dialect -- --ignored
 //! ```
 
+mod common;
+
 use std::sync::Arc;
 
 use delta_delta_ingest::dbt::analyze::{analyze, Verdict};
 use delta_delta_ingest::dbt::Manifest;
 use delta_delta_ingest::transform::{SqlTransform, Transform};
 use delta_delta_ingest::trino::{TrinoClient, TrinoConnection};
-use deltalake::arrow::array::{AsArray, RecordBatch, StringArray};
-use deltalake::arrow::datatypes::{DataType, Field, Schema};
+use deltalake::arrow::array::{
+    Array, ArrayRef, AsArray, Decimal128Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    StructArray, TimestampMicrosecondArray,
+};
+use deltalake::arrow::compute::cast;
+use deltalake::arrow::datatypes::{
+    DataType, Field, Fields, Float32Type, Float64Type, Schema, TimeUnit,
+};
 
 /// Streamable models in Trino's spelling: `FORMAT JSON` in every position this engine reads
 /// it, and other constructs a converted model is rendered from its parse tree with.
@@ -208,60 +221,156 @@ async fn converted_transform_sql_parses_in_trino() {
     );
 }
 
+/// One source both engines read: Trino from `from`, a `VALUES` clause that names its
+/// relation `source`, and this engine from `batch`, which holds the same rows.
+struct Source {
+    from: String,
+    batch: RecordBatch,
+}
+
+/// The first value of `SELECT <expr> AS v FROM source` for each of `exprs`, in Trino and
+/// here, one line per expression where the two differ. `per_batch` plans the statement as a
+/// publication, the one place a model may aggregate.
+async fn differences<E: AsRef<str>>(
+    trino: &TrinoClient,
+    source: &Source,
+    exprs: &[E],
+    per_batch: bool,
+) -> Vec<String> {
+    let mut differ = Vec::new();
+    for expr in exprs {
+        let expr = expr.as_ref();
+        let theirs = trino
+            .query(&format!("SELECT {expr} AS v FROM {}", source.from))
+            .await
+            .unwrap_or_else(|e| panic!("Trino refused {expr}: {e}"))
+            .scalar();
+        let sql = format!("SELECT {expr} AS v FROM source");
+        let transform = if per_batch {
+            SqlTransform::new_per_batch(sql)
+        } else {
+            SqlTransform::new(sql)
+        };
+        let out = match transform.apply(vec![source.batch.clone()]).await {
+            Ok(out) => out,
+            Err(e) => {
+                differ.push(format!("{expr}\n  Trino: {theirs:?}\n  ddi:   failed, {e}"));
+                continue;
+            }
+        };
+        let (theirs, ours) = spelt_alike(theirs, out[0].column(0));
+        if theirs != ours {
+            differ.push(format!("{expr}\n  Trino: {theirs:?}\n  ddi:   {ours:?}"));
+        }
+    }
+    differ
+}
+
+/// Trino's text for a value and this engine's first value in `col`, spelt so that equal
+/// values compare equal. A DOUBLE or REAL is spelt as Rust spells that float, with Trino's
+/// text read back as the same type: the two engines spell a float differently, and each
+/// spelling reads back exactly, so equal text is equal bits. Anything else is its text.
+fn spelt_alike(theirs: Option<String>, col: &ArrayRef) -> (Option<String>, Option<String>) {
+    if col.is_null(0) {
+        return (theirs, None);
+    }
+    match col.data_type() {
+        DataType::Float64 => (
+            theirs.map(|t| t.parse::<f64>().map_or(t, |v| format!("{v:?}"))),
+            Some(format!("{:?}", col.as_primitive::<Float64Type>().value(0))),
+        ),
+        DataType::Float32 => (
+            theirs.map(|t| t.parse::<f32>().map_or(t, |v| format!("{v:?}"))),
+            Some(format!("{:?}", col.as_primitive::<Float32Type>().value(0))),
+        ),
+        _ => {
+            let text = cast(col, &DataType::Utf8).unwrap();
+            (theirs, Some(text.as_string::<i32>().value(0).to_string()))
+        }
+    }
+}
+
 /// A document with an emoji in a key, in a string, in a container and as an array element,
 /// spelt as the character and as a lower-case escape.
 const EMOJI_DOC: &str = r#"{"！":1,"😊":["😊"],"s":"😊","e":"\ud83d\ude00","l":[{"a":"😊"},"😊"]}"#;
 
 /// The JSON functions and the ways a value reaches a constructor or a cast, over
-/// [`EMOJI_DOC`]. `json_query` and `json_value` are missing because no spelling of them
-/// runs in both engines yet: Trino requires a `lax` or `strict` mode on their path, and
-/// this engine does not read one.
+/// [`EMOJI_DOC`] and a row holding an emoji. `json_query` and `json_value` are missing
+/// because no spelling of them runs in both engines yet: Trino requires a `lax` or `strict`
+/// mode on their path, and this engine does not read one. So is `CAST(.. AS JSON)` of a
+/// MAP, which this engine refuses, and of a `ROW(..)` literal, whose fields DataFusion names
+/// `c0`, `c1` where Trino leaves them unnamed.
 const EMOJI_JSON: &[&str] = &[
     // Written as bytes: the surrogate pair, upper case.
     "json_format(json_parse(data))",
+    "json_parse(data)",
+    "json_format(json_parse('\"😊\"'))",
     "json_format(json_extract(data, '$'))",
+    "json_extract(data, '$.l')",
     "json_format(json_extract(data, '$.e'))",
+    "json_format(json_extract(data, '$[\"😊\"]'))",
     "json_object('k' VALUE json_extract_scalar(data, '$.s'), 'n' VALUE json_array(1, 'x😊'))",
+    "json_object(json_extract_scalar(data, '$.s') VALUE 1)",
+    // In HashMap order, which hashes the emoji as its two UTF-16 halves.
+    "json_object('naïve' VALUE 1, '😀' VALUE 2, 'a' VALUE 3, '日本' VALUE 4, 'b' VALUE 5)",
     "json_array(json_extract_scalar(data, '$.e'), 'x')",
+    // A JSON scalar as a member is cast to varchar first, and escaped again as text.
+    "json_array(json_extract(data, '$.s'))",
+    // Text after FORMAT JSON is read and written again.
+    "json_object('d' VALUE json_format(json_extract(data, '$.l')) FORMAT JSON)",
+    "json_array(data FORMAT JSON)",
     "json_format(CAST(json_extract_scalar(data, '$.s') AS JSON))",
+    "CAST(json_extract_scalar(data, '$.s') AS JSON)",
+    "json_format(CAST(ARRAY['😊', json_extract_scalar(data, '$.s')] AS JSON))",
+    "json_format(CAST(r AS JSON))",
+    "CAST(r AS JSON)",
     "json_object('l' VALUE json_format(CAST(CAST(json_extract(data, '$.l') AS ARRAY(JSON)) \
      AS JSON)) FORMAT JSON)",
     // Written as a Java string, or copied as spelt: the character.
     "json_format(json_array_get(json_extract(data, '$.l'), 0))",
+    "json_array_get(json_extract(data, '$.l'), 0)",
     "json_format(CAST(json_array_get(json_extract(data, '$.l'), 0) AS JSON))",
     "json_format(CAST(CAST(json_extract(data, '$.l') AS ARRAY(JSON)) AS JSON))",
+    "json_format(CAST(json_extract(data, '$.l') AS ARRAY(JSON))[2])",
     // Not JSON at all: the character.
     "json_extract_scalar(data, '$.s')",
     "json_extract_scalar(data, '$.e')",
+    "json_array_get(json_extract(data, '$.l'), 1)",
+    "CAST(json_extract(data, '$.s') AS VARCHAR)",
 ];
 
 #[tokio::test]
 #[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
 async fn json_text_spells_an_emoji_as_trino_does() {
-    let trino = trino();
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, true)])),
-        vec![Arc::new(StringArray::from(vec![EMOJI_DOC]))],
-    )
-    .unwrap();
-    let mut differ = Vec::new();
-    for expr in EMOJI_JSON {
-        let theirs = trino
-            .query(&format!(
-                "SELECT {expr} AS v FROM (VALUES '{EMOJI_DOC}') AS source(data)"
-            ))
-            .await
-            .unwrap_or_else(|e| panic!("Trino refused {expr}: {e}"))
-            .scalar();
-        let out = SqlTransform::new(format!("SELECT {expr} AS v FROM source"))
-            .apply(vec![batch.clone()])
-            .await
-            .unwrap_or_else(|e| panic!("{expr} failed here: {e}"));
-        let ours = out[0].column(0).as_string::<i32>().value(0).to_string();
-        if theirs.as_deref() != Some(ours.as_str()) {
-            differ.push(format!("{expr}\n  Trino: {theirs:?}\n  ddi:   {ours:?}"));
-        }
-    }
+    // `r` is a row, as a Delta struct column reaches a model: Trino has no other spelling of a
+    // row with named fields that this engine reads.
+    let fields = Fields::from(vec![
+        Field::new("s", DataType::Utf8, true),
+        Field::new("n", DataType::Int32, true),
+    ]);
+    let row = StructArray::new(
+        fields.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["😊"])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![1])),
+        ],
+        None,
+    );
+    let source = Source {
+        from: format!(
+            "(VALUES ('{EMOJI_DOC}', CAST(ROW('😊', 1) AS ROW(s VARCHAR, n INTEGER)))) \
+             AS source(data, r)"
+        ),
+        batch: RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("data", DataType::Utf8, true),
+                Field::new("r", DataType::Struct(fields), true),
+            ])),
+            vec![Arc::new(StringArray::from(vec![EMOJI_DOC])), Arc::new(row)],
+        )
+        .unwrap(),
+    };
+    let differ = differences(&trino(), &source, EMOJI_JSON, false).await;
     assert!(
         differ.is_empty(),
         "JSON text differs:\n{}",
@@ -269,9 +378,210 @@ async fn json_text_spells_an_emoji_as_trino_does() {
     );
 }
 
+/// The DECIMAL columns of [`decimals`]: name, precision, scale and value.
+const DECIMAL_COLUMNS: &[(&str, u8, i8, &str)] = &[
+    // Issue #12's first row as a short decimal, which Trino divides: 0.4998, the double below
+    // the nearest; and as a long one, which it rounds correctly.
+    ("short17", 17, 17, "0.49979999999999997"),
+    ("long17", 38, 17, "0.49979999999999997"),
+    // Past 2^24 unscaled, so divided as floats it is the REAL 1413830.125, not the nearest.
+    ("r", 9, 2, "1413830.04"),
+    // Past 2^53 unscaled, so divided it is a double off the nearest.
+    ("d", 18, 8, "1175317522.91864620"),
+    // Long, and read as text: past 2^53 unscaled, past 10^22 in scale, and halfway between
+    // two doubles.
+    ("wide", 38, 3, "12345678901234567890123456789012345.678"),
+    ("tiny", 38, 38, "0.00000000000000000000000000000012345678"),
+    ("half", 38, 1, "9007199254740993.5"),
+];
+
+/// `rows` copies of one row of DECIMAL `columns`, each `(name, precision, scale, value)`.
+fn decimals(columns: &[(&str, u8, i8, &str)], rows: usize) -> Source {
+    let row = columns
+        .iter()
+        .map(|(_, p, s, v)| format!("CAST('{v}' AS DECIMAL({p}, {s}))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let names = columns.iter().map(|c| c.0).collect::<Vec<_>>().join(", ");
+    let from = format!(
+        "(VALUES {}) AS source({names})",
+        vec![format!("({row})"); rows].join(", ")
+    );
+    let (fields, arrays): (Vec<_>, Vec<_>) = columns
+        .iter()
+        .map(|&(name, p, s, v)| {
+            let (whole, fraction) = v.split_once('.').unwrap_or((v, ""));
+            assert_eq!(fraction.len(), s as usize, "{v} is not at scale {s}");
+            let unscaled: i128 = format!("{whole}{fraction}").parse().unwrap();
+            let array = Decimal128Array::from(vec![unscaled; rows])
+                .with_precision_and_scale(p, s)
+                .unwrap();
+            (
+                Field::new(name, DataType::Decimal128(p, s), false),
+                Arc::new(array) as ArrayRef,
+            )
+        })
+        .unzip();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+    Source { from, batch }
+}
+
+/// A DECIMAL converted to DOUBLE or REAL, each way a model reaches the conversion: a
+/// `CAST`, a `TRY_CAST`, the cast coercion inserts, a list cast, a lambda, and a decimal
+/// computed from an integer literal, whose type decides whether it is divided or rounded.
+/// A decimal compared with a DOUBLE, or beside one in a `CASE` or `coalesce`, and a literal
+/// with a decimal point are missing: DataFusion types each otherwise than Trino, as the
+/// README says.
+const DECIMAL_TO_FLOAT: &[&str] = &[
+    "CAST(short17 AS DOUBLE)",
+    "CAST(long17 AS DOUBLE)",
+    "TRY_CAST(short17 AS DOUBLE)",
+    "TRY_CAST(long17 AS DOUBLE)",
+    "CAST(short17 AS REAL)",
+    "CAST(long17 AS REAL)",
+    "CAST(r AS REAL)",
+    "CAST(r AS DOUBLE)",
+    "CAST(CAST(r AS DECIMAL(38, 2)) AS REAL)",
+    "CAST(d AS DOUBLE)",
+    "CAST(d AS REAL)",
+    "CAST(wide AS DOUBLE)",
+    "CAST(wide AS REAL)",
+    "CAST(-wide AS DOUBLE)",
+    "CAST(tiny AS DOUBLE)",
+    "CAST(tiny AS REAL)",
+    "CAST(half AS DOUBLE)",
+    "CAST(half AS REAL)",
+    "short17 * 1e0",
+    "long17 * 1e0",
+    "d * 1e0",
+    "short17 + 0e0",
+    "r * REAL '1'",
+    "CAST(-short17 AS DOUBLE)",
+    "CAST(-r AS REAL)",
+    "CAST(ARRAY[short17] AS ARRAY(DOUBLE))[1]",
+    "CAST(ARRAY[long17, short17] AS ARRAY(DOUBLE))[2]",
+    "CAST(ARRAY[r] AS ARRAY(REAL))[1]",
+    "transform(ARRAY[short17], x -> CAST(x AS DOUBLE))[1]",
+    "transform(ARRAY[r], x -> CAST(coalesce(x, 0) AS REAL))[1]",
+    "CAST(coalesce(d, 0) AS DOUBLE)",
+    "CAST(coalesce(r, 0) AS REAL)",
+    "CAST(CASE WHEN d > 0 THEN d ELSE 0 END AS DOUBLE)",
+    "CAST(CASE WHEN r > 0 THEN r ELSE 0 END AS REAL)",
+    "CAST(nullif(d, 0) AS DOUBLE)",
+    "CAST(greatest(d, 0) AS DOUBLE)",
+    "CAST(least(r, 2000000) AS REAL)",
+    "CAST(d + 1 AS DOUBLE)",
+    "CAST(r + 1 AS REAL)",
+    "CAST(2 - r AS REAL)",
+    "CAST(r * 2 AS REAL)",
+    // The spellings the README gives for a literal with a decimal point beside a decimal.
+    "CAST(short17 AS DOUBLE) = 0.4998e0",
+    "CAST(coalesce(short17, CAST(0.0 AS DECIMAL(17, 17))) AS DOUBLE)",
+    "CAST(coalesce(d, CAST(0.0 AS DECIMAL(18, 8))) AS DOUBLE)",
+];
+
+#[tokio::test]
+#[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
+async fn a_decimal_converts_to_the_double_or_real_trino_gives() {
+    let differ = differences(
+        &trino(),
+        &decimals(DECIMAL_COLUMNS, 1),
+        DECIMAL_TO_FLOAT,
+        false,
+    )
+    .await;
+    assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
+}
+
+/// Aggregates over a DECIMAL(8,2) and a DECIMAL(8,3), converted: Trino sums to
+/// DECIMAL(38,s) and rounds that correctly, and keeps the argument's type for `min` and
+/// `max`.
+const DECIMAL_AGGREGATES: &[&str] = &[
+    "CAST(sum(s) AS REAL)",
+    "CAST(sum(s) AS DOUBLE)",
+    "CAST(sum(y) AS REAL)",
+    "CAST(sum(s) * 2 AS REAL)",
+    "CAST(sum(s) + 1 AS DOUBLE)",
+    "CAST(sum(CASE WHEN s < 0 THEN s ELSE y END) AS REAL)",
+    "CAST(min(s) AS REAL)",
+    "CAST(max(y) AS REAL)",
+];
+
+#[tokio::test]
+#[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
+async fn a_decimal_sum_converts_to_the_real_trino_gives() {
+    // Two rows, whose sums are past 2^24 unscaled.
+    let source = decimals(&[("s", 8, 2, "706915.02"), ("y", 8, 3, "80164.834")], 2);
+    let differ = differences(&trino(), &source, DECIMAL_AGGREGATES, true).await;
+    assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
+}
+
+/// A JSON number of 16 or 17 significant digits, each way a model reads it as a DOUBLE or
+/// REAL: issue #12's four rows, where a parser that divides is one ULP off.
+const JSON_NUMBERS: &[&str] = &[
+    "CAST(json_extract_scalar(doc, '$.a') AS DOUBLE)",
+    "CAST(json_extract_scalar(doc, '$.b') AS DOUBLE)",
+    "CAST(json_extract_scalar(doc, '$.c') AS DOUBLE)",
+    "CAST(json_extract_scalar(doc, '$.d') AS DOUBLE)",
+    "CAST(json_extract_scalar(doc, '$.a') AS REAL)",
+    "CAST(json_extract(doc, '$.b') AS DOUBLE)",
+    "CAST(json_array_get(json_extract(doc, '$.l'), 2) AS DOUBLE)",
+    "CAST(CAST(json_extract(doc, '$.l') AS ARRAY(JSON))[4] AS DOUBLE)",
+    "transform(CAST(json_extract(doc, '$.l') AS ARRAY(JSON)), x -> CAST(x AS DOUBLE))[1]",
+    "CAST(CAST(json_extract_scalar(doc, '$.a') AS DECIMAL(38, 17)) AS DOUBLE)",
+    "CAST(CAST(json_extract_scalar(doc, '$.a') AS DECIMAL(17, 17)) AS DOUBLE)",
+];
+
+#[tokio::test]
+#[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
+async fn a_json_number_reads_as_the_double_trino_gives() {
+    let [a, b, c, d] = common::SEVENTEEN_DIGIT_DOUBLES;
+    let doc = format!(r#"{{"a":{a},"b":{b},"c":{c},"d":{d},"l":[{a},{b},{c},{d}]}}"#);
+    let source = Source {
+        from: format!("(VALUES '{doc}') AS source(doc)"),
+        batch: RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("doc", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec![doc]))],
+        )
+        .unwrap(),
+    };
+    let differ = differences(&trino(), &source, JSON_NUMBERS, false).await;
+    assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
+}
+
+/// Columns for `from_unixtime`: `n` a NULL BIGINT, `t` a NULL zoned timestamp, and `x` an
+/// epoch in 2376.
+fn epochs() -> Source {
+    let from = "(VALUES (CAST(NULL AS BIGINT), CAST(NULL AS TIMESTAMP(6) WITH TIME ZONE), \
+                BIGINT '12828758400')) AS source(n, t, x)";
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new(
+                "t",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("x", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![None])) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(vec![None]).with_timezone("UTC")),
+            Arc::new(Int64Array::from(vec![12828758400])),
+        ],
+    )
+    .unwrap();
+    Source {
+        from: from.into(),
+        batch,
+    }
+}
+
 /// `from_unixtime` in each form it is accepted in, as the calendar date it falls on: where
-/// the zone decides the answer, and past 2262, where the nanosecond range ends and Trino's
-/// does not.
+/// the zone decides the answer, before 1970, and around and past 2262, where the nanosecond
+/// range ends and Trino's does not. Before 1970 only in a zone the tz database has not
+/// merged into another, and after 2099 in a zone with daylight saving only away from local
+/// midnight: either can differ, as the README says.
 const FROM_UNIXTIME: &[&str] = &[
     "from_unixtime(1711924200, 'Europe/Amsterdam')",
     "from_unixtime(12828758400, 'Europe/Amsterdam')",
@@ -280,36 +590,84 @@ const FROM_UNIXTIME: &[&str] = &[
     "from_unixtime(1711924200, 'Etc/GMT+5')",
     "from_unixtime(1711924200, 'UTC+05:30')",
     "from_unixtime(1711924200) AT TIME ZONE 'Asia/Kolkata'",
+    "from_unixtime(x) AT TIME ZONE 'Australia/Sydney'",
+    "from_unixtime(1711924200, 'GMT-3')",
     // Rounded to the millisecond as Java rounds, across local midnight.
     "from_unixtime(1711922399.9996, 'Europe/Amsterdam')",
+    // Summer and winter in Sydney, each half an hour from local midnight.
+    "from_unixtime(1705325400, 'Australia/Sydney')",
+    "from_unixtime(1721050200, 'Australia/Sydney')",
+    // A fixed offset, either side of local midnight.
+    "from_unixtime(1711922400, '+02:00')",
+    "from_unixtime(1711922399, '+02:00')",
+    // Before 1970: Berlin's double summer time of 1947, and Java's rounding below zero.
+    "from_unixtime(-712722600, 'Europe/Berlin')",
+    "from_unixtime(-1)",
+    "from_unixtime(-1800, 1, 0)",
+    "from_unixtime(-1800, 'Australia/Sydney')",
+    "from_unixtime(-0.0015, 'UTC')",
+    "from_unixtime(-0.0005, 'UTC')",
+    // The last second the nanosecond range holds, and the next.
+    "from_unixtime(9223372036, 'UTC')",
+    "from_unixtime(9223372037, 'UTC')",
+    "from_unixtime(9223372036, '+02:00')",
+    "from_unixtime(9223372036, 0, 13)",
+    "from_unixtime(9223328836, 'Australia/Sydney')",
+    "from_unixtime(9223328836, 'Europe/Amsterdam')",
+    // Past it, from a column as well as a literal.
+    "from_unixtime(x, 'Australia/Sydney')",
+    "from_unixtime(x, 'UTC')",
+    "from_unixtime(253402300799, 'UTC')",
 ];
 
 #[tokio::test]
 #[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
 async fn from_unixtime_falls_on_the_date_trino_gives() {
-    let trino = trino();
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)])),
-        vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1]))],
-    )
-    .unwrap();
-    let mut differ = Vec::new();
-    for expr in FROM_UNIXTIME {
-        let date = format!("CAST(CAST({expr} AS DATE) AS VARCHAR)");
-        let theirs = trino
-            .query(&format!("SELECT {date} AS v"))
-            .await
-            .unwrap_or_else(|e| panic!("Trino refused {expr}: {e}"))
-            .scalar();
-        let out = SqlTransform::new(format!("SELECT {date} AS v FROM source"))
-            .apply(vec![batch.clone()])
-            .await
-            .unwrap_or_else(|e| panic!("{expr} failed here: {e}"));
-        let ours = deltalake::arrow::compute::cast(out[0].column(0), &DataType::Utf8).unwrap();
-        let ours = ours.as_string::<i32>().value(0).to_string();
-        if theirs.as_deref() != Some(ours.as_str()) {
-            differ.push(format!("{expr}\n  Trino: {theirs:?}\n  ddi:   {ours:?}"));
-        }
-    }
+    let dates: Vec<String> = FROM_UNIXTIME
+        .iter()
+        .map(|expr| format!("CAST(CAST({expr} AS DATE) AS VARCHAR)"))
+        .collect();
+    let differ = differences(&trino(), &epochs(), &dates, false).await;
     assert!(differ.is_empty(), "dates differ:\n{}", differ.join("\n"));
+}
+
+/// The local wall clock of `from_unixtime`, in an offset that is not whole hours, that
+/// changes with the season, or that is three hours, as Berlin's was in the summer of 1947.
+const FROM_UNIXTIME_CLOCK: &[&str] = &[
+    "EXTRACT(HOUR FROM from_unixtime(1711924200, 'Europe/Amsterdam'))",
+    "EXTRACT(HOUR FROM from_unixtime(1705325400, 'Australia/Sydney'))",
+    "EXTRACT(HOUR FROM from_unixtime(1721050200, 'Australia/Sydney'))",
+    "EXTRACT(MINUTE FROM from_unixtime(1711924200, 5, 45))",
+    "EXTRACT(HOUR FROM from_unixtime(-712722600, 'Europe/Berlin'))",
+    "EXTRACT(HOUR FROM from_unixtime(x, '+02:00'))",
+    "EXTRACT(MINUTE FROM from_unixtime(x, -5, -30))",
+];
+
+#[tokio::test]
+#[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
+async fn from_unixtime_reads_the_wall_clock_trino_gives() {
+    let differ = differences(&trino(), &epochs(), FROM_UNIXTIME_CLOCK, false).await;
+    assert!(differ.is_empty(), "clocks differ:\n{}", differ.join("\n"));
+}
+
+/// A `coalesce`, `CASE` or `nullif` whose branches are bare names that are not JSON, over
+/// [`epochs`]: each keeps its own type, and a zoned timestamp past 2262 its date. `if` is
+/// missing because DataFusion has no such function.
+const BRANCHES: &[&str] = &[
+    "coalesce(n, 0)",
+    "coalesce(n, x)",
+    "CASE WHEN x > 0 THEN x END",
+    "CASE WHEN n IS NULL THEN x ELSE n END",
+    "nullif(x, 0)",
+    "coalesce(n, 0) + 1",
+    "CAST(CAST(coalesce(t, from_unixtime(x, 'UTC')) AS DATE) AS VARCHAR)",
+    "CAST(CAST(CASE WHEN t IS NULL THEN from_unixtime(x, 'UTC') ELSE t END AS DATE) AS VARCHAR)",
+    "EXTRACT(YEAR FROM coalesce(t, from_unixtime(x, 'UTC')))",
+];
+
+#[tokio::test]
+#[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
+async fn a_coalesce_over_names_gives_the_value_trino_gives() {
+    let differ = differences(&trino(), &epochs(), BRANCHES, false).await;
+    assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
 }
