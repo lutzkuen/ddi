@@ -212,10 +212,10 @@ impl SqlTransform {
                 .with_config(config)
                 .with_runtime_env(crate::budget::runtime().map_err(Failure::Other)?)
                 .with_default_features()
-                // Around DataFusion's own coercion: an integer literal beside a DECIMAL is
-                // typed as Trino types it before coercion widens it, and after coercion,
-                // so that the casts it inserts are covered too, a DECIMAL becomes a DOUBLE or
-                // REAL as Trino converts it rather than by Arrow's division. See
+                // Around DataFusion's own coercion: an integer literal beside a DECIMAL, and a
+                // sum over one, is typed as Trino types it before coercion widens it, and after
+                // coercion, so that the casts it inserts are covered too, a DECIMAL becomes a
+                // DOUBLE or REAL as Trino converts it rather than by Arrow's division. See
                 // `crate::transform::decimal`.
                 .with_analyzer_rules(crate::transform::decimal::analyzer_rules())
                 .build(),

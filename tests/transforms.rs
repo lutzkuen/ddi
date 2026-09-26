@@ -477,6 +477,122 @@ async fn an_integer_literal_beside_a_decimal_is_typed_as_trino_types_it() {
 }
 
 #[tokio::test]
+async fn a_sum_over_a_decimal_is_typed_as_trino_types_it() {
+    // DataFusion sums a DECIMAL(p,s) to DECIMAL(p+10,s), so over 8 digits or fewer to a short
+    // decimal, which Trino divides on its way to a REAL; Trino's own sum is DECIMAL(38,s)
+    // whatever p is, and correctly rounded. Summed in a publication, the one place a model
+    // may aggregate, 706915.02 twice as a DECIMAL(8,2) was the REAL 1413830.125, where Trino
+    // gives 1413830.0. Types and values are what Trino 480 returns.
+    use delta_delta_ingest::schema::SchemaCoercer;
+    use deltalake::arrow::array::{AsArray, Decimal128Array};
+    use deltalake::arrow::datatypes::{Decimal128Type, Float32Type, Float64Type};
+
+    // DECIMAL(8,2) 706915.02 and DECIMAL(8,3) 80164.834, twice: sums past 2^24 unscaled that
+    // divide to something other than the nearest float.
+    let batch = || {
+        let decimal = |v: i128, p: u8, s: i8| {
+            Arc::new(
+                Decimal128Array::from(vec![v, v])
+                    .with_precision_and_scale(p, s)
+                    .unwrap(),
+            ) as ArrayRef
+        };
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("r", DataType::Decimal128(8, 2), false),
+                Field::new("y", DataType::Decimal128(8, 3), false),
+            ])),
+            vec![decimal(70691502, 8, 2), decimal(80164834, 8, 3)],
+        )
+        .unwrap()
+    };
+    let publish = |sql: &'static str| async move {
+        let b = batch();
+        SqlTransform::new_per_batch(sql)
+            .run(b.schema(), vec![b])
+            .await
+            .expect("publication should succeed")
+    };
+
+    let out = publish(
+        "SELECT sum(r), sum(y) AS y_sum, min(r) AS r_min, max(y) AS y_max, \
+                sum(CASE WHEN r < 0 THEN r ELSE y END) AS branched \
+         FROM source",
+    )
+    .await;
+    let schema = out[0].schema();
+    for (name, (p, s)) in [
+        // Unaliased, and still called what DataFusion calls it.
+        ("sum(source.r)", (38, 2)),
+        ("y_sum", (38, 3)),
+        ("r_min", (8, 2)),
+        ("y_max", (8, 3)),
+        // The branches coerce to DECIMAL(9,3); typed by its first alone, the CASE would have
+        // been summed at a scale of 2 and lost a digit.
+        ("branched", (38, 3)),
+    ] {
+        assert_eq!(
+            schema.field_with_name(name).unwrap().data_type(),
+            &DataType::Decimal128(p, s),
+            "{name}: Trino's decimal({p},{s})"
+        );
+    }
+    let branched = common::column_of(&out, "branched");
+    assert_eq!(
+        branched.as_primitive::<Decimal128Type>().value(0),
+        160329668,
+        "160329.668"
+    );
+
+    let out = publish(
+        "SELECT CAST(sum(r) AS REAL) AS r_real, CAST(sum(r) AS DOUBLE) AS r_double, \
+                CAST(sum(y) AS REAL) AS y_real, CAST(sum(y) AS DOUBLE) AS y_double, \
+                CAST(sum(r) * 2 AS REAL) AS doubled, CAST(sum(r) + 1 AS DOUBLE) AS plus_one \
+         FROM source \
+         HAVING sum(r) > 1000",
+    )
+    .await;
+    for (name, want) in [
+        ("r_real", "1413830.0"),
+        ("y_real", "160329.67"),
+        ("doubled", "2827660.0"),
+    ] {
+        let want: f32 = want.parse().unwrap();
+        let got = common::column_of(&out, name)
+            .as_primitive::<Float32Type>()
+            .value(0);
+        assert_eq!(got.to_bits(), want.to_bits(), "{name}: got {got:?}");
+    }
+    for (name, want) in [
+        ("r_double", "1413830.04"),
+        ("y_double", "160329.668"),
+        ("plus_one", "1413831.04"),
+    ] {
+        let want: f64 = want.parse().unwrap();
+        let got = common::column_of(&out, name)
+            .as_primitive::<Float64Type>()
+            .value(0);
+        assert_eq!(got.to_bits(), want.to_bits(), "{name}: got {got:?}");
+    }
+
+    // And landing in a REAL target column, which converts by the type the model produced.
+    let out = publish("SELECT sum(r) AS r FROM source").await;
+    let target = SchemaCoercer::new(Arc::new(Schema::new(vec![Field::new(
+        "r",
+        DataType::Float32,
+        false,
+    )])));
+    let landed = target.coerce(&out[0]).unwrap();
+    let got = landed.column(0).as_primitive::<Float32Type>().value(0);
+    let want: f32 = "1413830.0".parse().unwrap();
+    assert_eq!(
+        got.to_bits(),
+        want.to_bits(),
+        "in a REAL column: got {got:?}"
+    );
+}
+
+#[tokio::test]
 async fn array_sum_over_decimals_starts_from_the_nearest_doubles() {
     // The array aggregates read their elements as doubles, and a decimal element becomes the
     // nearest one: a one-element array sums to exactly it.

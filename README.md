@@ -1207,13 +1207,16 @@ value is follows its type's precision, so a computed decimal has to have Trino's
 integer literal beside a decimal — `coalesce(amount, 0)`, `CASE .. ELSE 0 END`,
 `amount + 1` — is typed as Trino types it, an INTEGER, where DataFusion's BIGINT would make
 the result ten digits wider: `coalesce(amount, 0)` over a DECIMAL(18,8) is a DECIMAL(18,8), as
-in Trino. Two computed decimals still differ. A quotient of decimals DataFusion computes to
-fewer digits — DECIMAL(9,2) / DECIMAL(9,2) is DECIMAL(15,6) there and DECIMAL(21,12) in Trino,
-and the digits differ too — and `sum` over a DECIMAL of 8 digits or fewer, in a publication,
-is 18 digits in DataFusion and 38 in Trino, so cast to DOUBLE it is divided in `ddi` and
-correctly rounded in Trino. That covers `CAST` and `TRY_CAST`, the casts DataFusion's
-coercion inserts (`dec * 1e0`), lambda bodies, a list of decimals cast to a list of doubles, a
-DECIMAL column landing in a DOUBLE or REAL target, and the `array_*` aggregates over decimals.
+in Trino. A `sum` over a decimal, in a publication, is a DECIMAL(38,s) as in Trino, where
+DataFusion's has ten digits more than its argument, and so over 8 digits or fewer would be
+divided: over DECIMAL(8,2), 1413830.04 cast to REAL is 1413830.0 in both. `min` and `max` keep
+their argument's type in both engines, and `avg`, a DECIMAL(p+4,s+4) in DataFusion and a
+DECIMAL(p,s) in Trino, is refused in every model. One computed decimal still differs: a
+quotient of decimals, which DataFusion computes to fewer digits — DECIMAL(9,2) / DECIMAL(9,2)
+is DECIMAL(15,6) there and DECIMAL(21,12) in Trino, and the digits differ too. That covers
+`CAST` and `TRY_CAST`, the casts DataFusion's coercion inserts (`dec * 1e0`), lambda bodies, a
+list of decimals cast to a list of doubles, a DECIMAL column landing in a DOUBLE or REAL
+target, and the `array_*` aggregates over decimals.
 It does not yet cover `log` and `power` over a DECIMAL, which DataFusion computes on the
 decimal itself and not as Trino does; a decimal inside a ROW or MAP being cast; or
 `arrow_cast`. Those keep Arrow's arithmetic.

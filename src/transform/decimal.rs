@@ -23,13 +23,17 @@
 //! `0.49979999999999997` is `0.4998` there too — but it is Trino's, so it is this module's.
 //! For a DOUBLE it is also Arrow's; for a REAL it is not, since Arrow divides as doubles and
 //! narrows after. Which of the two a value is follows its type's precision, so a computed
-//! decimal has to have Trino's type. A product does in both engines. An integer literal beside
-//! a decimal would not — DataFusion reads it as a BIGINT, ten digits wider than Trino's INTEGER
-//! — so it is typed as Trino types it first ([`retype_integer_literals`]). Two computed
-//! decimals still differ: a quotient of decimals, which DataFusion computes to fewer digits
+//! decimal has to have Trino's type. A product does in both engines, and so do `min` and `max`.
+//! An integer literal beside a decimal would not — DataFusion reads it as a BIGINT, ten digits
+//! wider than Trino's INTEGER — so it is typed as Trino types it first
+//! ([`retype_integer_literals`]). Nor would `sum`: DataFusion gives it ten digits more than its
+//! argument and Trino 38, so over 8 digits or fewer it would be short here and long there, and
+//! its argument is widened to 38 digits first ([`widen_decimal_sums`]). `avg` differs too,
+//! DECIMAL(p+4, s+4) against Trino's DECIMAL(p, s), but no model can use it: a transform
+//! aggregates nothing, and a publication only what a client can add up. One computed decimal
+//! still differs: a quotient of decimals, which DataFusion computes to fewer digits
 //! (DECIMAL(9,2) / DECIMAL(9,2) is DECIMAL(15,6) there and DECIMAL(21,12) in Trino, and the
-//! digits themselves differ), and `sum` over a DECIMAL of 8 digits or fewer, 18 digits in
-//! DataFusion and 38 in Trino.
+//! digits themselves differ).
 //!
 //! What goes through it: a CAST or TRY_CAST in a model, including the casts DataFusion's
 //! coercion inserts (`dec * 1e0`), and the same in a lambda body; casts of a list of decimals
@@ -465,9 +469,60 @@ fn narrow_beside_a_decimal<'a>(
     changed
 }
 
-/// DataFusion's analyzer rules, with this module's two where they belong: Trino's integer
-/// literals just before `TypeCoercion`, which is what widens them, and Trino's DECIMAL casts
-/// at the end, after it, so that they also see the casts coercion inserts.
+/// Type every `sum` over a DECIMAL in `expr` as Trino types it: DECIMAL(38, s), whatever its
+/// argument's precision. `schema` is what `expr`'s columns resolve against.
+///
+/// DataFusion gives a sum ten digits more than its argument, up to 38, so over a DECIMAL of 8
+/// digits or fewer it is a short decimal, which converts to DOUBLE or REAL by dividing, where
+/// Trino's DECIMAL(38, s) is correctly rounded: over DECIMAL(8,2), 1413830.04 is the REAL
+/// 1413830.0 in Trino and 1413830.125 divided. So the argument is cast to DECIMAL(38, s),
+/// which DataFusion sums to DECIMAL(38, s) too. Both sums are exact, so only the type changes.
+///
+/// Before coercion, like [`retype_integer_literals`], because this changes the type of the
+/// aggregate's column, and coercion is what fits every node above it to that. The scale is
+/// the one coercion gives the argument, asked of coercion itself: before it, a CASE is typed
+/// by its first branch alone. Never fails on the expression's account: an argument whose type
+/// cannot be worked out is left as it was.
+pub(crate) fn widen_decimal_sums(expr: Expr, schema: &DFSchema) -> DFResult<Transformed<Expr>> {
+    use deltalake::datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
+
+    expr.transform_up(|mut e| {
+        let Expr::AggregateFunction(sum) = &mut e else {
+            return Ok(Transformed::no(e));
+        };
+        if sum.func.name() != "sum" {
+            return Ok(Transformed::no(e));
+        }
+        let [arg] = sum.params.args.as_mut_slice() else {
+            return Ok(Transformed::no(e));
+        };
+        let mut coercion = TypeCoercionRewriter::new(schema);
+        let scale = match arg
+            .clone()
+            .rewrite(&mut coercion)
+            .and_then(|coerced| coerced.data.get_type(schema))
+        {
+            Ok(DataType::Decimal128(38, _)) => None,
+            Ok(
+                DataType::Decimal32(_, s) | DataType::Decimal64(_, s) | DataType::Decimal128(_, s),
+            ) => Some(s),
+            _ => None,
+        };
+        let Some(scale) = scale else {
+            return Ok(Transformed::no(e));
+        };
+        *arg = Expr::Cast(Cast::new(
+            Box::new(std::mem::take(arg)),
+            DataType::Decimal128(38, scale),
+        ));
+        Ok(Transformed::yes(e))
+    })
+}
+
+/// DataFusion's analyzer rules, with this module's three where they belong: Trino's integer
+/// literals and decimal sums just before `TypeCoercion`, which is what widens the one and fits
+/// the plan to the other, and Trino's DECIMAL casts at the end, after it, so that they also
+/// see the casts coercion inserts.
 pub(crate) fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     use deltalake::datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
     use deltalake::datafusion::optimizer::Analyzer;
@@ -478,6 +533,7 @@ pub(crate) fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
         .iter()
         .position(|r| r.name() == coercion.name())
         .unwrap_or(0);
+    rules.insert(at, Arc::new(TrinoDecimalSums));
     rules.insert(at, Arc::new(TrinoIntegerLiterals));
     rules.push(Arc::new(TrinoDecimalCasts));
     rules
@@ -497,6 +553,24 @@ impl AnalyzerRule for TrinoIntegerLiterals {
 
     fn name(&self) -> &str {
         "ddi_trino_integer_literals"
+    }
+}
+
+/// The analyzer pass that applies [`widen_decimal_sums`] to every expression of a plan and its
+/// subqueries, after [`TrinoIntegerLiterals`]. Handled node by node as [`TrinoDecimalCasts`]
+/// handles them, so an unaliased `sum(amount)` keeps its name.
+#[derive(Debug, Default)]
+pub(crate) struct TrinoDecimalSums;
+
+impl AnalyzerRule for TrinoDecimalSums {
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> DFResult<LogicalPlan> {
+        Ok(plan
+            .transform_up_with_subqueries(|p| rewrite_plan(p, widen_decimal_sums))?
+            .data)
+    }
+
+    fn name(&self) -> &str {
+        "ddi_trino_decimal_sums"
     }
 }
 
