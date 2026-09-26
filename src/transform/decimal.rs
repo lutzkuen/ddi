@@ -47,11 +47,13 @@
 //! does; and, keeping Arrow's division, a decimal inside a ROW or MAP being cast, and
 //! `arrow_cast`, whose cast is only made after the analyzer has run.
 //!
-//! Three types DataFusion decides otherwise than Trino are left as they are. A literal with a
+//! Four types DataFusion decides otherwise than Trino are left as they are. A literal with a
 //! decimal point is a DOUBLE there and a DECIMAL in Trino; a decimal beside a DOUBLE or REAL,
 //! compared with it or in a `CASE` or `coalesce` with it, is converted to the float in Trino,
-//! where DataFusion casts the float to a DECIMAL; and an integer a function returns is typed as
-//! DataFusion types it, `length` an INTEGER where Trino's is a BIGINT. Once there is a plan,
+//! where DataFusion casts the float to a DECIMAL; an integer a function returns is typed as
+//! DataFusion types it, `length` an INTEGER where Trino's is a BIGINT; and an integer
+//! expression a CTE or subquery computes meets a decimal only as a column, and `nullif(qty, 0)`
+//! computed there is DataFusion's BIGINT where Trino's is an INTEGER. Once there is a plan,
 //! `0.5` and `0.5e0` are the same DOUBLE, so no rule here can tell the literal Trino reads as a
 //! decimal from the one it reads as a double. The README gives the spelling that means the same
 //! in both.
@@ -421,8 +423,11 @@ pub(crate) fn rewrite_expr(expr: Expr, schema: &DFSchema) -> DFResult<Transforme
 /// literal in it is one, where Trino keeps the INTEGER: `amount / nullif(qty, 0)` over a
 /// DECIMAL(12,2) is DECIMAL(32,22) here and DECIMAL(23,13) in Trino, and `p * coalesce(q, 1)`
 /// over a DECIMAL(7,2) DECIMAL(28,2), correctly rounded, where Trino's DECIMAL(18,2) is divided.
-/// Such an expression is cast to Trino's type rather than computed in it: DataFusion's integer
-/// arithmetic wraps where Trino's fails, and the cast fails where Trino would.
+/// Such an expression is computed in DataFusion's type and its result cast to Trino's, rather
+/// than computed in Trino's, in which DataFusion's integer arithmetic wraps where Trino's fails:
+/// a result past an INTEGER fails the cast, as it fails in Trino, but a step inside it past one,
+/// `qty * 1000000` in `(qty * 1000000) / 1000`, is computed in a BIGINT, as it is anywhere else
+/// in a model, and does not fail where Trino's does.
 ///
 /// Never fails on the expression's account: one whose type cannot be worked out is taken
 /// for no decimal.
@@ -509,8 +514,11 @@ fn narrow_beside_a_decimal<'a>(
 /// The integer type Trino gives `expr`, or `None` when it is no integer. A literal is an
 /// INTEGER where it fits one; arithmetic, `coalesce`, `greatest`, `least` and a CASE of integers
 /// are the widest integer among them, and `nullif` its first argument's type, where DataFusion
-/// makes each a BIGINT once a literal in it is one. Anything else is taken as DataFusion types
-/// it, as a column is.
+/// makes each a BIGINT once a literal in it is one. `length`, `strpos` and `extract` are
+/// BIGINTs, where DataFusion makes them INTEGERs: taken as those, `nullif(length(s), 0)`, a
+/// BIGINT in both engines, was cast to an INTEGER. The planner names a function called by
+/// another of its names, `length` for `character_length`, with an alias, which is looked
+/// through. Anything else is taken as DataFusion types it, as a column is.
 fn trino_integer(expr: &Expr, schema: &DFSchema) -> Option<DataType> {
     use deltalake::datafusion::logical_expr::Operator;
 
@@ -543,11 +551,17 @@ fn trino_integer(expr: &Expr, schema: &DFSchema) -> Option<DataType> {
             widest(vec![&b.left, &b.right])
         }
         Expr::Negative(e) => trino_integer(e, schema),
+        Expr::Alias(a) => trino_integer(&a.expr, schema),
         Expr::ScalarFunction(f) if f.name() == "nullif" => {
             f.args.first().and_then(|a| trino_integer(a, schema))
         }
         Expr::ScalarFunction(f) if matches!(f.name(), "coalesce" | "greatest" | "least") => {
             widest(f.args.iter().collect())
+        }
+        Expr::ScalarFunction(f)
+            if matches!(f.name(), "character_length" | "strpos" | "date_part") =>
+        {
+            Some(DataType::Int64)
         }
         Expr::Case(c) => widest(
             c.when_then_expr
@@ -795,7 +809,10 @@ fn retype_as_trino(expr: Expr, schema: &DFSchema) -> DFResult<Transformed<Expr>>
 /// rewritten once every node below it has been. As a pass each, a quotient or a `round` over a
 /// `sum` was typed before the sum was widened, from DataFusion's DECIMAL(p + 10, s) rather than
 /// Trino's DECIMAL(38, s): `sum(amount) / count(*)` over a DECIMAL(8,2) was a DECIMAL(38,22),
-/// where Trino's is DECIMAL(38,6).
+/// where Trino's is DECIMAL(38,6). And every node's schema is recomputed, its own expressions
+/// changed or not: DataFusion rebuilds a node over new inputs with the schema it had, so a
+/// CTE's alias, or a projection that passes a `sum` through, handed the node above DataFusion's
+/// types, and a quotient over a CTE's `floor` or `sum` was typed from those.
 #[derive(Debug, Default)]
 pub(crate) struct TrinoDecimalTypes;
 
@@ -818,7 +835,7 @@ impl AnalyzerRule for TrinoDecimalTypes {
 /// inserted. Each node is handled the way `TypeCoercion` handles it: expressions resolve
 /// against the node's inputs (and a scan's source), a rewritten expression keeps the name it
 /// had, so an unaliased `CAST(dec AS DOUBLE)` column is still called that, and the node's
-/// schema is recomputed when anything changed.
+/// schema is recomputed.
 #[derive(Debug, Default)]
 pub(crate) struct TrinoDecimalCasts;
 
@@ -846,15 +863,11 @@ fn rewrite_plan(
     }
 
     let names = NamePreserver::new(&plan);
-    let rewritten = plan.map_expressions(|expr| {
+    plan.map_expressions(|expr| {
         let name = names.save(&expr);
         Ok(rewrite(expr, &schema)?.update_data(|e| name.restore(e)))
-    })?;
-    if rewritten.transformed {
-        rewritten.map_data(|p| p.recompute_schema())
-    } else {
-        Ok(rewritten)
-    }
+    })?
+    .map_data(|p| p.recompute_schema())
 }
 
 #[cfg(test)]

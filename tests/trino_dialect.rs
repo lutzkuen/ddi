@@ -240,30 +240,60 @@ async fn differences<E: AsRef<str>>(
     let mut differ = Vec::new();
     for expr in exprs {
         let expr = expr.as_ref();
-        let theirs = trino
-            .query(&format!("SELECT {expr} AS v FROM {}", source.from))
-            .await
-            .unwrap_or_else(|e| panic!("Trino refused {expr}: {e}"))
-            .scalar();
-        let sql = format!("SELECT {expr} AS v FROM source");
-        let transform = if per_batch {
-            SqlTransform::new_per_batch(sql)
-        } else {
-            SqlTransform::new(sql)
-        };
-        let out = match transform.apply(vec![source.batch.clone()]).await {
-            Ok(out) => out,
-            Err(e) => {
-                differ.push(format!("{expr}\n  Trino: {theirs:?}\n  ddi:   failed, {e}"));
-                continue;
-            }
-        };
-        let (theirs, ours) = spelt_alike(theirs, out[0].column(0));
-        if theirs != ours {
-            differ.push(format!("{expr}\n  Trino: {theirs:?}\n  ddi:   {ours:?}"));
-        }
+        let theirs = format!("SELECT {expr} AS v FROM {}", source.from);
+        let ours = format!("SELECT {expr} AS v FROM source");
+        differ.extend(difference(trino, source, expr, &theirs, ours, per_batch).await);
     }
     differ
+}
+
+/// As [`differences`], for whole statements over `source`, each giving one column: Trino reads
+/// `source` from a CTE of the same rows, put first among any the statement has.
+async fn statement_differences(
+    trino: &TrinoClient,
+    source: &Source,
+    statements: &[&str],
+    per_batch: bool,
+) -> Vec<String> {
+    let rows = format!("source AS (SELECT * FROM {})", source.from);
+    let mut differ = Vec::new();
+    for statement in statements {
+        let theirs = match statement.strip_prefix("WITH ") {
+            Some(ctes) => format!("WITH {rows}, {ctes}"),
+            None => format!("WITH {rows} {statement}"),
+        };
+        let ours = statement.to_string();
+        differ.extend(difference(trino, source, statement, &theirs, ours, per_batch).await);
+    }
+    differ
+}
+
+/// The first value of `theirs` in Trino and of `ours` here, over `source`, as a line naming
+/// `what` where the two differ.
+async fn difference(
+    trino: &TrinoClient,
+    source: &Source,
+    what: &str,
+    theirs: &str,
+    ours: String,
+    per_batch: bool,
+) -> Option<String> {
+    let theirs = trino
+        .query(theirs)
+        .await
+        .unwrap_or_else(|e| panic!("Trino refused {what}: {e}"))
+        .scalar();
+    let transform = if per_batch {
+        SqlTransform::new_per_batch(ours)
+    } else {
+        SqlTransform::new(ours)
+    };
+    let out = match transform.apply(vec![source.batch.clone()]).await {
+        Ok(out) => out,
+        Err(e) => return Some(format!("{what}\n  Trino: {theirs:?}\n  ddi:   failed, {e}")),
+    };
+    let (theirs, ours) = spelt_alike(theirs, out[0].column(0));
+    (theirs != ours).then(|| format!("{what}\n  Trino: {theirs:?}\n  ddi:   {ours:?}"))
 }
 
 /// Trino's text for a value and this engine's first value in `col`, spelt so that equal
@@ -567,6 +597,14 @@ const INTEGER_BESIDE_A_DECIMAL: &[&str] = &[
     "CAST(p * coalesce(q, 1) AS REAL)",
     "CAST(p * (q + 0) AS REAL)",
     "CAST(coalesce(p, q + 1) AS REAL)",
+    // An integer a function returns, a BIGINT in Trino and an INTEGER in DataFusion, whose
+    // coercion makes it a BIGINT beside a literal.
+    "CAST(amount / nullif(length(s), 0) AS DOUBLE)",
+    "amount / nullif(length(s), 0)",
+    "CAST(amount / (length(s) + 0) AS DOUBLE)",
+    "CAST(amount / nullif(strpos(s, 'x'), 0) AS DOUBLE)",
+    "CAST(amount / nullif(extract(day FROM DATE '2024-01-15'), 0) AS DOUBLE)",
+    "CAST(p * (length(s) - 4) AS REAL)",
 ];
 
 #[tokio::test]
@@ -581,7 +619,7 @@ async fn a_decimal_beside_an_integer_expression_converts_as_in_trino() {
     };
     let source = Source {
         from: "(VALUES (CAST('100.00' AS DECIMAL(12, 2)), 3, CAST('94255.07' AS DECIMAL(7, 2)), \
-               15)) AS source(amount, qty, p, q)"
+               15, 'abcdefghijklmnopqrx')) AS source(amount, qty, p, q, s)"
             .into(),
         batch: RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -589,12 +627,14 @@ async fn a_decimal_beside_an_integer_expression_converts_as_in_trino() {
                 Field::new("qty", DataType::Int32, false),
                 Field::new("p", DataType::Decimal128(7, 2), false),
                 Field::new("q", DataType::Int32, false),
+                Field::new("s", DataType::Utf8, false),
             ])),
             vec![
                 decimal(10000, 12, 2),
                 Arc::new(Int32Array::from(vec![3])),
                 decimal(9425507, 7, 2),
                 Arc::new(Int32Array::from(vec![15])),
+                Arc::new(StringArray::from(vec!["abcdefghijklmnopqrx"])),
             ],
         )
         .unwrap(),
@@ -648,6 +688,42 @@ async fn a_decimal_sum_converts_to_the_real_trino_gives() {
         "CAST(sum(s) / 100 AS REAL)",
     ];
     differ.extend(differences(&trino(), &source, &rounded, true).await);
+    assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
+}
+
+/// Quotients, and a quotient of a `floor`, of a CTE's or a subquery's columns: typed from the
+/// columns as Trino types them, not as DataFusion does before its types are made Trino's.
+const DECIMAL_THROUGH_A_CTE: &[&str] = &[
+    "WITH t AS (SELECT floor(r / 10) AS f FROM source) SELECT f / 3 AS v FROM t",
+    "WITH t AS (SELECT r / 7 AS q FROM source) SELECT CAST(q / 3 AS DOUBLE) AS v FROM t",
+    "SELECT q / 3 AS v FROM (SELECT d / 7 AS q FROM source) x",
+];
+
+/// Aggregates of a CTE or subquery over a DECIMAL(8,2), divided: typed from the sum as Trino
+/// types it, DECIMAL(38, s), whatever passes it through.
+const DECIMAL_AGGREGATES_THROUGH_A_CTE: &[&str] = &[
+    "WITH agg AS (SELECT sum(s) AS total, count(*) AS n FROM source) \
+     SELECT total / n AS v FROM agg",
+    "WITH agg AS (SELECT sum(s) AS total, count(*) AS n FROM source) \
+     SELECT CAST(total / n AS DOUBLE) AS v FROM agg",
+    "SELECT CAST(total / 7 AS DOUBLE) AS v FROM (SELECT sum(s) AS total FROM source) x",
+];
+
+#[tokio::test]
+#[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
+async fn a_decimal_through_a_cte_is_the_decimal_trino_gives() {
+    let trino = trino();
+    let mut differ = statement_differences(
+        &trino,
+        &decimals(DECIMAL_COLUMNS, 1),
+        DECIMAL_THROUGH_A_CTE,
+        false,
+    )
+    .await;
+    let source = decimal_rows("s", 8, 2, &["706915.02", "706915.03", "1.23"]);
+    differ.extend(
+        statement_differences(&trino, &source, DECIMAL_AGGREGATES_THROUGH_A_CTE, true).await,
+    );
     assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
 }
 

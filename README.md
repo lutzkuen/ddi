@@ -1253,18 +1253,22 @@ BIGINT would make the result ten digits wider: `coalesce(amount, 0)` over a DECI
 DECIMAL(18,8), as in Trino. So is an integer expression such a literal makes a BIGINT in
 DataFusion where Trino keeps an INTEGER — `nullif(qty, 0)`, `coalesce(qty, 1)` or `qty + 1` over
 an INTEGER `qty` — so `amount / nullif(qty, 0)` over a DECIMAL(12,2) is a DECIMAL(23,13) in both.
-An integer a function returns keeps DataFusion's type, and `length` is an INTEGER there where
-Trino's is a BIGINT, so a quotient by it has thirteen digits of scale here and twenty-two in
-Trino; `CAST(length(s) AS BIGINT)` means the same in both. A `sum` over a decimal, in a
-publication, is a DECIMAL(38,s) as in Trino, where DataFusion's has ten digits more than its
-argument, and so over 8 digits or fewer would be divided: over DECIMAL(8,2), 1413830.04 cast to
-REAL is 1413830.0 in both. `min` and `max` keep
+That takes the expression beside the decimal: computed as `n` in a CTE or subquery,
+`nullif(qty, 0)` meets it only as a column, DataFusion's BIGINT, and `amount / n` is a
+DECIMAL(32,22) here; `CAST(nullif(qty, 0) AS INTEGER)` there means the same in both. An integer
+a function returns keeps DataFusion's type, and `length`, `strpos` and `extract` are INTEGERs
+there where Trino's are BIGINTs, so a quotient by one has thirteen digits of scale here and
+twenty-two in Trino; `CAST(length(s) AS BIGINT)` means the same in both. A `sum` over a
+decimal, in a publication, is a DECIMAL(38,s) as in Trino, where DataFusion's has ten digits
+more than its argument, and so over 8 digits or fewer would be divided: over DECIMAL(8,2),
+1413830.04 cast to REAL is 1413830.0 in both. `min` and `max` keep
 their argument's type in both engines, and `avg`, a DECIMAL(p+4,s+4) in DataFusion and a
 DECIMAL(p,s) in Trino, is refused in every model. A quotient of decimals, and `floor`, `ceil`
 and `round` of one, are cast to Trino's types: DataFusion would make DECIMAL(9,2) /
 DECIMAL(9,2) a DECIMAL(15,6), where Trino's is DECIMAL(21,12), and keep `floor` of a
 DECIMAL(9,2) one, where Trino's is DECIMAL(8,0). Over a `sum`, each is typed from the sum's
-DECIMAL(38,s). A quotient's last digit is rounded as Trino rounds it. That covers
+DECIMAL(38,s), and over a CTE's or subquery's decimal column from its type as Trino has
+it. A quotient's last digit is rounded as Trino rounds it. That covers
 `CAST` and `TRY_CAST`, the casts DataFusion's coercion inserts (`dec * 1e0`), lambda bodies, a
 list of decimals cast to a list of doubles, a DECIMAL column landing in a DOUBLE or REAL
 target, and the `array_*` aggregates over decimals.
