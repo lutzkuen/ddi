@@ -777,18 +777,19 @@ fn compile(
                 if f.func.signature().volatility != Volatility::Immutable
         ))
     })?;
-    // What the top of the query gets: coercion, then Trino's DECIMAL casts, which the
-    // top's analyzer applies after it (a body is planned here, never analyzed), then
-    // simplification — which is where `now()`, `current_date` and `arrow_cast` are turned
-    // into what they mean — then the function rewrites `create_physical_expr` applies.
+    // What the top of the query gets: Trino's integer literals, coercion, then Trino's DECIMAL
+    // casts, which the top's analyzer applies around it (a body is planned here, never
+    // analyzed), then simplification — which is where `now()`, `current_date` and
+    // `arrow_cast` are turned into what they mean — then the function rewrites
+    // `create_physical_expr` applies.
     let simplifier = ExprSimplifier::new(
         SimplifyContext::default()
             .with_schema(Arc::new(df_schema.clone()))
             .with_config_options(Arc::clone(state.config_options()))
             .with_query_execution_start_time(state.execution_props().query_execution_start_time),
     );
-    let simplified = simplifier
-        .coerce(logical, &df_schema)
+    let simplified = crate::transform::decimal::retype_integer_literals(logical, &df_schema)
+        .and_then(|e| simplifier.coerce(e.data, &df_schema))
         .and_then(|e| crate::transform::decimal::rewrite_expr(e, &df_schema).map(|t| t.data))
         .and_then(|e| simplifier.simplify(e))
         .map_err(|e| {

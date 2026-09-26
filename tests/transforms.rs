@@ -369,6 +369,114 @@ async fn a_decimal_casts_to_the_double_trino_gives() {
 }
 
 #[tokio::test]
+async fn an_integer_literal_beside_a_decimal_is_typed_as_trino_types_it() {
+    // DataFusion reads `0` as a BIGINT, which beside a decimal is DECIMAL(20,0); Trino reads it
+    // as an INTEGER, DECIMAL(10,0). Those ten digits decide whether `coalesce(r, 0)` is a short
+    // decimal, which Trino divides on its way to a DOUBLE or REAL, or a long one, which it
+    // rounds correctly: ddi rounded these where Trino divides. Types and values are what
+    // Trino 480 returns.
+    use delta_delta_ingest::schema::SchemaCoercer;
+    use deltalake::arrow::array::{AsArray, Decimal128Array};
+    use deltalake::arrow::datatypes::{Float32Type, Float64Type};
+
+    // DECIMAL(9,2) 1413830.04, past 2^24 unscaled, and DECIMAL(18,8) 1175317522.91864620,
+    // past 2^53: both divide to something other than the nearest float and double.
+    let batch = || {
+        let decimal = |v: i128, p: u8, s: i8| {
+            Arc::new(
+                Decimal128Array::from(vec![v])
+                    .with_precision_and_scale(p, s)
+                    .unwrap(),
+            ) as ArrayRef
+        };
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("r", DataType::Decimal128(9, 2), false),
+                Field::new("d", DataType::Decimal128(18, 8), false),
+            ])),
+            vec![decimal(141383004, 9, 2), decimal(117531752291864620, 18, 8)],
+        )
+        .unwrap()
+    };
+    let real: f32 = "1413830.125".parse().unwrap();
+    let double: f64 = "1175317522.9186463".parse().unwrap();
+
+    let out = run_on(
+        batch(),
+        "SELECT coalesce(r, 0) AS coalesced, \
+                CASE WHEN r > 0 THEN d ELSE 0 END AS branched, \
+                nullif(d, 0) AS nulled, \
+                greatest(d, 0) AS greatest, \
+                r + 2 AS added, \
+                2 - r AS subtracted, \
+                r * 2 AS multiplied \
+         FROM source",
+    )
+    .await;
+    let schema = out[0].schema();
+    for (name, (p, s)) in [
+        ("coalesced", (12, 2)),
+        ("branched", (18, 8)),
+        ("nulled", (18, 8)),
+        ("greatest", (18, 8)),
+        ("added", (13, 2)),
+        ("subtracted", (13, 2)),
+        ("multiplied", (20, 2)),
+    ] {
+        assert_eq!(
+            schema.field_with_name(name).unwrap().data_type(),
+            &DataType::Decimal128(p, s),
+            "{name}: Trino's decimal({p},{s})"
+        );
+    }
+
+    let out = run_on(
+        batch(),
+        "SELECT CAST(coalesce(r, 0) AS REAL) AS coalesced, \
+                CAST(CASE WHEN r > 0 THEN r ELSE 0 END AS REAL) AS branched, \
+                transform(ARRAY[r], x -> CAST(coalesce(x, 0) AS REAL))[1] AS in_lambda, \
+                CAST(coalesce(d, 0) AS DOUBLE) AS double \
+         FROM source",
+    )
+    .await;
+    for name in ["coalesced", "branched", "in_lambda"] {
+        let got = common::column_of(&out, name)
+            .as_primitive::<Float32Type>()
+            .value(0);
+        assert_eq!(got.to_bits(), real.to_bits(), "{name}: got {got:?}");
+    }
+    let got = common::column_of(&out, "double")
+        .as_primitive::<Float64Type>()
+        .value(0);
+    assert_eq!(got.to_bits(), double.to_bits(), "got {got:?}");
+
+    // And landing in a REAL or DOUBLE target column, which converts by the type the
+    // transform produced.
+    let out = run_on(
+        batch(),
+        "SELECT coalesce(r, 0) AS r, coalesce(d, 0) AS d FROM source",
+    )
+    .await;
+    let target = SchemaCoercer::new(Arc::new(Schema::new(vec![
+        Field::new("r", DataType::Float32, false),
+        Field::new("d", DataType::Float64, false),
+    ])));
+    let landed = target.coerce(&out[0]).unwrap();
+    let got = landed.column(0).as_primitive::<Float32Type>().value(0);
+    assert_eq!(
+        got.to_bits(),
+        real.to_bits(),
+        "in a REAL column: got {got:?}"
+    );
+    let got = landed.column(1).as_primitive::<Float64Type>().value(0);
+    assert_eq!(
+        got.to_bits(),
+        double.to_bits(),
+        "in a DOUBLE column: got {got:?}"
+    );
+}
+
+#[tokio::test]
 async fn array_sum_over_decimals_starts_from_the_nearest_doubles() {
     // The array aggregates read their elements as doubles, and a decimal element becomes the
     // nearest one: a one-element array sums to exactly it.

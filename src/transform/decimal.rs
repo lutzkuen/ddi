@@ -22,9 +22,14 @@
 //! (2^24) that rounds twice, and the answer is not always the nearest — DECIMAL(17,17)
 //! `0.49979999999999997` is `0.4998` there too — but it is Trino's, so it is this module's.
 //! For a DOUBLE it is also Arrow's; for a REAL it is not, since Arrow divides as doubles and
-//! narrows after. Which of the two a value is follows its type's precision, so a decimal
-//! DataFusion computes can still land on the other side from Trino's: its product of two
-//! decimals has one digit more.
+//! narrows after. Which of the two a value is follows its type's precision, so a computed
+//! decimal has to have Trino's type. A product does in both engines. An integer literal beside
+//! a decimal would not — DataFusion reads it as a BIGINT, ten digits wider than Trino's INTEGER
+//! — so it is typed as Trino types it first ([`retype_integer_literals`]). Two computed
+//! decimals still differ: a quotient of decimals, which DataFusion computes to fewer digits
+//! (DECIMAL(9,2) / DECIMAL(9,2) is DECIMAL(15,6) there and DECIMAL(21,12) in Trino, and the
+//! digits themselves differ), and `sum` over a DECIMAL of 8 digits or fewer, 18 digits in
+//! DataFusion and 38 in Trino.
 //!
 //! What goes through it: a CAST or TRY_CAST in a model, including the casts DataFusion's
 //! coercion inserts (`dec * 1e0`), and the same in a lambda body; casts of a list of decimals
@@ -380,6 +385,121 @@ pub(crate) fn rewrite_expr(expr: Expr, schema: &DFSchema) -> DFResult<Transforme
     })
 }
 
+/// Type every integer literal in `expr` that meets a DECIMAL as Trino types it: an INTEGER,
+/// where DataFusion reads a BIGINT. `schema` is what `expr`'s columns resolve against.
+///
+/// Before coercion, which is what widens the literal: DataFusion makes a BIGINT
+/// DECIMAL(20,0) beside a decimal, and Trino an INTEGER DECIMAL(10,0). Ten digits of the
+/// result's precision decide which side of the 18-digit line it falls on, and so how it
+/// converts to DOUBLE or REAL: `coalesce(amount, 0)` over a DECIMAL(18,8) is DECIMAL(28,8) in
+/// DataFusion, correctly rounded, and DECIMAL(18,8) in Trino, divided. So a literal that fits
+/// an INTEGER becomes one in arithmetic (`+ - * / %`), in the branches of a CASE, and among the
+/// arguments of `coalesce`, `nullif`, `greatest` and `least`, wherever a decimal is beside it.
+/// A literal past an INTEGER, and a BIGINT column, stay DECIMAL(20,0) where Trino's BIGINT is
+/// DECIMAL(19,0): the result is a long decimal in both, so it converts the same.
+///
+/// Never fails on the expression's account: one whose type cannot be worked out is taken
+/// for no decimal.
+pub(crate) fn retype_integer_literals(
+    expr: Expr,
+    schema: &DFSchema,
+) -> DFResult<Transformed<Expr>> {
+    use deltalake::datafusion::logical_expr::Operator;
+
+    expr.transform_up(|mut e| {
+        let changed = match &mut e {
+            Expr::BinaryExpr(b)
+                if matches!(
+                    b.op,
+                    Operator::Plus
+                        | Operator::Minus
+                        | Operator::Multiply
+                        | Operator::Divide
+                        | Operator::Modulo
+                ) =>
+            {
+                narrow_beside_a_decimal([b.left.as_mut(), b.right.as_mut()], schema)
+            }
+            Expr::Case(c) => narrow_beside_a_decimal(
+                c.when_then_expr
+                    .iter_mut()
+                    .map(|(_, then)| then.as_mut())
+                    .chain(c.else_expr.as_deref_mut()),
+                schema,
+            ),
+            Expr::ScalarFunction(f)
+                if matches!(f.name(), "coalesce" | "nullif" | "greatest" | "least") =>
+            {
+                narrow_beside_a_decimal(f.args.iter_mut(), schema)
+            }
+            _ => false,
+        };
+        Ok(Transformed::new_transformed(e, changed))
+    })
+}
+
+/// Make each integer literal among `values` an INTEGER, when one of `values` is a decimal.
+/// True when anything changed.
+fn narrow_beside_a_decimal<'a>(
+    values: impl IntoIterator<Item = &'a mut Expr>,
+    schema: &DFSchema,
+) -> bool {
+    let values: Vec<&mut Expr> = values.into_iter().collect();
+    if !values
+        .iter()
+        .any(|v| v.get_type(schema).is_ok_and(|t| t.is_decimal()))
+    {
+        return false;
+    }
+    let mut changed = false;
+    for v in values {
+        if let Expr::Literal(value, _) = v {
+            if let ScalarValue::Int64(Some(n)) = *value {
+                if let Ok(n) = i32::try_from(n) {
+                    *value = ScalarValue::Int32(Some(n));
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// DataFusion's analyzer rules, with this module's two where they belong: Trino's integer
+/// literals just before `TypeCoercion`, which is what widens them, and Trino's DECIMAL casts
+/// at the end, after it, so that they also see the casts coercion inserts.
+pub(crate) fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+    use deltalake::datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
+    use deltalake::datafusion::optimizer::Analyzer;
+
+    let mut rules = Analyzer::new().rules;
+    let coercion = TypeCoercion::new();
+    let at = rules
+        .iter()
+        .position(|r| r.name() == coercion.name())
+        .unwrap_or(0);
+    rules.insert(at, Arc::new(TrinoIntegerLiterals));
+    rules.push(Arc::new(TrinoDecimalCasts));
+    rules
+}
+
+/// The analyzer pass that applies [`retype_integer_literals`] to every expression of a plan
+/// and its subqueries. Handled node by node as [`TrinoDecimalCasts`] handles them.
+#[derive(Debug, Default)]
+pub(crate) struct TrinoIntegerLiterals;
+
+impl AnalyzerRule for TrinoIntegerLiterals {
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> DFResult<LogicalPlan> {
+        Ok(plan
+            .transform_up_with_subqueries(|p| rewrite_plan(p, retype_integer_literals))?
+            .data)
+    }
+
+    fn name(&self) -> &str {
+        "ddi_trino_integer_literals"
+    }
+}
+
 /// The analyzer pass that applies [`rewrite_expr`] to every expression of a plan and its
 /// subqueries.
 ///
@@ -389,19 +509,24 @@ pub(crate) fn rewrite_expr(expr: Expr, schema: &DFSchema) -> DFResult<Transforme
 /// had, so an unaliased `CAST(dec AS DOUBLE)` column is still called that, and the node's
 /// schema is recomputed when anything changed.
 #[derive(Debug, Default)]
-pub(crate) struct CorrectlyRoundedDecimalCasts;
+pub(crate) struct TrinoDecimalCasts;
 
-impl AnalyzerRule for CorrectlyRoundedDecimalCasts {
+impl AnalyzerRule for TrinoDecimalCasts {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> DFResult<LogicalPlan> {
-        Ok(plan.transform_up_with_subqueries(rewrite_plan)?.data)
+        Ok(plan
+            .transform_up_with_subqueries(|p| rewrite_plan(p, rewrite_expr))?
+            .data)
     }
 
     fn name(&self) -> &str {
-        "ddi_correctly_rounded_decimal_casts"
+        "ddi_trino_decimal_casts"
     }
 }
 
-fn rewrite_plan(plan: LogicalPlan) -> DFResult<Transformed<LogicalPlan>> {
+fn rewrite_plan(
+    plan: LogicalPlan,
+    rewrite: fn(Expr, &DFSchema) -> DFResult<Transformed<Expr>>,
+) -> DFResult<Transformed<LogicalPlan>> {
     let mut schema = merge_schema(&plan.inputs());
     if let LogicalPlan::TableScan(ts) = &plan {
         let source =
@@ -412,7 +537,7 @@ fn rewrite_plan(plan: LogicalPlan) -> DFResult<Transformed<LogicalPlan>> {
     let names = NamePreserver::new(&plan);
     let rewritten = plan.map_expressions(|expr| {
         let name = names.save(&expr);
-        Ok(rewrite_expr(expr, &schema)?.update_data(|e| name.restore(e)))
+        Ok(rewrite(expr, &schema)?.update_data(|e| name.restore(e)))
     })?;
     if rewritten.transformed {
         rewritten.map_data(|p| p.recompute_schema())

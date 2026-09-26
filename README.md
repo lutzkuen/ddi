@@ -323,8 +323,10 @@ Instants agree with Trino. Wall clocks can differ:
 
 For a date, `CAST(from_unixtime(x, 'UTC') AS DATE)`, or the same with a fixed offset such as
 `'+02:00'`, gives Trino's answer wherever both convert. A zone with daylight saving can still
-differ after 2099, for an instant in the hour before local midnight, and so can the
-one-argument form.
+differ after 2099, where `ddi`'s zone data ends and keeps the zone's last offset, for an
+instant within an hour of its local midnight: the hour after it where that offset is standard
+time, as in Europe/Amsterdam, and the hour before it where it is daylight saving time, as in
+Australia/Sydney. So can the one-argument form.
 
 ### Pinned Delta lookups
 
@@ -1192,14 +1194,20 @@ A DECIMAL of more than 18 digits cast to DOUBLE or REAL is correctly rounded too
 one ULP off. One of 18 digits or fewer Trino divides in floating point itself — the unscaled
 integer over the power of ten, as doubles for a DOUBLE and as floats for a REAL — so `ddi`
 does that, and DECIMAL(17,17) `0.49979999999999997` is `0.4998` in both. Which of the two a
-value is follows its type's precision, and DataFusion gives a product of two decimals one
-digit more than Trino does, so a computed decimal near that line can still differ. That
-covers `CAST` and `TRY_CAST`, the casts DataFusion's coercion inserts (`dec * 1e0`), lambda
-bodies, a list of decimals cast to a list of doubles, a DECIMAL column landing in a DOUBLE or
-REAL target, and the `array_*` aggregates over decimals. It does not yet cover `log` and
-`power` over a DECIMAL, which DataFusion computes on the decimal itself and not as Trino
-does; a decimal inside a ROW or MAP being cast; or `arrow_cast`. Those keep Arrow's
-arithmetic.
+value is follows its type's precision, so a computed decimal has to have Trino's type. An
+integer literal beside a decimal — `coalesce(amount, 0)`, `CASE .. ELSE 0 END`,
+`amount + 1` — is typed as Trino types it, an INTEGER, where DataFusion's BIGINT would make
+the result ten digits wider: `coalesce(amount, 0)` over a DECIMAL(18,8) is a DECIMAL(18,8), as
+in Trino. Two computed decimals still differ. A quotient of decimals DataFusion computes to
+fewer digits — DECIMAL(9,2) / DECIMAL(9,2) is DECIMAL(15,6) there and DECIMAL(21,12) in Trino,
+and the digits differ too — and `sum` over a DECIMAL of 8 digits or fewer, in a publication,
+is 18 digits in DataFusion and 38 in Trino, so cast to DOUBLE it is divided in `ddi` and
+correctly rounded in Trino. That covers `CAST` and `TRY_CAST`, the casts DataFusion's
+coercion inserts (`dec * 1e0`), lambda bodies, a list of decimals cast to a list of doubles, a
+DECIMAL column landing in a DOUBLE or REAL target, and the `array_*` aggregates over decimals.
+It does not yet cover `log` and `power` over a DECIMAL, which DataFusion computes on the
+decimal itself and not as Trino does; a decimal inside a ROW or MAP being cast; or
+`arrow_cast`. Those keep Arrow's arithmetic.
 
 #### Building JSON: `json_object`, `json_array`, `CAST(.. AS JSON)`
 

@@ -397,9 +397,9 @@ fn cross_row_set_expr(body: &SetExpr) -> Option<&'static str> {
 ///   fails.
 /// - As text, the value reads `2024-04-01T00:30:00+02:00` where Trino writes
 ///   `2024-04-01 00:30:00.000 Europe/Amsterdam`; inside `json_object` it is written in UTC.
-/// - The zone database here tabulates daylight saving only up to 2099, so after that a
-///   summer instant's local time is an hour off Trino's. `CAST(.. AS DATE)` differs only
-///   within that hour of local midnight.
+/// - The zone database here tabulates daylight saving only up to 2099, and after that keeps
+///   the zone's last offset, so for half of each year its local time is an hour off Trino's.
+///   `CAST(.. AS DATE)` differs only within that hour of local midnight.
 /// - `NaN` fails, where Trino returns 1970; an epoch between about 71,000 and 292,000 years
 ///   converts here and fails there.
 /// - The one-argument form's local time, and near midnight its date, is UTC's rather than the
