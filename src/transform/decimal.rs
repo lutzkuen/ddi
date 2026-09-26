@@ -25,7 +25,8 @@
 //! narrows after. Which of the two a value is follows its type's precision, so a computed
 //! decimal has to have Trino's type. A product does in both engines, and so do `min` and `max`.
 //! An integer literal beside a decimal would not — DataFusion reads it as a BIGINT, ten digits
-//! wider than Trino's INTEGER — so it is typed as Trino types it first
+//! wider than Trino's INTEGER — nor would an integer expression a literal makes a BIGINT,
+//! `nullif(qty, 0)` or `qty + 1` over an INTEGER, so each is typed as Trino types it first
 //! ([`retype_integer_literals`]). Nor would `sum`: DataFusion gives it ten digits more than its
 //! argument and Trino 38, so over 8 digits or fewer it would be short here and long there, and
 //! its argument is widened to 38 digits first ([`widen_decimal_sums`]). Nor would a quotient,
@@ -34,10 +35,9 @@
 //! DECIMAL(21,12) in Trino), nor `floor`, `ceil` and `round`, which keep their argument's
 //! precision where Trino narrows it: each is cast to Trino's type
 //! ([`retype_decimal_results`]), a quotient computed to one digit more first, so that the cast
-//! rounds its last digit as Trino does. Past 38 digits there is no room for that digit, and a
-//! quotient's last is DataFusion's, truncated where Trino rounds it. `avg` differs too,
-//! DECIMAL(p+4, s+4) against Trino's DECIMAL(p, s), but no model can use it: a transform
-//! aggregates nothing, and a publication only what a client can add up.
+//! rounds its last digit as Trino does. `avg` differs too, DECIMAL(p+4, s+4) against Trino's
+//! DECIMAL(p, s), but no model can use it: a transform aggregates nothing, and a publication
+//! only what a client can add up.
 //!
 //! What goes through it: a CAST or TRY_CAST in a model, including the casts DataFusion's
 //! coercion inserts (`dec * 1e0`), and the same in a lambda body; casts of a list of decimals
@@ -47,13 +47,14 @@
 //! does; and, keeping Arrow's division, a decimal inside a ROW or MAP being cast, and
 //! `arrow_cast`, whose cast is only made after the analyzer has run.
 //!
-//! Two types DataFusion decides otherwise than Trino are left as they are. A literal with a
-//! decimal point is a DOUBLE there and a DECIMAL in Trino; and a decimal beside a DOUBLE or
-//! REAL, compared with it or in a `CASE` or `coalesce` with it, is converted to the float in
-//! Trino, where DataFusion casts the float to a DECIMAL. Once there is a plan, `0.5` and
-//! `0.5e0` are the same DOUBLE, so no rule here can tell the literal Trino reads as a decimal
-//! from the one it reads as a double. The README gives the spelling that means the same in
-//! both.
+//! Three types DataFusion decides otherwise than Trino are left as they are. A literal with a
+//! decimal point is a DOUBLE there and a DECIMAL in Trino; a decimal beside a DOUBLE or REAL,
+//! compared with it or in a `CASE` or `coalesce` with it, is converted to the float in Trino,
+//! where DataFusion casts the float to a DECIMAL; and an integer a function returns is typed as
+//! DataFusion types it, `length` an INTEGER where Trino's is a BIGINT. Once there is a plan,
+//! `0.5` and `0.5e0` are the same DOUBLE, so no rule here can tell the literal Trino reads as a
+//! decimal from the one it reads as a double. The README gives the spelling that means the same
+//! in both.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -415,6 +416,14 @@ pub(crate) fn rewrite_expr(expr: Expr, schema: &DFSchema) -> DFResult<Transforme
 /// A literal past an INTEGER, and a BIGINT column, stay DECIMAL(20,0) where Trino's BIGINT is
 /// DECIMAL(19,0): the result is a long decimal in both, so it converts the same.
 ///
+/// An integer expression beside a decimal is typed as Trino types it too ([`trino_integer`]).
+/// DataFusion makes `nullif(qty, 0)`, `coalesce(qty, 1)`, `qty + 1` or `60 * 60` a BIGINT once a
+/// literal in it is one, where Trino keeps the INTEGER: `amount / nullif(qty, 0)` over a
+/// DECIMAL(12,2) is DECIMAL(32,22) here and DECIMAL(23,13) in Trino, and `p * coalesce(q, 1)`
+/// over a DECIMAL(7,2) DECIMAL(28,2), correctly rounded, where Trino's DECIMAL(18,2) is divided.
+/// Such an expression is cast to Trino's type rather than computed in it: DataFusion's integer
+/// arithmetic wraps where Trino's fails, and the cast fails where Trino would.
+///
 /// Never fails on the expression's account: one whose type cannot be worked out is taken
 /// for no decimal.
 pub(crate) fn retype_integer_literals(
@@ -458,7 +467,8 @@ pub(crate) fn retype_integer_literals(
     })
 }
 
-/// Make each integer literal among `values` an INTEGER, when one of `values` is a decimal.
+/// Make each integer literal among `values` an INTEGER, and cast each integer expression
+/// DataFusion types wider than Trino does to Trino's type, when one of `values` is a decimal.
 /// True when anything changed.
 fn narrow_beside_a_decimal<'a>(
     values: impl IntoIterator<Item = &'a mut Expr>,
@@ -480,9 +490,85 @@ fn narrow_beside_a_decimal<'a>(
                     changed = true;
                 }
             }
+            continue;
+        }
+        let (Some(ours), Some(theirs)) = (
+            coerced_type(v, schema).and_then(|t| integer_digits(&t)),
+            trino_integer(v, schema),
+        ) else {
+            continue;
+        };
+        if integer_digits(&theirs).is_some_and(|digits| digits < ours) {
+            *v = Expr::Cast(Cast::new(Box::new(std::mem::take(v)), theirs));
+            changed = true;
         }
     }
     changed
+}
+
+/// The integer type Trino gives `expr`, or `None` when it is no integer. A literal is an
+/// INTEGER where it fits one; arithmetic, `coalesce`, `greatest`, `least` and a CASE of integers
+/// are the widest integer among them, and `nullif` its first argument's type, where DataFusion
+/// makes each a BIGINT once a literal in it is one. Anything else is taken as DataFusion types
+/// it, as a column is.
+fn trino_integer(expr: &Expr, schema: &DFSchema) -> Option<DataType> {
+    use deltalake::datafusion::logical_expr::Operator;
+
+    let widest = |exprs: Vec<&Expr>| {
+        exprs
+            .into_iter()
+            .map(|e| trino_integer(e, schema))
+            .try_fold(DataType::Int8, |widest, t| {
+                let t = t?;
+                Some(match integer_digits(&t)? > integer_digits(&widest)? {
+                    true => t,
+                    false => widest,
+                })
+            })
+    };
+    match expr {
+        Expr::Literal(ScalarValue::Int64(Some(n)), _) if i32::try_from(*n).is_ok() => {
+            Some(DataType::Int32)
+        }
+        Expr::BinaryExpr(b)
+            if matches!(
+                b.op,
+                Operator::Plus
+                    | Operator::Minus
+                    | Operator::Multiply
+                    | Operator::Divide
+                    | Operator::Modulo
+            ) =>
+        {
+            widest(vec![&b.left, &b.right])
+        }
+        Expr::Negative(e) => trino_integer(e, schema),
+        Expr::ScalarFunction(f) if f.name() == "nullif" => {
+            f.args.first().and_then(|a| trino_integer(a, schema))
+        }
+        Expr::ScalarFunction(f) if matches!(f.name(), "coalesce" | "greatest" | "least") => {
+            widest(f.args.iter().collect())
+        }
+        Expr::Case(c) => widest(
+            c.when_then_expr
+                .iter()
+                .map(|(_, then)| then.as_ref())
+                .chain(c.else_expr.as_deref())
+                .collect(),
+        ),
+        _ => coerced_type(expr, schema).filter(|t| integer_digits(t).is_some()),
+    }
+}
+
+/// The decimal digits of a signed integer type, which order them by width.
+fn integer_digits(t: &DataType) -> Option<u8> {
+    match t {
+        DataType::Int8 => Some(3),
+        DataType::Int16 => Some(5),
+        DataType::Int32 => Some(10),
+        DataType::Int64 => Some(19),
+        _ => None,
+    }
 }
 
 /// Type every `sum` over a DECIMAL in `expr` as Trino types it: DECIMAL(38, s), whatever its
@@ -541,8 +627,13 @@ pub(crate) fn widen_decimal_sums(expr: Expr, schema: &DFSchema) -> DFResult<Tran
 /// DECIMAL(8,0) there. And `round(x, n)` narrows the scale to `n`, where Trino's keeps it and
 /// adds a digit, DECIMAL(p + 1, s). So each is cast to Trino's type. A quotient's dividend is
 /// first cast to the scale that has Arrow compute one digit past Trino's, which the cast then
-/// rounds half up, as Trino rounds: Arrow truncates. A quotient of 38 digits has no room for
-/// that digit, and its last is Arrow's.
+/// rounds half up, as Trino rounds: Arrow truncates. Arrow multiplies the dividend by
+/// 10^(4 + s2) before it divides, in the dividend's own integer, so where that can pass 38
+/// digits both operands are made 256-bit decimals first: in 128 bits `amount / 100` over a
+/// DECIMAL(38,0) 2·10^33 overflowed where Trino divides it, and a quotient of 38 digits had no
+/// room for the digit to round by. And `floor` and `ceil` get a digit more to round into:
+/// DataFusion checks the result against its argument's own precision, so `ceil` over a
+/// DECIMAL(5,2) 999.50 failed where Trino's is 1000.
 ///
 /// Before coercion, like [`widen_decimal_sums`], because this changes the type of a node, and
 /// coercion is what fits every node above it to that; and after
@@ -564,14 +655,24 @@ pub(crate) fn retype_decimal_results(expr: Expr, schema: &DFSchema) -> DFResult<
                     return Ok(Transformed::no(e));
                 }
                 let (p, s) = trino_quotient((l.precision, l.scale), (r.precision, r.scale));
-                let scale = if p < 38 { s - 3 } else { s - 4 };
-                if scale > l.scale {
-                    let precision = i16::from(l.precision) + i16::from(scale - l.scale);
+                let scale = (s - 3).max(l.scale);
+                let precision = l.precision + (scale - l.scale) as u8;
+                if precision + 4 + r.scale as u8 > 38 {
                     let dividend = std::mem::take(&mut q.left);
-                    *q.left = Expr::Cast(Cast::new(
-                        dividend,
-                        DataType::Decimal128(precision.min(38) as u8, scale),
-                    ));
+                    *q.left =
+                        Expr::Cast(Cast::new(dividend, DataType::Decimal256(precision, scale)));
+                    // An integer divisor coercion makes a 256-bit decimal of scale 0 itself.
+                    if r.decimal {
+                        let divisor = std::mem::take(&mut q.right);
+                        *q.right = Expr::Cast(Cast::new(
+                            divisor,
+                            DataType::Decimal256(r.precision, r.scale),
+                        ));
+                    }
+                } else if scale > l.scale {
+                    let dividend = std::mem::take(&mut q.left);
+                    *q.left =
+                        Expr::Cast(Cast::new(dividend, DataType::Decimal128(precision, scale)));
                 }
                 (p, s)
             }
@@ -580,6 +681,14 @@ pub(crate) fn retype_decimal_results(expr: Expr, schema: &DFSchema) -> DFResult<
                 let Some(a) = argument.filter(|a| a.decimal) else {
                     return Ok(Transformed::no(e));
                 };
+                if matches!(f.name(), "floor" | "ceil") && a.scale > 0 {
+                    let widened = match a.precision < 38 {
+                        true => DataType::Decimal128(a.precision + 1, a.scale),
+                        false => DataType::Decimal256(a.precision + 1, a.scale),
+                    };
+                    let argument = std::mem::take(&mut f.args[0]);
+                    f.args[0] = Expr::Cast(Cast::new(Box::new(argument), widened));
+                }
                 match (f.name(), f.args.len()) {
                     ("round", 2) => ((a.precision + 1).min(38), a.scale),
                     _ => (a.precision - a.scale as u8 + u8::from(a.scale > 0), 0),
@@ -650,10 +759,10 @@ fn coerced_type(expr: &Expr, schema: &DFSchema) -> Option<DataType> {
         .ok()
 }
 
-/// DataFusion's analyzer rules, with this module's four where they belong: Trino's integer
-/// literals, then its types for quotients, `floor`, `ceil` and `round`, and for sums, just
-/// before `TypeCoercion`, which is what widens the literals and fits the plan to the rest, and
-/// Trino's DECIMAL casts at the end, after it, so that they also see the casts coercion inserts.
+/// DataFusion's analyzer rules, with this module's two where they belong: Trino's types for
+/// integer literals, quotients, `floor`, `ceil`, `round` and sums just before `TypeCoercion`,
+/// which is what widens the literals and fits the plan to the rest, and Trino's DECIMAL casts at
+/// the end, after it, so that they also see the casts coercion inserts.
 pub(crate) fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     use deltalake::datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
     use deltalake::datafusion::optimizer::Analyzer;
@@ -664,63 +773,41 @@ pub(crate) fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
         .iter()
         .position(|r| r.name() == coercion.name())
         .unwrap_or(0);
-    rules.insert(at, Arc::new(TrinoDecimalSums));
-    rules.insert(at, Arc::new(TrinoDecimalResults));
-    rules.insert(at, Arc::new(TrinoIntegerLiterals));
+    rules.insert(at, Arc::new(TrinoDecimalTypes));
     rules.push(Arc::new(TrinoDecimalCasts));
     rules
 }
 
-/// The analyzer pass that applies [`retype_integer_literals`] to every expression of a plan
-/// and its subqueries. Handled node by node as [`TrinoDecimalCasts`] handles them.
-#[derive(Debug, Default)]
-pub(crate) struct TrinoIntegerLiterals;
-
-impl AnalyzerRule for TrinoIntegerLiterals {
-    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> DFResult<LogicalPlan> {
-        Ok(plan
-            .transform_up_with_subqueries(|p| rewrite_plan(p, retype_integer_literals))?
-            .data)
-    }
-
-    fn name(&self) -> &str {
-        "ddi_trino_integer_literals"
-    }
+/// Trino's types for one expression: its integer literals ([`retype_integer_literals`]), then
+/// its quotients, `floor`, `ceil` and `round` ([`retype_decimal_results`]), which have to see
+/// those literals, then its sums ([`widen_decimal_sums`]), whose argument can be a quotient.
+fn retype_as_trino(expr: Expr, schema: &DFSchema) -> DFResult<Transformed<Expr>> {
+    retype_integer_literals(expr, schema)?
+        .transform_data(|e| retype_decimal_results(e, schema))?
+        .transform_data(|e| widen_decimal_sums(e, schema))
 }
 
-/// The analyzer pass that applies [`retype_decimal_results`] to every expression of a plan and
-/// its subqueries, after [`TrinoIntegerLiterals`]. Handled node by node as
-/// [`TrinoDecimalCasts`] handles them, so an unaliased `floor(amount)` keeps its name.
+/// The analyzer pass that applies [`retype_as_trino`] to every expression of a plan and its
+/// subqueries. Handled node by node as [`TrinoDecimalCasts`] handles them, so an unaliased
+/// `floor(amount)` or `sum(amount)` keeps its name.
+///
+/// One pass for the three, because each asks the types of a node's inputs, and a node is only
+/// rewritten once every node below it has been. As a pass each, a quotient or a `round` over a
+/// `sum` was typed before the sum was widened, from DataFusion's DECIMAL(p + 10, s) rather than
+/// Trino's DECIMAL(38, s): `sum(amount) / count(*)` over a DECIMAL(8,2) was a DECIMAL(38,22),
+/// where Trino's is DECIMAL(38,6).
 #[derive(Debug, Default)]
-pub(crate) struct TrinoDecimalResults;
+pub(crate) struct TrinoDecimalTypes;
 
-impl AnalyzerRule for TrinoDecimalResults {
+impl AnalyzerRule for TrinoDecimalTypes {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> DFResult<LogicalPlan> {
         Ok(plan
-            .transform_up_with_subqueries(|p| rewrite_plan(p, retype_decimal_results))?
+            .transform_up_with_subqueries(|p| rewrite_plan(p, retype_as_trino))?
             .data)
     }
 
     fn name(&self) -> &str {
-        "ddi_trino_decimal_results"
-    }
-}
-
-/// The analyzer pass that applies [`widen_decimal_sums`] to every expression of a plan and its
-/// subqueries, after [`TrinoDecimalResults`]. Handled node by node as [`TrinoDecimalCasts`]
-/// handles them, so an unaliased `sum(amount)` keeps its name.
-#[derive(Debug, Default)]
-pub(crate) struct TrinoDecimalSums;
-
-impl AnalyzerRule for TrinoDecimalSums {
-    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> DFResult<LogicalPlan> {
-        Ok(plan
-            .transform_up_with_subqueries(|p| rewrite_plan(p, widen_decimal_sums))?
-            .data)
-    }
-
-    fn name(&self) -> &str {
-        "ddi_trino_decimal_sums"
+        "ddi_trino_decimal_types"
     }
 }
 

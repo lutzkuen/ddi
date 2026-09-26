@@ -586,6 +586,247 @@ async fn a_quotient_floor_ceil_and_round_of_a_decimal_are_typed_as_trino_types_t
 }
 
 #[tokio::test]
+async fn a_quotient_rounds_its_last_digit_as_trino_rounds_it() {
+    // Arrow truncates a quotient where Trino rounds its last digit half up, so the dividend is
+    // scaled for Arrow to compute one digit more, which the cast to Trino's type rounds. Past
+    // 38 digits in 128 bits there was no room for that digit, and a big enough dividend
+    // overflowed where Trino divides. Values are what Trino 480 returns.
+    use deltalake::arrow::array::{AsArray, Decimal128Array};
+    use deltalake::arrow::datatypes::Decimal128Type;
+
+    let decimal = |v: i128, p: u8, s: i8| {
+        Arc::new(
+            Decimal128Array::from(vec![v])
+                .with_precision_and_scale(p, s)
+                .unwrap(),
+        ) as ArrayRef
+    };
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("d", DataType::Decimal128(18, 8), false),
+            Field::new("r", DataType::Decimal128(9, 2), false),
+            Field::new("cent", DataType::Decimal128(5, 2), false),
+            Field::new("rate", DataType::Decimal128(2, 1), false),
+            Field::new("two", DataType::Decimal128(1, 0), false),
+            Field::new("big", DataType::Decimal128(38, 0), false),
+            Field::new("big33", DataType::Decimal128(33, 0), false),
+            Field::new("seven", DataType::Decimal128(5, 0), false),
+        ])),
+        vec![
+            decimal(117531752291864620, 18, 8),
+            decimal(141383004, 9, 2),
+            decimal(1, 5, 2),
+            decimal(64, 2, 1),
+            decimal(2, 1, 0),
+            decimal(2 * 10i128.pow(33), 38, 0),
+            decimal(2 * 10i128.pow(32), 33, 0),
+            decimal(7, 5, 0),
+        ],
+    )
+    .unwrap();
+
+    let out = run_on(
+        batch,
+        "SELECT d / r AS inexact, \
+                -d / r AS negative, \
+                cent / rate AS tie, \
+                -cent / rate AS negative_tie, \
+                two / 3 AS thirds, \
+                big / 100 AS big, \
+                big33 / seven AS big_and_inexact \
+         FROM source",
+    )
+    .await;
+    for (name, (p, s), trino) in [
+        // Truncated, each of these ends a digit lower.
+        ("inexact", (30, 18), 831300431923660498825i128),
+        ("negative", (30, 18), -831300431923660498825),
+        ("tie", (10, 6), 1563),
+        ("negative_tie", (10, 6), -1563),
+        ("thirds", (12, 11), 66666666667),
+        // Of 38 digits, which overflowed in 128 bits, or had no room for the digit to round by.
+        ("big", (38, 6), 2 * 10i128.pow(37)),
+        (
+            "big_and_inexact",
+            (38, 6),
+            28571428571428571428571428571428571429,
+        ),
+    ] {
+        let column = common::column_of(&out, name);
+        assert_eq!(
+            column.data_type(),
+            &DataType::Decimal128(p, s),
+            "{name}: Trino's decimal({p},{s})"
+        );
+        assert_eq!(
+            column.as_primitive::<Decimal128Type>().value(0),
+            trino,
+            "{name}: unscaled, at scale {s}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn floor_and_ceil_at_the_top_of_a_decimals_range_round_as_trino_rounds_them() {
+    // DataFusion checks `floor` and `ceil` against their argument's own precision, so rounding
+    // DECIMAL(5,2) 999.50 up to 1000.00 failed, and the row was set aside as one the model
+    // cannot evaluate, where Trino's DECIMAL(4,0) holds 1000. As a DECIMAL(2,2), every positive
+    // fraction's `ceil` failed.
+    use deltalake::arrow::array::{AsArray, Decimal128Array};
+    use deltalake::arrow::datatypes::Decimal128Type;
+
+    let decimal = |v: i128, p: u8, s: i8| {
+        Arc::new(
+            Decimal128Array::from(vec![v])
+                .with_precision_and_scale(p, s)
+                .unwrap(),
+        ) as ArrayRef
+    };
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("price", DataType::Decimal128(5, 2), false),
+            Field::new("fraction", DataType::Decimal128(2, 2), false),
+            Field::new("widest", DataType::Decimal128(38, 2), false),
+        ])),
+        vec![
+            decimal(99950, 5, 2),
+            decimal(25, 2, 2),
+            decimal(10i128.pow(38) - 50, 38, 2),
+        ],
+    )
+    .unwrap();
+
+    let out = run_on(
+        batch,
+        "SELECT ceil(price) AS ceiled, \
+                floor(-price) AS floored, \
+                ceil(fraction) AS fraction_ceiled, \
+                floor(-fraction) AS fraction_floored, \
+                ceil(widest) AS widest \
+         FROM source",
+    )
+    .await;
+    for (name, (p, s), trino) in [
+        ("ceiled", (4, 0), 1000i128),
+        ("floored", (4, 0), -1000),
+        ("fraction_ceiled", (1, 0), 1),
+        ("fraction_floored", (1, 0), -1),
+        ("widest", (37, 0), 10i128.pow(36)),
+    ] {
+        let column = common::column_of(&out, name);
+        assert_eq!(
+            column.data_type(),
+            &DataType::Decimal128(p, s),
+            "{name}: Trino's decimal({p},{s})"
+        );
+        assert_eq!(
+            column.as_primitive::<Decimal128Type>().value(0),
+            trino,
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_integer_expression_beside_a_decimal_is_typed_as_trino_types_it() {
+    // DataFusion makes an INTEGER combined with a literal a BIGINT, and Trino keeps the
+    // INTEGER: `amount / nullif(qty, 0)`, the usual safe division, was a DECIMAL(32,22) where
+    // Trino's is DECIMAL(23,13), so its DOUBLE had nine digits Trino's has not; and
+    // `p * coalesce(q, 1)` was a long decimal, correctly rounded to a REAL, where Trino's
+    // DECIMAL(18,2) is divided. Types and values are what Trino 480 returns.
+    use deltalake::arrow::array::{AsArray, Decimal128Array, Int32Array};
+    use deltalake::arrow::datatypes::{Float32Type, Float64Type};
+
+    let decimal = |v: i128, p: u8, s: i8| {
+        Arc::new(
+            Decimal128Array::from(vec![v])
+                .with_precision_and_scale(p, s)
+                .unwrap(),
+        ) as ArrayRef
+    };
+    let batch = || {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("amount", DataType::Decimal128(12, 2), false),
+                Field::new("qty", DataType::Int32, false),
+                Field::new("p", DataType::Decimal128(7, 2), false),
+                Field::new("q", DataType::Int32, false),
+            ])),
+            vec![
+                decimal(10000, 12, 2),
+                Arc::new(Int32Array::from(vec![3])) as ArrayRef,
+                decimal(9425507, 7, 2),
+                Arc::new(Int32Array::from(vec![15])) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+
+    let out = run_on(
+        batch(),
+        "SELECT amount / nullif(qty, 0) AS nulled, \
+                amount / (60 * 60) AS product_of_literals, \
+                amount / coalesce(qty, 1) AS coalesced, \
+                amount / (qty + 1) AS added, \
+                amount / -qty AS negated, \
+                amount / CASE WHEN qty > 0 THEN 100 ELSE 1000 END AS branched, \
+                amount + (qty + 1) AS sum_of_them, \
+                p * coalesce(q, 1) AS multiplied \
+         FROM source",
+    )
+    .await;
+    let schema = out[0].schema();
+    for (name, (p, s)) in [
+        ("nulled", (23, 13)),
+        ("product_of_literals", (23, 13)),
+        ("coalesced", (23, 13)),
+        ("added", (23, 13)),
+        ("negated", (23, 13)),
+        ("branched", (23, 13)),
+        ("sum_of_them", (13, 2)),
+        ("multiplied", (18, 2)),
+    ] {
+        assert_eq!(
+            schema.field_with_name(name).unwrap().data_type(),
+            &DataType::Decimal128(p, s),
+            "{name}: Trino's decimal({p},{s})"
+        );
+    }
+
+    let out = run_on(
+        batch(),
+        "SELECT CAST(amount / nullif(qty, 0) AS DOUBLE) AS nulled, \
+                CAST(amount / (60 * 60) AS DOUBLE) AS product_of_literals, \
+                CAST(p * coalesce(q, 1) AS REAL) AS multiplied \
+         FROM source",
+    )
+    .await;
+    for (name, trino) in [
+        ("nulled", "33.3333333333333"),
+        ("product_of_literals", "0.0277777777778"),
+    ] {
+        let want: f64 = trino.parse().unwrap();
+        let got = common::column_of(&out, name)
+            .as_primitive::<Float64Type>()
+            .value(0);
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{name}: got {got:?}, Trino gives {want:?}"
+        );
+    }
+    let want: f32 = "1413826.125".parse().unwrap();
+    let got = common::column_of(&out, "multiplied")
+        .as_primitive::<Float32Type>()
+        .value(0);
+    assert_eq!(
+        got.to_bits(),
+        want.to_bits(),
+        "got {got:?}, Trino gives {want:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_sum_over_a_decimal_is_typed_as_trino_types_it() {
     // DataFusion sums a DECIMAL(p,s) to DECIMAL(p+10,s), so over 8 digits or fewer to a short
     // decimal, which Trino divides on its way to a REAL; Trino's own sum is DECIMAL(38,s)
@@ -698,6 +939,98 @@ async fn a_sum_over_a_decimal_is_typed_as_trino_types_it() {
         got.to_bits(),
         want.to_bits(),
         "in a REAL column: got {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_quotient_or_round_of_a_sum_is_typed_from_trinos_sum() {
+    // Trino sums a DECIMAL(p,s) to DECIMAL(38,s), and a quotient or a `round` of the sum is
+    // typed from that. Here they were typed from DataFusion's DECIMAL(p+10,s), before the sum
+    // was widened: `sum(s) / count(*)` over a DECIMAL(8,2) was a DECIMAL(38,22) where Trino's
+    // is DECIMAL(38,6), with sixteen digits Trino's DOUBLE has not, and `round(sum(t), 2)` over
+    // a DECIMAL(7,2) a short DECIMAL(18,2), divided on its way to a REAL, where Trino's
+    // DECIMAL(38,2) is correctly rounded. Types and values are what Trino 480 returns.
+    use deltalake::arrow::array::{AsArray, Decimal128Array};
+    use deltalake::arrow::datatypes::{Float32Type, Float64Type};
+
+    let column = |name: &str, p: u8, s: i8, unscaled: Vec<i128>| {
+        let values = Decimal128Array::from(unscaled)
+            .with_precision_and_scale(p, s)
+            .unwrap();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                name,
+                DataType::Decimal128(p, s),
+                false,
+            )])),
+            vec![Arc::new(values) as ArrayRef],
+        )
+        .unwrap()
+    };
+    let publish = |batch: RecordBatch, sql: &'static str| async move {
+        SqlTransform::new_per_batch(sql)
+            .run(batch.schema(), vec![batch])
+            .await
+            .expect("publication should succeed")
+    };
+    // 1413831.28, whose thirds and sevenths are inexact.
+    let means = || column("s", 8, 2, vec![70691502, 70691503, 123]);
+    // 14 × 99999.99 and 13830.18, 1413830.04: past 2^24 unscaled.
+    let totals = || {
+        let mut rows = vec![9999999; 14];
+        rows.push(1383018);
+        column("t", 7, 2, rows)
+    };
+
+    let out = publish(
+        means(),
+        "SELECT sum(s) / count(*) AS mean, sum(s) / 7 AS seventh FROM source",
+    )
+    .await;
+    let out_rounded = publish(totals(), "SELECT round(sum(t), 2) AS rounded FROM source").await;
+    for (out, name, (p, s)) in [
+        (&out, "mean", (38, 6)),
+        (&out, "seventh", (38, 6)),
+        (&out_rounded, "rounded", (38, 2)),
+    ] {
+        assert_eq!(
+            out[0].schema().field_with_name(name).unwrap().data_type(),
+            &DataType::Decimal128(p, s),
+            "{name}: Trino's decimal({p},{s})"
+        );
+    }
+
+    let out = publish(
+        means(),
+        "SELECT CAST(sum(s) / count(*) AS DOUBLE) AS mean, \
+                CAST(sum(s) / 7 AS DOUBLE) AS seventh \
+         FROM source",
+    )
+    .await;
+    for (name, trino) in [("mean", "471277.093333"), ("seventh", "201975.897143")] {
+        let want: f64 = trino.parse().unwrap();
+        let got = common::column_of(&out, name)
+            .as_primitive::<Float64Type>()
+            .value(0);
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{name}: got {got:?}, Trino gives {want:?}"
+        );
+    }
+    let out = publish(
+        totals(),
+        "SELECT CAST(round(sum(t), 2) AS REAL) AS rounded FROM source",
+    )
+    .await;
+    let want: f32 = "1413830.0".parse().unwrap();
+    let got = common::column_of(&out, "rounded")
+        .as_primitive::<Float32Type>()
+        .value(0);
+    assert_eq!(
+        got.to_bits(),
+        want.to_bits(),
+        "got {got:?}, Trino gives {want:?}"
     );
 }
 
