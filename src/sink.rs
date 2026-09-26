@@ -20,7 +20,8 @@ use deltalake::DeltaTable;
 use tracing::debug;
 
 use crate::dbt::watermark::{
-    HANDOVER_OLD_LOG_HEAD_KEY, HANDOVER_SOURCE_HEAD_KEY, SOURCE_TABLE_ID_VERSION_KEY,
+    HANDOVER_OLD_LOG_HEAD_KEY, HANDOVER_ROW_PAST_HEAD_KEY, HANDOVER_SOURCE_HEAD_KEY,
+    SOURCE_TABLE_ID_VERSION_KEY,
 };
 use crate::dedup::RecordedCutoff;
 use crate::error::{Error, Result};
@@ -43,6 +44,9 @@ pub struct Sink {
     /// The handover head carried across the source's last drop and recreate, recorded from
     /// then on while a watermark table is set. See [`HANDOVER_OLD_LOG_HEAD_KEY`].
     handover_old_log_head: Option<Version>,
+    /// A newest watermark found past the source's head, recorded while it stays the newest.
+    /// See [`HANDOVER_ROW_PAST_HEAD_KEY`].
+    handover_row_past_head: Option<Version>,
     /// The exact lookup snapshots that enriched the source batch currently being committed.
     lookup_snapshots: Vec<LookupCommit>,
     /// The coverage window the batch being committed was filtered in, while that window stays
@@ -69,6 +73,7 @@ impl Sink {
             source_identity: None,
             handover_source_head: None,
             handover_old_log_head: None,
+            handover_row_past_head: None,
             lookup_snapshots: Vec::new(),
             cutoff: None,
         }
@@ -86,6 +91,11 @@ impl Sink {
 
     pub fn with_handover_old_log_head(mut self, head: Option<Version>) -> Self {
         self.handover_old_log_head = head;
+        self
+    }
+
+    pub fn with_handover_row_past_head(mut self, row: Option<Version>) -> Self {
+        self.handover_row_past_head = row;
         self
     }
 
@@ -152,6 +162,12 @@ impl Sink {
             metadata.push((
                 HANDOVER_OLD_LOG_HEAD_KEY.to_string(),
                 serde_json::Value::from(head),
+            ));
+        }
+        if let Some(row) = self.handover_row_past_head {
+            metadata.push((
+                HANDOVER_ROW_PAST_HEAD_KEY.to_string(),
+                serde_json::Value::from(row),
             ));
         }
         for lookup in &self.lookup_snapshots {

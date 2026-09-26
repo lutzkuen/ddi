@@ -367,18 +367,19 @@ that recorded one, `ddi` resumes from that version and skips nothing by timestam
 exact whatever order rows arrive in. `_timestamp` is then only the fallback, for a rebuild
 that recorded nothing. That includes one whose post-hook has not run yet, and another
 writer's `DELETE`, which records nothing at all: the table's newest row is then an earlier
-rebuild's, and `ddi` counts a row only when it is newer than how far the rebuild it last
-handed over from had read, or is the version its own offset is at. A few rebuilds of your own
-are taken for earlier ones by that rule and get `_timestamp` instead — the first after
-upgrading from 0.3.1 among them, and one that found nothing new while `ddi` streamed on; the
+rebuild's, and `ddi` counts a row when it is newer than how far the rebuild it last handed
+over from can have read, or is the version its own offset is at, and otherwise not; the
+README's handover section has the finer print. A few rebuilds of your own are taken for earlier
+ones by that rule and get `_timestamp` instead — the first after upgrading from 0.3.1 among
+them, and one that read no further than `ddi`'s last handover while `ddi` streamed on; the
 README's handover section lists them. With a post-hook, `ddi` reopening before it runs gets
 `_timestamp` too, so a multi-partition source wants the pre-hook — or, where the previous
-rebuild's row is the version its own offset is at, resumes from there, and appends again what
-the new rebuild read past it while `ddi` was stopped. The cut-off still applies on a first
-start against a table that already has rows and after the source was replaced, and to a
-staged upsert, whose merge reads `ddi`'s own staging table rather than the source the
-watermark counts versions of, and so does not read the watermark table. A watermark per Kafka
-partition would be exact there too; `ddi` does not offer one yet.
+rebuild's row is the version its own offset is at, or `ddi` missed that rebuild, resumes from
+there, and appends again what the new rebuild read past it while `ddi` was stopped. The
+cut-off still applies on a first start against a table that already has rows and after the
+source was replaced, and to a staged upsert, whose merge reads `ddi`'s own staging table
+rather than the source the watermark counts versions of, and so does not read the watermark
+table. A watermark per Kafka partition would be exact there too; `ddi` does not offer one yet.
 
 ### What else can happen to a shared table
 

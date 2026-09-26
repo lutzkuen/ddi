@@ -39,26 +39,27 @@
 //! `DELETE` or `MERGE` by another writer, which reads just like a rebuild. Resuming from that
 //! row would append again everything since it, and bring back what the rewrite deleted. So
 //! each commit of ours carries the newest source version the rebuild at our last handover can
-//! have read ([`HANDOVER_SOURCE_HEAD_KEY`]): the watermark we resumed from, where it was newer
-//! than the last such version, and otherwise the source head as read after the target. A row
-//! newer than that was recorded since, for a later rebuild, and counts. So does a row naming
-//! the version our own offset is at, or a later one with only commits that add no data in
-//! between, as resuming from it is resuming from that offset, whichever rebuild recorded it.
-//! With `dedup_timestamp` set only those count, and a rewrite without one falls back to the
-//! rescan, as does one whose row names a version past the source's head, which no rebuild of
-//! it can have read; with no timestamp there is nothing to fall back on, and the newest row is
-//! used whatever it is. After the source is dropped and recreated, a row no newer than the
-//! handover carried across that ([`HANDOVER_OLD_LOG_HEAD_KEY`]) may name a version of the old
-//! log, and never counts as our offset in the new one.
+//! have read ([`HANDOVER_SOURCE_HEAD_KEY`]): the source head as read after the target, and never
+//! less than the watermark we resumed from. A row newer than that was recorded since, for a
+//! later rebuild, and counts. So does a row naming the version our own offset is at, or a later
+//! one with only commits the stream reads nothing from in between, as resuming from it is
+//! resuming from that offset, whichever rebuild recorded it. With `dedup_timestamp` set only
+//! those count, and a rewrite without one falls back to the rescan, as does one whose row names
+//! a version past the source's head, which no rebuild of it can have read, and every rewrite
+//! after it while that row is the newest ([`HANDOVER_ROW_PAST_HEAD_KEY`]); with no timestamp
+//! there is nothing to fall back on, and the newest row is used whatever it is. After the
+//! source is dropped and recreated, a row no newer than the handover carried across that
+//! ([`HANDOVER_OLD_LOG_HEAD_KEY`]) may name a version of the old log, and never counts as our
+//! offset in the new one.
 //!
 //! That takes a few rebuilds' own rows for earlier ones', and their rows go through the rescan's
-//! cut-off: one that read exactly as far as our last handover recorded while we streamed on
-//! past it — where we rescanned, as far as the source then reached, and where we followed a
-//! watermark, one that found nothing new and recorded it again; one already running when a
-//! pipeline first opened with a watermark table; and the first after upgrading from ddi 0.3.1,
-//! or after setting `watermark_uri`, whose commits recorded no handover — each unless it read
-//! exactly as far as our own offset. It takes an earlier rebuild's row for this one's, too,
-//! where it is our own offset and this one's post-hook has not run: see below.
+//! cut-off: one that read no further than the head our last handover recorded while we streamed
+//! on past it — one of a source with nothing new since, or one already running at that
+//! handover, or when a pipeline first opened with a watermark table — and the first after
+//! upgrading from ddi 0.3.1, or after setting `watermark_uri`, whose commits recorded no
+//! handover, each unless it read exactly as far as our own offset. It takes an earlier
+//! rebuild's row for this one's, too, where this one's post-hook has not run and the row is our
+//! own offset, or one we missed: see below.
 //!
 //! # Ordering
 //!
@@ -74,12 +75,11 @@
 //! offset is at, as it is where the source was quiet between the two rebuilds: then it
 //! resumes from it, and appends again whatever this rebuild read past it while we were stopped.
 //! Where we missed the previous rebuild, it cannot tell the two apart, and re-streams from its
-//! row; and unless that row is our own offset, it records it as how far this rebuild can have
-//! read, so the post-hook's row lands above it, and the next rewrite that records none —
-//! another writer's `DELETE` — re-streams from that row too. Without one it re-streams from
-//! there, which duplicates rows rather than dropping them. That asymmetry is deliberate:
-//! duplicates are visible and the next dbt run erases them, whereas a gap is silent and
-//! permanent.
+//! row, once: what it records is how far the source had reached, so this rebuild's own row,
+//! when its post-hook writes it, is known at the next rewrite for an earlier one's. Without one
+//! it re-streams from there, which duplicates rows rather than dropping them. That asymmetry is
+//! deliberate: duplicates are visible and the next dbt run erases them, whereas a gap is silent
+//! and permanent.
 
 use std::collections::BTreeMap;
 
@@ -340,6 +340,9 @@ pub struct OurLastCommit {
     /// `None` where it never was, since a watermark table was set. See
     /// [`HANDOVER_OLD_LOG_HEAD_KEY`].
     pub handover_old_log_head: Option<Version>,
+    /// A newest watermark found past the source's head, while it stays the newest. See
+    /// [`HANDOVER_ROW_PAST_HEAD_KEY`].
+    pub handover_row_past_head: Option<Version>,
     /// Delta identities of the pinned lookups that produced the commit. A table recreated at
     /// the same URI has a new id; resuming against it would silently change an old join.
     /// Empty for pre-lookup commits and for tables we have never written.
@@ -357,17 +360,27 @@ pub struct OurLastCommit {
 pub const SOURCE_TABLE_ID_VERSION_KEY: &str = "ddi.sourceTableIdVersion";
 
 /// `commitInfo` key naming the newest source version the rebuild this pipeline last handed over
-/// from can have read — the watermark it resumed from, where that was newer than the last one,
-/// and otherwise the source head read after the target — or, before its first handover, the
-/// head at the first open that recorded one. A watermark above it was recorded since, so for a
-/// later rebuild. Recorded only while `watermark_uri` is set.
+/// from can have read — the source head read after the target, and never less than the
+/// watermark it resumed from — or, before its first handover, the head read after the target at
+/// the first open that recorded one. A watermark above it was recorded since, so for a later
+/// rebuild. Recorded only while `watermark_uri` is set.
 pub const HANDOVER_SOURCE_HEAD_KEY: &str = "ddi.handover.sourceHead";
 
 /// `commitInfo` key naming the handover head ([`HANDOVER_SOURCE_HEAD_KEY`]) this pipeline carried
-/// across the last time its source was dropped and recreated: a watermark at or below it may name
-/// a version of the old log, so it is never taken for the version this pipeline's offset in the
-/// new one is at. Recorded from then on, while `watermark_uri` is set.
+/// across the last time its source was dropped and recreated, and never less than the newest
+/// watermark the table held then: a watermark at or below it may name a version of the old log,
+/// so it is never taken for the version this pipeline's offset in the new one is at. Recorded
+/// from then on, while `watermark_uri` is set.
 pub const HANDOVER_OLD_LOG_HEAD_KEY: &str = "ddi.handover.oldLogHead";
+
+/// `commitInfo` key naming a newest watermark this pipeline found past its source's head, which
+/// no rebuild of it can have read: another table's version, a hook's mistake, or a version of
+/// the log the source had before it was dropped and recreated. While it stays the newest it
+/// counts as none, even once the source's log has reached it — taken then for the version our
+/// offset is at, or for a later rebuild's, it resumed past versions a rebuild that read less had
+/// wiped. Recorded until an open finds another newest row: one newer, or, the row deleted, one
+/// below it, which then counts as it would have.
+pub const HANDOVER_ROW_PAST_HEAD_KEY: &str = "ddi.handover.rowPastHead";
 
 /// Walk the target log backwards for the most recent commit that carries our txn action,
 /// and report what it said about the source it came from.
@@ -410,6 +423,7 @@ pub async fn our_last_commit(
                 info(SOURCE_TABLE_ID_VERSION_KEY).and_then(|v| v.as_u64());
             let handover_source_head = info(HANDOVER_SOURCE_HEAD_KEY).and_then(|v| v.as_u64());
             let handover_old_log_head = info(HANDOVER_OLD_LOG_HEAD_KEY).and_then(|v| v.as_u64());
+            let handover_row_past_head = info(HANDOVER_ROW_PAST_HEAD_KEY).and_then(|v| v.as_u64());
             let lookup_table_ids = actions
                 .iter()
                 .filter_map(|a| match a {
@@ -433,6 +447,7 @@ pub async fn our_last_commit(
                 source_table_id_version,
                 handover_source_head,
                 handover_old_log_head,
+                handover_row_past_head,
                 lookup_table_ids,
                 cutoff,
             });

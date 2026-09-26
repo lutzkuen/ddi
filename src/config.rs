@@ -306,11 +306,14 @@ pub struct PipelineConfig {
     /// recorded none. A row that may be an earlier rebuild's counts as none: one no newer than
     /// what this pipeline's last handover recorded, or, where its last commit recorded no
     /// handover (made by ddi 0.3.1, or before this was set), any row — either way unless it is
-    /// the version its own offset is at; a pipeline that has never committed takes the newest
-    /// row. A row past the source's head counts as none too, and so, with a warning, does a
-    /// table that is not there or not `(app_id VARCHAR, source_version BIGINT)`; a read that
-    /// fails stops the open, which is retried, and so does a container that does not exist. Not
-    /// read by a staged upsert's merge, whose source is the stage.
+    /// the version its own offset is at, or a later one with only commits the stream reads
+    /// nothing from in between; a pipeline that has never committed takes the newest row. After
+    /// the source was dropped and recreated, a row no newer than the handover carried across
+    /// that counts as none, its own offset or not. A row past the source's head counts as none
+    /// too, and still does once the source's log has reached it, while it is the newest; so,
+    /// with a warning, does a table that is not there or not `(app_id VARCHAR, source_version
+    /// BIGINT)`; a read that fails stops the open, which is retried, and so does a container
+    /// that does not exist. Not read by a staged upsert's merge, whose source is the stage.
     #[serde(default)]
     pub watermark_uri: Option<String>,
 

@@ -16,6 +16,7 @@ use delta_delta_ingest::config::{ResolvedPipeline, WriteMode};
 use delta_delta_ingest::dbt::watermark::{target_state, TargetState, WatermarkStore};
 use delta_delta_ingest::dedup::CoverageReason;
 use delta_delta_ingest::pipeline::{CoverageWindow, Pipeline, StepOutcome};
+use delta_delta_ingest::source::ChangePolicy;
 use deltalake::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use deltalake::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use deltalake::kernel::engine::arrow_conversion::TryIntoKernel;
@@ -1042,12 +1043,15 @@ async fn a_rewrite_after_upgrading_does_not_take_the_last_rebuilds_watermark_for
 }
 
 #[tokio::test]
-async fn a_rebuild_of_the_head_the_last_handover_opened_at_is_not_taken_for_an_earlier_one() {
-    // ddi handed over at source head 3 from a rebuild that had read 2. The next rebuild read 3,
-    // nothing having landed since, and ddi streamed 4 while it ran. ddi had recorded the head
-    // it handed over at, so that watermark read as the earlier rebuild's: it rescanned, and
-    // the cut-off dropped 4 and the late 2, older than 5, where the watermark says they were
-    // never in the rebuild.
+async fn a_rebuild_of_the_head_the_last_handover_opened_at_is_followed_from_ddis_offset() {
+    // ddi handed over at source head 3 from a rebuild that had read 2, and recorded that head.
+    // The next rebuild read 3, nothing having landed since, and so recorded a version no newer
+    // than that; taken for an earlier rebuild's, it sent ddi into the rescan, whose cut-off
+    // dropped 4 and the late 2, older than 5, where the watermark says they were never in the
+    // rebuild. It is also the version ddi's offset is at, and resuming from it is resuming from
+    // that offset. Had ddi streamed on past it while the rebuild ran, it would be taken for an
+    // earlier rebuild's still, the price of recording the head at a handover that followed a
+    // watermark: see a rebuild found after a missed one, below.
     let lake = lake().await;
     let cfg = cfg_with_watermark_and_timestamp(&lake);
     let mut p = Pipeline::open(cfg.clone()).await.unwrap();
@@ -1062,11 +1066,10 @@ async fn a_rebuild_of_the_head_the_last_handover_opened_at_is_not_taken_for_an_e
     p.run_until_caught_up().await.unwrap();
     assert_eq!(read_ids(&lake.f.target).await, vec![1, 3, 5]);
 
-    // The next rebuild records version 3 before it reads it, and 4 lands before it commits.
+    // The next rebuild records version 3 before it reads it; 4 and the late 2 land after it.
     record_watermark(&lake.watermark, &cfg.app_id, 3).await;
-    append(&lake.f.source, &[4]).await; // version 4
-    p.run_until_caught_up().await.unwrap();
     dbt_rebuild(&lake.f.target, &[1, 3, 5]).await;
+    append(&lake.f.source, &[4]).await; // version 4
     append(&lake.f.source, &[2]).await; // version 5
 
     let mut p = Pipeline::open(cfg).await.unwrap();
@@ -1145,6 +1148,43 @@ async fn a_rebuild_of_a_head_that_adds_no_data_is_followed_after_a_rescan() {
     assert_eq!(p.coverage(), None, "resumed from the rebuild's watermark");
     p.run_until_caught_up().await.unwrap();
     assert_eq!(read_ids(&lake.f.target).await, vec![1, 4, 5, 6]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_of_a_head_the_stream_skips_is_followed_after_a_rescan() {
+    // As above, with a DELETE on bronze where the OPTIMIZE was, and change_policy =
+    // skip_change_commits: the stream steps over it as it steps over the OPTIMIZE, but it was
+    // counted as data, so the next rebuild's row, its version, was neither newer than ddi's
+    // handover nor ddi's offset, and the rescan's cut-off dropped 4, older than 6.
+    let lake = lake().await;
+    let mut cfg = cfg_with_watermark_and_timestamp(&lake);
+    cfg.change_policy = ChangePolicy::SkipChangeCommits;
+    cfg.target_uri = hooked(&lake.f.target);
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    for i in [1, 5] {
+        append(&lake.f.source, &[i]).await; // versions 1, 2
+    }
+    p.run_until_caught_up().await.unwrap();
+
+    dbt_rebuild(&lake.f.target, &[1, 5]).await; // its post-hook has not run
+    append(&lake.f.source, &[6]).await; // version 3
+    let source = lake.f.source.clone();
+    before_next_read(&lake.f.target, async move {
+        delete_from(&source, "id = 1").await; // version 4
+    });
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(read_ids(&lake.f.target).await, vec![1, 5, 6]);
+    record_watermark(&lake.watermark, &cfg.app_id, 2).await; // the post-hook
+
+    record_watermark(&lake.watermark, &cfg.app_id, 4).await;
+    dbt_rebuild(&lake.f.target, &[5, 6]).await;
+    append(&lake.f.source, &[4]).await; // version 5
+
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    assert_eq!(p.coverage(), None, "resumed from the rebuild's watermark");
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(read_ids(&lake.f.target).await, vec![4, 5, 6]);
 }
 
 #[tokio::test]
@@ -1314,6 +1354,166 @@ async fn a_watermark_recorded_before_bronze_was_recreated_is_not_taken_for_ddis_
 }
 
 #[tokio::test]
+async fn a_watermark_recorded_before_bronze_was_recreated_is_passed_over_after_upgrading() {
+    // As above, but the old log was read by commits that recorded no handover, as ddi 0.3.1's,
+    // or ones made before watermark_uri was set: the open that found bronze recreated carried
+    // across the new log's head, 2, below the old log's 5, which then counted as the version
+    // ddi's offset was at, and 11, which the rebuild had wiped, was never read again.
+    let lake = lake().await;
+    let cfg = cfg_with_watermark_and_timestamp(&lake);
+    let mut before = cfg.clone();
+    before.watermark_uri = None;
+    let mut p = Pipeline::open(before.clone()).await.unwrap();
+    for i in 1..=6 {
+        append(&lake.f.source, &[i]).await;
+    }
+    p.run_until_caught_up().await.unwrap();
+    dbt_rebuild(&lake.f.target, &[1, 2, 3, 4, 5]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 5).await;
+    Pipeline::open(before)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(read_ids(&lake.f.target).await, (1..=6).collect::<Vec<_>>());
+
+    std::fs::remove_dir_all(&lake.f.source).unwrap();
+    create_table(&lake.f.source).await;
+    append(&lake.f.source, &[7]).await; // version 1 of the new log
+    append(&lake.f.source, &[8]).await; // version 2
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+
+    dbt_rebuild(&lake.f.target, &(1..=8).collect::<Vec<_>>()).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 2).await;
+    append(&lake.f.source, &[9]).await; // version 3
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+
+    append(&lake.f.source, &[10]).await; // version 4
+    p.run_until_caught_up().await.unwrap();
+    record_watermark(&lake.watermark, &cfg.app_id, 4).await;
+    append(&lake.f.source, &[11]).await; // version 5
+    p.run_until_caught_up().await.unwrap();
+    dbt_rebuild(&lake.f.target, &(1..=10).collect::<Vec<_>>()).await;
+
+    Pipeline::open(cfg)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        (1..=11).collect::<Vec<_>>(),
+        "11, which the rebuild wiped, re-streamed"
+    );
+}
+
+#[tokio::test]
+async fn a_watermark_recorded_before_bronze_was_recreated_before_upgrading_is_passed_over() {
+    // Bronze was dropped and recreated while ddi's commits recorded no handover, so no open
+    // since has found it replaced: the first to record one recorded the new log's head, 2,
+    // below the old log's 5. Once the new log had reached 5, a rebuild that read its version 4
+    // and wiped what ddi streamed after it, found before its post-hook, had that 5 taken for
+    // the version ddi's offset was at, and 10 was never read again.
+    let lake = lake().await;
+    let cfg = cfg_with_watermark_and_timestamp(&lake);
+    let mut before = cfg.clone();
+    before.watermark_uri = None;
+    let mut p = Pipeline::open(before.clone()).await.unwrap();
+    for i in 1..=5 {
+        append(&lake.f.source, &[i]).await;
+    }
+    p.run_until_caught_up().await.unwrap();
+    dbt_rebuild(&lake.f.target, &[1, 2, 3, 4, 5]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 5).await;
+
+    std::fs::remove_dir_all(&lake.f.source).unwrap();
+    create_table(&lake.f.source).await;
+    append(&lake.f.source, &[6]).await; // version 1 of the new log
+    append(&lake.f.source, &[7]).await; // version 2
+    Pipeline::open(before)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(read_ids(&lake.f.target).await, (1..=7).collect::<Vec<_>>());
+
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    for i in 8..=10 {
+        append(&lake.f.source, &[i]).await; // versions 3 to 5
+    }
+    p.run_until_caught_up().await.unwrap();
+    dbt_rebuild(&lake.f.target, &(1..=9).collect::<Vec<_>>()).await; // its post-hook has not run
+
+    Pipeline::open(cfg)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        (1..=10).collect::<Vec<_>>(),
+        "10, which the rebuild wiped, re-streamed"
+    );
+}
+
+#[tokio::test]
+async fn a_row_the_old_log_recorded_past_the_last_handover_is_not_taken_for_ddis_offset() {
+    // The old log's newest row, 6, was recorded after ddi's last handover, 5, by a pre-hook
+    // whose model then failed, and bronze was dropped and recreated before another rebuild.
+    // The handover carried across the recreate was 5, below that row, and no rewrite found the
+    // row past the new log's head before the new log reached it: it then counted as the version
+    // ddi's offset was at, and 12, which a rebuild that read version 5 had wiped, was never
+    // read again.
+    let lake = lake().await;
+    let cfg = cfg_with_watermark_and_timestamp(&lake);
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    for i in 1..=5 {
+        append(&lake.f.source, &[i]).await;
+    }
+    p.run_until_caught_up().await.unwrap();
+    dbt_rebuild(&lake.f.target, &[1, 2, 3, 4, 5]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 5).await;
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    append(&lake.f.source, &[6]).await; // version 6
+    p.run_until_caught_up().await.unwrap();
+    record_watermark(&lake.watermark, &cfg.app_id, 6).await; // its model failed
+
+    std::fs::remove_dir_all(&lake.f.source).unwrap();
+    create_table(&lake.f.source).await;
+    append(&lake.f.source, &[7]).await; // version 1 of the new log
+    append(&lake.f.source, &[8]).await; // version 2
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    for i in 9..=12 {
+        append(&lake.f.source, &[i]).await; // versions 3 to 6
+    }
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(read_ids(&lake.f.target).await, (1..=12).collect::<Vec<_>>());
+    dbt_rebuild(&lake.f.target, &(1..=11).collect::<Vec<_>>()).await; // its post-hook has not run
+
+    Pipeline::open(cfg)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        (1..=12).collect::<Vec<_>>(),
+        "12, which the rebuild wiped, re-streamed"
+    );
+}
+
+#[tokio::test]
 async fn a_watermark_past_the_sources_head_is_passed_over() {
     // A hook that recorded another table's version, far past bronze's head. Followed, it read
     // as bronze's log gone backwards: ddi started over from starting_version, and every commit
@@ -1344,6 +1544,94 @@ async fn a_watermark_past_the_sources_head_is_passed_over() {
     assert_eq!(read_ids(&lake.f.target).await, vec![1, 5, 6]);
 
     // The row is deleted, and the next rebuild reads version 4 while ddi streams 5.
+    delete_from(&lake.watermark, "source_version = 100").await;
+    append(&lake.f.source, &[7]).await; // version 4
+    p.run_until_caught_up().await.unwrap();
+    record_watermark(&lake.watermark, &cfg.app_id, 4).await;
+    append(&lake.f.source, &[8]).await; // version 5
+    p.run_until_caught_up().await.unwrap();
+    dbt_rebuild(&lake.f.target, &[1, 5, 6, 7]).await;
+    append(&lake.f.source, &[4]).await; // version 6
+
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    assert_eq!(p.coverage(), None, "resumed from the rebuild's watermark");
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(read_ids(&lake.f.target).await, vec![1, 4, 5, 6, 7, 8]);
+}
+
+#[tokio::test]
+async fn a_watermark_past_the_sources_head_is_passed_over_once_the_log_reaches_it() {
+    // A hook recorded 6 while bronze's head was 3, and the row was left in place. ddi passed it
+    // over, but recorded only the head it had read, so once bronze's log reached 6 the row
+    // counted as newer than that: a rebuild that read version 4, and wiped what ddi had
+    // streamed after it, was followed from version 7, and 8 and 9 were never read again.
+    let lake = lake().await;
+    let cfg = cfg_with_watermark_and_timestamp(&lake);
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    for i in [1, 5] {
+        append(&lake.f.source, &[i]).await; // versions 1, 2
+    }
+    p.run_until_caught_up().await.unwrap();
+
+    record_watermark(&lake.watermark, &cfg.app_id, 6).await;
+    dbt_rebuild(&lake.f.target, &[1, 5]).await;
+    append(&lake.f.source, &[6]).await; // version 3
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    assert!(p.coverage().is_some(), "the rescan");
+    p.run_until_caught_up().await.unwrap();
+
+    // The next rebuild records version 4 before it reads it, and ddi streams 8 to 10.
+    append(&lake.f.source, &[7]).await; // version 4
+    p.run_until_caught_up().await.unwrap();
+    record_watermark(&lake.watermark, &cfg.app_id, 4).await;
+    for i in 8..=10 {
+        append(&lake.f.source, &[i]).await; // versions 5 to 7
+    }
+    p.run_until_caught_up().await.unwrap();
+    dbt_rebuild(&lake.f.target, &[1, 5, 6, 7]).await;
+
+    Pipeline::open(cfg)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        vec![1, 5, 6, 7, 8, 9, 10],
+        "8 and 9, which the rebuild wiped, re-streamed"
+    );
+}
+
+#[tokio::test]
+async fn a_watermark_past_the_sources_head_is_passed_over_by_a_pipeline_that_never_committed() {
+    // A pipeline deployed beside a model dbt had rebuilt already had read no source yet, so it
+    // was not asked whether the row was past bronze's head. Followed, it read as bronze's log
+    // gone backwards: ddi started over from starting_version, and recorded the row as the
+    // handover it carried across a recreate, so once the row was deleted, the next rebuild's
+    // row, below it, was passed over, and the rescan's cut-off dropped 4, older than 7.
+    let lake = lake().await;
+    let cfg = cfg_with_watermark_and_timestamp(&lake);
+    for i in [1, 5] {
+        append(&lake.f.source, &[i]).await; // versions 1, 2
+    }
+    dbt_rebuild(&lake.f.target, &[1]).await;
+    dbt_rebuild(&lake.f.target, &[1, 5]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 100).await;
+    append(&lake.f.source, &[6]).await; // version 3
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    assert_eq!(
+        p.coverage(),
+        Some(CoverageWindow {
+            reason: CoverageReason::Rebuilt,
+            through: Some(3),
+            resumed: false,
+        }),
+        "the rescan, not bronze taken for a table dropped and recreated"
+    );
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(read_ids(&lake.f.target).await, vec![1, 5, 6]);
+
     delete_from(&lake.watermark, "source_version = 100").await;
     append(&lake.f.source, &[7]).await; // version 4
     p.run_until_caught_up().await.unwrap();
@@ -1442,6 +1730,47 @@ async fn a_rebuild_that_read_past_the_source_this_open_loaded_is_not_taken_for_a
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_that_read_past_the_source_a_first_open_loaded_is_not_taken_for_a_later_rebuild() {
+    // The same moment at ddi's first open, where dbt's first fill of the empty target read and
+    // committed: removing nothing, it reads as no rewrite, and ddi recorded the head it had
+    // loaded as its first handover, below the version the fill's post-hook then wrote. After
+    // another writer's DELETE that row read as a later rebuild's: ddi resumed from it and
+    // appended again every row since, the deleted one included.
+    let lake = lake().await;
+    let mut cfg = cfg_with_watermark_and_timestamp(&lake);
+    cfg.target_uri = hooked(&lake.f.target);
+    for i in 1..=2 {
+        append(&lake.f.source, &[i]).await;
+    }
+    let (source, target) = (lake.f.source.clone(), lake.f.target.clone());
+    before_next_read(&lake.f.target, async move {
+        append(&source, &[3]).await; // version 3
+        append(&target, &[1, 2, 3]).await; // the fill
+    });
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    record_watermark(&lake.watermark, &cfg.app_id, 3).await; // the post-hook
+    for i in 4..=6 {
+        append(&lake.f.source, &[i]).await;
+    }
+    p.run_until_caught_up().await.unwrap();
+    // 3 twice: a first start's window closes after the head this open loaded.
+    assert_eq!(read_ids(&lake.f.target).await, vec![1, 2, 3, 3, 4, 5, 6]);
+
+    delete_from(&lake.f.target, "id = 5").await;
+    Pipeline::open(cfg)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        vec![1, 2, 3, 3, 4, 6],
+        "5 stays deleted, and nothing more is written twice"
+    );
+}
+
 #[tokio::test]
 async fn a_rebuild_that_read_past_ddis_offset_is_not_taken_for_a_later_one() {
     // A rebuild recorded version 3, as far as ddi's offset, and another read version 4 and
@@ -1484,6 +1813,99 @@ async fn a_rebuild_that_read_past_ddis_offset_is_not_taken_for_a_later_one() {
         read_ids(&lake.f.target).await,
         vec![1, 2, 3, 4, 4, 5, 7],
         "6 stays deleted, and nothing more is written twice"
+    );
+}
+
+#[tokio::test]
+async fn a_rebuild_found_after_a_missed_one_is_not_taken_for_a_later_one() {
+    // ddi, stopped, missed a rebuild, and reopened after the next one's overwrite, before its
+    // post-hook ran: the missed rebuild's row, 4, counts as newer than ddi's last handover, and
+    // ddi re-streams from it. It recorded that row as how far the rebuild had read, below the 5
+    // the post-hook then wrote, so at the next rebuild, found before its post-hook as the
+    // reopen after a CREATE OR REPLACE finds it, 5 counted as newer in turn: 6 and 7, which that
+    // rebuild held, were appended again, 5 was recorded, and so on at every rebuild.
+    let lake = lake().await;
+    let cfg = cfg_with_watermark_and_timestamp(&lake);
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    for i in 1..=3 {
+        append(&lake.f.source, &[i]).await;
+    }
+    p.run_until_caught_up().await.unwrap();
+    drop(p);
+    dbt_rebuild(&lake.f.target, &[1, 2]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 2).await;
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+
+    append(&lake.f.source, &[4]).await; // version 4
+    dbt_rebuild(&lake.f.target, &[1, 2, 3, 4]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 4).await;
+    append(&lake.f.source, &[5]).await; // version 5
+    dbt_rebuild(&lake.f.target, &[1, 2, 3, 4, 5]).await; // its post-hook has not run
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+    // 5 twice: the missed rebuild's row cannot be told from this one's.
+    assert_eq!(read_ids(&lake.f.target).await, vec![1, 2, 3, 4, 5, 5]);
+    record_watermark(&lake.watermark, &cfg.app_id, 5).await; // the post-hook
+    for i in 6..=7 {
+        append(&lake.f.source, &[i]).await;
+    }
+    p.run_until_caught_up().await.unwrap();
+
+    dbt_rebuild(&lake.f.target, &(1..=7).collect::<Vec<_>>()).await; // its post-hook has not run
+    Pipeline::open(cfg)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        (1..=7).collect::<Vec<_>>(),
+        "6 and 7 are not appended again"
+    );
+}
+
+#[tokio::test]
+async fn a_rebuild_a_first_open_found_before_its_post_hook_is_not_taken_for_a_later_one() {
+    // A pipeline deployed beside a model dbt had rebuilt twice, the second time with its
+    // post-hook still to come, follows the first rebuild's row, 2, having appended nothing a
+    // stale row could append again. Recorded as how far the rebuild had read, that row would put
+    // the 3 the post-hook then writes above it, and after another writer's DELETE, 3 would read
+    // as a later rebuild's: every row since appended again, the deleted one included.
+    let lake = lake().await;
+    let cfg = cfg_with_watermark_and_timestamp(&lake);
+    for i in 1..=3 {
+        append(&lake.f.source, &[i]).await;
+    }
+    dbt_rebuild(&lake.f.target, &[1, 2]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 2).await;
+    dbt_rebuild(&lake.f.target, &[1, 2, 3]).await; // its post-hook has not run
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+    // 3 twice: resuming from the first rebuild's row appends again what the second read.
+    assert_eq!(read_ids(&lake.f.target).await, vec![1, 2, 3, 3]);
+    record_watermark(&lake.watermark, &cfg.app_id, 3).await; // the post-hook
+    for i in 4..=6 {
+        append(&lake.f.source, &[i]).await;
+    }
+    p.run_until_caught_up().await.unwrap();
+
+    delete_from(&lake.f.target, "id = 5").await;
+    Pipeline::open(cfg)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        vec![1, 2, 3, 3, 4, 6],
+        "5 stays deleted, and nothing more is written twice"
     );
 }
 
