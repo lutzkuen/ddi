@@ -41,11 +41,11 @@
 //! each commit of ours carries the newest source version the rebuild at our last handover can
 //! have read ([`HANDOVER_SOURCE_HEAD_KEY`]): the watermark we resumed from, or where we
 //! rescanned, the source head as read after the target. A row newer than that was recorded
-//! since, for a later rebuild. So is, in effect, a row naming the version our own offset is at:
-//! resuming from it is resuming from our own offset, whichever rebuild recorded it. With
-//! `dedup_timestamp` set only such a row counts, and a rewrite without one falls back to the
-//! rescan; with no timestamp there is nothing to fall back on, and the newest row is used
-//! whatever it is.
+//! since, for a later rebuild, and counts. So does a row naming the version our own offset is
+//! at, as resuming from it is resuming from that offset, whichever rebuild recorded it. With
+//! `dedup_timestamp` set only those count, and a rewrite without one falls back to the rescan;
+//! with no timestamp there is nothing to fall back on, and the newest row is used whatever it
+//! is.
 //!
 //! That takes a few rebuilds' own rows for earlier ones', and their rows go through the rescan's
 //! cut-off: one that read exactly where our last rescan found the source while we streamed on

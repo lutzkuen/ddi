@@ -309,8 +309,10 @@ Instants agree with Trino. Wall clocks can differ:
   Trino gives the local one — and that cast is to nanoseconds, so past 2262 it fails;
 - as text the value reads `2024-04-01T00:30:00+02:00`, where Trino writes
   `2024-04-01 00:30:00.000 Europe/Amsterdam`;
-- the zone database here tabulates daylight saving only up to 2099, so after that a summer
-  instant's local time is an hour off Trino's;
+- the zone database here tabulates daylight saving only up to 2099, and after that keeps the
+  zone's last offset, so for half of each year its local time is an hour off Trino's: in summer
+  where that offset is standard time, as in Europe/Amsterdam, and in winter where it is
+  daylight saving time, as in Australia/Sydney;
 - before 1970, a zone the tz database has since merged into another — `Europe/Amsterdam`
   and `Europe/Luxembourg` into `Europe/Brussels`, `Asia/Kuala_Lumpur` into
   `Asia/Singapore`, `Atlantic/Reykjavik` into `Africa/Abidjan`, among others — has the other

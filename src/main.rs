@@ -112,7 +112,7 @@ enum Command {
 enum DbtCommand {
     /// Classify every model in a dbt manifest as streamable or not, with reasons.
     Check {
-        /// Path to target/manifest.json. Defaults to [dbt].manifest in the config.
+        /// Path to target/manifest.json. Defaults to `manifest` in the config.
         #[arg(long)]
         manifest: Option<PathBuf>,
         /// Show only the models that cannot be streamed.
