@@ -1760,7 +1760,8 @@ async fn adjust_for_replaced_source(
 /// `dedup_timestamp`, a rescan whose cut-off is handed back with the position, for
 /// [`coverage_cutoff`] to hold until the rescan has caught up with what the rebuild covered.
 /// A watermark no newer than the source head at our last handover was recorded for an
-/// earlier rebuild, and with `dedup_timestamp` set it is passed over for the rescan.
+/// earlier rebuild, and with `dedup_timestamp` set it is passed over for the rescan, as is a
+/// watermark table that cannot be used at all; one that could not be read this time fails.
 ///
 /// See [`crate::dbt::watermark`] for the full argument.
 async fn resume_cursor(
@@ -1810,13 +1811,31 @@ async fn resume_cursor(
     // for exactly the pipelines it is documented for.
     if let Some(uri) = cfg.watermark_uri.as_deref() {
         let store = watermark::WatermarkStore::new(uri).with_storage(cfg.storage.clone());
-        match store.last(&cfg.app_id).await? {
+        match store.last(&cfg.app_id).await {
+            // Not there, or not shaped as a watermark table: a fact about the deployment,
+            // which every retry would meet again and which says nothing about this rebuild.
+            // `[storage].watermark_uri` is read for every dbt model, and each has a timestamp,
+            // so the rescan answers it as it answers a table without a row, rather than every
+            // model stopping at every rebuild over a table nothing read before. A read that
+            // failed is not that: a timeout or throttling says nothing about what the table
+            // holds, and the rescan's cut-off drops for good a lagging partition's late rows
+            // that the watermark would have kept, so it fails the open, which is retried.
+            Err(Error::WatermarkUnusable(why)) if cfg.dedup_timestamp.is_some() => warn!(
+                pipeline = %cfg.name,
+                overwritten_at_target_version = at,
+                watermark_uri = uri,
+                error = %why,
+                "target was rebuilt, but the watermark table cannot be used, so falling back to \
+                 the dedup_timestamp rescan, whose cut-off drops a late row older than the \
+                 target's newest. Fix the table as the error says, or unset watermark_uri"
+            ),
+            Err(e) => return Err(e),
             // Recorded no later than our last handover, so for that rebuild or an earlier one:
             // this rewrite has recorded nothing yet — a post-hook that has not run, or another
             // writer's `DELETE`, which records none. Resuming from it would append again every
             // row since it, and bring back what the rewrite deleted; the rescan below drops
             // what the target holds instead.
-            Some(w)
+            Ok(Some(w))
                 if cfg.dedup_timestamp.is_some()
                     && ours.handover_source_head.is_some_and(|h| w <= h) =>
             {
@@ -1830,7 +1849,7 @@ async fn resume_cursor(
                      falling back to the dedup_timestamp rescan"
                 )
             }
-            Some(w) => {
+            Ok(Some(w)) => {
                 let reset = StreamCursor::at_version(w + 1);
                 warn!(
                     pipeline = %cfg.name,
@@ -1853,7 +1872,7 @@ async fn resume_cursor(
             }
             // Refusing is the whole point. Continuing from our own offset would drop every
             // row we streamed after dbt started reading, silently and for good.
-            None if cfg.dedup_timestamp.is_none() => {
+            Ok(None) if cfg.dedup_timestamp.is_none() => {
                 return Err(Error::Config(format!(
                     "pipeline {:?}: target {:?} was rewritten at version {at} by another \
                      writer (a dbt rebuild), but the watermark table {uri:?} holds no \
@@ -1865,7 +1884,7 @@ async fn resume_cursor(
                     cfg.name, cfg.target_uri, cfg.app_id
                 )));
             }
-            None => warn!(
+            Ok(None) => warn!(
                 pipeline = %cfg.name,
                 overwritten_at_target_version = at,
                 watermark_uri = uri,

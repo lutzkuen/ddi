@@ -22,6 +22,20 @@ pub enum Error {
     #[error("config error: {0}")]
     Config(String),
 
+    /// The watermark table cannot be used at all: no backend here reaches its URI, there is
+    /// no Delta table there, or it is not `(app_id VARCHAR, source_version BIGINT)`.
+    ///
+    /// Its own variant rather than [`Self::Config`] or a failed read, because with
+    /// `dedup_timestamp` set the two want opposite handling. This one is a fact about the
+    /// deployment that every retry meets again, and the rescan answers it as it answers a
+    /// table without a row. A read that failed says nothing about what the table holds, and
+    /// the rescan's cut-off can drop a lagging partition's late rows that the watermark would
+    /// have kept, so that one fails the open, which is retried. See `resume_cursor` in
+    /// [`crate::pipeline`]. Displayed as [`Self::Config`] is, since without a timestamp it
+    /// still stops the pipeline as one.
+    #[error("config error: {0}")]
+    WatermarkUnusable(String),
+
     /// A commit contained a `Remove` with `dataChange: true` and the policy is `Fail`.
     ///
     /// The message names the alternatives because the fix is always a policy choice,

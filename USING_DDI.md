@@ -353,7 +353,12 @@ it read in a watermark table, and point `ddi` at the table:
 watermark_uri = "abfss://lake@mylake.dfs.core.windows.net/meta/ddi_watermark"
 ```
 
-It is the one place to set it for a dbt project, and it applies to every model. The README's
+It is the one place to set it for a dbt project, and it applies to every model: `ddi` reads it
+after each rebuild of a model's target. A table that is not there, or not `(app_id VARCHAR,
+source_version BIGINT)`, counts as one with no row, so `_timestamp` is used and `ddi` warns,
+naming the table and what is wrong with it. A read that fails — a timeout, throttling — stops
+the pipeline until a retry succeeds instead, because `_timestamp` could drop late rows the
+watermark would have kept. The README's
 [handover section](README.md#the-handover-and-why-it-needs-a-watermark) shows the one
 `INSERT` the rebuild runs. Run it in a **pre-hook**, and pin the model's read to the version it
 records (`FOR VERSION AS OF`), so the row is there before the overwrite lands. After a rebuild

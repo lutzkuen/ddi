@@ -99,16 +99,27 @@ impl WatermarkStore {
     /// taking the max is immune to row ordering and to a post-hook that appends without
     /// deleting. A pipeline that genuinely needs to rewind should be reset explicitly
     /// rather than by writing a lower watermark.
+    ///
+    /// [`Error::WatermarkUnusable`] when the table cannot be used however often it is asked:
+    /// a URI no backend here reaches, no table there, a column missing or of another type, or
+    /// a row no rebuild can have written. Any other error is a read that failed this time.
     pub async fn last(&self, app_id: &str) -> Result<Option<Version>> {
         use deltalake::arrow::array::{Array, AsArray, RecordBatch};
         use deltalake::arrow::datatypes::Int64Type;
 
-        let table = self.storage.open(&self.uri).await.map_err(|e| {
-            Error::Config(format!(
-                "{e}. The watermark table must exist before a pipeline that shares its \
-                 target with dbt can start."
-            ))
+        // Touches no storage, so everything it refuses is configuration.
+        self.storage.check(&self.uri).map_err(|e| match e {
+            Error::Config(why) => Error::WatermarkUnusable(why),
+            e => e,
         })?;
+        let Some(table) = self.storage.open_if_exists(&self.uri).await? else {
+            return Err(Error::WatermarkUnusable(format!(
+                "watermark table {:?} does not exist: there is no Delta table there. The \
+                 watermark table must exist before a pipeline that shares its target with dbt \
+                 can start; create it as (app_id VARCHAR, source_version BIGINT)",
+                self.uri
+            )));
+        };
         use deltalake::delta_datafusion::DataFusionMixins;
         let declared = table
             .snapshot()
@@ -135,14 +146,14 @@ impl WatermarkStore {
         let mut best: Option<Version> = None;
         for b in &batches {
             let app = b.schema().index_of("app_id").map_err(|_| {
-                Error::Config(format!(
+                Error::WatermarkUnusable(format!(
                     "watermark table {:?} has no app_id column; expected \
                      (app_id VARCHAR, source_version BIGINT)",
                     self.uri
                 ))
             })?;
             let ver = b.schema().index_of("source_version").map_err(|_| {
-                Error::Config(format!(
+                Error::WatermarkUnusable(format!(
                     "watermark table {:?} has no source_version column; expected \
                      (app_id VARCHAR, source_version BIGINT)",
                     self.uri
@@ -154,13 +165,13 @@ impl WatermarkStore {
                 b.column(app),
                 &deltalake::arrow::datatypes::DataType::Utf8,
             )
-            .map_err(|e| Error::Config(format!("watermark app_id is not text: {e}")))?;
+            .map_err(|e| Error::WatermarkUnusable(format!("watermark app_id is not text: {e}")))?;
             let ids = ids.as_string::<i32>();
             let versions = b
                 .column(ver)
                 .as_primitive_opt::<Int64Type>()
                 .ok_or_else(|| {
-                    Error::Config(format!(
+                    Error::WatermarkUnusable(format!(
                         "watermark table {:?}: source_version must be a BIGINT",
                         self.uri
                     ))
@@ -172,7 +183,7 @@ impl WatermarkStore {
                 }
                 let v = versions.value(i);
                 if v < 0 {
-                    return Err(Error::Other(format!(
+                    return Err(Error::WatermarkUnusable(format!(
                         "watermark table {:?} holds a negative source_version ({v}) for \
                          app_id {app_id:?}; refusing to guess a resume point",
                         self.uri

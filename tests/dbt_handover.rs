@@ -82,15 +82,19 @@ struct Lake {
 
 async fn lake() -> Lake {
     let f = Fixture::new().await;
-    let watermark = std::path::Path::new(&f.target)
-        .parent()
-        .unwrap()
-        .join("ddi_watermark")
-        .to_str()
-        .unwrap()
-        .to_string();
+    let watermark = beside_the_target(&f, "ddi_watermark");
     create_watermark_table(&watermark).await;
     Lake { f, watermark }
+}
+
+fn beside_the_target(f: &Fixture, name: &str) -> String {
+    std::path::Path::new(&f.target)
+        .parent()
+        .unwrap()
+        .join(name)
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 fn cfg_with_watermark(lake: &Lake, name: &str) -> ResolvedPipeline {
@@ -374,6 +378,133 @@ async fn a_rebuild_that_recorded_no_watermark_falls_back_to_the_timestamp() {
         .unwrap();
     let got = read_ids(&lake.f.target).await;
     assert_eq!(got, vec![1, 2, 3, 4], "row 3 recovered by the rescan");
+}
+
+#[tokio::test]
+async fn a_watermark_table_that_is_not_there_falls_back_to_the_timestamp() {
+    // `[storage].watermark_uri` is read for every dbt model, and each has a timestamp. Before
+    // it was read for them, a table nobody created, or one since moved, stopped nothing: the
+    // rescan answered the rebuild. It still does, where it stopped the model at every rebuild.
+    // Without a timestamp there is nothing to fall back on, and the open still refuses.
+    let lake = lake().await;
+    let mut cfg = cfg_with_watermark_and_timestamp(&lake);
+    cfg.watermark_uri = Some(beside_the_target(&lake.f, "never_created"));
+    for i in 1..=3 {
+        append(&lake.f.source, &[i]).await;
+    }
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+
+    dbt_rebuild(&lake.f.target, &[1, 2]).await;
+    append(&lake.f.source, &[4]).await;
+
+    let mut without_a_timestamp = cfg.clone();
+    without_a_timestamp.dedup_timestamp = None;
+    without_a_timestamp.dedup_key = None;
+    let Err(e) = Pipeline::open(without_a_timestamp).await else {
+        panic!("with nothing to fall back on, a missing watermark table must still refuse");
+    };
+    assert!(e.to_string().contains("must exist"), "got: {e}");
+
+    Pipeline::open(cfg)
+        .await
+        .expect("the rescan needs no watermark table")
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        vec![1, 2, 3, 4],
+        "row 3 recovered by the rescan"
+    );
+}
+
+#[tokio::test]
+async fn a_watermark_table_of_another_shape_falls_back_to_the_timestamp() {
+    // What a warehouse writes when the table is declared with an INTEGER source_version: a
+    // row the store refuses to read, at every retry.
+    let lake = lake().await;
+    let mut cfg = cfg_with_watermark_and_timestamp(&lake);
+    let watermark = beside_the_target(&lake.f, "ddi_watermark_int");
+    cfg.watermark_uri = Some(watermark.clone());
+    let int_typed = Arc::new(Schema::new(vec![
+        Field::new("app_id", DataType::Utf8, false),
+        Field::new("source_version", DataType::Int32, false),
+    ]));
+    let row = RecordBatch::try_new(
+        int_typed,
+        vec![
+            Arc::new(StringArray::from(vec![cfg.app_id.as_str()])) as ArrayRef,
+            Arc::new(deltalake::arrow::array::Int32Array::from(vec![2])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    DeltaTable::try_from_url(ensure_table_uri(&watermark).unwrap())
+        .await
+        .unwrap()
+        .write(vec![row])
+        .await
+        .unwrap();
+
+    for i in 1..=3 {
+        append(&lake.f.source, &[i]).await;
+    }
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    dbt_rebuild(&lake.f.target, &[1, 2]).await;
+    append(&lake.f.source, &[4]).await;
+
+    Pipeline::open(cfg)
+        .await
+        .expect("an INTEGER source_version is refused, and the rescan needs none")
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        vec![1, 2, 3, 4],
+        "row 3 recovered by the rescan"
+    );
+}
+
+#[tokio::test]
+async fn a_watermark_table_that_cannot_be_read_stops_the_open_rather_than_falling_back() {
+    // A read that failed says nothing about what the table holds, and the rescan's cut-off
+    // would drop for good the late rows the watermark kept. Here the file holding this
+    // rebuild's row is gone, as a read racing a VACUUM finds it: the open fails, to be retried,
+    // rather than taking the rescan.
+    let lake = lake().await;
+    let cfg = cfg_with_watermark_and_timestamp(&lake);
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    for i in 1..=3 {
+        append(&lake.f.source, &[i]).await;
+    }
+    p.run_until_caught_up().await.unwrap();
+
+    dbt_rebuild(&lake.f.target, &[1, 2]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 2).await;
+    for file in std::fs::read_dir(&lake.watermark).unwrap() {
+        let path = file.unwrap().path();
+        if path.extension().is_some_and(|e| e == "parquet") {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    let Err(e) = Pipeline::open(cfg).await else {
+        panic!("a watermark table that could not be read must not fall back to the rescan");
+    };
+    assert!(
+        e.to_string().contains("cannot read watermark table"),
+        "got: {e}"
+    );
 }
 
 #[tokio::test]

@@ -539,6 +539,15 @@ visible then had read no further, so an older row was recorded for it or one bef
 the rebuild falls back to the timestamp as one that recorded none. Without a timestamp there
 is nothing to fall back on, and the newest row is used whatever it is.
 
+In manifest mode `[storage].watermark_uri` is read for every model, after each rebuild of its
+target. A table that cannot be used at all — nothing at that URI, or not `(app_id VARCHAR,
+source_version BIGINT)`, as when the warehouse declared `source_version` an `INTEGER` — counts
+as one without a row: the model falls back to its timestamp, and `ddi` warns, naming the table
+and what is wrong with it. A read that fails, a timeout or throttling, stops the open instead,
+which is retried: the timestamp's cut-off can drop a late row the watermark would have kept
+(below), so a read that did not happen is no reason to use it. Without a timestamp either one
+is an error.
+
 ### When the rebuild cannot be changed at all
 
 A watermark table means touching the dbt project. If the batch side must stay untouched —
