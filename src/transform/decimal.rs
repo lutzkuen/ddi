@@ -42,6 +42,14 @@
 //! not: `log` and `power`, which DataFusion computes on the decimal itself, and not as Trino
 //! does; and, keeping Arrow's division, a decimal inside a ROW or MAP being cast, and
 //! `arrow_cast`, whose cast is only made after the analyzer has run.
+//!
+//! Two types DataFusion decides otherwise than Trino are left as they are. A literal with a
+//! decimal point is a DOUBLE there and a DECIMAL in Trino; and a decimal beside a DOUBLE or
+//! REAL, compared with it or in a `CASE` or `coalesce` with it, is converted to the float in
+//! Trino, where DataFusion casts the float to a DECIMAL. Once there is a plan, `0.5` and
+//! `0.5e0` are the same DOUBLE, so no rule here can tell the literal Trino reads as a decimal
+//! from the one it reads as a double. The README gives the spelling that means the same in
+//! both.
 
 use std::any::Any;
 use std::sync::Arc;

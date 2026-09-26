@@ -311,6 +311,12 @@ Instants agree with Trino. Wall clocks can differ:
   `2024-04-01 00:30:00.000 Europe/Amsterdam`;
 - the zone database here tabulates daylight saving only up to 2099, so after that a summer
   instant's local time is an hour off Trino's;
+- before 1970, a zone the tz database has since merged into another — `Europe/Amsterdam`
+  and `Europe/Luxembourg` into `Europe/Brussels`, `Asia/Kuala_Lumpur` into
+  `Asia/Singapore`, `Atlantic/Reykjavik` into `Africa/Abidjan`, among others — has the other
+  zone's offsets here, where Trino keeps the zone's own history, which the database moved
+  to its `backzone` file: at noon UTC on 14 July 1900 Amsterdam's clock reads 12:19 in Trino
+  and 12:00 here;
 - `NaN` fails where Trino returns 1970, and an epoch between about 71,000 and 292,000 years
   converts here where Trino refuses it;
 - `date_trunc` to the hour or coarser fails on a value past 2262 where Trino truncates it.
@@ -326,7 +332,9 @@ For a date, `CAST(from_unixtime(x, 'UTC') AS DATE)`, or the same with a fixed of
 differ after 2099, where `ddi`'s zone data ends and keeps the zone's last offset, for an
 instant within an hour of its local midnight: the hour after it where that offset is standard
 time, as in Europe/Amsterdam, and the hour before it where it is daylight saving time, as in
-Australia/Sydney. So can the one-argument form.
+Australia/Sydney. A merged zone can differ before 1970, within the gap between the two zones'
+offsets of its local midnight — `from_unixtime(-2208989400, 'Europe/Amsterdam')` is
+1900-01-01 in Trino and 1899-12-31 here — and so can the one-argument form.
 
 ### Pinned Delta lookups
 
@@ -1220,6 +1228,18 @@ target, and the `array_*` aggregates over decimals.
 It does not yet cover `log` and `power` over a DECIMAL, which DataFusion computes on the
 decimal itself and not as Trino does; a decimal inside a ROW or MAP being cast; or
 `arrow_cast`. Those keep Arrow's arithmetic.
+
+Two more types are decided otherwise than in Trino, whatever the conversion does. A literal
+with a decimal point, `0.5`, is a DECIMAL in Trino and a DOUBLE in DataFusion, which reads
+it as it reads `0.5e0`. And a decimal beside a DOUBLE or REAL — compared with it, or with it
+in a `CASE`, `coalesce`, `nullif`, `greatest`, `least`, `IN` or `BETWEEN` — is converted to
+that float in Trino, where DataFusion casts the float to a DECIMAL, a DOUBLE to
+DECIMAL(30,15), and compares or returns a decimal. So over a DECIMAL(17,17)
+0.49979999999999997, `amount = 0.4998e0` and `amount = 0.49979999999999997` are both true in
+Trino and false here, and `coalesce(amount, 0.0)` is a DECIMAL(17,17) there and a
+DECIMAL(32,17) here, which in a DOUBLE column is 0.4998 there and 0.49979999999999997 here.
+Spell what Trino means: `CAST(amount AS DOUBLE) = 0.4998e0`, and a literal beside a decimal
+in the decimal's type, `coalesce(amount, CAST(0.0 AS DECIMAL(17, 17)))`.
 
 #### Building JSON: `json_object`, `json_array`, `CAST(.. AS JSON)`
 

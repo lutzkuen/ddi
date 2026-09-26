@@ -400,6 +400,11 @@ fn cross_row_set_expr(body: &SetExpr) -> Option<&'static str> {
 /// - The zone database here tabulates daylight saving only up to 2099, and after that keeps
 ///   the zone's last offset, so for half of each year its local time is an hour off Trino's.
 ///   `CAST(.. AS DATE)` differs only within that hour of local midnight.
+/// - Before 1970, a zone the tz database has merged into another (Europe/Amsterdam into
+///   Europe/Brussels, Atlantic/Reykjavik into Africa/Abidjan, among others) has the other
+///   zone's offsets here. Trino keeps the zone's own history, which the database moved to its
+///   `backzone` file, so Amsterdam in 1900 is 19 minutes 32 seconds ahead of UTC there and
+///   on UTC here, and `CAST(.. AS DATE)` differs within that much of local midnight.
 /// - `NaN` fails, where Trino returns 1970; an epoch between about 71,000 and 292,000 years
 ///   converts here and fails there.
 /// - The one-argument form's local time, and near midnight its date, is UTC's rather than the
@@ -407,7 +412,8 @@ fn cross_row_set_expr(body: &SetExpr) -> Option<&'static str> {
 ///
 /// For a date, `CAST(from_unixtime(x, 'UTC') AS DATE)`, or a fixed offset in place of `'UTC'`,
 /// gives Trino's answer wherever both convert. A zone that keeps daylight saving can still
-/// differ after 2099, as above, and so can the one-argument form.
+/// differ after 2099, and a merged zone before 1970, as above, and so can the one-argument
+/// form.
 fn rewrite_trino_from_unixtime(query: &mut Query) -> Result<()> {
     struct V(Option<Error>);
 
