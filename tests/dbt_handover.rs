@@ -11,9 +11,10 @@ mod common;
 use std::sync::Arc;
 
 use common::*;
-use delta_delta_ingest::config::ResolvedPipeline;
+use delta_delta_ingest::config::{ResolvedPipeline, WriteMode};
 use delta_delta_ingest::dbt::watermark::{target_state, TargetState, WatermarkStore};
-use delta_delta_ingest::pipeline::Pipeline;
+use delta_delta_ingest::dedup::CoverageReason;
+use delta_delta_ingest::pipeline::{CoverageWindow, Pipeline, StepOutcome};
 use deltalake::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use deltalake::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use deltalake::kernel::engine::arrow_conversion::TryIntoKernel;
@@ -346,6 +347,92 @@ async fn a_recorded_watermark_wins_over_the_timestamp_rescan() {
         vec![1, 3, 4, 5],
         "3 re-streamed from dbt's watermark and 4 after it, neither dropped for being older \
          than 5"
+    );
+}
+
+#[tokio::test]
+async fn a_recorded_watermark_wins_over_the_timestamp_rescan_for_an_upsert() {
+    // The same under write_mode = upsert, whose own commits remove what they replace, and
+    // where a cut-off would filter what is merged: from the watermark there is none, and 3 and
+    // 4 land on their keys.
+    let lake = lake().await;
+    let mut cfg = cfg_with_watermark_and_timestamp(&lake);
+    cfg.write_mode = WriteMode::Upsert;
+    cfg.upsert_key = Some("id".into());
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    for i in [1, 5, 3] {
+        append(&lake.f.source, &[i]).await; // versions 1, 2, 3
+    }
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(read_ids(&lake.f.target).await, vec![1, 3, 5]);
+
+    dbt_rebuild(&lake.f.target, &[1, 5]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 2).await;
+    append(&lake.f.source, &[4]).await;
+
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    assert_eq!(p.coverage(), None);
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        vec![1, 3, 4, 5],
+        "3 and 4 merged in, neither dropped for being older than 5"
+    );
+}
+
+#[tokio::test]
+async fn no_window_our_last_commit_recorded_outlives_a_watermark_handover() {
+    // A batch job loaded the target through source version 2 before ddi first started on it,
+    // so ddi opened a first start's window, closing after version 3, and recorded it in its
+    // commit. 25 is a lagging partition's row, older than the target's newest. The rebuild
+    // then recorded that it read version 2, so version 3 is plainly not the target's: resuming
+    // the window would read the rebuilt target's newest, 30, and drop 25 for good.
+    //
+    // The window was opened before watermark_uri was set, as on a first start since upgrading:
+    // one opened with it set records a handover head no older than the window's, so a
+    // watermark newer than that head resumes past where the window closes anyway.
+    let lake = lake().await;
+    append(&lake.f.target, &[10, 20, 30]).await;
+    append(&lake.f.source, &[10, 20]).await; // version 1
+    append(&lake.f.source, &[30]).await; // version 2
+    append(&lake.f.source, &[25]).await; // version 3
+    let mut cfg = cfg_with_watermark_and_timestamp(&lake);
+    cfg.max_files_per_batch = 1;
+    let mut before = cfg.clone();
+    before.watermark_uri = None;
+
+    let mut p = Pipeline::open(before).await.unwrap();
+    assert_eq!(
+        p.coverage(),
+        Some(CoverageWindow {
+            reason: CoverageReason::Bootstrap,
+            through: Some(3),
+            resumed: false,
+        })
+    );
+    let first = p.step().await.unwrap();
+    assert!(
+        matches!(first, StepOutcome::Skipped { covered: 2, .. }),
+        "version 1 is the target's already: {first:?}"
+    );
+    assert!(p.coverage().is_some(), "and the window is still open");
+    drop(p);
+
+    dbt_rebuild(&lake.f.target, &[10, 20, 30]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 2).await;
+
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    assert_eq!(
+        p.coverage(),
+        None,
+        "the rebuild said what the target holds, so the window our last commit recorded, \
+         which described the target before it, is not resumed"
+    );
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        vec![10, 20, 25, 30],
+        "25 is past what the rebuild read, older than 30 or not"
     );
 }
 
