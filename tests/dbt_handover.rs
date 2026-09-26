@@ -504,6 +504,28 @@ async fn the_watermark_store_reads_the_highest_version_for_its_own_app_id() {
 }
 
 #[tokio::test]
+async fn the_watermark_store_reads_only_the_files_that_can_hold_its_own_app_id() {
+    // The table gains a file with every rebuild of every model, and every model reads it after
+    // each of its own rebuilds, so read whole it costs models × nights files per read. Delta's
+    // file statistics say which files can hold an app_id's rows. Here another model's file is
+    // gone — as a read racing a VACUUM finds it — and this model's read never touches it.
+    let lake = lake().await;
+    record_watermark(&lake.watermark, "ddi.other", 999).await;
+    let others: Vec<_> = std::fs::read_dir(&lake.watermark)
+        .unwrap()
+        .map(|f| f.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .collect();
+    record_watermark(&lake.watermark, "ddi.mine", 5).await;
+    for file in others {
+        std::fs::remove_file(file).unwrap();
+    }
+
+    let store = WatermarkStore::new(&lake.watermark);
+    assert_eq!(store.last("ddi.mine").await.unwrap(), Some(5));
+}
+
+#[tokio::test]
 async fn a_recorded_watermark_wins_over_the_timestamp_rescan() {
     // Both set, as every dbt model has them: `ddi_timestamp` defaults to `_timestamp`. The
     // watermark is exact however rows arrive, and the rescan is not: here 3 is a lagging

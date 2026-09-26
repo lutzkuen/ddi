@@ -106,7 +106,8 @@ impl Storage {
     ///
     /// Every other failure is `open`'s. A store that timed out, throttled or refused the
     /// credential has said nothing about whether the table is there, so it is never taken
-    /// for a table that is not.
+    /// for a table that is not. Nor is a container that does not exist: Azure answers a listing
+    /// of it with an error `object_store` reports as it reports any other failed request.
     pub async fn open_if_exists(&self, uri: &str) -> Result<Option<DeltaTable>> {
         let url = ensure_table_uri(uri)
             .map_err(|e| Error::Config(format!("{uri:?} is not a usable table URI: {e}")))?;

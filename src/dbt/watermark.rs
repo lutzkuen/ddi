@@ -72,7 +72,6 @@ use std::collections::BTreeMap;
 use deltalake::kernel::Action;
 use deltalake::logstore::get_actions;
 use deltalake::DeltaTable;
-use futures::TryStreamExt;
 use tracing::warn;
 
 use crate::dedup::RecordedCutoff;
@@ -115,7 +114,7 @@ impl WatermarkStore {
     /// a row no rebuild can have written. Any other error is a read that failed this time.
     pub async fn last(&self, app_id: &str) -> Result<Option<Version>> {
         use deltalake::arrow::array::{Array, AsArray, RecordBatch};
-        use deltalake::arrow::datatypes::Int64Type;
+        use deltalake::arrow::datatypes::{DataType, Int64Type};
 
         // Touches no storage, so everything it refuses is configuration.
         self.storage.check(&self.uri).map_err(|e| match e {
@@ -130,21 +129,55 @@ impl WatermarkStore {
                 self.uri
             )));
         };
+        use deltalake::datafusion::catalog::TableProvider;
+        use deltalake::datafusion::prelude::{col, lit};
         use deltalake::delta_datafusion::DataFusionMixins;
         let declared = table
             .snapshot()
             .map_err(Error::Delta)?
             .snapshot()
             .read_schema();
-
-        let (_t, stream) = table
-            .scan_table()
-            .with_session_state(std::sync::Arc::new(crate::budget::session(&table)?))
-            .await
-            .map_err(Error::Delta)?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(|e| {
+        let unreadable = |e: &dyn std::fmt::Display| {
             Error::Other(format!("cannot read watermark table {:?}: {e}", self.uri))
+        };
+
+        // Two columns, and only the files whose statistics say they can hold this app_id's
+        // rows. The table gains a file with every rebuild of every model, and every model reads
+        // it after each rebuild of its own: read whole, that is models × nights files per read,
+        // for as long as the table has been growing. Resolved against the scan's own schema,
+        // which orders a partition column last, as `grain::key_stream` explains.
+        let provider = table.table_provider().await.map_err(|e| unreadable(&e))?;
+        let schema = TableProvider::schema(provider.as_ref());
+        let app = schema.index_of("app_id").map_err(|_| {
+            Error::WatermarkUnusable(format!(
+                "watermark table {:?} has no app_id column; expected \
+                 (app_id VARCHAR, source_version BIGINT)",
+                self.uri
+            ))
         })?;
+        let ver = schema.index_of("source_version").map_err(|_| {
+            Error::WatermarkUnusable(format!(
+                "watermark table {:?} has no source_version column; expected \
+                 (app_id VARCHAR, source_version BIGINT)",
+                self.uri
+            ))
+        })?;
+        // An app_id of another type is refused below, by the reading that checks it.
+        let only_ours = match schema.field(app).data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                vec![col("app_id").eq(lit(app_id))]
+            }
+            _ => Vec::new(),
+        };
+        let state = crate::budget::session(&table)?;
+        let scan = provider
+            .scan(&state, Some(&vec![app, ver]), &only_ours, None)
+            .await
+            .map_err(|e| unreadable(&e))?;
+        let batches: Vec<RecordBatch> =
+            deltalake::datafusion::physical_plan::collect(scan, state.task_ctx())
+                .await
+                .map_err(|e| unreadable(&e))?;
         // As the table declares its columns. This table is written by dbt, against whatever
         // warehouse the project targets, so it is the likeliest of all of them to be typed
         // by an engine with its own ideas about precision.
@@ -155,27 +188,14 @@ impl WatermarkStore {
 
         let mut best: Option<Version> = None;
         for b in &batches {
-            let app = b.schema().index_of("app_id").map_err(|_| {
-                Error::WatermarkUnusable(format!(
-                    "watermark table {:?} has no app_id column; expected \
-                     (app_id VARCHAR, source_version BIGINT)",
-                    self.uri
-                ))
-            })?;
-            let ver = b.schema().index_of("source_version").map_err(|_| {
-                Error::WatermarkUnusable(format!(
-                    "watermark table {:?} has no source_version column; expected \
-                     (app_id VARCHAR, source_version BIGINT)",
-                    self.uri
-                ))
-            })?;
+            // The two columns, in the order they were projected.
+            let (app, ver) = (0, 1);
 
             // Normalise the id column: a scan may hand back Utf8, LargeUtf8 or Utf8View.
-            let ids = deltalake::arrow::compute::cast(
-                b.column(app),
-                &deltalake::arrow::datatypes::DataType::Utf8,
-            )
-            .map_err(|e| Error::WatermarkUnusable(format!("watermark app_id is not text: {e}")))?;
+            let ids =
+                deltalake::arrow::compute::cast(b.column(app), &DataType::Utf8).map_err(|e| {
+                    Error::WatermarkUnusable(format!("watermark app_id is not text: {e}"))
+                })?;
             let ids = ids.as_string::<i32>();
             let versions = b
                 .column(ver)

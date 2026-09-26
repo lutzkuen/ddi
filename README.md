@@ -558,13 +558,20 @@ source is dropped and recreated, the rows its old log's rebuilds recorded stay e
 and so the new log's rebuilds get the cut-off until that log reaches past them.
 
 In manifest mode `[storage].watermark_uri` is read for every model, after each rebuild of its
-target. A table that cannot be used at all — nothing at that URI, or not `(app_id VARCHAR,
-source_version BIGINT)`, as when the warehouse declared `source_version` an `INTEGER` — counts
-as one without a row: the model falls back to its timestamp, and `ddi` warns, naming the table
-and what is wrong with it. A read that fails, a timeout or throttling, stops the open instead,
-which is retried: the timestamp's cut-off can drop a late row the watermark would have kept
-(below), so a read that did not happen is no reason to use it. Without a timestamp either one
-is an error.
+target. A table that cannot be used at all — no Delta table at that path, or not `(app_id
+VARCHAR, source_version BIGINT)`, as when the warehouse declared `source_version` an `INTEGER` —
+counts as one without a row: the model falls back to its timestamp, and `ddi` warns, naming the
+table and what is wrong with it. A read that fails, a timeout or throttling, stops the open
+instead, which is retried: the timestamp's cut-off can drop a late row the watermark would have
+kept (below), so a read that did not happen is no reason to use it. Without a timestamp either
+one is an error. A container that does not exist is one of those failed reads, not a table that
+is not there: Azure answers a listing of it as it answers an outage, so a mistyped container in
+`watermark_uri` stops every model at its next rebuild until the URI is fixed.
+
+Each read takes the two columns, and only the files whose statistics say they can hold the
+model's `app_id`. The table still gains a file with every rebuild of every model; compacting it
+now and then keeps that down, and rows older than an `app_id`'s newest can be deleted, as only
+the newest is ever read.
 
 ### When the rebuild cannot be changed at all
 

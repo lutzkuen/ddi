@@ -358,7 +358,8 @@ after each rebuild of a model's target. A table that is not there, or not `(app_
 source_version BIGINT)`, counts as one with no row, so `_timestamp` is used and `ddi` warns,
 naming the table and what is wrong with it. A read that fails — a timeout, throttling — stops
 the pipeline until a retry succeeds instead, because `_timestamp` could drop late rows the
-watermark would have kept. The README's
+watermark would have kept; so does a container that does not exist, which the store reports as
+it reports an outage. The README's
 [handover section](README.md#the-handover-and-why-it-needs-a-watermark) shows the one
 `INSERT` the rebuild runs. Run it in a **pre-hook**, and pin the model's read to the version it
 records (`FOR VERSION AS OF`), so the row is there before the overwrite lands. After a rebuild

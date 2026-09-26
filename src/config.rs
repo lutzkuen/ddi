@@ -306,8 +306,9 @@ pub struct PipelineConfig {
     /// recorded none. A row that may be an earlier rebuild's — no newer than what this
     /// pipeline's last handover recorded, and not the version its own offset is at — counts as
     /// none, and so, with a warning, does a table that is not there or not `(app_id VARCHAR,
-    /// source_version BIGINT)`; a read that fails stops the open, which is retried. Not read by
-    /// a staged upsert's merge, whose source is the stage.
+    /// source_version BIGINT)`; a read that fails stops the open, which is retried, and so does
+    /// a container that does not exist. Not read by a staged upsert's merge, whose source is
+    /// the stage.
     #[serde(default)]
     pub watermark_uri: Option<String>,
 
