@@ -541,11 +541,21 @@ row streamed while dbt was reading.
 The table only grows, so its newest row can be an earlier rebuild's: this one's post-hook has
 not run yet, or the rewrite was another writer's `UPDATE`, `DELETE` or `MERGE`, which records
 nothing. Resuming from that row would append again every row since, deleted ones included.
-So with a timestamp set, a row counts only when it is newer than the source head at `ddi`'s
-last handover, which each of its commits records (`ddi.handover.sourceHead`): a rebuild
-visible then had read no further, so an older row was recorded for it or one before it, and
-the rebuild falls back to the timestamp as one that recorded none. Without a timestamp there
-is nothing to fall back on, and the newest row is used whatever it is.
+So each of `ddi`'s commits records how far the rebuild it last handed over from can have read
+(`ddi.handover.sourceHead`): the watermark it resumed from, or where it rescanned, the source
+head as read after the target. With a timestamp set, a row counts when it is newer than that,
+which only a later rebuild can have recorded, or when it is the version `ddi`'s own offset is
+at, where resuming from it is resuming from that offset. Otherwise the rebuild falls back to
+the timestamp as one that recorded none. Without a timestamp there is nothing to fall back
+on, and the newest row is used whatever it is.
+
+That takes a few rebuilds' own rows for earlier ones', and those rebuilds get the timestamp's
+cut-off (below): one that read exactly where `ddi`'s last rescan found the source while `ddi`
+streamed on past it; one already running when a pipeline first opened with a watermark table;
+and the first after upgrading from 0.3.1, or after setting `watermark_uri`, whose commits
+recorded no handover — each unless it read exactly as far as `ddi`'s own offset. After the
+source is dropped and recreated, the rows its old log's rebuilds recorded stay earlier ones',
+and so the new log's rebuilds get the cut-off until that log reaches past them.
 
 In manifest mode `[storage].watermark_uri` is read for every model, after each rebuild of its
 target. A table that cannot be used at all — nothing at that URI, or not `(app_id VARCHAR,
@@ -1323,10 +1333,13 @@ Prefer a **pre-hook** that records the version and a model that pins its read to
 (`FOR VERSION AS OF`). Then the watermark is on disk before the overwrite lands and there is
 no window at all. With a post-hook the watermark appears one commit later; if `ddi` looks in
 between it finds only the previous rebuild's watermark. With `dedup_timestamp` set it knows
-that one for what it is and falls back to the rescan and its cut-off. Without one it
-re-streams from the previous watermark, which duplicates rows rather than dropping them. That
-asymmetry is deliberate — duplicates are visible and the next rebuild erases them, whereas a
-gap is silent and permanent. A pre-hook whose model then fails leaves a row no rebuild wrote:
+that one for what it is, provided it handed over from that rebuild, and falls back to the
+rescan, whose cut-off can drop a lagging partition's late rows — so a source written from a
+multi-partition topic wants the pre-hook. Where `ddi` missed the previous rebuild, down all
+the while, the two cannot be told apart, and it re-streams from the previous watermark, as it
+does without a timestamp. That duplicates rows rather than dropping them, and the asymmetry is
+deliberate — duplicates are visible and the next rebuild erases them, whereas a gap is silent
+and permanent. A pre-hook whose model then fails leaves a row no rebuild wrote:
 should another writer rewrite the target before the next run succeeds, `ddi` resumes from it
 as though that rebuild had landed.
 

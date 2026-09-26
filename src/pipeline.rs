@@ -247,11 +247,9 @@ impl Pipeline {
 
         let offsets = OffsetStore::new(&cfg.app_id, cfg.starting_version);
         let resume = resume_cursor(&cfg, &offsets, &source, &target, &ours).await?;
-        let handover_source_head = handover_source_head(&cfg, &source, &ours, &resume);
+        let handover_source_head = handover_source_head(&cfg, &ours, &resume);
 
-        let replaced =
-            adjust_for_replaced_source(&cfg, &source, &ours, resume.cursor, resume.bootstrapping)
-                .await?;
+        let replaced = adjust_for_replaced_source(&cfg, &source, &ours, &resume).await?;
         let cursor = replaced.unwrap_or(resume.cursor);
 
         // After the adjustment, because a replaced source restarts from `starting_version` and
@@ -1668,21 +1666,18 @@ async fn adjust_for_replaced_source(
     cfg: &ResolvedPipeline,
     source: &DeltaTable,
     ours: &watermark::OurLastCommit,
-    cursor: StreamCursor,
-    bootstrapping: bool,
+    resume: &Resume,
 ) -> Result<Option<StreamCursor>> {
-    // `source` is already loaded — `Storage::open` loads it — so its snapshot version *is*
-    // the head, and asking the log store again would be both a second round trip and a
-    // liability: `get_latest_version` floors the kernel's log segment at the version it is
-    // given, so the hardcoded `0` this used to pass failed outright once the source's own
-    // `delta.logRetentionDuration` reclaimed commit 0. That failure arrived here, in
-    // `Pipeline::open`, as `delta error: Invalid table version: 0` — before the stream
-    // existed, which is why none of this module's own errors could describe it.
-    //
-    // Reading it off the snapshot is also not staler in a direction that matters: a commit
-    // landing between the open and this line lowers the head relative to now, which makes
-    // `log_went_backwards` *less* likely to fire, never more.
-    let head = source.version();
+    let (cursor, bootstrapping) = (resume.cursor, resume.bootstrapping);
+    // The head `Storage::open` loaded, or the one read again after the watermark table where
+    // the cursor may follow a watermark: a rebuild can read, and record, a version that
+    // snapshot did not have yet, and against its head a cursor just past it would read as a
+    // log gone backwards. Never `get_latest_version(0)`, which floors the kernel's log segment
+    // at the version it is given: the hardcoded `0` this used to pass failed outright once the
+    // source's own `delta.logRetentionDuration` reclaimed commit 0, and that failure arrived
+    // here, in `Pipeline::open`, as `delta error: Invalid table version: 0` — before the
+    // stream existed, which is why none of this module's own errors could describe it.
+    let head = resume.source_head;
 
     // Identity is the reliable signal. The log going backwards is the fallback for
     // targets written before we recorded it.
@@ -1759,9 +1754,9 @@ async fn adjust_for_replaced_source(
 /// watermark is the authority instead, where this rebuild recorded one — and otherwise, with
 /// `dedup_timestamp`, a rescan whose cut-off is handed back with the position, for
 /// [`coverage_cutoff`] to hold until the rescan has caught up with what the rebuild covered.
-/// A watermark no newer than the source head at our last handover was recorded for an
-/// earlier rebuild, and with `dedup_timestamp` set it is passed over for the rescan, as is a
-/// watermark table that cannot be used at all; one that could not be read this time fails.
+/// With `dedup_timestamp` set, a watermark that cannot be told from an earlier rebuild's is
+/// passed over for the rescan (see [`watermark_passed_over`]), as is a watermark table that
+/// cannot be used at all; one that could not be read this time fails.
 ///
 /// See [`crate::dbt::watermark`] for the full argument.
 async fn resume_cursor(
@@ -1782,13 +1777,15 @@ async fn resume_cursor(
         Some(v) => StreamCursor::at_version(v + 1),
         None => StreamCursor::at_version(cfg.starting_version),
     };
+    let mut source_head = source.version();
 
     if cfg.watermark_uri.is_none() && cfg.dedup_timestamp.is_none() {
         return Ok(Resume {
             cursor: own,
             bootstrapping,
             rebuilt: None,
-            from_watermark: false,
+            from_watermark: None,
+            source_head,
         });
     }
 
@@ -1798,7 +1795,8 @@ async fn resume_cursor(
             cursor: own,
             bootstrapping,
             rebuilt: None,
-            from_watermark: false,
+            from_watermark: None,
+            source_head,
         });
     };
 
@@ -1811,7 +1809,7 @@ async fn resume_cursor(
     // for exactly the pipelines it is documented for.
     if let Some(uri) = cfg.watermark_uri.as_deref() {
         let store = watermark::WatermarkStore::new(uri).with_storage(cfg.storage.clone());
-        match store.last(&cfg.app_id).await {
+        let last = match store.last(&cfg.app_id).await {
             // Not there, or not shaped as a watermark table: a fact about the deployment,
             // which every retry would meet again and which says nothing about this rebuild.
             // `[storage].watermark_uri` is read for every dbt model, and each has a timestamp,
@@ -1820,59 +1818,69 @@ async fn resume_cursor(
             // failed is not that: a timeout or throttling says nothing about what the table
             // holds, and the rescan's cut-off drops for good a lagging partition's late rows
             // that the watermark would have kept, so it fails the open, which is retried.
-            Err(Error::WatermarkUnusable(why)) if cfg.dedup_timestamp.is_some() => warn!(
-                pipeline = %cfg.name,
-                overwritten_at_target_version = at,
-                watermark_uri = uri,
-                error = %why,
-                "target was rebuilt, but the watermark table cannot be used, so falling back to \
-                 the dedup_timestamp rescan, whose cut-off drops a late row older than the \
-                 target's newest. Fix the table as the error says, or unset watermark_uri"
-            ),
-            Err(e) => return Err(e),
-            // Recorded no later than our last handover, so for that rebuild or an earlier one:
-            // this rewrite has recorded nothing yet — a post-hook that has not run, or another
-            // writer's `DELETE`, which records none. Resuming from it would append again every
-            // row since it, and bring back what the rewrite deleted; the rescan below drops
-            // what the target holds instead.
-            Ok(Some(w))
-                if cfg.dedup_timestamp.is_some()
-                    && ours.handover_source_head.is_some_and(|h| w <= h) =>
-            {
+            Err(Error::WatermarkUnusable(why)) if cfg.dedup_timestamp.is_some() => {
                 warn!(
                     pipeline = %cfg.name,
                     overwritten_at_target_version = at,
-                    watermark = w,
-                    last_handover_source_head = ?ours.handover_source_head,
-                    "target was rewritten, but the newest watermark is no newer than the source \
-                     head at this pipeline's last handover, so an earlier rebuild recorded it; \
-                     falling back to the dedup_timestamp rescan"
-                )
-            }
-            Ok(Some(w)) => {
-                let reset = StreamCursor::at_version(w + 1);
-                warn!(
-                    pipeline = %cfg.name,
-                    overwritten_at_target_version = at,
-                    own_offset = %own,
-                    watermark = w,
-                    resume_from = %reset,
-                    "target was rebuilt by dbt; resuming from dbt's watermark rather than our \
-                     own offset, and skipping nothing by timestamp"
+                    watermark_uri = uri,
+                    error = %why,
+                    "target was rebuilt, but the watermark table cannot be used, so falling \
+                     back to the dedup_timestamp rescan, whose cut-off drops a late row older \
+                     than the target's newest. Fix the table as the error says, or unset \
+                     watermark_uri"
                 );
-                // Same argument as the rescan below: dbt's watermark is an assertion about what
-                // the target already covers, so this position is not a bootstrap even when no
-                // txn action of ours survives the rebuild.
-                return Ok(Resume {
-                    cursor: reset,
-                    bootstrapping: false,
-                    rebuilt: None,
-                    from_watermark: true,
-                });
+                None
+            }
+            Err(e) => return Err(e),
+            Ok(w) => Some(w),
+        };
+        // Read again, after the target and the watermark table, rather than taken from the
+        // snapshot this open loaded before either: a rebuild that read the source, and
+        // committed or recorded its version, while this open was loading can have read past
+        // that snapshot's head. What is handed on is compared with the versions they name.
+        source_head = source_head_now(source).await?;
+        match last {
+            None => {}
+            Some(Some(w)) => {
+                // With no timestamp to fall back on, the newest row is used whatever it is.
+                let passed_over = watermark_passed_over(w, stored, ours)
+                    .filter(|_| cfg.dedup_timestamp.is_some());
+                if let Some(why) = passed_over {
+                    warn!(
+                        pipeline = %cfg.name,
+                        overwritten_at_target_version = at,
+                        watermark = w,
+                        committed_source_version = ?stored,
+                        last_handover_source_version = ?ours.handover_source_head,
+                        "target was rewritten, but the newest watermark may be an earlier \
+                         rebuild's: {why}. Falling back to the dedup_timestamp rescan"
+                    );
+                } else {
+                    let reset = StreamCursor::at_version(w + 1);
+                    warn!(
+                        pipeline = %cfg.name,
+                        overwritten_at_target_version = at,
+                        own_offset = %own,
+                        watermark = w,
+                        resume_from = %reset,
+                        "target was rebuilt by dbt; resuming from dbt's watermark rather than \
+                         our own offset, and skipping nothing by timestamp"
+                    );
+                    // Same argument as the rescan below: dbt's watermark is an assertion about
+                    // what the target already covers, so this position is not a bootstrap even
+                    // when no txn action of ours survives the rebuild.
+                    return Ok(Resume {
+                        cursor: reset,
+                        bootstrapping: false,
+                        rebuilt: None,
+                        from_watermark: Some(w),
+                        source_head,
+                    });
+                }
             }
             // Refusing is the whole point. Continuing from our own offset would drop every
             // row we streamed after dbt started reading, silently and for good.
-            Ok(None) if cfg.dedup_timestamp.is_none() => {
+            Some(None) if cfg.dedup_timestamp.is_none() => {
                 return Err(Error::Config(format!(
                     "pipeline {:?}: target {:?} was rewritten at version {at} by another \
                      writer (a dbt rebuild), but the watermark table {uri:?} holds no \
@@ -1884,7 +1892,7 @@ async fn resume_cursor(
                     cfg.name, cfg.target_uri, cfg.app_id
                 )));
             }
-            Ok(None) => warn!(
+            Some(None) => warn!(
                 pipeline = %cfg.name,
                 overwritten_at_target_version = at,
                 watermark_uri = uri,
@@ -1944,33 +1952,99 @@ async fn resume_cursor(
         cursor: from,
         bootstrapping: false,
         rebuilt: Some(dedup),
-        from_watermark: false,
+        from_watermark: None,
+        source_head,
     })
 }
 
-/// The source head this open's commits record for the next rebuild handover, while a
-/// watermark table is set: its own head when it has just handed over from a rebuild, or when
-/// our last commit recorded none, and otherwise the one that commit recorded.
+/// Why `w`, the newest watermark recorded for this pipeline, may be an earlier rebuild's rather
+/// than the one the rewrite this open found recorded, or `None` where it counts. `committed` is
+/// the last source version our own offset names.
 ///
-/// Its own head at a handover because a rebuild visible then had read the source no later than
-/// it — this open loads the source before the target — so any watermark at or below it was
-/// recorded for that rebuild or an earlier one, including the one a post-hook writes a moment
-/// after this open. Where nothing is recorded yet, a first open or the first since upgrading,
-/// every row the table holds was recorded before this open, and the same head says so.
+/// It counts when it is newer than what our last commit recorded for its handover
+/// ([`handover_source_head`]), which only a rebuild since can have recorded. It counts, too,
+/// when it is the version our own offset is at, as a rebuild of a source with nothing new
+/// records the version the last one did: whichever rebuild recorded it, one since read no
+/// less, so resuming from it is resuming from our own offset, which appends nothing twice and
+/// skips nothing the rebuild wiped. And it counts for a pipeline that has never committed,
+/// which has appended nothing a stale row could append again.
+///
+/// Anything else may be an earlier rebuild's, and is passed over: a row no newer than our last
+/// handover recorded, and any row at all where our last commit recorded none — one made before
+/// `watermark_uri` was set, or by ddi 0.3.1, which never read the table where a timestamp was
+/// set — as the row is then as likely last night's as tonight's. That passes over a few
+/// rebuilds' own rows too: one that read exactly where our last rescan found the source while
+/// we streamed on past it, and one already running when this pipeline first opened with a
+/// watermark table.
+fn watermark_passed_over(
+    w: Version,
+    committed: Option<Version>,
+    ours: &watermark::OurLastCommit,
+) -> Option<&'static str> {
+    if committed == Some(w) {
+        return None;
+    }
+    match ours.handover_source_head {
+        Some(h) if w > h => None,
+        Some(_) => Some(
+            "it is no newer than the source version this pipeline's last handover recorded, \
+             nor the version its own offset is at",
+        ),
+        None if committed.is_none() => None,
+        None => Some(
+            "this pipeline's last commit recorded no handover (it was made before watermark_uri \
+             was set, or by ddi 0.3.1), and the watermark is not the version its own offset is \
+             at",
+        ),
+    }
+}
+
+/// The source's head as its log has it now, rather than as the snapshot `Pipeline::open`
+/// loaded it. Listed from that snapshot's version, which the log has by construction.
+async fn source_head_now(source: &DeltaTable) -> Result<Option<Version>> {
+    let Some(loaded) = source.version() else {
+        return Ok(None);
+    };
+    Ok(Some(
+        source
+            .log_store()
+            .get_latest_version(loaded)
+            .await
+            .map_err(Error::Delta)?,
+    ))
+}
+
+/// What this open's commits record for the next rebuild handover, while a watermark table is
+/// set ([`watermark::HANDOVER_SOURCE_HEAD_KEY`]): the newest source version the rebuild it has
+/// just handed over from can have read, so that a watermark newer than that was recorded for a
+/// later one.
+///
+/// Where it resumed from that rebuild's watermark, the watermark: the table held nothing newer
+/// when it was read, and the rebuild had recorded its own. Where it rescanned, the source head
+/// read after the target and the watermark table: the rebuild committed before the target was
+/// read, so it had read no further, and nor had the post-hook that records its version a
+/// moment after this open. The head this open loaded would not do, because it is loaded before
+/// the target, and a rebuild that read and committed in between would record a version above
+/// it. Where it did not hand over and nothing is recorded yet — a first open, or the first
+/// since upgrading — the head it loaded, past which no row recorded before then can name a
+/// version; and otherwise what our last commit recorded, carried forward until the next
+/// handover.
+///
+/// Never lower than what our last commit recorded: after the source is dropped and recreated
+/// its head starts again from zero, and the rows its old log's rebuilds recorded have to stay no
+/// newer than this, rather than outrank the rows the new log's rebuilds record.
 fn handover_source_head(
     cfg: &ResolvedPipeline,
-    source: &DeltaTable,
     ours: &watermark::OurLastCommit,
     resume: &Resume,
 ) -> Option<Version> {
     cfg.watermark_uri.as_ref()?;
-    match (
-        resume.from_watermark || resume.rebuilt.is_some(),
-        ours.handover_source_head,
-    ) {
-        (false, Some(recorded)) => Some(recorded),
-        _ => source.version(),
-    }
+    let now = match (resume.from_watermark, &resume.rebuilt) {
+        (Some(w), _) => Some(w),
+        (None, Some(_)) => resume.source_head,
+        (None, None) => return ours.handover_source_head.or(resume.source_head),
+    };
+    ours.handover_source_head.max(now)
 }
 
 /// Where a pipeline resumes, whether it has ever committed, and what a rebuild left behind.
@@ -1995,11 +2069,15 @@ struct Resume {
     /// start. Handed on rather than read again, because it is the same question of the same
     /// target, and the answer is what the rescan has to be filtered by.
     rebuilt: Option<Dedup>,
-    /// True when `cursor` follows the source version a rebuild recorded in `watermark_uri`.
+    /// The source version a rebuild recorded in `watermark_uri`, when `cursor` follows it.
     /// The rebuild has then said what the target holds, so no window is inferred from its
     /// data — not even one our last commit recorded, which described the target as it was
     /// before that rebuild.
-    from_watermark: bool,
+    from_watermark: Option<Version>,
+    /// The source's head: as the snapshot this open loaded it, or where the target turned out
+    /// rewritten and a watermark table is set, as read again after that table, whose rows can
+    /// name versions the snapshot did not have yet.
+    source_head: Option<Version>,
 }
 
 /// The coverage window this open starts in, if the target's coverage has to be inferred.
@@ -2017,9 +2095,9 @@ struct Resume {
 /// A rebuild that recorded its source version in `watermark_uri` is not "rebuilt" here, and
 /// opens none: the position it gave is exact on its own, as our offset is.
 ///
-/// `H` is the source version this open loaded, which is read before the target, so a rebuild
-/// visible in the target read the source no later than `H`. It can be a little low, never
-/// high, and low errs towards duplicates. A replaced source gets no `H`: its target was filled
+/// `H` is the source version this open loaded. That is loaded before the target, so a rebuild
+/// visible in the target can have read a little further: `H` can be a little low, never high,
+/// and low errs towards duplicates. A replaced source gets no `H`: its target was filled
 /// from the old table, and the new one is usually re-seeded after this open. Nor does a stage
 /// source — the apply half of a staged upsert — because the stage is filled at the ingest
 /// half's own pace, and a raw row a rebuild covered can be staged long after this head.
@@ -2058,7 +2136,7 @@ async fn coverage_cutoff(
             None => Dedup::read(target, ts, key).await?,
         };
         (CoverageReason::SourceReplaced, None, false, dedup)
-    } else if resume.from_watermark {
+    } else if resume.from_watermark.is_some() {
         return Ok(None);
     } else if let Some(dedup) = resume.rebuilt {
         (CoverageReason::Rebuilt, head, false, dedup)

@@ -35,8 +35,8 @@ pub struct Sink {
     /// replaced in place gets a new id as well, but keeps its log, which still gives that
     /// version the id it had there: the version is what tells the two apart.
     source_identity: Option<(Version, String)>,
-    /// The source head at this pipeline's last handover from a rebuild of its target, recorded
-    /// while a watermark table is set. See [`HANDOVER_SOURCE_HEAD_KEY`].
+    /// The newest source version the rebuild this pipeline last handed over from can have
+    /// read, recorded while a watermark table is set. See [`HANDOVER_SOURCE_HEAD_KEY`].
     handover_source_head: Option<Version>,
     /// The exact lookup snapshots that enriched the source batch currently being committed.
     lookup_snapshots: Vec<LookupCommit>,

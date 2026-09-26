@@ -38,12 +38,20 @@
 //! rebuild's post-hook has not run yet, or the rewrite records nothing at all — an `UPDATE`,
 //! `DELETE` or `MERGE` by another writer, which reads just like a rebuild. Resuming from that
 //! row would append again everything since it, and bring back what the rewrite deleted. So
-//! each commit of ours carries the source head at our last handover
-//! ([`HANDOVER_SOURCE_HEAD_KEY`]). A rebuild visible then had read the source no later than
-//! that head, so a watermark at or below it was recorded for that rebuild or an earlier one,
-//! and only one above it for a rebuild since. With `dedup_timestamp` set only such a row
-//! counts, and a rewrite without one falls back to the rescan; with no timestamp there is
-//! nothing to fall back on, and the newest row is used whatever it is.
+//! each commit of ours carries the newest source version the rebuild at our last handover can
+//! have read ([`HANDOVER_SOURCE_HEAD_KEY`]): the watermark we resumed from, or where we
+//! rescanned, the source head as read after the target. A row newer than that was recorded
+//! since, for a later rebuild. So is, in effect, a row naming the version our own offset is at:
+//! resuming from it is resuming from our own offset, whichever rebuild recorded it. With
+//! `dedup_timestamp` set only such a row counts, and a rewrite without one falls back to the
+//! rescan; with no timestamp there is nothing to fall back on, and the newest row is used
+//! whatever it is.
+//!
+//! That takes a few rebuilds' own rows for earlier ones', and their rows go through the rescan's
+//! cut-off: one that read exactly where our last rescan found the source while we streamed on
+//! past it; one already running when a pipeline first opened with a watermark table; and the
+//! first after upgrading from ddi 0.3.1, or after setting `watermark_uri`, whose commits
+//! recorded no handover — each unless it read exactly as far as our own offset.
 //!
 //! # Ordering
 //!
@@ -52,10 +60,12 @@
 //! disk before the overwrite lands and there is no window at all.
 //!
 //! With a post-hook the watermark appears one commit after the overwrite. If `ddi` looks
-//! in between it sees the previous night's watermark: with `dedup_timestamp` it falls back
-//! to the rescan, and without one it re-streams from there, which duplicates rows rather
-//! than dropping them. That asymmetry is deliberate: duplicates are visible and the next dbt
-//! run erases them, whereas a gap is silent and permanent.
+//! in between it sees the previous rebuild's watermark. With `dedup_timestamp` it takes that
+//! for what it is where we handed over from that rebuild, and falls back to the rescan, whose
+//! cut-off can drop a lagging partition's late rows; where we missed it, it cannot tell the two
+//! apart, and re-streams from there. Without one it re-streams from there, which duplicates rows
+//! rather than dropping them. That asymmetry is deliberate: duplicates are visible and the next
+//! dbt run erases them, whereas a gap is silent and permanent.
 
 use std::collections::BTreeMap;
 
@@ -284,8 +294,8 @@ pub struct OurLastCommit {
     /// A source version that had `source_table_id`. `None` for commits written before this
     /// was recorded. See [`SOURCE_TABLE_ID_VERSION_KEY`].
     pub source_table_id_version: Option<Version>,
-    /// The source head at our last handover from a rebuild. `None` for commits written
-    /// before this was recorded, and without a watermark table. See
+    /// The newest source version the rebuild at our last handover can have read. `None` for
+    /// commits written before this was recorded, and without a watermark table. See
     /// [`HANDOVER_SOURCE_HEAD_KEY`].
     pub handover_source_head: Option<Version>,
     /// Delta identities of the pinned lookups that produced the commit. A table recreated at
@@ -304,10 +314,11 @@ pub struct OurLastCommit {
 /// replaced in place.
 pub const SOURCE_TABLE_ID_VERSION_KEY: &str = "ddi.sourceTableIdVersion";
 
-/// `commitInfo` key naming the source head at this pipeline's last handover from a rebuild of
-/// its target — or, before its first, at the first open that recorded one. A watermark at or
-/// below it cannot be the one a later rebuild recorded. Recorded only while `watermark_uri` is
-/// set.
+/// `commitInfo` key naming the newest source version the rebuild this pipeline last handed over
+/// from can have read — the watermark it resumed from, or where it rescanned, the source head
+/// read after the target — or, before its first handover, the head at the first open that
+/// recorded one. A watermark above it was recorded since, so for a later rebuild. Recorded only
+/// while `watermark_uri` is set.
 pub const HANDOVER_SOURCE_HEAD_KEY: &str = "ddi.handover.sourceHead";
 
 /// Walk the target log backwards for the most recent commit that carries our txn action,

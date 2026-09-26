@@ -366,8 +366,12 @@ that recorded one, `ddi` resumes from that version and skips nothing by timestam
 exact whatever order rows arrive in. `_timestamp` is then only the fallback, for a rebuild
 that recorded nothing. That includes one whose post-hook has not run yet, and another
 writer's `DELETE`, which records nothing at all: the table's newest row is then an earlier
-rebuild's, and `ddi` counts a row only when it is newer than the source head at its last
-handover. The cut-off still applies on a first start against a table that already has rows
+rebuild's, and `ddi` counts a row only when it is newer than how far the rebuild it last
+handed over from had read, or is the version its own offset is at. A few rebuilds of your own
+are taken for earlier ones by that rule and get `_timestamp` instead — the first after
+upgrading from 0.3.1 among them; the README's handover section lists them. With a post-hook,
+`ddi` reopening before it runs gets `_timestamp` too, so a multi-partition source wants the
+pre-hook. The cut-off still applies on a first start against a table that already has rows
 and after the source was replaced, and to a staged upsert, whose merge reads `ddi`'s own
 staging table rather than the source the watermark counts versions of. A watermark per Kafka
 partition would be exact there too; `ddi` does not offer one yet.
@@ -377,7 +381,7 @@ partition would be exact there too; `ddi` does not offer one yet.
 | Event | What `ddi` does |
 |---|---|
 | Restart, redeploy, crash | Resumes from its own offset; nothing is skipped by timestamp |
-| dbt full-refresh | Resumes from the source version it recorded in `watermark_uri`, or, where it recorded none newer than the last rebuild's, rescans from its high-water mark; no gaps, no duplicates |
+| dbt full-refresh | Resumes from the source version it recorded in `watermark_uri`, or, where it recorded none, or one `ddi` cannot tell from an earlier rebuild's, rescans from its high-water mark; no gaps, no duplicates |
 | Rows arrive while dbt runs | Re-emitted afterwards, by timestamp |
 | Another writer appends to the target | Not taken as coverage; nothing is skipped because of it |
 | Another writer updates, deletes or merges in the target | Treated as a rebuild. Timestamps it writes newer than rows `ddi` has not delivered yet make it skip the source versions holding them (logged as `versions_not_reread`) |
