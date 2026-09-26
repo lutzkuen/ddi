@@ -167,6 +167,29 @@ async fn replace_in_place(path: &str, schema: SchemaRef) {
         .unwrap();
 }
 
+/// `VACUUM` as an operator runs it, once the files a commit removed are past the default
+/// seven-day retention. The clock moves rather than the retention, so its safety check stays on.
+async fn vacuum(path: &str) {
+    #[derive(Debug)]
+    struct EightDaysLater;
+    impl deltalake::operations::vacuum::Clock for EightDaysLater {
+        fn current_timestamp_millis(&self) -> i64 {
+            chrono::Utc::now().timestamp_millis() + 8 * 86_400_000
+        }
+    }
+    let (_t, m) = open_table(ensure_table_uri(path).unwrap())
+        .await
+        .unwrap()
+        .vacuum()
+        .with_clock(Arc::new(EightDaysLater))
+        .await
+        .unwrap();
+    assert!(
+        !m.files_deleted.is_empty(),
+        "VACUUM deleted nothing, so this proves nothing"
+    );
+}
+
 impl Lake {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -664,16 +687,52 @@ async fn bronze_replaced_in_place_is_read_on_as_one_table() {
         .expect("reading across the replacement");
     lake.assert_exactly(&orders(1..=9)).await;
 
-    // The reopen finds the new id where its commits recorded the old one, and starts over
-    // from `starting_version` under the cut-off — through versions that carry the old id.
+    // Its commits since record the new id, so a restart resumes from its own offset. It used
+    // to find the new id where they recorded the old one and start over from
+    // `starting_version`, through the files the replacement removed — which, once VACUUM had
+    // deleted them, failed on every retry.
+    vacuum(&lake.raw).await;
     drop(p);
     let mut p = Pipeline::open(cfg).await.unwrap();
+    assert_eq!(p.coverage(), None, "the offset is exact; nothing to infer");
+    lake.arrive(&orders(10..=12)).await;
     p.run_until_caught_up()
         .await
-        .expect("reading the history before the replacement");
-    lake.arrive(&orders(10..=12)).await;
-    p.run_until_caught_up().await.unwrap();
+        .expect("resuming after the replacement");
     lake.assert_exactly(&orders(1..=12)).await;
+}
+
+#[tokio::test]
+async fn a_restart_after_bronze_was_replaced_in_place_reads_on_from_its_own_offset() {
+    // The replacement lands while the pipeline is stopped, part-way through bronze, so its last
+    // commit recorded the old id. Bronze's log still gives the version that commit recorded the
+    // old id, which a table dropped and recreated could not: the reopen reads on from its own
+    // offset, through the old id's last versions and across the replacement. It used to take
+    // bronze for a new table and, without a dedup_timestamp, refuse to start.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=3)).await;
+    let mut cfg = lake.cfg();
+    cfg.dedup_timestamp = None;
+    cfg.dedup_key = None;
+    cfg.max_files_per_batch = 1;
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+
+    lake.arrive(&orders(4..=6)).await;
+    replace_in_place(&lake.raw, raw_schema()).await;
+    lake.arrive(&orders(7..=9)).await;
+
+    let mut p = Pipeline::open(cfg)
+        .await
+        .expect("the same log, replaced in place");
+    p.run_until_caught_up()
+        .await
+        .expect("reading on across the replacement");
+    lake.assert_exactly(&orders(1..=9)).await;
 }
 
 #[tokio::test]

@@ -19,18 +19,25 @@ use deltalake::protocol::SaveMode;
 use deltalake::DeltaTable;
 use tracing::debug;
 
+use crate::dbt::watermark::{HANDOVER_SOURCE_HEAD_KEY, SOURCE_TABLE_ID_VERSION_KEY};
 use crate::dedup::RecordedCutoff;
 use crate::error::{Error, Result};
 use crate::lookup::LookupSnapshot;
+use crate::source::Version;
 use crate::upsert::MergePlan;
 
 pub struct Sink {
     app_id: String,
     target_file_size: Option<NonZeroU64>,
-    /// Which source table this pipeline is reading, so a later run can tell whether it is
-    /// still the same one. A dropped-and-recreated source keeps its path but gets a new
-    /// id, and nothing else in the log records that.
-    source_table_id: Option<String>,
+    /// Which source table this pipeline is reading, and a source version that had that id, so
+    /// a later run can tell whether it is still the same one. A dropped-and-recreated source
+    /// keeps its path but gets a new id, and nothing else in the log records that. A table
+    /// replaced in place gets a new id as well, but keeps its log, which still gives that
+    /// version the id it had there: the version is what tells the two apart.
+    source_identity: Option<(Version, String)>,
+    /// The source head at this pipeline's last handover from a rebuild of its target, recorded
+    /// while a watermark table is set. See [`HANDOVER_SOURCE_HEAD_KEY`].
+    handover_source_head: Option<Version>,
     /// The exact lookup snapshots that enriched the source batch currently being committed.
     lookup_snapshots: Vec<LookupCommit>,
     /// The coverage window the batch being committed was filtered in, while that window stays
@@ -54,15 +61,28 @@ impl Sink {
         Self {
             app_id: app_id.into(),
             target_file_size: NonZeroU64::new(target_file_size),
-            source_table_id: None,
+            source_identity: None,
+            handover_source_head: None,
             lookup_snapshots: Vec::new(),
             cutoff: None,
         }
     }
 
-    pub fn with_source_table_id(mut self, id: Option<String>) -> Self {
-        self.source_table_id = id;
+    pub fn with_source_identity(mut self, identity: Option<(Version, String)>) -> Self {
+        self.source_identity = identity;
         self
+    }
+
+    pub fn with_handover_source_head(mut self, head: Option<Version>) -> Self {
+        self.handover_source_head = head;
+        self
+    }
+
+    /// Replace the source identity recorded with the next target commit: the id the batch was
+    /// read under, which differs from the one at open once the stream has read across a table
+    /// replaced in place.
+    pub fn set_source_identity(&mut self, identity: Option<(Version, String)>) {
+        self.source_identity = identity;
     }
 
     /// Replace the provenance recorded with the next target commit.
@@ -101,10 +121,20 @@ impl Sink {
                 serde_json::Value::from(self.app_id.clone()),
             ),
         ];
-        if let Some(id) = &self.source_table_id {
+        if let Some((version, id)) = &self.source_identity {
             metadata.push((
                 "ddi.sourceTableId".to_string(),
                 serde_json::Value::from(id.clone()),
+            ));
+            metadata.push((
+                SOURCE_TABLE_ID_VERSION_KEY.to_string(),
+                serde_json::Value::from(*version),
+            ));
+        }
+        if let Some(head) = self.handover_source_head {
+            metadata.push((
+                HANDOVER_SOURCE_HEAD_KEY.to_string(),
+                serde_json::Value::from(head),
             ));
         }
         for lookup in &self.lookup_snapshots {

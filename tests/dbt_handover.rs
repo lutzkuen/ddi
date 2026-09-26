@@ -99,6 +99,15 @@ fn cfg_with_watermark(lake: &Lake, name: &str) -> ResolvedPipeline {
     c
 }
 
+/// Both, as every dbt model has them once a watermark table is set: `ddi_timestamp` defaults
+/// to `_timestamp`. `id` plays the timestamp here.
+fn cfg_with_watermark_and_timestamp(lake: &Lake) -> ResolvedPipeline {
+    let mut c = cfg_with_watermark(lake, "copy");
+    c.dedup_timestamp = Some("id".into());
+    c.dedup_key = Some("id".into());
+    c
+}
+
 // ------------------------------------------------------------------ the hazard
 
 #[tokio::test]
@@ -306,19 +315,14 @@ async fn a_recorded_watermark_wins_over_the_timestamp_rescan() {
     // Kafka partition's row, landing after 5, so under the target's max(_timestamp) of 5 it
     // reads as already covered, and its commit is not even re-read.
     let lake = lake().await;
+    let cfg = cfg_with_watermark_and_timestamp(&lake);
+    // Running before dbt reads, as it would be: a watermark counts only when it is newer than
+    // the source head this pipeline last handed over at, or first opened at.
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
     for i in [1, 5, 3] {
         append(&lake.f.source, &[i]).await; // versions 1, 2, 3
     }
-
-    let mut cfg = cfg_with_watermark(&lake, "copy");
-    cfg.dedup_timestamp = Some("id".into());
-    cfg.dedup_key = Some("id".into());
-    Pipeline::open(cfg.clone())
-        .await
-        .unwrap()
-        .run_until_caught_up()
-        .await
-        .unwrap();
+    p.run_until_caught_up().await.unwrap();
     assert_eq!(read_ids(&lake.f.target).await, vec![1, 3, 5]);
 
     // dbt rebuilds from source version 2, and records that. Row 3 is gone.
@@ -343,17 +347,15 @@ async fn a_recorded_watermark_wins_over_the_timestamp_rescan() {
 
 #[tokio::test]
 async fn a_rebuild_that_recorded_no_watermark_falls_back_to_the_timestamp() {
-    // The same pair of settings, and a rebuild that wrote nothing to the watermark table —
-    // a first night, or a post-hook that has not run yet. With a timestamp to fall back on,
-    // that is no reason to refuse.
+    // The same pair of settings, and a rebuild that wrote nothing to the watermark table on
+    // its first night: an empty table. With a timestamp to fall back on, that is no reason to
+    // refuse. A table holding only earlier rebuilds' rows is the test after this one.
     let lake = lake().await;
     for i in 1..=3 {
         append(&lake.f.source, &[i]).await;
     }
 
-    let mut cfg = cfg_with_watermark(&lake, "copy");
-    cfg.dedup_timestamp = Some("id".into());
-    cfg.dedup_key = Some("id".into());
+    let cfg = cfg_with_watermark_and_timestamp(&lake);
     Pipeline::open(cfg.clone())
         .await
         .unwrap()
@@ -372,6 +374,106 @@ async fn a_rebuild_that_recorded_no_watermark_falls_back_to_the_timestamp() {
         .unwrap();
     let got = read_ids(&lake.f.target).await;
     assert_eq!(got, vec![1, 2, 3, 4], "row 3 recovered by the rescan");
+}
+
+#[tokio::test]
+async fn a_watermark_an_earlier_rebuild_recorded_does_not_stand_for_this_one() {
+    // The table only grows, so its newest row can be last night's: here the post-hook has not
+    // run yet when ddi reopens. Taken for this rebuild's, it appended again every row since
+    // last night on top of a rebuild that already held them, and ddi's next commit hid the
+    // rebuild, so the row the post-hook then wrote was never read.
+    let lake = lake().await;
+    let cfg = cfg_with_watermark_and_timestamp(&lake);
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    for i in 1..=3 {
+        append(&lake.f.source, &[i]).await; // versions 1..=3
+    }
+    p.run_until_caught_up().await.unwrap();
+
+    // Night 1: dbt rebuilds from source version 2 and records it.
+    dbt_rebuild(&lake.f.target, &[1, 2]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 2).await;
+    append(&lake.f.source, &[4]).await; // version 4
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    for i in 5..=6 {
+        append(&lake.f.source, &[i]).await; // versions 5, 6
+    }
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(read_ids(&lake.f.target).await, vec![1, 2, 3, 4, 5, 6]);
+
+    // Night 2: dbt rebuilds from source version 6, and ddi reopens before the post-hook
+    // records it. The newest row is night 1's.
+    dbt_rebuild(&lake.f.target, &[1, 2, 3, 4, 5, 6]).await;
+    append(&lake.f.source, &[7]).await; // version 7
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+    let got = read_ids(&lake.f.target).await;
+    assert_eq!(
+        got,
+        vec![1, 2, 3, 4, 5, 6, 7],
+        "the rescan's cut-off, not night 1's watermark: 3 to 6 are not appended again"
+    );
+
+    // The post-hook lands late. Night 3 records its version before reading it, as a pre-hook
+    // does, and ddi streams 9 while dbt runs: that row counts, and 9 is re-streamed.
+    record_watermark(&lake.watermark, &cfg.app_id, 6).await;
+    append(&lake.f.source, &[8]).await; // version 8
+    p.run_until_caught_up().await.unwrap();
+    record_watermark(&lake.watermark, &cfg.app_id, 8).await;
+    append(&lake.f.source, &[9]).await; // version 9
+    p.run_until_caught_up().await.unwrap();
+    dbt_rebuild(&lake.f.target, &[1, 2, 3, 4, 5, 6, 7, 8]).await;
+
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    assert_eq!(p.coverage(), None, "resumed from night 3's watermark");
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
+    );
+}
+
+#[tokio::test]
+async fn a_delete_after_a_handover_is_not_undone_by_the_watermark_before_it() {
+    // Another writer's DELETE on the target reads like a rebuild, and records no watermark.
+    // The newest row is then the last rebuild's, and resuming from it appended again every
+    // row since, the deleted one included.
+    let lake = lake().await;
+    let cfg = cfg_with_watermark_and_timestamp(&lake);
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    for i in 1..=3 {
+        append(&lake.f.source, &[i]).await;
+    }
+    p.run_until_caught_up().await.unwrap();
+
+    dbt_rebuild(&lake.f.target, &[1, 2]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 2).await;
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    for i in 4..=6 {
+        append(&lake.f.source, &[i]).await;
+    }
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(read_ids(&lake.f.target).await, vec![1, 2, 3, 4, 5, 6]);
+
+    // A GDPR delete, and a restart before ddi commits again.
+    let (_t, m) = open(&lake.f.target)
+        .await
+        .delete()
+        .with_predicate("id = 4")
+        .await
+        .unwrap();
+    assert!(m.num_deleted_rows.unwrap_or(0) > 0, "nothing was deleted");
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        vec![1, 2, 3, 5, 6],
+        "4 stays deleted, and nothing is written twice"
+    );
+
+    append(&lake.f.source, &[7]).await;
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(read_ids(&lake.f.target).await, vec![1, 2, 3, 5, 6, 7]);
 }
 
 // ------------------------------------------------------- zero-cooperation dedup

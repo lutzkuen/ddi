@@ -32,6 +32,19 @@
 //! INSERT INTO lake.meta.ddi_watermark VALUES ('ddi.silver.orders', 100)
 //! ```
 //!
+//! # Which rebuild a watermark belongs to
+//!
+//! The table only grows, so its newest row can be one an earlier rebuild recorded: this
+//! rebuild's post-hook has not run yet, or the rewrite records nothing at all — an `UPDATE`,
+//! `DELETE` or `MERGE` by another writer, which reads just like a rebuild. Resuming from that
+//! row would append again everything since it, and bring back what the rewrite deleted. So
+//! each commit of ours carries the source head at our last handover
+//! ([`HANDOVER_SOURCE_HEAD_KEY`]). A rebuild visible then had read the source no later than
+//! that head, so a watermark at or below it was recorded for that rebuild or an earlier one,
+//! and only one above it for a rebuild since. With `dedup_timestamp` set only such a row
+//! counts, and a rewrite without one falls back to the rescan; with no timestamp there is
+//! nothing to fall back on, and the newest row is used whatever it is.
+//!
 //! # Ordering
 //!
 //! Prefer a **pre-hook** that records the version and a model that pins its read to it
@@ -39,9 +52,10 @@
 //! disk before the overwrite lands and there is no window at all.
 //!
 //! With a post-hook the watermark appears one commit after the overwrite. If `ddi` looks
-//! in between it sees the previous night's watermark and re-streams from there, which
-//! duplicates rows rather than dropping them. That asymmetry is deliberate: duplicates
-//! are visible and the next dbt run erases them, whereas a gap is silent and permanent.
+//! in between it sees the previous night's watermark: with `dedup_timestamp` it falls back
+//! to the rescan, and without one it re-streams from there, which duplicates rows rather
+//! than dropping them. That asymmetry is deliberate: duplicates are visible and the next dbt
+//! run erases them, whereas a gap is silent and permanent.
 
 use std::collections::BTreeMap;
 
@@ -256,6 +270,13 @@ pub struct OurLastCommit {
     /// The source table id we were reading. `None` for commits written before this was
     /// recorded, or when we have never written to this target.
     pub source_table_id: Option<String>,
+    /// A source version that had `source_table_id`. `None` for commits written before this
+    /// was recorded. See [`SOURCE_TABLE_ID_VERSION_KEY`].
+    pub source_table_id_version: Option<Version>,
+    /// The source head at our last handover from a rebuild. `None` for commits written
+    /// before this was recorded, and without a watermark table. See
+    /// [`HANDOVER_SOURCE_HEAD_KEY`].
+    pub handover_source_head: Option<Version>,
     /// Delta identities of the pinned lookups that produced the commit. A table recreated at
     /// the same URI has a new id; resuming against it would silently change an old join.
     /// Empty for pre-lookup commits and for tables we have never written.
@@ -265,6 +286,18 @@ pub struct OurLastCommit {
     /// reopen from resuming a window that has already ended. See [`crate::dedup`].
     pub cutoff: Option<RecordedCutoff>,
 }
+
+/// `commitInfo` key naming a source version that had the table id a commit of ours records
+/// (`ddi.sourceTableId`): the newest the stream had loaded. A reopen that finds another id
+/// loads that version again, and a log that still gives it the recorded id is the same log,
+/// replaced in place.
+pub const SOURCE_TABLE_ID_VERSION_KEY: &str = "ddi.sourceTableIdVersion";
+
+/// `commitInfo` key naming the source head at this pipeline's last handover from a rebuild of
+/// its target — or, before its first, at the first open that recorded one. A watermark at or
+/// below it cannot be the one a later rebuild recorded. Recorded only while `watermark_uri` is
+/// set.
+pub const HANDOVER_SOURCE_HEAD_KEY: &str = "ddi.handover.sourceHead";
 
 /// Walk the target log backwards for the most recent commit that carries our txn action,
 /// and report what it said about the source it came from.
@@ -295,14 +328,17 @@ pub async fn our_last_commit(
             .iter()
             .any(|a| matches!(a, Action::Txn(t) if t.app_id == app_id))
         {
-            let source_table_id = actions.iter().find_map(|a| match a {
-                Action::CommitInfo(ci) => ci
-                    .info
-                    .get("ddi.sourceTableId")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                _ => None,
-            });
+            let info = |key: &str| {
+                actions.iter().find_map(|a| match a {
+                    Action::CommitInfo(ci) => ci.info.get(key).cloned(),
+                    _ => None,
+                })
+            };
+            let source_table_id =
+                info("ddi.sourceTableId").and_then(|v| v.as_str().map(str::to_string));
+            let source_table_id_version =
+                info(SOURCE_TABLE_ID_VERSION_KEY).and_then(|v| v.as_u64());
+            let handover_source_head = info(HANDOVER_SOURCE_HEAD_KEY).and_then(|v| v.as_u64());
             let lookup_table_ids = actions
                 .iter()
                 .filter_map(|a| match a {
@@ -323,6 +359,8 @@ pub async fn our_last_commit(
             return Ok(OurLastCommit {
                 commit_version: Some(v),
                 source_table_id,
+                source_table_id_version,
+                handover_source_head,
                 lookup_table_ids,
                 cutoff,
             });

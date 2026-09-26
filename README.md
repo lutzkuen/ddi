@@ -507,7 +507,13 @@ INSERT INTO lake.meta.ddi_watermark VALUES ('ddi.orders_header', 100)
 ```
 
 Plain SQL on purpose — an `INSERT` any adapter can run, rather than a `txn` action only the
-Spark writer can produce.
+Spark writer can produce. Point `ddi` at the table in its config; in manifest mode this is
+the only place to set it, and it applies to every model:
+
+```toml
+[storage]
+watermark_uri = "abfss://lake@mylake.dfs.core.windows.net/meta/ddi_watermark"
+```
 
 `ddi` walks the target's log backwards on startup. If the most recent commit that touched
 data is not its own, the target was rebuilt, and dbt's watermark takes over — also when
@@ -521,6 +527,15 @@ pipeline "orders_header": target "..." was rewritten at version 41 by another wr
 "ddi.orders_header". Resuming from this pipeline's own offset would silently drop every
 row streamed while dbt was reading.
 ```
+
+The table only grows, so its newest row can be an earlier rebuild's: this one's post-hook has
+not run yet, or the rewrite was another writer's `UPDATE`, `DELETE` or `MERGE`, which records
+nothing. Resuming from that row would append again every row since, deleted ones included.
+So with a timestamp set, a row counts only when it is newer than the source head at `ddi`'s
+last handover, which each of its commits records (`ddi.handover.sourceHead`): a rebuild
+visible then had read no further, so an older row was recorded for it or one before it, and
+the rebuild falls back to the timestamp as one that recorded none. Without a timestamp there
+is nothing to fall back on, and the newest row is used whatever it is.
 
 ### When the rebuild cannot be changed at all
 
@@ -605,7 +620,7 @@ will not line up, it falls back to a full rescan — being slow is a cost, being
 not an option.
 
 `watermark_uri` remains the better choice where you can set it: exact, no rescan, and no
-ordering requirement on any column. With both set, a recorded watermark wins.
+ordering requirement on any column. With both set, a watermark the rebuild recorded wins.
 
 ### What the watermark costs to read
 
@@ -638,7 +653,8 @@ these and asserts the same invariant every time — no key missing, no key twice
 | `DELETE` behind the target's watermark | Left deleted |
 | Target dropped and recreated | Refilled from scratch |
 | Source dropped and recreated | Starts over, emitting only what is missing |
-| Source replaced while `ddi` is running | The step fails, and the reopen starts over |
+| Source dropped and recreated while `ddi` is running | The step fails, and the reopen starts over |
+| Source replaced in place (`CREATE OR REPLACE`) | Read on as one table, running and across restarts |
 
 The source being dropped and recreated is the trap, and not in the obvious direction.
 Dropping and recreating a table keeps its path and its name but gives it a new identity and
@@ -649,19 +665,28 @@ comfortably inside the log, so nothing looks wrong while the new table's early c
 skipped and never read.
 
 Neither is detectable from the version alone, so `ddi` records the source's table id in
-each of its commits and compares it on restart. When the source turns out to be a
-different table, it starts over from the beginning; `dedup_timestamp` then drops whatever
-the target already holds, so only genuinely missing rows are emitted. Without a
-`dedup_timestamp` there is nothing to filter on and starting over would append the whole
-table a second time, so it stops and says so.
+each of its commits, with a source version that had it, and compares it on restart. When the
+source turns out to be a different table, it starts over from the beginning;
+`dedup_timestamp` then drops whatever the target already holds, so only genuinely missing
+rows are emitted. Without a `dedup_timestamp` there is nothing to filter on and starting over
+would append the whole table a second time, so it stops and says so.
 
 The filter holds until the new table delivers a row newer than the target's watermark — not
 until the head it reopened against — so a re-seed that lands after `ddi` has reopened is
 still filtered, across restarts too. That is the usual order: opening fails until the new
 table exists, and the retry starts at a second. It relies on the re-seed carrying the
 original timestamps. A running pipeline notices a replacement as well — a head that went
-below a version it had read, or a snapshot with a different id — and fails the step rather
-than reading the new table from the old one's position; the reopen then does the rest.
+below a version it had read, or a snapshot with a different id where the log no longer gives
+a version it read the id it had there — and fails the step rather than reading the new table
+from the old one's position; the reopen then does the rest.
+
+A table replaced in place — `CREATE OR REPLACE`, or delta-rs creating in overwrite mode — gets
+a new id too, but keeps its log, so the offset still means what it did. Its versions before
+the replacing commit carry the old id and those after it the new one, and the log still gives
+the recorded version the recorded id, which a table recreated at the path cannot. So it is
+read on as one table, by a running pipeline and by a restart alike, from the pipeline's own
+offset. The replacing commit removes every file, so reading across it takes a
+`change_policy` of `skip_change_commits` or `ignore_changes`.
 
 ## Bad rows, and broken streams
 
@@ -1257,9 +1282,13 @@ something else.
 Prefer a **pre-hook** that records the version and a model that pins its read to it
 (`FOR VERSION AS OF`). Then the watermark is on disk before the overwrite lands and there is
 no window at all. With a post-hook the watermark appears one commit later; if `ddi` looks in
-between it re-streams from the previous watermark, which duplicates rows rather than dropping
-them. That asymmetry is deliberate — duplicates are visible and the next rebuild erases them,
-whereas a gap is silent and permanent.
+between it finds only the previous rebuild's watermark. With `dedup_timestamp` set it knows
+that one for what it is and falls back to the rescan and its cut-off. Without one it
+re-streams from the previous watermark, which duplicates rows rather than dropping them. That
+asymmetry is deliberate — duplicates are visible and the next rebuild erases them, whereas a
+gap is silent and permanent. A pre-hook whose model then fails leaves a row no rebuild wrote:
+should another writer rewrite the target before the next run succeeds, `ddi` resumes from it
+as though that rebuild had landed.
 
 `OPTIMIZE` on the target is not mistaken for a rebuild: its `Remove` actions carry
 `dataChange: false`.

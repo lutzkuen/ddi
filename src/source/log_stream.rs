@@ -307,9 +307,11 @@ impl LogStreamBuilder {
     /// the floor. So a stale floor is re-resolved once, from the log rather than from the
     /// stale snapshot, and the two are told apart by the answer. Retention reclaims a log's
     /// tail and never its head, so a head below a version this stream saw exist — or a
-    /// snapshot with a different table id — is a different table, and that is
+    /// snapshot with a different table id, where the log no longer gives a version this stream
+    /// loaded the id it had there — is a different table, and that is
     /// [`Error::SourceReplaced`]: carrying on would read the new table from a position that
-    /// only meant something in the old one. `Pipeline::open` decides what to do about it.
+    /// only meant something in the old one. `Pipeline::open` decides what to do about it. A
+    /// table replaced in place keeps its log, and is read on; see [`Self::check_identity`].
     pub async fn latest_version(&mut self) -> Result<Version> {
         let stale = match self.log_store.get_latest_version(self.version_floor).await {
             Ok(v) => {
@@ -356,6 +358,13 @@ impl LogStreamBuilder {
         );
         self.version_floor = resolved;
         Ok(self.log_store.get_latest_version(resolved).await?)
+    }
+
+    /// The newest version this stream has loaded, with the Delta id the table had there: what
+    /// a commit records as the source it read, so that a reopen can tell a table replaced in
+    /// place from one dropped and recreated. See `keeps_identity`.
+    pub fn identity(&self) -> Option<(Version, String)> {
+        self.identity.clone()
     }
 
     /// The source head as observed by the last [`Self::next_batch`] poll.
@@ -640,6 +649,33 @@ impl LogStreamBuilder {
             source_uri: self.source_uri.clone(),
             detail,
         }
+    }
+}
+
+/// Whether `table`'s log still gives `version` the id `id`: whether it is the log that id was
+/// read from, however often the table has been replaced in place since.
+///
+/// The test [`LogStreamBuilder::check_identity`] makes of a running stream, for a reopen: a
+/// table recreated at this path cannot give a version the id another table had there. `false`
+/// when the log does not have that version — a table recreated shorter, or a version retention
+/// has reclaimed — which proves nothing either way. The kernel reports a version past the head
+/// as a log segment that ends early, so the head is asked first.
+pub(crate) async fn keeps_identity(table: &DeltaTable, version: Version, id: &str) -> Result<bool> {
+    if table.version().is_none_or(|head| version > head) {
+        return Ok(false);
+    }
+    let mut then = DeltaTable::new(table.log_store(), without_files());
+    match then.load_version(version).await {
+        Ok(()) => Ok(crate::lookup::table_id(&then).as_deref() == Some(id)),
+        Err(
+            DeltaTableError::InvalidVersion(_)
+            | DeltaTableError::NotATable(_)
+            | DeltaTableError::KernelError(_),
+        ) => Ok(false),
+        Err(DeltaTableError::ObjectStore {
+            source: deltalake::logstore::object_store::Error::NotFound { .. },
+        }) => Ok(false),
+        Err(e) => Err(Error::Delta(e)),
     }
 }
 

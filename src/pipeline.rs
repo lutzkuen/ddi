@@ -246,10 +246,12 @@ impl Pipeline {
         let lookup_validation = validate_lookup_tables(&cfg, &source, &target, &ours).await?;
 
         let offsets = OffsetStore::new(&cfg.app_id, cfg.starting_version);
-        let resume = resume_cursor(&cfg, &offsets, &source, &target).await?;
+        let resume = resume_cursor(&cfg, &offsets, &source, &target, &ours).await?;
+        let handover_source_head = handover_source_head(&cfg, &source, &ours, &resume);
 
         let replaced =
-            adjust_for_replaced_source(&cfg, &source, &ours, resume.cursor, resume.bootstrapping)?;
+            adjust_for_replaced_source(&cfg, &source, &ours, resume.cursor, resume.bootstrapping)
+                .await?;
         let cursor = replaced.unwrap_or(resume.cursor);
 
         // After the adjustment, because a replaced source restarts from `starting_version` and
@@ -307,8 +309,9 @@ impl Pipeline {
             None => Box::new(Identity),
         };
 
-        let sink =
-            Sink::new(&cfg.app_id, cfg.target_file_size).with_source_table_id(table_id(&source));
+        let sink = Sink::new(&cfg.app_id, cfg.target_file_size)
+            .with_source_identity(source.version().zip(table_id(&source)))
+            .with_handover_source_head(handover_source_head);
 
         info!(
             pipeline = %cfg.name,
@@ -548,6 +551,9 @@ impl Pipeline {
         };
         let files = batch.files.len();
         let through = batch.through_version;
+        // The id this batch was read under, which is not the one at open once the stream has
+        // read across a table replaced in place: a reopen compares it with the log's.
+        self.sink.set_source_identity(self.stream.identity());
 
         // A lookup is selected from the source commit's timestamp before any input is read or
         // target write is attempted. If anything below fails, retrying this source version asks
@@ -1641,6 +1647,12 @@ async fn validate_lookup_tables(
 /// already has more, we resume past its early commits and never read them at all. The
 /// second is the dangerous one, because nothing looks wrong.
 ///
+/// A table replaced in place — `CREATE OR REPLACE`, or delta-rs creating in overwrite mode —
+/// has a new id too, but it keeps its log, so our offset still means what it meant. It is told
+/// apart by the source version our last commit recorded with the id: the same log still gives
+/// that version the id it had then, and a table recreated at this path cannot. Such a source
+/// is read on from our own offset, as the running stream reads on across it.
+///
 /// Starting over is the obvious answer, and it is safe exactly when `dedup_timestamp` is
 /// set: the target's coverage then has to be inferred from its data, so [`coverage_cutoff`]
 /// opens a window that drops whatever the target already holds and re-emits only what is
@@ -1652,7 +1664,7 @@ async fn validate_lookup_tables(
 ///
 /// Returns the cursor to start over from, or `None` when the source is still the table this
 /// pipeline was reading.
-fn adjust_for_replaced_source(
+async fn adjust_for_replaced_source(
     cfg: &ResolvedPipeline,
     source: &DeltaTable,
     ours: &watermark::OurLastCommit,
@@ -1676,7 +1688,23 @@ fn adjust_for_replaced_source(
     // targets written before we recorded it.
     let recorded = &ours.source_table_id;
     let current = table_id(source);
-    let different_table = matches!((recorded, &current), (Some(a), Some(b)) if a != b);
+    let mut different_table = matches!((recorded, &current), (Some(a), Some(b)) if a != b);
+    if let (true, Some(was), Some(seen_at)) =
+        (different_table, recorded, ours.source_table_id_version)
+    {
+        if crate::source::log_stream::keeps_identity(source, seen_at, was).await? {
+            warn!(
+                pipeline = %cfg.name,
+                previous_table_id = %was,
+                current_table_id = ?current,
+                seen_at,
+                resume_from = %cursor,
+                "the source was replaced in place since this pipeline last committed; its log \
+                 is still the one it was reading, so it resumes there and reads on, as one table"
+            );
+            different_table = false;
+        }
+    }
     // "Backwards" is a comparison against a position this pipeline reached, so a pipeline
     // that has never committed has nothing for the log to have gone backwards *from*. Its
     // cursor is the configured `starting_version`, and a `starting_version` above the head is
@@ -1728,9 +1756,11 @@ fn adjust_for_replaced_source(
 /// describe rows that no longer exist: `txn` actions survive an overwrite, so after a nightly
 /// rebuild we would resume past everything we streamed while dbt was reading, and those rows
 /// would never come back. When the target has been rewritten since our last append, dbt's
-/// watermark is the authority instead, where it recorded one — and otherwise, with
+/// watermark is the authority instead, where this rebuild recorded one — and otherwise, with
 /// `dedup_timestamp`, a rescan whose cut-off is handed back with the position, for
 /// [`coverage_cutoff`] to hold until the rescan has caught up with what the rebuild covered.
+/// A watermark no newer than the source head at our last handover was recorded for an
+/// earlier rebuild, and with `dedup_timestamp` set it is passed over for the rescan.
 ///
 /// See [`crate::dbt::watermark`] for the full argument.
 async fn resume_cursor(
@@ -1738,6 +1768,7 @@ async fn resume_cursor(
     offsets: &OffsetStore,
     source: &DeltaTable,
     target: &DeltaTable,
+    ours: &watermark::OurLastCommit,
 ) -> Result<Resume> {
     let stored = offsets.last_committed_version(target).await?;
     // Taken from the one authority on it rather than inferred from the cursor, because every
@@ -1780,6 +1811,25 @@ async fn resume_cursor(
     if let Some(uri) = cfg.watermark_uri.as_deref() {
         let store = watermark::WatermarkStore::new(uri).with_storage(cfg.storage.clone());
         match store.last(&cfg.app_id).await? {
+            // Recorded no later than our last handover, so for that rebuild or an earlier one:
+            // this rewrite has recorded nothing yet — a post-hook that has not run, or another
+            // writer's `DELETE`, which records none. Resuming from it would append again every
+            // row since it, and bring back what the rewrite deleted; the rescan below drops
+            // what the target holds instead.
+            Some(w)
+                if cfg.dedup_timestamp.is_some()
+                    && ours.handover_source_head.is_some_and(|h| w <= h) =>
+            {
+                warn!(
+                    pipeline = %cfg.name,
+                    overwritten_at_target_version = at,
+                    watermark = w,
+                    last_handover_source_head = ?ours.handover_source_head,
+                    "target was rewritten, but the newest watermark is no newer than the source \
+                     head at this pipeline's last handover, so an earlier rebuild recorded it; \
+                     falling back to the dedup_timestamp rescan"
+                )
+            }
             Some(w) => {
                 let reset = StreamCursor::at_version(w + 1);
                 warn!(
@@ -1877,6 +1927,31 @@ async fn resume_cursor(
         rebuilt: Some(dedup),
         from_watermark: false,
     })
+}
+
+/// The source head this open's commits record for the next rebuild handover, while a
+/// watermark table is set: its own head when it has just handed over from a rebuild, or when
+/// our last commit recorded none, and otherwise the one that commit recorded.
+///
+/// Its own head at a handover because a rebuild visible then had read the source no later than
+/// it — this open loads the source before the target — so any watermark at or below it was
+/// recorded for that rebuild or an earlier one, including the one a post-hook writes a moment
+/// after this open. Where nothing is recorded yet, a first open or the first since upgrading,
+/// every row the table holds was recorded before this open, and the same head says so.
+fn handover_source_head(
+    cfg: &ResolvedPipeline,
+    source: &DeltaTable,
+    ours: &watermark::OurLastCommit,
+    resume: &Resume,
+) -> Option<Version> {
+    cfg.watermark_uri.as_ref()?;
+    match (
+        resume.from_watermark || resume.rebuilt.is_some(),
+        ours.handover_source_head,
+    ) {
+        (false, Some(recorded)) => Some(recorded),
+        _ => source.version(),
+    }
 }
 
 /// Where a pipeline resumes, whether it has ever committed, and what a rebuild left behind.

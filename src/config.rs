@@ -298,11 +298,14 @@ pub struct PipelineConfig {
     ///
     /// Set this whenever dbt also writes `target_uri`. Without it, a dbt overwrite
     /// silently strands every row this pipeline streamed after dbt began its read — see
-    /// [`crate::dbt::watermark`]. Defaults to `[dbt].watermark_uri`.
+    /// [`crate::dbt::watermark`]. Defaults to `[storage].watermark_uri`, the only place to
+    /// set it for the pipelines a dbt manifest derives.
     ///
-    /// With `dedup_timestamp` also set, a row here wins after a rebuild, because it is exact
-    /// however rows arrive; the timestamp rescan is the fallback for a rebuild that recorded
-    /// none. Not read by a staged upsert's merge, whose source is the stage.
+    /// With `dedup_timestamp` also set, a row the rebuild recorded here wins, because it is
+    /// exact however rows arrive; the timestamp rescan is the fallback for a rebuild that
+    /// recorded none. A row no newer than the source head at this pipeline's last handover was
+    /// recorded for an earlier rebuild, and counts as none. Not read by a staged upsert's
+    /// merge, whose source is the stage.
     #[serde(default)]
     pub watermark_uri: Option<String>,
 
@@ -317,7 +320,7 @@ pub struct PipelineConfig {
     /// there must it be non-decreasing in the order rows arrive in the source. A table
     /// written from a multi-partition Kafka topic is append-only and still does not meet
     /// that. After a rebuild, a source version the rebuild recorded in `watermark_uri` is
-    /// exact for it, and is used instead of this whenever there is one. See
+    /// exact for it, and is used instead of this whenever it recorded one. See
     /// [`crate::dedup`].
     #[serde(default)]
     pub dedup_timestamp: Option<String>,

@@ -346,22 +346,33 @@ indistinguishable from one the rebuild already wrote, and will be dropped. Appen
 enough: a table written from a multi-partition Kafka topic (kafka-delta-ingest and similar)
 orders timestamps only within each partition, so a lagging partition's rows routinely land
 after newer ones from another. For such a source, have the rebuild record the source version
-it read in a watermark table and point `watermark_uri` at it. After a rebuild that recorded
-one, `ddi` resumes from that version and skips nothing by timestamp, which is exact whatever
-order rows arrive in; `_timestamp` is then only the fallback, for a rebuild that recorded
-nothing. The README's
+it read in a watermark table, and point `ddi` at the table:
+
+```toml
+[storage]
+watermark_uri = "abfss://lake@mylake.dfs.core.windows.net/meta/ddi_watermark"
+```
+
+It is the one place to set it for a dbt project, and it applies to every model. The README's
 [handover section](README.md#the-handover-and-why-it-needs-a-watermark) shows the one
-`INSERT` it takes. The cut-off still applies on a first start against a table that already
-has rows and after the source was replaced, and to a staged upsert, whose merge reads `ddi`'s
-own staging table rather than the source the watermark counts versions of. A watermark per
-Kafka partition would be exact there too; `ddi` does not offer one yet.
+`INSERT` the rebuild runs. Run it in a **pre-hook**, and pin the model's read to the version it
+records (`FOR VERSION AS OF`), so the row is there before the overwrite lands. After a rebuild
+that recorded one, `ddi` resumes from that version and skips nothing by timestamp, which is
+exact whatever order rows arrive in. `_timestamp` is then only the fallback, for a rebuild
+that recorded nothing. That includes one whose post-hook has not run yet, and another
+writer's `DELETE`, which records nothing at all: the table's newest row is then an earlier
+rebuild's, and `ddi` counts a row only when it is newer than the source head at its last
+handover. The cut-off still applies on a first start against a table that already has rows
+and after the source was replaced, and to a staged upsert, whose merge reads `ddi`'s own
+staging table rather than the source the watermark counts versions of. A watermark per Kafka
+partition would be exact there too; `ddi` does not offer one yet.
 
 ### What else can happen to a shared table
 
 | Event | What `ddi` does |
 |---|---|
 | Restart, redeploy, crash | Resumes from its own offset; nothing is skipped by timestamp |
-| dbt full-refresh | Resumes from the source version it recorded in `watermark_uri`, or else rescans from its high-water mark; no gaps, no duplicates |
+| dbt full-refresh | Resumes from the source version it recorded in `watermark_uri`, or, where it recorded none newer than the last rebuild's, rescans from its high-water mark; no gaps, no duplicates |
 | Rows arrive while dbt runs | Re-emitted afterwards, by timestamp |
 | Another writer appends to the target | Not taken as coverage; nothing is skipped because of it |
 | Another writer updates, deletes or merges in the target | Treated as a rebuild. Timestamps it writes newer than rows `ddi` has not delivered yet make it skip the source versions holding them (logged as `versions_not_reread`) |
@@ -371,6 +382,7 @@ Kafka partition would be exact there too; `ddi` does not offer one yet.
 | Same key delivered again with changes | Appended as a second row — or, under `ddi_write_mode: upsert`, replaces the stored one |
 | Target dropped and recreated | Refilled from scratch |
 | Source dropped and recreated | Starts over, emitting only what is missing — including rows re-seeded after `ddi` reopened, provided they carry their original timestamps |
+| Source replaced in place (`CREATE OR REPLACE`) | Read on as one table from `ddi`'s own offset, while running and after a restart: the log is the one it was reading |
 
 The rescan after a rebuild is bounded by the source's own file statistics — Delta records
 `maxValues` per file — so a rebuild costs a read of the last commit or two, not the whole
