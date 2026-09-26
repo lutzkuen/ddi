@@ -45,6 +45,10 @@ fn watermark_schema() -> SchemaRef {
 }
 
 async fn create_watermark_table(path: &str) {
+    create_watermark_table_partitioned_by(path, &[]).await;
+}
+
+async fn create_watermark_table_partitioned_by(path: &str, columns: &[&str]) {
     let delta: StructType = watermark_schema().as_ref().try_into_kernel().unwrap();
     let url = ensure_table_uri(path).unwrap();
     DeltaTable::try_from_url(url)
@@ -52,9 +56,24 @@ async fn create_watermark_table(path: &str) {
         .unwrap()
         .create()
         .with_columns(delta.fields().cloned().collect::<Vec<_>>())
+        .with_partition_columns(columns.iter().copied())
         .with_save_mode(SaveMode::ErrorIfExists)
         .await
         .unwrap();
+}
+
+/// Every data file under `dir`, in partition directories too.
+fn parquet_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() && !path.ends_with("_delta_log") {
+            files.extend(parquet_files(&path));
+        } else if path.extension().is_some_and(|e| e == "parquet") {
+            files.push(path);
+        }
+    }
+    files
 }
 
 /// What a dbt post-hook does: `INSERT INTO ddi_watermark VALUES (app_id, version)`.
@@ -523,6 +542,33 @@ async fn the_watermark_store_reads_only_the_files_that_can_hold_its_own_app_id()
 
     let store = WatermarkStore::new(&lake.watermark);
     assert_eq!(store.last("ddi.mine").await.unwrap(), Some(5));
+}
+
+#[tokio::test]
+async fn the_watermark_store_reads_only_the_partition_of_its_own_app_id() {
+    // A table partitioned by app_id reaches the scan with the column as a dictionary of its
+    // text, which the store took for an app_id it could not filter on: it read every file of
+    // every model at every handover. Here another model's partition has lost its file, as a
+    // read racing a VACUUM finds it, and this model's read never touches it.
+    let lake = lake().await;
+    let watermark = beside_the_target(&lake.f, "ddi_watermark_by_app_id");
+    create_watermark_table_partitioned_by(&watermark, &["app_id"]).await;
+    record_watermark(&watermark, "ddi.other", 999).await;
+    let others = parquet_files(std::path::Path::new(&watermark));
+    assert!(
+        others
+            .iter()
+            .all(|f| f.to_string_lossy().contains("app_id=ddi.other")),
+        "the premise: a partition per app_id, {others:?}"
+    );
+    record_watermark(&watermark, "ddi.mine", 5).await;
+    record_watermark(&watermark, "ddi.mine", 11).await;
+    for file in others {
+        std::fs::remove_file(file).unwrap();
+    }
+
+    let store = WatermarkStore::new(&watermark);
+    assert_eq!(store.last("ddi.mine").await.unwrap(), Some(11));
 }
 
 #[tokio::test]

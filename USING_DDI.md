@@ -374,8 +374,9 @@ upgrading from 0.3.1 among them; the README's handover section lists them. With 
 `ddi` reopening before it runs gets `_timestamp` too, so a multi-partition source wants the
 pre-hook. The cut-off still applies on a first start against a table that already has rows
 and after the source was replaced, and to a staged upsert, whose merge reads `ddi`'s own
-staging table rather than the source the watermark counts versions of. A watermark per Kafka
-partition would be exact there too; `ddi` does not offer one yet.
+staging table rather than the source the watermark counts versions of, and so does not read
+the watermark table. A watermark per Kafka partition would be exact there too; `ddi` does not
+offer one yet.
 
 ### What else can happen to a shared table
 

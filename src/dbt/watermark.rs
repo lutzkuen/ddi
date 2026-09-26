@@ -162,11 +162,15 @@ impl WatermarkStore {
                 self.uri
             ))
         })?;
-        // An app_id of another type is refused below, by the reading that checks it.
+        // A table partitioned by app_id, the layout a read by app_id invites, has the scan
+        // hand the column back as a dictionary of its text, and the same filter prunes whole
+        // partitions. An app_id of another type is refused below, by the reading that checks
+        // it.
+        let text =
+            |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
         let only_ours = match schema.field(app).data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                vec![col("app_id").eq(lit(app_id))]
-            }
+            DataType::Dictionary(_, t) if text(t) => vec![col("app_id").eq(lit(app_id))],
+            t if text(t) => vec![col("app_id").eq(lit(app_id))],
             _ => Vec::new(),
         };
         let state = crate::budget::session(&table)?;

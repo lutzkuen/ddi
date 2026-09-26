@@ -1726,10 +1726,15 @@ impl Config {
                 .max_output_rows_per_batch
                 .unwrap_or(d.max_output_rows_per_batch),
             target_file_size,
-            watermark_uri: p
-                .watermark_uri
-                .clone()
-                .or_else(|| self.storage.watermark_uri.clone()),
+            // Not for a staged upsert's apply half, whose source is the stage: `expand_staged`
+            // cleared it, and the default would put it back.
+            watermark_uri: match crate::stage::is_stage_uri(&p.source_uri) {
+                true => None,
+                false => p
+                    .watermark_uri
+                    .clone()
+                    .or_else(|| self.storage.watermark_uri.clone()),
+            },
             dedup_timestamp: p.dedup_timestamp.clone(),
             dedup_key: p.dedup_key.clone(),
             write_mode: p.write_mode,
@@ -2162,6 +2167,30 @@ apply_max_latency_secs = 900
         assert_eq!(ingest.write_mode, WriteMode::Append);
         assert_eq!(apply.write_mode, WriteMode::Upsert);
         assert!(!r.iter().any(|p| p.write_mode.is_staged()));
+    }
+
+    #[test]
+    fn the_half_that_merges_reads_no_watermark_table() {
+        // Its source is the stage, whose versions no rebuild records: a rebuild of the target
+        // is the rescan's to answer. `[storage].watermark_uri` is the only way to set the table
+        // for a manifest's models, and as the default it was put back on the apply half, which
+        // then read the table under its own app_id at every rebuild of the target, and
+        // recorded a handover in stage versions.
+        let toml = format!("[storage]\nwatermark_uri = \"/tmp/meta/ddi_watermark\"\n{STAGED}");
+        let r = Config::from_toml_str(&toml).unwrap().resolve().unwrap();
+        assert_eq!(
+            r[0].watermark_uri.as_deref(),
+            Some("/tmp/meta/ddi_watermark")
+        );
+        assert_eq!(r[1].name, "style__apply");
+        assert_eq!(r[1].watermark_uri, None);
+
+        let toml = STAGED.replace(
+            "write_mode = \"staged_upsert\"\n",
+            "write_mode = \"staged_upsert\"\nwatermark_uri = \"/tmp/meta/ddi_watermark\"\n",
+        );
+        let r = Config::from_toml_str(&toml).unwrap().resolve().unwrap();
+        assert_eq!(r[1].watermark_uri, None, "nor one set on the pipeline");
     }
 
     #[test]

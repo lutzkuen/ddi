@@ -570,10 +570,12 @@ one is an error. A container that does not exist is one of those failed reads, n
 is not there: Azure answers a listing of it as it answers an outage, so a mistyped container in
 `watermark_uri` stops every model at its next rebuild until the URI is fixed.
 
-Each read takes the two columns, and only the files whose statistics say they can hold the
-model's `app_id`. The table still gains a file with every rebuild of every model; compacting it
-now and then keeps that down, and rows older than an `app_id`'s newest can be deleted, as only
-the newest is ever read.
+Each read takes the two columns, and only the files whose statistics, or partition where the
+table is partitioned by `app_id`, say they can hold the model's `app_id`. The table still gains
+a file with every rebuild of every model; compacting it now and then keeps that down, and rows
+older than an `app_id`'s newest can be deleted, as only the newest is ever read. The half of a
+`staged_upsert` that merges does not read it: its source is the stage, whose versions no
+rebuild records, so a rebuild of its target gets the timestamp's cut-off (below).
 
 ### When the rebuild cannot be changed at all
 
