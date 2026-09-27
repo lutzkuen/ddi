@@ -303,11 +303,6 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
                 for lookup in &p.lookups {
                     p.storage.check(&lookup.uri)?;
                 }
-                // Read only after a rebuild, which is a long way from the deploy that got
-                // it wrong.
-                if let Some(uri) = &p.watermark_uri {
-                    p.storage.check(uri)?;
-                }
                 // write_mode is shown because it changes what the target *is*, not just how
                 // fast it fills: an upserted table holds one row per key and can only be
                 // read downstream by another upserting pipeline.

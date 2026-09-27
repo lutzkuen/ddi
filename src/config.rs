@@ -296,24 +296,14 @@ pub struct PipelineConfig {
 
     /// Delta table where dbt records the source version it last rebuilt this target from.
     ///
-    /// Set this whenever dbt also writes `target_uri`. Without it, a dbt overwrite
-    /// silently strands every row this pipeline streamed after dbt began its read — see
-    /// [`crate::dbt::watermark`]. Defaults to `[storage].watermark_uri`, the only place to
-    /// set it for the pipelines a dbt manifest derives.
+    /// Set this whenever dbt also writes `target_uri` and there is no `dedup_timestamp`.
+    /// Without either, a dbt overwrite silently strands every row this pipeline streamed after
+    /// dbt began its read — see [`crate::dbt::watermark`]. Defaults to
+    /// `[storage].watermark_uri`.
     ///
-    /// With `dedup_timestamp` also set, a row the rebuild recorded here wins, because it is
-    /// exact however rows arrive; the timestamp rescan is the fallback for a rebuild that
-    /// recorded none. A row that may be an earlier rebuild's counts as none: one no newer than
-    /// what this pipeline's last handover recorded, or, where its last commit recorded no
-    /// handover (made by ddi 0.3.1, or before this was set), any row — either way unless it is
-    /// the version its own offset is at, or a later one with only commits the stream reads
-    /// nothing from in between; a pipeline that has never committed takes the newest row. After
-    /// the source was dropped and recreated, a row no newer than the handover carried across
-    /// that counts as none, its own offset or not. A row past the source's head counts as none
-    /// too, and still does once the source's log has reached it, while it is the newest; so,
-    /// with a warning, does a table that is not there or not `(app_id VARCHAR, source_version
-    /// BIGINT)`; a read that fails stops the open, which is retried, and so does a container
-    /// that does not exist. Not read by a staged upsert's merge, whose source is the stage.
+    /// Read only by a pipeline without `dedup_timestamp`. With one set — every dbt model, and
+    /// every upsert — the handover after a rebuild is the timestamp rescan, and this table is
+    /// not read, whatever it holds.
     #[serde(default)]
     pub watermark_uri: Option<String>,
 
@@ -327,9 +317,8 @@ pub struct PipelineConfig {
     /// first start against a populated target, after the source was replaced — and only
     /// there must it be non-decreasing in the order rows arrive in the source. A table
     /// written from a multi-partition Kafka topic is append-only and still does not meet
-    /// that. After a rebuild, a source version the rebuild recorded in `watermark_uri` is
-    /// exact for it, and is used instead of this whenever it recorded one. See
-    /// [`crate::dedup`].
+    /// that, and `watermark_uri` does not help it: where this is set, the watermark table is
+    /// not read. See [`crate::dedup`].
     #[serde(default)]
     pub dedup_timestamp: Option<String>,
 
@@ -470,6 +459,10 @@ pub struct StorageConfig {
 
     /// Optional table where a cooperating batch job records the source version it
     /// consumed. See [`crate::dbt::watermark`]; `meta.ddi_timestamp` needs no such thing.
+    ///
+    /// The default for every pipeline, but read only by one without `dedup_timestamp`: never
+    /// by a dbt model, whose `ddi_timestamp` defaults to `_timestamp`. See
+    /// [`PipelineConfig::watermark_uri`].
     #[serde(default)]
     pub watermark_uri: Option<String>,
 
@@ -1731,15 +1724,10 @@ impl Config {
                 .max_output_rows_per_batch
                 .unwrap_or(d.max_output_rows_per_batch),
             target_file_size,
-            // Not for a staged upsert's apply half, whose source is the stage: `expand_staged`
-            // cleared it, and the default would put it back.
-            watermark_uri: match crate::stage::is_stage_uri(&p.source_uri) {
-                true => None,
-                false => p
-                    .watermark_uri
-                    .clone()
-                    .or_else(|| self.storage.watermark_uri.clone()),
-            },
+            watermark_uri: p
+                .watermark_uri
+                .clone()
+                .or_else(|| self.storage.watermark_uri.clone()),
             dedup_timestamp: p.dedup_timestamp.clone(),
             dedup_key: p.dedup_key.clone(),
             write_mode: p.write_mode,
@@ -2172,30 +2160,6 @@ apply_max_latency_secs = 900
         assert_eq!(ingest.write_mode, WriteMode::Append);
         assert_eq!(apply.write_mode, WriteMode::Upsert);
         assert!(!r.iter().any(|p| p.write_mode.is_staged()));
-    }
-
-    #[test]
-    fn the_half_that_merges_reads_no_watermark_table() {
-        // Its source is the stage, whose versions no rebuild records: a rebuild of the target
-        // is the rescan's to answer. `[storage].watermark_uri` is the only way to set the table
-        // for a manifest's models, and as the default it was put back on the apply half, which
-        // then read the table under its own app_id at every rebuild of the target, and
-        // recorded a handover in stage versions.
-        let toml = format!("[storage]\nwatermark_uri = \"/tmp/meta/ddi_watermark\"\n{STAGED}");
-        let r = Config::from_toml_str(&toml).unwrap().resolve().unwrap();
-        assert_eq!(
-            r[0].watermark_uri.as_deref(),
-            Some("/tmp/meta/ddi_watermark")
-        );
-        assert_eq!(r[1].name, "style__apply");
-        assert_eq!(r[1].watermark_uri, None);
-
-        let toml = STAGED.replace(
-            "write_mode = \"staged_upsert\"\n",
-            "write_mode = \"staged_upsert\"\nwatermark_uri = \"/tmp/meta/ddi_watermark\"\n",
-        );
-        let r = Config::from_toml_str(&toml).unwrap().resolve().unwrap();
-        assert_eq!(r[1].watermark_uri, None, "nor one set on the pipeline");
     }
 
     #[test]

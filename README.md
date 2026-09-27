@@ -519,19 +519,11 @@ INSERT INTO lake.meta.ddi_watermark VALUES ('ddi.orders_header', 100)
 ```
 
 Plain SQL on purpose — an `INSERT` any adapter can run, rather than a `txn` action only the
-Spark writer can produce. Point `ddi` at the table in its config; in manifest mode this is
-the only place to set it, and it applies to every model:
-
-```toml
-[storage]
-watermark_uri = "abfss://lake@mylake.dfs.core.windows.net/meta/ddi_watermark"
-```
+Spark writer can produce.
 
 `ddi` walks the target's log backwards on startup. If the most recent commit that touched
-data is not its own, the target was rebuilt, and dbt's watermark takes over — also when
-`dedup_timestamp` (below) is set, as it always is for a dbt model, because the watermark is
-exact however rows arrive. A target rebuilt with *no* watermark recorded falls back to that
-timestamp where one is set, and is otherwise a hard error, not a guess:
+data is not its own, the target was rebuilt, and dbt's watermark takes over. A target
+rebuilt with *no* watermark recorded is a hard error, not a guess:
 
 ```
 pipeline "orders_header": target "..." was rewritten at version 41 by another writer
@@ -540,52 +532,11 @@ pipeline "orders_header": target "..." was rewritten at version 41 by another wr
 row streamed while dbt was reading.
 ```
 
-The table only grows, so its newest row can be an earlier rebuild's: this one's post-hook has
-not run yet, or the rewrite was another writer's `UPDATE`, `DELETE` or `MERGE`, which records
-nothing. Resuming from that row would append again every row since, deleted ones included.
-So each of `ddi`'s commits records how far the rebuild it last handed over from can have read
-(`ddi.handover.sourceHead`): the source head as read after the target, and never less than the
-watermark it resumed from. With a timestamp set, a row counts when it is newer than that, which
-only a later rebuild can have recorded, or when it is the version `ddi`'s own offset is at — or
-a later one with only commits the stream reads nothing from in between, such as an `OPTIMIZE`,
-or a `DELETE` that `skip_change_commits` skips — where resuming from it is resuming from that
-offset. Otherwise the rebuild falls back to the timestamp as one that recorded none, and so does
-one whose row names a version past the source's head, which no rebuild of it can have read:
-another table's version, or a mistake in the hook. `ddi` records that row
-(`ddi.handover.rowPastHead`) and passes it over for as long as it is the newest, also once the
-source's log has reached it; delete it once the hook is fixed. Without a timestamp there is
-nothing to fall back on, and the newest row is used whatever it is.
-
-That takes a few rebuilds' own rows for earlier ones', and those rebuilds get the timestamp's
-cut-off (below): one that read no further than the source head `ddi`'s last handover recorded
-while `ddi` streamed on past it — one of a source with nothing new since, or one already
-running at that handover, or when a pipeline first opened with a watermark table — and the
-first after upgrading from 0.3.1, or after setting `watermark_uri`, whose commits recorded no
-handover, each unless it read exactly as far as `ddi`'s own offset. After the source is dropped
-and recreated, the rows its old log's rebuilds recorded stay earlier ones'
-(`ddi.handover.oldLogHead`, never less than the newest row the table held when `ddi` found the
-source replaced), even where one is the version `ddi`'s offset in the new log is at, and so the
-new log's rebuilds get the cut-off until that log reaches past them. Where it was recreated
-before upgrading from 0.3.1, the old log's newest row is passed over as a row past the head, if
-the new log had not reached it at the first open since.
-
-In manifest mode `[storage].watermark_uri` is read for every model, after each rebuild of its
-target. A table that cannot be used at all — no Delta table at that path, or not `(app_id
-VARCHAR, source_version BIGINT)`, as when the warehouse declared `source_version` an `INTEGER` —
-counts as one without a row: the model falls back to its timestamp, and `ddi` warns, naming the
-table and what is wrong with it. A read that fails, a timeout or throttling, stops the open
-instead, which is retried: the timestamp's cut-off can drop a late row the watermark would have
-kept (below), so a read that did not happen is no reason to use it. Without a timestamp either
-one is an error. A container that does not exist is one of those failed reads, not a table that
-is not there: Azure answers a listing of it as it answers an outage, so a mistyped container in
-`watermark_uri` stops every model at its next rebuild until the URI is fixed.
-
-Each read takes the two columns, and only the files whose statistics, or partition where the
-table is partitioned by `app_id`, say they can hold the model's `app_id`. The table still gains
-a file with every rebuild of every model; compacting it now and then keeps that down, and rows
-older than an `app_id`'s newest can be deleted, as only the newest is ever read. The half of a
-`staged_upsert` that merges does not read it: its source is the stage, whose versions no
-rebuild records, so a rebuild of its target gets the timestamp's cut-off (below).
+That is the handover of a pipeline without `dedup_timestamp` (below). With one set — every
+dbt model, since `ddi_timestamp` defaults to `_timestamp`, and every upsert — the handover
+after a rebuild is the timestamp rescan, and `watermark_uri` is not read at all, whatever the
+table holds: a row in it cannot say which rebuild recorded it, where the target's own data
+says what the rebuild left behind.
 
 ### When the rebuild cannot be changed at all
 
@@ -653,14 +604,13 @@ topic (kafka-delta-ingest and its like) orders timestamps only within a partitio
 ingester commit carries a slice of every partition's backlog, so a later commit routinely
 holds a lagging partition's rows that are older than rows already delivered. Inside a window
 those are dropped with the covered ones — counted, but dropped — and the rescan bound below
-can start past them. For such sources have the rebuild record its source version in
-`watermark_uri`: a rebuild that recorded one opens no window at all, even with
-`dedup_timestamp` set, unless its row is taken for an earlier rebuild's (above). A first start
-against a populated target, a replaced source and a staged upsert's merge, which reads the
-stage rather than the source, still use the cut-off. A
-watermark per value of a partition column — the newest timestamp or offset per Kafka
-partition — would be exact there too; it is a possible future option, not something `ddi`
-does today.
+can start past them. So after a rebuild, on a first start against a populated target and
+after a replaced source, such a source can lose a lagging partition's late rows at or below the
+target's newest timestamp. That is a known limitation, and `watermark_uri` does not lift it:
+with `dedup_timestamp` set it is not read (above). A watermark per value of a partition column
+— the newest timestamp or offset per Kafka partition — would be exact there, and so would
+resuming from the source version a rebuild recorded, given a way to tell which rebuild
+recorded it; both are possible future options, not something `ddi` does today.
 
 The rescan is bounded by the source's own file statistics. Delta records `maxValues` per
 file, so the log itself says how far back the rebuild's contents reach: walking backwards
@@ -670,8 +620,10 @@ the last commit or two, not the history. Where statistics are missing or of a ty
 will not line up, it falls back to a full rescan — being slow is a cost, being wrong is
 not an option.
 
-`watermark_uri` remains the better choice where you can set it: exact, no rescan, and no
-ordering requirement on any column. With both set, a watermark the rebuild recorded wins.
+`watermark_uri` is exact, needs no rescan and puts no ordering requirement on any column, but
+only a pipeline without `dedup_timestamp` reads it: one written out in TOML that appends, since
+a dbt model and an upsert always have a timestamp. With both set, the rescan answers the
+rebuild and the watermark table is not read.
 
 ### What the watermark costs to read
 
@@ -1368,22 +1320,10 @@ something else.
 
 Prefer a **pre-hook** that records the version and a model that pins its read to it
 (`FOR VERSION AS OF`). Then the watermark is on disk before the overwrite lands and there is
-no window at all, but for the rebuilds the handover section lists, whose rows are taken for
-earlier ones'. With a post-hook the watermark appears one commit later; if `ddi` looks in
-between it finds only the previous rebuild's watermark. With `dedup_timestamp` set it knows
-that one for what it is, provided it handed over from that rebuild, and falls back to the
-rescan, whose cut-off can drop a lagging partition's late rows — so a source written from a
-multi-partition topic wants the pre-hook. Where that watermark is the version `ddi`'s own
-offset is at, as it is when the source was quiet between the two rebuilds, `ddi` resumes from
-it instead, and appends again whatever the new rebuild read past it while `ddi` was stopped or
-behind. Where `ddi` missed the previous rebuild, down all the while, the two cannot be told
-apart, and it re-streams from the previous watermark once, as it does without a timestamp: what
-it records is how far the source had reached, so the new rebuild's own row, when the post-hook
-writes it, is known at the next rewrite for an earlier one's. That duplicates rows rather than
-dropping them, and the asymmetry is deliberate — duplicates are visible and the next rebuild
-erases them, whereas a gap is silent and permanent. A pre-hook whose model then fails leaves a
-row no rebuild wrote: should another writer rewrite the target before the next run succeeds,
-`ddi` resumes from it as though that rebuild had landed.
+no window at all. With a post-hook the watermark appears one commit later; if `ddi` looks in
+between it re-streams from the previous watermark, which duplicates rows rather than dropping
+them. That asymmetry is deliberate — duplicates are visible and the next rebuild erases them,
+whereas a gap is silent and permanent.
 
 `OPTIMIZE` on the target is not mistaken for a rebuild: its `Remove` actions carry
 `dataChange: false`.

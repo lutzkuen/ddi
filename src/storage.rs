@@ -95,41 +95,15 @@ impl Storage {
     pub async fn open(&self, uri: &str) -> Result<DeltaTable> {
         let url = ensure_table_uri(uri)
             .map_err(|e| Error::Config(format!("{uri:?} is not a usable table URI: {e}")))?;
-        match open_table_with_storage_options(url.clone(), self.options.clone()).await {
-            Ok(t) => Ok(t),
-            Err(first) => self.open_failed(uri, &url, first).await,
-        }
-    }
-
-    /// [`Self::open`], or `None` when there is no Delta table at `uri`: nothing there, or no
-    /// commit in its `_delta_log`.
-    ///
-    /// Every other failure is `open`'s. A store that timed out, throttled or refused the
-    /// credential has said nothing about whether the table is there, so it is never taken
-    /// for a table that is not. Nor is a container that does not exist: Azure answers a listing
-    /// of it with an error `object_store` reports as it reports any other failed request.
-    pub async fn open_if_exists(&self, uri: &str) -> Result<Option<DeltaTable>> {
-        let url = ensure_table_uri(uri)
-            .map_err(|e| Error::Config(format!("{uri:?} is not a usable table URI: {e}")))?;
-        match open_table_with_storage_options(url.clone(), self.options.clone()).await {
-            Ok(t) => Ok(Some(t)),
-            Err(deltalake::DeltaTableError::NotATable(_)) => Ok(None),
-            Err(first) => self.open_failed(uri, &url, first).await.map(Some),
-        }
-    }
-
-    /// What [`Self::open`] makes of a first attempt delta-rs refused: a foreign checkpoint
-    /// is bypassed by replaying the log, and anything else is reported with the scheme.
-    async fn open_failed(
-        &self,
-        uri: &str,
-        url: &url::Url,
-        first: deltalake::DeltaTableError,
-    ) -> Result<DeltaTable> {
         let scheme = url.scheme().to_string();
+        let first = match open_table_with_storage_options(url.clone(), self.options.clone()).await {
+            Ok(t) => return Ok(t),
+            Err(e) => e,
+        };
+
         if is_unreadable_checkpoint(&first) {
             self.say_once(uri).await;
-            match self.open_replaying_the_log(url).await {
+            match self.open_replaying_the_log(&url).await {
                 Ok(t) => return Ok(t),
                 Err(second) => {
                     // Almost always one thing: log retention has already removed the

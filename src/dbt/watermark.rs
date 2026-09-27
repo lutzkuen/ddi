@@ -32,60 +32,34 @@
 //! INSERT INTO lake.meta.ddi_watermark VALUES ('ddi.silver.orders', 100)
 //! ```
 //!
-//! # Which rebuild a watermark belongs to
+//! # Which pipelines read it
 //!
-//! The table only grows, so its newest row can be one an earlier rebuild recorded: this
-//! rebuild's post-hook has not run yet, or the rewrite records nothing at all — an `UPDATE`,
-//! `DELETE` or `MERGE` by another writer, which reads just like a rebuild. Resuming from that
-//! row would append again everything since it, and bring back what the rewrite deleted. So
-//! each commit of ours carries the newest source version the rebuild at our last handover can
-//! have read ([`HANDOVER_SOURCE_HEAD_KEY`]): the source head as read after the target, and never
-//! less than the watermark we resumed from. A row newer than that was recorded since, for a
-//! later rebuild, and counts. So does a row naming the version our own offset is at, or a later
-//! one with only commits the stream reads nothing from in between, as resuming from it is
-//! resuming from that offset, whichever rebuild recorded it. With `dedup_timestamp` set only
-//! those count, and a rewrite without one falls back to the rescan, as does one whose row names
-//! a version past the source's head, which no rebuild of it can have read, and every rewrite
-//! after it while that row is the newest ([`HANDOVER_ROW_PAST_HEAD_KEY`]); with no timestamp
-//! there is nothing to fall back on, and the newest row is used whatever it is. After the
-//! source is dropped and recreated, a row no newer than the handover carried across that
-//! ([`HANDOVER_OLD_LOG_HEAD_KEY`]) may name a version of the old log, and never counts as our
-//! offset in the new one.
-//!
-//! That takes a few rebuilds' own rows for earlier ones', and their rows go through the rescan's
-//! cut-off: one that read no further than the head our last handover recorded while we streamed
-//! on past it — one of a source with nothing new since, or one already running at that
-//! handover, or when a pipeline first opened with a watermark table — and the first after
-//! upgrading from ddi 0.3.1, or after setting `watermark_uri`, whose commits recorded no
-//! handover, each unless it read exactly as far as our own offset. It takes an earlier
-//! rebuild's row for this one's, too, where this one's post-hook has not run and the row is our
-//! own offset, or one we missed: see below.
+//! Only those without `dedup_timestamp`. With one set — every dbt model, whose `ddi_timestamp`
+//! defaults to `_timestamp`, and every upsert — the handover after a rebuild is the timestamp
+//! rescan and its coverage window ([`crate::dedup`]), and this table is not read, whatever it
+//! holds. The target's data says what the rebuild left behind, where a row here cannot say
+//! which rebuild recorded it: the table only grows, and a rewrite that records nothing, or a
+//! post-hook still to run, leaves an earlier rebuild's row the newest. The rescan's price is
+//! its ordering requirement: a source written from a multi-partition Kafka topic can lose a
+//! lagging partition's late rows to its cut-off, as [`crate::dedup`] says.
 //!
 //! # Ordering
 //!
 //! Prefer a **pre-hook** that records the version and a model that pins its read to it
 //! (`FOR VERSION AS OF` in Trino, `VERSION AS OF` in Spark). Then the watermark is on
-//! disk before the overwrite lands, and there is no window at all, but for the rebuilds above
-//! whose rows are taken for earlier ones'.
+//! disk before the overwrite lands and there is no window at all.
 //!
 //! With a post-hook the watermark appears one commit after the overwrite. If `ddi` looks
-//! in between it sees the previous rebuild's watermark. With `dedup_timestamp` it takes that
-//! for what it is where we handed over from that rebuild, and falls back to the rescan, whose
-//! cut-off can drop a lagging partition's late rows — unless the row is the version our own
-//! offset is at, as it is where the source was quiet between the two rebuilds: then it
-//! resumes from it, and appends again whatever this rebuild read past it while we were stopped.
-//! Where we missed the previous rebuild, it cannot tell the two apart, and re-streams from its
-//! row, once: what it records is how far the source had reached, so this rebuild's own row,
-//! when its post-hook writes it, is known at the next rewrite for an earlier one's. Without one
-//! it re-streams from there, which duplicates rows rather than dropping them. That asymmetry is
-//! deliberate: duplicates are visible and the next dbt run erases them, whereas a gap is silent
-//! and permanent.
+//! in between it sees the previous night's watermark and re-streams from there, which
+//! duplicates rows rather than dropping them. That asymmetry is deliberate: duplicates
+//! are visible and the next dbt run erases them, whereas a gap is silent and permanent.
 
 use std::collections::BTreeMap;
 
 use deltalake::kernel::Action;
 use deltalake::logstore::get_actions;
 use deltalake::DeltaTable;
+use futures::TryStreamExt;
 use tracing::warn;
 
 use crate::dedup::RecordedCutoff;
@@ -122,80 +96,31 @@ impl WatermarkStore {
     /// taking the max is immune to row ordering and to a post-hook that appends without
     /// deleting. A pipeline that genuinely needs to rewind should be reset explicitly
     /// rather than by writing a lower watermark.
-    ///
-    /// [`Error::WatermarkUnusable`] when the table cannot be used however often it is asked:
-    /// a URI no backend here reaches, no table there, a column missing or of another type, or
-    /// a row no rebuild can have written. Any other error is a read that failed this time.
     pub async fn last(&self, app_id: &str) -> Result<Option<Version>> {
         use deltalake::arrow::array::{Array, AsArray, RecordBatch};
-        use deltalake::arrow::datatypes::{DataType, Int64Type};
+        use deltalake::arrow::datatypes::Int64Type;
 
-        // Touches no storage, so everything it refuses is configuration.
-        self.storage.check(&self.uri).map_err(|e| match e {
-            Error::Config(why) => Error::WatermarkUnusable(why),
-            e => e,
+        let table = self.storage.open(&self.uri).await.map_err(|e| {
+            Error::Config(format!(
+                "{e}. The watermark table must exist before a pipeline that shares its \
+                 target with dbt can start."
+            ))
         })?;
-        let Some(table) = self.storage.open_if_exists(&self.uri).await? else {
-            return Err(Error::WatermarkUnusable(format!(
-                "watermark table {:?} does not exist: there is no Delta table there. The \
-                 watermark table must exist before a pipeline that shares its target with dbt \
-                 can start; create it as (app_id VARCHAR, source_version BIGINT)",
-                self.uri
-            )));
-        };
-        use deltalake::datafusion::catalog::TableProvider;
-        use deltalake::datafusion::prelude::{col, lit};
         use deltalake::delta_datafusion::DataFusionMixins;
         let declared = table
             .snapshot()
             .map_err(Error::Delta)?
             .snapshot()
             .read_schema();
-        let unreadable = |e: &dyn std::fmt::Display| {
-            Error::Other(format!("cannot read watermark table {:?}: {e}", self.uri))
-        };
 
-        // Two columns, and only the files whose statistics say they can hold this app_id's
-        // rows. The table gains a file with every rebuild of every model, and every model reads
-        // it after each rebuild of its own: read whole, that is models × nights files per read,
-        // for as long as the table has been growing. Resolved against the scan's own schema,
-        // which orders a partition column last, as `grain::key_stream` explains.
-        let provider = table.table_provider().await.map_err(|e| unreadable(&e))?;
-        let schema = TableProvider::schema(provider.as_ref());
-        let app = schema.index_of("app_id").map_err(|_| {
-            Error::WatermarkUnusable(format!(
-                "watermark table {:?} has no app_id column; expected \
-                 (app_id VARCHAR, source_version BIGINT)",
-                self.uri
-            ))
-        })?;
-        let ver = schema.index_of("source_version").map_err(|_| {
-            Error::WatermarkUnusable(format!(
-                "watermark table {:?} has no source_version column; expected \
-                 (app_id VARCHAR, source_version BIGINT)",
-                self.uri
-            ))
-        })?;
-        // A table partitioned by app_id, the layout a read by app_id invites, has the scan
-        // hand the column back as a dictionary of its text, and the same filter prunes whole
-        // partitions. An app_id of another type is refused below, by the reading that checks
-        // it.
-        let text =
-            |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
-        let only_ours = match schema.field(app).data_type() {
-            DataType::Dictionary(_, t) if text(t) => vec![col("app_id").eq(lit(app_id))],
-            t if text(t) => vec![col("app_id").eq(lit(app_id))],
-            _ => Vec::new(),
-        };
-        let state = crate::budget::session(&table)?;
-        let scan = provider
-            .scan(&state, Some(&vec![app, ver]), &only_ours, None)
+        let (_t, stream) = table
+            .scan_table()
+            .with_session_state(std::sync::Arc::new(crate::budget::session(&table)?))
             .await
-            .map_err(|e| unreadable(&e))?;
-        let batches: Vec<RecordBatch> =
-            deltalake::datafusion::physical_plan::collect(scan, state.task_ctx())
-                .await
-                .map_err(|e| unreadable(&e))?;
+            .map_err(Error::Delta)?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(|e| {
+            Error::Other(format!("cannot read watermark table {:?}: {e}", self.uri))
+        })?;
         // As the table declares its columns. This table is written by dbt, against whatever
         // warehouse the project targets, so it is the likeliest of all of them to be typed
         // by an engine with its own ideas about precision.
@@ -206,20 +131,33 @@ impl WatermarkStore {
 
         let mut best: Option<Version> = None;
         for b in &batches {
-            // The two columns, in the order they were projected.
-            let (app, ver) = (0, 1);
+            let app = b.schema().index_of("app_id").map_err(|_| {
+                Error::Config(format!(
+                    "watermark table {:?} has no app_id column; expected \
+                     (app_id VARCHAR, source_version BIGINT)",
+                    self.uri
+                ))
+            })?;
+            let ver = b.schema().index_of("source_version").map_err(|_| {
+                Error::Config(format!(
+                    "watermark table {:?} has no source_version column; expected \
+                     (app_id VARCHAR, source_version BIGINT)",
+                    self.uri
+                ))
+            })?;
 
             // Normalise the id column: a scan may hand back Utf8, LargeUtf8 or Utf8View.
-            let ids =
-                deltalake::arrow::compute::cast(b.column(app), &DataType::Utf8).map_err(|e| {
-                    Error::WatermarkUnusable(format!("watermark app_id is not text: {e}"))
-                })?;
+            let ids = deltalake::arrow::compute::cast(
+                b.column(app),
+                &deltalake::arrow::datatypes::DataType::Utf8,
+            )
+            .map_err(|e| Error::Config(format!("watermark app_id is not text: {e}")))?;
             let ids = ids.as_string::<i32>();
             let versions = b
                 .column(ver)
                 .as_primitive_opt::<Int64Type>()
                 .ok_or_else(|| {
-                    Error::WatermarkUnusable(format!(
+                    Error::Config(format!(
                         "watermark table {:?}: source_version must be a BIGINT",
                         self.uri
                     ))
@@ -231,7 +169,7 @@ impl WatermarkStore {
                 }
                 let v = versions.value(i);
                 if v < 0 {
-                    return Err(Error::WatermarkUnusable(format!(
+                    return Err(Error::Other(format!(
                         "watermark table {:?} holds a negative source_version ({v}) for \
                          app_id {app_id:?}; refusing to guess a resume point",
                         self.uri
@@ -332,17 +270,6 @@ pub struct OurLastCommit {
     /// A source version that had `source_table_id`. `None` for commits written before this
     /// was recorded. See [`SOURCE_TABLE_ID_VERSION_KEY`].
     pub source_table_id_version: Option<Version>,
-    /// The newest source version the rebuild at our last handover can have read. `None` for
-    /// commits written before this was recorded, and without a watermark table. See
-    /// [`HANDOVER_SOURCE_HEAD_KEY`].
-    pub handover_source_head: Option<Version>,
-    /// The handover head carried across the last time the source was dropped and recreated.
-    /// `None` where it never was, since a watermark table was set. See
-    /// [`HANDOVER_OLD_LOG_HEAD_KEY`].
-    pub handover_old_log_head: Option<Version>,
-    /// A newest watermark found past the source's head, while it stays the newest. See
-    /// [`HANDOVER_ROW_PAST_HEAD_KEY`].
-    pub handover_row_past_head: Option<Version>,
     /// Delta identities of the pinned lookups that produced the commit. A table recreated at
     /// the same URI has a new id; resuming against it would silently change an old join.
     /// Empty for pre-lookup commits and for tables we have never written.
@@ -358,29 +285,6 @@ pub struct OurLastCommit {
 /// loads that version again, and a log that still gives it the recorded id is the same log,
 /// replaced in place.
 pub const SOURCE_TABLE_ID_VERSION_KEY: &str = "ddi.sourceTableIdVersion";
-
-/// `commitInfo` key naming the newest source version the rebuild this pipeline last handed over
-/// from can have read — the source head read after the target, and never less than the
-/// watermark it resumed from — or, before its first handover, the head read after the target at
-/// the first open that recorded one. A watermark above it was recorded since, so for a later
-/// rebuild. Recorded only while `watermark_uri` is set.
-pub const HANDOVER_SOURCE_HEAD_KEY: &str = "ddi.handover.sourceHead";
-
-/// `commitInfo` key naming the handover head ([`HANDOVER_SOURCE_HEAD_KEY`]) this pipeline carried
-/// across the last time its source was dropped and recreated, and never less than the newest
-/// watermark the table held then: a watermark at or below it may name a version of the old log,
-/// so it is never taken for the version this pipeline's offset in the new one is at. Recorded
-/// from then on, while `watermark_uri` is set.
-pub const HANDOVER_OLD_LOG_HEAD_KEY: &str = "ddi.handover.oldLogHead";
-
-/// `commitInfo` key naming a newest watermark this pipeline found past its source's head, which
-/// no rebuild of it can have read: another table's version, a hook's mistake, or a version of
-/// the log the source had before it was dropped and recreated. While it stays the newest it
-/// counts as none, even once the source's log has reached it — taken then for the version our
-/// offset is at, or for a later rebuild's, it resumed past versions a rebuild that read less had
-/// wiped. Recorded until an open finds another newest row: one newer, or, the row deleted, one
-/// below it, which then counts as it would have.
-pub const HANDOVER_ROW_PAST_HEAD_KEY: &str = "ddi.handover.rowPastHead";
 
 /// Walk the target log backwards for the most recent commit that carries our txn action,
 /// and report what it said about the source it came from.
@@ -421,9 +325,6 @@ pub async fn our_last_commit(
                 info("ddi.sourceTableId").and_then(|v| v.as_str().map(str::to_string));
             let source_table_id_version =
                 info(SOURCE_TABLE_ID_VERSION_KEY).and_then(|v| v.as_u64());
-            let handover_source_head = info(HANDOVER_SOURCE_HEAD_KEY).and_then(|v| v.as_u64());
-            let handover_old_log_head = info(HANDOVER_OLD_LOG_HEAD_KEY).and_then(|v| v.as_u64());
-            let handover_row_past_head = info(HANDOVER_ROW_PAST_HEAD_KEY).and_then(|v| v.as_u64());
             let lookup_table_ids = actions
                 .iter()
                 .filter_map(|a| match a {
@@ -445,9 +346,6 @@ pub async fn our_last_commit(
                 commit_version: Some(v),
                 source_table_id,
                 source_table_id_version,
-                handover_source_head,
-                handover_old_log_head,
-                handover_row_past_head,
                 lookup_table_ids,
                 cutoff,
             });
