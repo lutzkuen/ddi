@@ -21,9 +21,9 @@
 //! zone, in each form of `from_unixtime` this engine rewrites, and
 //! `from_unixtime_reads_the_wall_clock_trino_gives` what the local clock reads. Which DOUBLE
 //! or REAL a DECIMAL converts to follows Trino's types as much as its arithmetic, and both
-//! were read from its source too; the `a_decimal_*` tests ask Trino for the value, and
-//! `a_json_number_reads_as_the_double_trino_gives` what a 17-digit JSON number reads as. A
-//! float is compared bit for bit.
+//! were read from its source too; `a_decimal_converts_to_the_double_or_real_trino_gives` asks
+//! Trino for the value, and `a_json_number_reads_as_the_double_trino_gives` what a 17-digit
+//! JSON number reads as. A float is compared bit for bit.
 //!
 //! Ignored by default because it needs a Trino listening. CI starts one and runs this with
 //! `--ignored`. To run it locally:
@@ -240,60 +240,30 @@ async fn differences<E: AsRef<str>>(
     let mut differ = Vec::new();
     for expr in exprs {
         let expr = expr.as_ref();
-        let theirs = format!("SELECT {expr} AS v FROM {}", source.from);
-        let ours = format!("SELECT {expr} AS v FROM source");
-        differ.extend(difference(trino, source, expr, &theirs, ours, per_batch).await);
-    }
-    differ
-}
-
-/// As [`differences`], for whole statements over `source`, each giving one column: Trino reads
-/// `source` from a CTE of the same rows, put first among any the statement has.
-async fn statement_differences(
-    trino: &TrinoClient,
-    source: &Source,
-    statements: &[&str],
-    per_batch: bool,
-) -> Vec<String> {
-    let rows = format!("source AS (SELECT * FROM {})", source.from);
-    let mut differ = Vec::new();
-    for statement in statements {
-        let theirs = match statement.strip_prefix("WITH ") {
-            Some(ctes) => format!("WITH {rows}, {ctes}"),
-            None => format!("WITH {rows} {statement}"),
+        let theirs = trino
+            .query(&format!("SELECT {expr} AS v FROM {}", source.from))
+            .await
+            .unwrap_or_else(|e| panic!("Trino refused {expr}: {e}"))
+            .scalar();
+        let sql = format!("SELECT {expr} AS v FROM source");
+        let transform = if per_batch {
+            SqlTransform::new_per_batch(sql)
+        } else {
+            SqlTransform::new(sql)
         };
-        let ours = statement.to_string();
-        differ.extend(difference(trino, source, statement, &theirs, ours, per_batch).await);
+        let out = match transform.apply(vec![source.batch.clone()]).await {
+            Ok(out) => out,
+            Err(e) => {
+                differ.push(format!("{expr}\n  Trino: {theirs:?}\n  ddi:   failed, {e}"));
+                continue;
+            }
+        };
+        let (theirs, ours) = spelt_alike(theirs, out[0].column(0));
+        if theirs != ours {
+            differ.push(format!("{expr}\n  Trino: {theirs:?}\n  ddi:   {ours:?}"));
+        }
     }
     differ
-}
-
-/// The first value of `theirs` in Trino and of `ours` here, over `source`, as a line naming
-/// `what` where the two differ.
-async fn difference(
-    trino: &TrinoClient,
-    source: &Source,
-    what: &str,
-    theirs: &str,
-    ours: String,
-    per_batch: bool,
-) -> Option<String> {
-    let theirs = trino
-        .query(theirs)
-        .await
-        .unwrap_or_else(|e| panic!("Trino refused {what}: {e}"))
-        .scalar();
-    let transform = if per_batch {
-        SqlTransform::new_per_batch(ours)
-    } else {
-        SqlTransform::new(ours)
-    };
-    let out = match transform.apply(vec![source.batch.clone()]).await {
-        Ok(out) => out,
-        Err(e) => return Some(format!("{what}\n  Trino: {theirs:?}\n  ddi:   failed, {e}")),
-    };
-    let (theirs, ours) = spelt_alike(theirs, out[0].column(0));
-    (theirs != ours).then(|| format!("{what}\n  Trino: {theirs:?}\n  ddi:   {ours:?}"))
 }
 
 /// Trino's text for a value and this engine's first value in `col`, spelt so that equal
@@ -414,7 +384,8 @@ const DECIMAL_COLUMNS: &[(&str, u8, i8, &str)] = &[
     // the nearest; and as a long one, which it rounds correctly.
     ("short17", 17, 17, "0.49979999999999997"),
     ("long17", 38, 17, "0.49979999999999997"),
-    // Past 2^24 unscaled, so divided as floats it is the REAL 1413830.125, not the nearest.
+    // Past 2^24 unscaled. As a long decimal its REAL is the nearest, 1413830.0; Trino divides
+    // the short one as floats, 1413830.125, and ddi narrows its double, as the README says.
     ("r", 9, 2, "1413830.04"),
     // Past 2^53 unscaled, so divided it is a double off the nearest.
     ("d", 18, 8, "1175317522.91864620"),
@@ -457,19 +428,17 @@ fn decimals(columns: &[(&str, u8, i8, &str)], rows: usize) -> Source {
 }
 
 /// A DECIMAL converted to DOUBLE or REAL, each way a model reaches the conversion: a
-/// `CAST`, a `TRY_CAST`, the cast coercion inserts, a list cast, a lambda, and a decimal
-/// computed from an integer literal, whose type decides whether it is divided or rounded.
-/// A decimal compared with a DOUBLE, or beside one in a `CASE` or `coalesce`, and a literal
-/// with a decimal point are missing: DataFusion types each otherwise than Trino, as the
-/// README says.
+/// `CAST`, a `TRY_CAST`, the cast coercion inserts, a list cast and a lambda. A decimal
+/// compared with a DOUBLE, or beside one in a `CASE` or `coalesce`, a literal with a decimal
+/// point, and a decimal computed beside an integer literal are missing: DataFusion types each
+/// otherwise than Trino. So is a short decimal to REAL where Trino's division of floats
+/// rounds twice, which `ddi` narrows from its double instead. The README lists each.
 const DECIMAL_TO_FLOAT: &[&str] = &[
     "CAST(short17 AS DOUBLE)",
     "CAST(long17 AS DOUBLE)",
     "TRY_CAST(short17 AS DOUBLE)",
     "TRY_CAST(long17 AS DOUBLE)",
-    "CAST(short17 AS REAL)",
     "CAST(long17 AS REAL)",
-    "CAST(r AS REAL)",
     "CAST(r AS DOUBLE)",
     "CAST(CAST(r AS DECIMAL(38, 2)) AS REAL)",
     "CAST(d AS DOUBLE)",
@@ -485,44 +454,10 @@ const DECIMAL_TO_FLOAT: &[&str] = &[
     "long17 * 1e0",
     "d * 1e0",
     "short17 + 0e0",
-    "r * REAL '1'",
     "CAST(-short17 AS DOUBLE)",
-    "CAST(-r AS REAL)",
     "CAST(ARRAY[short17] AS ARRAY(DOUBLE))[1]",
     "CAST(ARRAY[long17, short17] AS ARRAY(DOUBLE))[2]",
-    "CAST(ARRAY[r] AS ARRAY(REAL))[1]",
     "transform(ARRAY[short17], x -> CAST(x AS DOUBLE))[1]",
-    "transform(ARRAY[r], x -> CAST(coalesce(x, 0) AS REAL))[1]",
-    "CAST(coalesce(d, 0) AS DOUBLE)",
-    "CAST(coalesce(r, 0) AS REAL)",
-    "CAST(CASE WHEN d > 0 THEN d ELSE 0 END AS DOUBLE)",
-    "CAST(CASE WHEN r > 0 THEN r ELSE 0 END AS REAL)",
-    "CAST(nullif(d, 0) AS DOUBLE)",
-    "CAST(greatest(d, 0) AS DOUBLE)",
-    "CAST(least(r, 2000000) AS REAL)",
-    "CAST(d + 1 AS DOUBLE)",
-    "CAST(r + 1 AS REAL)",
-    "CAST(2 - r AS REAL)",
-    "CAST(r * 2 AS REAL)",
-    "CAST(ARRAY[r, 0] AS ARRAY(REAL))[1]",
-    // A quotient, and floor, ceil and round, typed as Trino types them, and so converted as it
-    // converts them. A float cannot tell a quotient's last digit rounded from one truncated:
-    // DECIMAL_RESULTS compares their text.
-    "CAST(r / 100 AS REAL)",
-    "CAST(coalesce(r, 0) / 100 AS REAL)",
-    "CAST(100000 / r AS REAL)",
-    "CAST(floor(r) AS REAL)",
-    "CAST(floor(coalesce(r, 0)) AS REAL)",
-    "CAST(ceil(r - 1) AS REAL)",
-    "CAST(round(r) AS REAL)",
-    "CAST(round(r, 1) AS REAL)",
-    "CAST(round(d, 3) AS DOUBLE)",
-    "CAST(d / 3 AS DOUBLE)",
-    "CAST(d / 7 AS DOUBLE)",
-    "CAST(d / r AS DOUBLE)",
-    "CAST(short17 / 3 AS DOUBLE)",
-    "CAST(long17 / 3 AS DOUBLE)",
-    "transform(ARRAY[r], x -> CAST(x / 100 AS REAL))[1]",
     // The spellings the README gives for a literal with a decimal point beside a decimal.
     "CAST(short17 AS DOUBLE) = 0.4998e0",
     "CAST(coalesce(short17, CAST(0.0 AS DECIMAL(17, 17))) AS DOUBLE)",
@@ -540,223 +475,6 @@ async fn a_decimal_converts_to_the_double_or_real_trino_gives() {
     )
     .await;
     assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
-}
-
-/// Quotients, `floor` and `ceil` of the DECIMAL columns of [`decimals`], and of decimals
-/// spelt out, compared as their text: a quotient whose last digit is truncated where Trino
-/// rounds it converts to the same float more often than not, and only its text tells.
-const DECIMAL_RESULTS: &[&str] = &[
-    "d / r",
-    "-d / r",
-    "d / 7",
-    "-d / 7",
-    "r / 7",
-    "short17 / 3",
-    "long17 / 3",
-    "100000 / r",
-    // A tie, which Trino rounds away from zero.
-    "CAST('0.01' AS DECIMAL(5, 2)) / CAST('6.4' AS DECIMAL(2, 1))",
-    "CAST('-0.01' AS DECIMAL(5, 2)) / CAST('6.4' AS DECIMAL(2, 1))",
-    "CAST(2 AS DECIMAL(1, 0)) / 3",
-    // Of 38 digits: with a dividend of 38 digits, and one Arrow multiplies past 128 bits.
-    "half / 3",
-    "CAST('2000000000000000000000000000000000' AS DECIMAL(38, 0)) / 100",
-    "CAST('200000000000000000000000000000000' AS DECIMAL(33, 0)) / CAST(7 AS DECIMAL(5, 0))",
-    // At the top of their argument's range.
-    "ceil(CAST('999.50' AS DECIMAL(5, 2)))",
-    "floor(CAST('-999.50' AS DECIMAL(5, 2)))",
-    "ceil(CAST('0.25' AS DECIMAL(2, 2)))",
-    "ceil(half)",
-];
-
-#[tokio::test]
-#[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
-async fn a_decimal_quotient_floor_and_ceil_are_the_decimals_trino_gives() {
-    let differ = differences(
-        &trino(),
-        &decimals(DECIMAL_COLUMNS, 1),
-        DECIMAL_RESULTS,
-        false,
-    )
-    .await;
-    assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
-}
-
-/// An integer expression beside a decimal, which DataFusion makes a BIGINT once a literal in
-/// it is one and Trino keeps an INTEGER: the quotient's type follows the divisor's, and a
-/// product's which side of the 18-digit line it falls on.
-const INTEGER_BESIDE_A_DECIMAL: &[&str] = &[
-    "CAST(amount / nullif(qty, 0) AS DOUBLE)",
-    "amount / nullif(qty, 0)",
-    "CAST(amount / (60 * 60) AS DOUBLE)",
-    "CAST(amount / coalesce(qty, 1) AS DOUBLE)",
-    "CAST(amount / greatest(qty, 1) AS DOUBLE)",
-    "CAST(amount / (qty - 5) AS DOUBLE)",
-    "CAST(amount / -qty AS DOUBLE)",
-    "CAST(amount / CASE WHEN qty > 0 THEN 7 ELSE 1000 END AS DOUBLE)",
-    "CAST(p * coalesce(q, 1) AS REAL)",
-    "CAST(p * (q + 0) AS REAL)",
-    "CAST(coalesce(p, q + 1) AS REAL)",
-    // An integer a function returns, a BIGINT in Trino and an INTEGER in DataFusion, whose
-    // coercion makes it a BIGINT beside a literal.
-    "CAST(amount / nullif(length(s), 0) AS DOUBLE)",
-    "amount / nullif(length(s), 0)",
-    "CAST(amount / (length(s) + 0) AS DOUBLE)",
-    "CAST(amount / nullif(strpos(s, 'x'), 0) AS DOUBLE)",
-    "CAST(amount / nullif(extract(day FROM DATE '2024-01-15'), 0) AS DOUBLE)",
-    "CAST(p * (length(s) - 4) AS REAL)",
-];
-
-#[tokio::test]
-#[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
-async fn a_decimal_beside_an_integer_expression_converts_as_in_trino() {
-    let decimal = |v: i128, p: u8, s: i8| {
-        Arc::new(
-            Decimal128Array::from(vec![v])
-                .with_precision_and_scale(p, s)
-                .unwrap(),
-        ) as ArrayRef
-    };
-    let source = Source {
-        from: "(VALUES (CAST('100.00' AS DECIMAL(12, 2)), 3, CAST('94255.07' AS DECIMAL(7, 2)), \
-               15, 'abcdefghijklmnopqrx')) AS source(amount, qty, p, q, s)"
-            .into(),
-        batch: RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("amount", DataType::Decimal128(12, 2), false),
-                Field::new("qty", DataType::Int32, false),
-                Field::new("p", DataType::Decimal128(7, 2), false),
-                Field::new("q", DataType::Int32, false),
-                Field::new("s", DataType::Utf8, false),
-            ])),
-            vec![
-                decimal(10000, 12, 2),
-                Arc::new(Int32Array::from(vec![3])),
-                decimal(9425507, 7, 2),
-                Arc::new(Int32Array::from(vec![15])),
-                Arc::new(StringArray::from(vec!["abcdefghijklmnopqrx"])),
-            ],
-        )
-        .unwrap(),
-    };
-    let differ = differences(&trino(), &source, INTEGER_BESIDE_A_DECIMAL, false).await;
-    assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
-}
-
-/// Aggregates over a DECIMAL(8,2) and a DECIMAL(8,3), converted: Trino sums to
-/// DECIMAL(38,s) and rounds that correctly, and keeps the argument's type for `min` and
-/// `max`.
-const DECIMAL_AGGREGATES: &[&str] = &[
-    "CAST(sum(s) AS REAL)",
-    "CAST(sum(s) AS DOUBLE)",
-    "CAST(sum(y) AS REAL)",
-    "CAST(sum(s) * 2 AS REAL)",
-    "CAST(sum(s) + 1 AS DOUBLE)",
-    "CAST(sum(CASE WHEN s < 0 THEN s ELSE y END) AS REAL)",
-    "CAST(min(s) AS REAL)",
-    "CAST(max(y) AS REAL)",
-    // Typed from the sum as Trino types it, DECIMAL(38, s).
-    "CAST(sum(s) / count(*) AS DOUBLE)",
-    "CAST(sum(y) / 7 AS DOUBLE)",
-    "sum(y) / 7",
-    "CAST(round(sum(y), 2) AS REAL)",
-    "CAST(floor(sum(y)) AS REAL)",
-];
-
-#[tokio::test]
-#[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
-async fn a_decimal_sum_converts_to_the_real_trino_gives() {
-    // Two rows, whose sums are past 2^24 unscaled.
-    let source = decimals(&[("s", 8, 2, "706915.02"), ("y", 8, 3, "80164.834")], 2);
-    let differ = differences(&trino(), &source, DECIMAL_AGGREGATES, true).await;
-    assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
-
-    // Rows whose sum's thirds and sevenths are inexact, and a DECIMAL(7,2) whose sum
-    // DataFusion types as a short DECIMAL(17,2).
-    let means = [
-        "CAST(sum(s) / count(*) AS DOUBLE)",
-        "CAST(sum(s) / 7 AS DOUBLE)",
-        "sum(s) / count(*)",
-    ];
-    let source = decimal_rows("s", 8, 2, &["706915.02", "706915.03", "1.23"]);
-    let mut differ = differences(&trino(), &source, &means, true).await;
-    let mut totals = vec!["99999.99"; 14];
-    totals.push("13830.18");
-    let source = decimal_rows("s", 7, 2, &totals);
-    let rounded = [
-        "CAST(round(sum(s), 2) AS REAL)",
-        "CAST(sum(s) / 100 AS REAL)",
-    ];
-    differ.extend(differences(&trino(), &source, &rounded, true).await);
-    assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
-}
-
-/// Quotients, and a quotient of a `floor`, of a CTE's or a subquery's columns: typed from the
-/// columns as Trino types them, not as DataFusion does before its types are made Trino's.
-const DECIMAL_THROUGH_A_CTE: &[&str] = &[
-    "WITH t AS (SELECT floor(r / 10) AS f FROM source) SELECT f / 3 AS v FROM t",
-    "WITH t AS (SELECT r / 7 AS q FROM source) SELECT CAST(q / 3 AS DOUBLE) AS v FROM t",
-    "SELECT q / 3 AS v FROM (SELECT d / 7 AS q FROM source) x",
-];
-
-/// Aggregates of a CTE or subquery over a DECIMAL(8,2), divided: typed from the sum as Trino
-/// types it, DECIMAL(38, s), whatever passes it through.
-const DECIMAL_AGGREGATES_THROUGH_A_CTE: &[&str] = &[
-    "WITH agg AS (SELECT sum(s) AS total, count(*) AS n FROM source) \
-     SELECT total / n AS v FROM agg",
-    "WITH agg AS (SELECT sum(s) AS total, count(*) AS n FROM source) \
-     SELECT CAST(total / n AS DOUBLE) AS v FROM agg",
-    "SELECT CAST(total / 7 AS DOUBLE) AS v FROM (SELECT sum(s) AS total FROM source) x",
-];
-
-#[tokio::test]
-#[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
-async fn a_decimal_through_a_cte_is_the_decimal_trino_gives() {
-    let trino = trino();
-    let mut differ = statement_differences(
-        &trino,
-        &decimals(DECIMAL_COLUMNS, 1),
-        DECIMAL_THROUGH_A_CTE,
-        false,
-    )
-    .await;
-    let source = decimal_rows("s", 8, 2, &["706915.02", "706915.03", "1.23"]);
-    differ.extend(
-        statement_differences(&trino, &source, DECIMAL_AGGREGATES_THROUGH_A_CTE, true).await,
-    );
-    assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
-}
-
-/// One DECIMAL(`p`, `s`) column called `name`, a row for each of `values`.
-fn decimal_rows(name: &str, p: u8, s: i8, values: &[&str]) -> Source {
-    let rows = values
-        .iter()
-        .map(|v| format!("(CAST('{v}' AS DECIMAL({p}, {s})))"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let unscaled = values
-        .iter()
-        .map(|v| {
-            let (whole, fraction) = v.split_once('.').unwrap_or((v, ""));
-            assert_eq!(fraction.len(), s as usize, "{v} is not at scale {s}");
-            format!("{whole}{fraction}").parse::<i128>().unwrap()
-        })
-        .collect::<Vec<_>>();
-    let array = Decimal128Array::from(unscaled)
-        .with_precision_and_scale(p, s)
-        .unwrap();
-    Source {
-        from: format!("(VALUES {rows}) AS source({name})"),
-        batch: RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                name,
-                DataType::Decimal128(p, s),
-                false,
-            )])),
-            vec![Arc::new(array) as ArrayRef],
-        )
-        .unwrap(),
-    }
 }
 
 /// A JSON number of 16 or 17 significant digits, each way a model reads it as a DOUBLE or

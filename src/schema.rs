@@ -78,8 +78,8 @@ impl SchemaCoercer {
                         col.clone()
                     } else {
                         // safe: false => a value that does not fit becomes an error, not NULL.
-                        // A DECIMAL landing in a DOUBLE or REAL column becomes the value
-                        // Trino makes of it — see `crate::transform::decimal`.
+                        // A DECIMAL landing in a DOUBLE or REAL column becomes the value a
+                        // CAST in a model makes of it — see `crate::transform::decimal`.
                         let opts = CastOptions {
                             safe: false,
                             ..Default::default()
