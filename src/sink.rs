@@ -19,7 +19,10 @@ use deltalake::protocol::SaveMode;
 use deltalake::DeltaTable;
 use tracing::debug;
 
-use crate::dbt::watermark::SOURCE_TABLE_ID_VERSION_KEY;
+use crate::dbt::watermark::{
+    HANDOVER_OLD_LOG_HEAD_KEY, HANDOVER_ROW_PAST_HEAD_KEY, HANDOVER_SOURCE_HEAD_KEY,
+    SOURCE_TABLE_ID_VERSION_KEY,
+};
 use crate::dedup::RecordedCutoff;
 use crate::error::{Error, Result};
 use crate::lookup::LookupSnapshot;
@@ -35,6 +38,15 @@ pub struct Sink {
     /// replaced in place gets a new id as well, but keeps its log, which still gives that
     /// version the id it had there: the version is what tells the two apart.
     source_identity: Option<(Version, String)>,
+    /// The newest source version the rebuild this pipeline last handed over from can have
+    /// read, recorded while a watermark table is set. See [`HANDOVER_SOURCE_HEAD_KEY`].
+    handover_source_head: Option<Version>,
+    /// The handover head carried across the source's last drop and recreate, recorded from
+    /// then on while a watermark table is set. See [`HANDOVER_OLD_LOG_HEAD_KEY`].
+    handover_old_log_head: Option<Version>,
+    /// A newest watermark found past the source's head, recorded while it stays the newest.
+    /// See [`HANDOVER_ROW_PAST_HEAD_KEY`].
+    handover_row_past_head: Option<Version>,
     /// The exact lookup snapshots that enriched the source batch currently being committed.
     lookup_snapshots: Vec<LookupCommit>,
     /// The coverage window the batch being committed was filtered in, while that window stays
@@ -59,6 +71,9 @@ impl Sink {
             app_id: app_id.into(),
             target_file_size: NonZeroU64::new(target_file_size),
             source_identity: None,
+            handover_source_head: None,
+            handover_old_log_head: None,
+            handover_row_past_head: None,
             lookup_snapshots: Vec::new(),
             cutoff: None,
         }
@@ -66,6 +81,21 @@ impl Sink {
 
     pub fn with_source_identity(mut self, identity: Option<(Version, String)>) -> Self {
         self.source_identity = identity;
+        self
+    }
+
+    pub fn with_handover_source_head(mut self, head: Option<Version>) -> Self {
+        self.handover_source_head = head;
+        self
+    }
+
+    pub fn with_handover_old_log_head(mut self, head: Option<Version>) -> Self {
+        self.handover_old_log_head = head;
+        self
+    }
+
+    pub fn with_handover_row_past_head(mut self, row: Option<Version>) -> Self {
+        self.handover_row_past_head = row;
         self
     }
 
@@ -120,6 +150,24 @@ impl Sink {
             metadata.push((
                 SOURCE_TABLE_ID_VERSION_KEY.to_string(),
                 serde_json::Value::from(*version),
+            ));
+        }
+        if let Some(head) = self.handover_source_head {
+            metadata.push((
+                HANDOVER_SOURCE_HEAD_KEY.to_string(),
+                serde_json::Value::from(head),
+            ));
+        }
+        if let Some(head) = self.handover_old_log_head {
+            metadata.push((
+                HANDOVER_OLD_LOG_HEAD_KEY.to_string(),
+                serde_json::Value::from(head),
+            ));
+        }
+        if let Some(row) = self.handover_row_past_head {
+            metadata.push((
+                HANDOVER_ROW_PAST_HEAD_KEY.to_string(),
+                serde_json::Value::from(row),
             ));
         }
         for lookup in &self.lookup_snapshots {

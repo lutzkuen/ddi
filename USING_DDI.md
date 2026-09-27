@@ -346,21 +346,48 @@ backwards relative to arrival order. A late row bearing an older timestamp is
 indistinguishable from one the rebuild already wrote, and will be dropped. Append-only is not
 enough: a table written from a multi-partition Kafka topic (kafka-delta-ingest and similar)
 orders timestamps only within each partition, so a lagging partition's rows routinely land
-after newer ones from another. So after a rebuild, on a first start against a table that
-already has rows, and after the source was replaced, such a source can lose a lagging
-partition's late rows at or below the table's `max(_timestamp)`: counted in
-`ddi_rows_skipped_as_covered_total`, but dropped. That is a known limitation. A watermark table
-(`watermark_uri`, in the README's
-[handover section](README.md#the-handover-and-why-it-needs-a-watermark)) does not help here: a
-model always has `_timestamp`, and with it set `ddi` never reads that table. A watermark per
-Kafka partition would be exact; `ddi` does not offer one yet.
+after newer ones from another. For such a source, have the rebuild record the source version
+it read in a watermark table, and point `ddi` at the table:
+
+```toml
+[storage]
+watermark_uri = "abfss://lake@mylake.dfs.core.windows.net/meta/ddi_watermark"
+```
+
+It is the one place to set it for a dbt project, and it applies to every model: `ddi` reads it
+after each rebuild of a model's target. A table that is not there, or not `(app_id VARCHAR,
+source_version BIGINT)`, counts as one with no row, so `_timestamp` is used and `ddi` warns,
+naming the table and what is wrong with it. A read that fails — a timeout, throttling — stops
+the pipeline until a retry succeeds instead, because `_timestamp` could drop late rows the
+watermark would have kept; so does a container that does not exist, which the store reports as
+it reports an outage. The README's
+[handover section](README.md#the-handover-and-why-it-needs-a-watermark) shows the one
+`INSERT` the rebuild runs. Run it in a **pre-hook**, and pin the model's read to the version it
+records (`FOR VERSION AS OF`), so the row is there before the overwrite lands. After a rebuild
+that recorded one, `ddi` resumes from that version and skips nothing by timestamp, which is
+exact whatever order rows arrive in. `_timestamp` is then only the fallback, for a rebuild
+that recorded nothing. That includes one whose post-hook has not run yet, and another
+writer's `DELETE`, which records nothing at all: the table's newest row is then an earlier
+rebuild's, and `ddi` counts a row when it is newer than how far the rebuild it last handed
+over from can have read, or is the version its own offset is at, and otherwise not; the
+README's handover section has the finer print. A few rebuilds of your own are taken for earlier
+ones by that rule and get `_timestamp` instead — the first after upgrading from 0.3.1 among
+them, and one that read no further than `ddi`'s last handover while `ddi` streamed on; the
+README's handover section lists them. With a post-hook, `ddi` reopening before it runs gets
+`_timestamp` too, so a multi-partition source wants the pre-hook — or, where the previous
+rebuild's row is the version its own offset is at, or `ddi` missed that rebuild, resumes from
+there, and appends again what the new rebuild read past it while `ddi` was stopped. The
+cut-off still applies on a first start against a table that already has rows and after the
+source was replaced, and to a staged upsert, whose merge reads `ddi`'s own staging table
+rather than the source the watermark counts versions of, and so does not read the watermark
+table. A watermark per Kafka partition would be exact there too; `ddi` does not offer one yet.
 
 ### What else can happen to a shared table
 
 | Event | What `ddi` does |
 |---|---|
 | Restart, redeploy, crash | Resumes from its own offset; nothing is skipped by timestamp |
-| dbt full-refresh | Rescans from the batch's high-water mark, whose `_timestamp` cut-off can drop a lagging partition's late rows (above), and can write again a version the rebuild read past the head `ddi` loaded |
+| dbt full-refresh | Resumes from the source version it recorded in `watermark_uri`, exactly, or, where it recorded none, or one `ddi` cannot tell from an earlier rebuild's, rescans from its high-water mark, whose `_timestamp` cut-off drops a lagging partition's late rows (above) and can write again a version the rebuild read past the head `ddi` loaded. With a post-hook, a reopen before it runs can also resume from an earlier rebuild's row and write again what this one read past it |
 | Rows arrive while dbt runs | Re-emitted afterwards, by timestamp |
 | Another writer appends to the target | Not taken as coverage; nothing is skipped because of it |
 | Another writer updates, deletes or merges in the target | Treated as a rebuild. Timestamps it writes newer than rows `ddi` has not delivered yet make it skip the source versions holding them (logged as `versions_not_reread`) |

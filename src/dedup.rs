@@ -35,12 +35,13 @@
 //! # When it applies
 //!
 //! Only while the pipeline has to infer from the target's data what the target already
-//! holds — a *coverage window*. One opens after a rebuild by another writer, on a first start
-//! against a target that already has rows, after the source was dropped and recreated or
-//! relocated, and on a reopen part-way through any of those. An ordinary restart opens none:
-//! the `txn` offset commits atomically with the rows it describes, so it is exact on its own,
-//! and a timestamp filter on top of it can only drop rows. Applying one on every open is what
-//! used to lose a lagging Kafka partition's late rows at every restart.
+//! holds — a *coverage window*. One opens after a rebuild by another writer that recorded no
+//! source version in `watermark_uri`, on a first start against a target that already has
+//! rows, after the source was dropped and recreated or relocated, and on a reopen part-way
+//! through any of those. An ordinary restart opens none: the `txn` offset commits atomically
+//! with the rows it describes, so it is exact on its own, and a timestamp filter on top of it
+//! can only drop rows. Applying one on every open is what used to lose a lagging Kafka
+//! partition's late rows at every restart.
 //!
 //! A window closes after the first batch that carries a row newer than the watermark.
 //! Whatever filled the target read a prefix of this source through the same model, so every
@@ -59,11 +60,8 @@
 //! inexact there. A table written from a multi-partition Kafka topic is append-only and still
 //! breaks it, because Kafka orders timestamps only within a partition: a late row at or below
 //! the watermark is dropped with the covered ones (and counted), and [`bounded_rescan_start`]
-//! can start past it. Outside a window the order does not matter at all. `watermark_uri` does
-//! not help such a source: a pipeline with a timestamp never reads it, so a rebuild's handover
-//! is always this rescan. A watermark per value of a partition column — the newest timestamp or
-//! offset per Kafka partition — would be exact there; it is a possible future option, not
-//! something `ddi` does today.
+//! can start past it. Outside a window the order does not matter at all, and a rebuild that
+//! records its source version in `watermark_uri` opens none, which is exact for such sources.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
