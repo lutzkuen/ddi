@@ -133,8 +133,9 @@ DuckDB's `json_extract_string` and Spark's `get_json_object` work as aliases of
 
 Paths support `$`, `.field`, `["field"]` and `[0]`. Following Trino,
 `json_extract_scalar` returns **NULL for an object or array** — only `json_extract`
-returns those. A missing path is NULL; malformed JSON stops the pipeline, because the
-input is a typed column rather than arbitrary text.
+returns those. A missing path is NULL; malformed JSON is an error, because the input is a
+typed column rather than arbitrary text: with a data-quality table the row is set aside
+(§9), and without one it stops the pipeline.
 
 The JSON text they write matches Starburst's byte for byte, down to how an emoji is spelt.
 `json_parse`, `json_extract`, `json_query`, the constructors below and `CAST(<text> AS

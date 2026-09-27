@@ -213,8 +213,10 @@ Arrow has no cast from text to a list, so the cast becomes `json_array_elements(
 internally. Two consequences worth knowing:
 
 - A row whose path is missing, or is not an array, contributes **no rows** rather than
-  failing — a NULL array expands to nothing, as in Trino. Malformed JSON still stops the
-  pipeline, because the input is a typed column rather than arbitrary text.
+  failing — a NULL array expands to nothing, as in Trino. Malformed JSON is still an error,
+  because the input is a typed column rather than arbitrary text: with a data-quality table
+  the row is set aside as one the [transform cannot evaluate](#a-row-the-transform-cannot-evaluate),
+  and without one it stops the pipeline.
 - A JSON `null` element is the JSON value `null`, as it is in Trino — a row, not a NULL
   one; `json_extract_scalar` on it is NULL.
 
@@ -1165,8 +1167,9 @@ FROM source
 Paths support `$`, `.field`, `["field"]` and `[0]`. Wildcards are rejected rather than
 quietly returning one of several matches. A missing path is NULL, and so is a container
 under `json_extract_scalar` — that is Trino's rule, and it is what stops `{"id":42}`
-landing in a column somebody casts to a number. Malformed JSON stops the pipeline: input
-is a typed column, not arbitrary text.
+landing in a column somebody casts to a number. Malformed JSON is an error, not a NULL:
+input is a typed column, not arbitrary text. With a data-quality table the row is [set
+aside](#a-row-the-transform-cannot-evaluate), and without one it stops the pipeline.
 
 The text these produce is what Starburst produces, byte for byte: `json_extract` copies a
 value in its source order, integers as written and floats re-spelt as doubles (`1.10`

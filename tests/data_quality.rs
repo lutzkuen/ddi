@@ -593,6 +593,51 @@ async fn a_row_the_transform_cannot_evaluate_is_set_aside_and_the_rest_commits()
 }
 
 #[tokio::test]
+async fn a_row_of_malformed_json_is_set_aside_like_any_the_transform_cannot_evaluate() {
+    // The JSON functions raise a document that does not parse rather than read it as NULL,
+    // because the column is typed text. With a data-quality table that is one row's failure,
+    // as the README says, not the pipeline's.
+    let lake = Lake::new().await;
+    lake.create_dq().await;
+    lake.arrive(&[
+        (1, Some(r#"{"n":100}"#), 10),
+        (2, Some("{not json"), 11),
+        (3, Some(r#"{"n":300}"#), 12),
+    ])
+    .await;
+
+    let mut cfg = lake.cfg();
+    cfg.transform_sql = Some(
+        "SELECT order_id, CAST(json_extract_scalar(amount, '$.n') AS BIGINT) AS amount, \
+         _timestamp FROM source"
+            .into(),
+    );
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    let outcome = p
+        .step()
+        .await
+        .expect("one malformed document must not stop this");
+    let StepOutcome::Progressed {
+        rows, unevaluable, ..
+    } = outcome
+    else {
+        panic!("expected a commit, got {outcome:?}");
+    };
+    assert_eq!((rows, unevaluable), (2, 1));
+
+    assert_eq!(lake.silver().await, vec![(1, Some(100)), (3, Some(300))]);
+    let rejects = lake.rejects().await;
+    assert_eq!(rejects.len(), 1, "{rejects:?}");
+    let (_, column, reason, payload) = &rejects[0];
+    assert_eq!(*column, None, "no one column is to blame");
+    assert!(reason.contains("is not valid JSON"), "{reason}");
+    assert!(
+        payload.contains("\"order_id\":2"),
+        "the source row: {payload}"
+    );
+}
+
+#[tokio::test]
 async fn without_a_data_quality_table_a_row_the_transform_cannot_evaluate_still_stops_the_pipeline()
 {
     let lake = Lake::new().await;

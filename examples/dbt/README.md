@@ -68,8 +68,9 @@ runs the batch here. `ddi` registers that name alongside Trino/Starburst's
 `json_extract_scalar` and Spark's `get_json_object`, all with identical behaviour, so the
 same model file streams unchanged whichever engine sits on the batch side.
 
-Malformed JSON stops the pipeline rather than nulling a column — there is no dead-letter
-queue by design.
+Malformed JSON is an error rather than a NULL in a column. Without a data-quality table
+beside the target, as here, it stops the pipeline; with one, the row is set aside and the
+rest of the batch commits.
 
 ## What is example-specific
 
