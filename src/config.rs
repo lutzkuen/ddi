@@ -313,7 +313,12 @@ pub struct PipelineConfig {
     /// us where it got to, we read `max(dedup_timestamp)` out of the target and emit only
     /// rows beyond it. The batch needs to know nothing about this tool.
     ///
-    /// Consulted only where what the target holds has to be inferred — after a rebuild, on a
+    /// It is read beyond the cut-off too, where the order rows arrive in does not matter:
+    /// every open checks the target has the column, an appending pipeline refuses a row
+    /// without a timestamp on every batch, and for `write_mode = "upsert"` or
+    /// `"staged_upsert"` it is the merge's sequence, which decides on every batch which of two
+    /// rows for a key is newer. As the cut-off that recognises covered rows, though, it is
+    /// consulted only where what the target holds has to be inferred — after a rebuild, on a
     /// first start against a populated target, after the source was replaced — and only
     /// there must it be non-decreasing in the order rows arrive in the source. A table
     /// written from a multi-partition Kafka topic is append-only and still does not meet
@@ -493,7 +498,9 @@ pub struct ResolvedPipeline {
     /// Where dbt records its rebuild watermark for this target, if dbt shares it.
     pub watermark_uri: Option<String>,
     /// Timestamp column used to recognise rows a rebuild, a populated target or a replaced
-    /// source already covers. Read only inside a coverage window; see [`crate::dedup`].
+    /// source already covers, which it recognises only inside a coverage window; see
+    /// [`crate::dedup`]. Also an upsert's merge sequence on every batch, and required of every
+    /// row an appending pipeline writes.
     pub dedup_timestamp: Option<String>,
     /// Row identity, for resolving ties at the watermark instant.
     pub dedup_key: Option<String>,

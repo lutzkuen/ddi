@@ -587,9 +587,12 @@ A window lasts until the first batch that carries a row newer than the target's 
 Whatever filled the target read a prefix of the source, so a newer row lies past its read
 point, and from there an older timestamp is a late row rather than a covered one. After a
 rebuild or on a first start it also ends once the source head it opened against has been
-read, because nothing committed after that can have been covered. A first start therefore
-assumes the target was filled from this source: one loaded from elsewhere while this source is
-still being backfilled gets what arrives after the open a second time. While a window is open
+read, because a rebuild that read no further cannot have covered anything committed after it.
+A first start therefore assumes the target was filled from this source: one loaded from
+elsewhere while this source is still being backfilled gets what arrives after the open a
+second time. And that head is loaded before the target, so a rebuild that commits between
+the two can have read a little past it: what it read past the head is written again, a
+duplicate rather than a gap. While a window is open
 each commit records it (`ddi.cutoff.reason` in the commit's info), so a restart in the middle
 carries on where it left off. `ddi` 0.3.1 and earlier recorded nothing, so a pipeline upgraded
 from one part-way through a rebuild's rescan or a first start's catch-up resumes without the

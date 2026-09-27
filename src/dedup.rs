@@ -46,10 +46,13 @@
 //! Whatever filled the target read a prefix of this source through the same model, so every
 //! row it read is at or below the watermark and a newer one lies past its read point: from
 //! there an older timestamp is a late row, not a covered one. The window of a rebuild or a
-//! first start also closes once the source head it opened against has been read, because
-//! nothing committed after that can have been covered. A replaced source's does not — its new
-//! table is usually re-seeded *after* the pipeline reopens on it — and neither does one on
-//! the apply half of a staged upsert, whose stage is filled at its own pace. While a window stays open each commit
+//! first start also closes once the source head it opened against has been read, because a
+//! rebuild that read no further cannot have covered anything committed after it. That head is
+//! loaded before the target, so a rebuild that commits between the two loads can have read a
+//! little past it, and what it read past the head is written again: the head errs towards
+//! duplicates, never towards a gap. A replaced source's window does not close at a head —
+//! its new table is usually re-seeded *after* the pipeline reopens on it — and neither does
+//! one on the apply half of a staged upsert, whose stage is filled at its own pace. While a window stays open each commit
 //! records it (see [`RecordedCutoff`]), so a reopen carries on where the last commit left off.
 //!
 //! Inside a window the ordering requirement still holds, and a source that breaks it is
