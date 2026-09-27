@@ -1202,54 +1202,37 @@ REAL`, is read from its text straight into the nearest double or real, as Trino'
 A DECIMAL of more than 18 digits cast to DOUBLE or REAL is correctly rounded too, as Trino's
 `DecimalConversions` does it, where Arrow's own cast divides in floating point and can land
 one ULP off. One of 18 digits or fewer Trino divides in floating point itself — the unscaled
-integer over the power of ten, as doubles — and so do Arrow and `ddi` for a DOUBLE:
-DECIMAL(17,17) `0.49979999999999997` is `0.4998` in both. For a REAL Trino divides the two
-as floats, and `ddi` does not yet: it narrows that double, as `ddi` 0.3.1 did, which can be
-an ULP of the float off Trino's where its division of floats rounds twice. Over a
-DECIMAL(9,2), 1413830.04 cast to REAL is 1413830.125 in Trino and 1413830.0 here. That
-covers `CAST` and `TRY_CAST`, the casts DataFusion's coercion inserts (`dec * 1e0`), lambda
-bodies, a list of decimals cast to a list of doubles, a DECIMAL column landing in a DOUBLE or
-REAL target, and the `array_*` aggregates over decimals.
+integer over the power of ten, as doubles for a DOUBLE and as floats for a REAL — so `ddi`
+does that, and DECIMAL(17,17) `0.49979999999999997` is `0.4998` in both. Which of the two a
+value is follows its type's precision, so a computed decimal has to have Trino's type. An
+integer literal beside a decimal — `coalesce(amount, 0)`, `CASE .. ELSE 0 END`,
+`amount + 1`, `ARRAY[amount, 0]` — is typed as Trino types it, an INTEGER, where DataFusion's
+BIGINT would make the result ten digits wider: `coalesce(amount, 0)` over a DECIMAL(18,8) is a
+DECIMAL(18,8), as in Trino. So is an integer expression such a literal makes a BIGINT in
+DataFusion where Trino keeps an INTEGER — `nullif(qty, 0)`, `coalesce(qty, 1)` or `qty + 1` over
+an INTEGER `qty` — so `amount / nullif(qty, 0)` over a DECIMAL(12,2) is a DECIMAL(23,13) in both.
+That takes the expression beside the decimal: computed as `n` in a CTE or subquery,
+`nullif(qty, 0)` meets it only as a column, DataFusion's BIGINT, and `amount / n` is a
+DECIMAL(32,22) here; `CAST(nullif(qty, 0) AS INTEGER)` there means the same in both. An integer
+a function returns keeps DataFusion's type, and `length`, `strpos` and `extract` are INTEGERs
+there where Trino's are BIGINTs, so a quotient by one has thirteen digits of scale here and
+twenty-two in Trino; `CAST(length(s) AS BIGINT)` means the same in both. A `sum` over a
+decimal, in a publication, is a DECIMAL(38,s) as in Trino, where DataFusion's has ten digits
+more than its argument, and so over 8 digits or fewer would be divided: over DECIMAL(8,2),
+1413830.04 cast to REAL is 1413830.0 in both. `min` and `max` keep
+their argument's type in both engines, and `avg`, a DECIMAL(p+4,s+4) in DataFusion and a
+DECIMAL(p,s) in Trino, is refused in every model. A quotient of decimals, and `floor`, `ceil`
+and `round` of one, are cast to Trino's types: DataFusion would make DECIMAL(9,2) /
+DECIMAL(9,2) a DECIMAL(15,6), where Trino's is DECIMAL(21,12), and keep `floor` of a
+DECIMAL(9,2) one, where Trino's is DECIMAL(8,0). Over a `sum`, each is typed from the sum's
+DECIMAL(38,s), and over a CTE's or subquery's decimal column from its type as Trino has
+it. A quotient's last digit is rounded as Trino rounds it. That covers
+`CAST` and `TRY_CAST`, the casts DataFusion's coercion inserts (`dec * 1e0`), lambda bodies, a
+list of decimals cast to a list of doubles, a DECIMAL column landing in a DOUBLE or REAL
+target, and the `array_*` aggregates over decimals.
 It does not yet cover `log` and `power` over a DECIMAL, which DataFusion computes on the
 decimal itself and not as Trino does; a decimal inside a ROW or MAP being cast; or
 `arrow_cast`. Those keep Arrow's arithmetic.
-
-Which way a decimal converts follows its type, and a decimal a model computes has
-DataFusion's type, which is not always Trino's: `ddi` does not yet type it as Trino does. So,
-as in 0.3.1, a computed decimal can have another type here than in Trino, and with it another
-value. Where the type falls on the other side of the 18-digit line its DOUBLE can differ too.
-Short here and long in Trino, as a `sum` can be, it did in 0.3.1 as well. Long here and short
-in Trino, as `coalesce(amount, 0)` can be, the difference is new: 0.3.1 divided every
-decimal, as Trino divides a short one, and so gave Trino's DOUBLE there, where `ddi` now
-rounds the long type correctly. A product has the same type in both engines, and `min` and
-`max` keep their argument's; `avg`, a DECIMAL(p+4,s+4) in DataFusion and a DECIMAL(p,s) in
-Trino, is refused in every model. These differ:
-
-- an integer literal beside a decimal — `coalesce(amount, 0)`, `CASE .. ELSE 0 END`,
-  `amount + 1` — is a BIGINT in DataFusion and an INTEGER in Trino, ten digits narrower, and
-  so is an integer expression over an INTEGER that a literal makes a BIGINT in DataFusion,
-  `nullif(qty, 0)` or `qty + 1`. `coalesce(amount, 0)` over a DECIMAL(18,8) is a
-  DECIMAL(28,8) here, correctly rounded to a DOUBLE, and a DECIMAL(18,8) in Trino, divided as
-  0.3.1 divided it: past 2^53 unscaled, above about 90 million at that scale, the two can be
-  an ULP apart. The literal in the decimal's type means the same in both engines,
-  `coalesce(amount, CAST(0 AS DECIMAL(18, 8)))` or `ELSE CAST(0 AS DECIMAL(18, 8))`. The
-  other way about, `length`, `strpos` and `extract` return an INTEGER in DataFusion and a
-  BIGINT in Trino;
-- `sum` over a decimal, in a publication, is a DECIMAL(p+10,s) in DataFusion and a
-  DECIMAL(38,s) in Trino, so over a DECIMAL of 8 digits or fewer it is divided here and
-  correctly rounded in Trino;
-- a quotient of decimals has four digits of scale more than its dividend in DataFusion, and
-  the dividend's scale plus the divisor's precision plus one, at least six, in Trino:
-  DECIMAL(9,2) / DECIMAL(9,2) is a DECIMAL(15,6) here and a DECIMAL(21,12) there. So its
-  digits differ, and DataFusion truncates the last where Trino rounds it;
-- `floor`, `ceil` and `round(x)` keep their argument's precision in DataFusion, where Trino
-  narrows it — `floor` of a DECIMAL(9,2) is a DECIMAL(8,0) there — and `round(x, n)` narrows
-  the scale to `n` here, where Trino keeps it. `floor` and `ceil` keep the scale too, so where
-  rounding carries into a digit the type has no room for they fail here, and Trino's narrower
-  type holds the answer: `ceil` of a DECIMAL(5,2) 999.50 is 1000 in Trino and a decimal
-  overflow here, and so are `floor` of -999.50 and `ceil` of any positive DECIMAL(2,2). Such
-  a row is one [the transform cannot evaluate](#a-row-the-transform-cannot-evaluate). Widened
-  by a digit first, `ceil(CAST(amount AS DECIMAL(6, 2)))`, it gives Trino's value.
 
 Two more types are decided otherwise than in Trino, whatever the conversion does. A literal
 with a decimal point, `0.5`, is a DECIMAL in Trino and a DOUBLE in DataFusion, which reads
