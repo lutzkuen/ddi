@@ -1214,17 +1214,23 @@ decimal itself and not as Trino does; a decimal inside a ROW or MAP being cast; 
 Which way a decimal converts follows its type, and a decimal a model computes has
 DataFusion's type, which is not always Trino's: `ddi` does not yet type it as Trino does. So,
 as in 0.3.1, a computed decimal can have another type here than in Trino, and with it another
-value, or another DOUBLE where the type falls on the other side of the 18-digit line. A
-product has the same type in both engines, and `min` and `max` keep their argument's; `avg`,
-a DECIMAL(p+4,s+4) in DataFusion and a DECIMAL(p,s) in Trino, is refused in every model.
-These differ:
+value. Where the type falls on the other side of the 18-digit line its DOUBLE can differ too.
+Short here and long in Trino, as a `sum` can be, it did in 0.3.1 as well. Long here and short
+in Trino, as `coalesce(amount, 0)` can be, the difference is new: 0.3.1 divided every
+decimal, as Trino divides a short one, and so gave Trino's DOUBLE there, where `ddi` now
+rounds the long type correctly. A product has the same type in both engines, and `min` and
+`max` keep their argument's; `avg`, a DECIMAL(p+4,s+4) in DataFusion and a DECIMAL(p,s) in
+Trino, is refused in every model. These differ:
 
 - an integer literal beside a decimal — `coalesce(amount, 0)`, `CASE .. ELSE 0 END`,
   `amount + 1` — is a BIGINT in DataFusion and an INTEGER in Trino, ten digits narrower, and
   so is an integer expression over an INTEGER that a literal makes a BIGINT in DataFusion,
   `nullif(qty, 0)` or `qty + 1`. `coalesce(amount, 0)` over a DECIMAL(18,8) is a
-  DECIMAL(28,8) here, correctly rounded to a DOUBLE, and a DECIMAL(18,8) in Trino, divided.
-  The other way about, `length`, `strpos` and `extract` return an INTEGER in DataFusion and a
+  DECIMAL(28,8) here, correctly rounded to a DOUBLE, and a DECIMAL(18,8) in Trino, divided as
+  0.3.1 divided it: past 2^53 unscaled, above about 90 million at that scale, the two can be
+  an ULP apart. The literal in the decimal's type means the same in both engines,
+  `coalesce(amount, CAST(0 AS DECIMAL(18, 8)))` or `ELSE CAST(0 AS DECIMAL(18, 8))`. The
+  other way about, `length`, `strpos` and `extract` return an INTEGER in DataFusion and a
   BIGINT in Trino;
 - `sum` over a decimal, in a publication, is a DECIMAL(p+10,s) in DataFusion and a
   DECIMAL(38,s) in Trino, so over a DECIMAL of 8 digits or fewer it is divided here and
@@ -1235,7 +1241,12 @@ These differ:
   digits differ, and DataFusion truncates the last where Trino rounds it;
 - `floor`, `ceil` and `round(x)` keep their argument's precision in DataFusion, where Trino
   narrows it — `floor` of a DECIMAL(9,2) is a DECIMAL(8,0) there — and `round(x, n)` narrows
-  the scale to `n` here, where Trino keeps it.
+  the scale to `n` here, where Trino keeps it. `floor` and `ceil` keep the scale too, so where
+  rounding carries into a digit the type has no room for they fail here, and Trino's narrower
+  type holds the answer: `ceil` of a DECIMAL(5,2) 999.50 is 1000 in Trino and a decimal
+  overflow here, and so are `floor` of -999.50 and `ceil` of any positive DECIMAL(2,2). Such
+  a row is one [the transform cannot evaluate](#a-row-the-transform-cannot-evaluate). Widened
+  by a digit first, `ceil(CAST(amount AS DECIMAL(6, 2)))`, it gives Trino's value.
 
 Two more types are decided otherwise than in Trino, whatever the conversion does. A literal
 with a decimal point, `0.5`, is a DECIMAL in Trino and a DOUBLE in DataFusion, which reads

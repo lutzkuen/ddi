@@ -394,6 +394,9 @@ const DECIMAL_COLUMNS: &[(&str, u8, i8, &str)] = &[
     ("wide", 38, 3, "12345678901234567890123456789012345.678"),
     ("tiny", 38, 38, "0.00000000000000000000000000000012345678"),
     ("half", 38, 1, "9007199254740993.5"),
+    // At the top of a DECIMAL(5,2): `ceil` carries it into a fourth integer digit, which
+    // Trino's DECIMAL(4,0) has and DataFusion's DECIMAL(5,2) has not.
+    ("top", 5, 2, "999.50"),
 ];
 
 /// `rows` copies of one row of DECIMAL `columns`, each `(name, precision, scale, value)`.
@@ -430,9 +433,10 @@ fn decimals(columns: &[(&str, u8, i8, &str)], rows: usize) -> Source {
 /// A DECIMAL converted to DOUBLE or REAL, each way a model reaches the conversion: a
 /// `CAST`, a `TRY_CAST`, the cast coercion inserts, a list cast and a lambda. A decimal
 /// compared with a DOUBLE, or beside one in a `CASE` or `coalesce`, a literal with a decimal
-/// point, and a decimal computed beside an integer literal are missing: DataFusion types each
-/// otherwise than Trino. So is a short decimal to REAL where Trino's division of floats
-/// rounds twice, which `ddi` narrows from its double instead. The README lists each.
+/// point, a decimal computed beside an integer literal, and `ceil` and `floor` at the top of a
+/// decimal's range are missing: DataFusion types each otherwise than Trino. So is a short
+/// decimal to REAL where Trino's division of floats rounds twice, which `ddi` narrows from its
+/// double instead. The README lists each.
 const DECIMAL_TO_FLOAT: &[&str] = &[
     "CAST(short17 AS DOUBLE)",
     "CAST(long17 AS DOUBLE)",
@@ -462,6 +466,13 @@ const DECIMAL_TO_FLOAT: &[&str] = &[
     "CAST(short17 AS DOUBLE) = 0.4998e0",
     "CAST(coalesce(short17, CAST(0.0 AS DECIMAL(17, 17))) AS DOUBLE)",
     "CAST(coalesce(d, CAST(0.0 AS DECIMAL(18, 8))) AS DOUBLE)",
+    // And for an integer literal beside one, which keeps `d` a DECIMAL(18,8) in both engines:
+    // `coalesce(d, 0)` is long here, and correctly rounded a double off Trino's division.
+    "CAST(coalesce(d, CAST(0 AS DECIMAL(18, 8))) AS DOUBLE)",
+    "CAST(CASE WHEN d > 0 THEN d ELSE CAST(0 AS DECIMAL(18, 8)) END AS DOUBLE)",
+    // And for `ceil` and `floor` at the top of a decimal's range, widened by a digit first.
+    "CAST(ceil(CAST(top AS DECIMAL(6, 2))) AS DOUBLE)",
+    "CAST(floor(CAST(-top AS DECIMAL(6, 2))) AS DOUBLE)",
 ];
 
 #[tokio::test]

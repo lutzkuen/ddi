@@ -43,13 +43,17 @@
 //! dividend, where Trino gives it `s1 + p2 + 1`, at least six (DECIMAL(9,2) / DECIMAL(9,2) is
 //! DECIMAL(15,6) here and DECIMAL(21,12) in Trino), and its last digit is truncated where
 //! Trino rounds it. And `floor`, `ceil` and `round(x)` keep their argument's precision, where
-//! Trino narrows it, and `round(x, n)` narrows the scale to `n`, where Trino keeps it. So, as
-//! in 0.3.1, the value itself can differ from Trino's there, as a quotient's digits do, and so
-//! can its DOUBLE, on the other side of the 18-digit line: `coalesce(amount, 0)` over a
-//! DECIMAL(18,8) is a long DECIMAL(28,8) here, correctly rounded, and a short DECIMAL(18,8) in
-//! Trino, divided. `avg` differs too, DECIMAL(p+4, s+4) against Trino's DECIMAL(p, s), but no
-//! model can use it: a transform aggregates nothing, and a publication only what a client can
-//! add up.
+//! Trino narrows it, and `round(x, n)` narrows the scale to `n`, where Trino keeps it; `floor`
+//! and `ceil` keep the scale too, so `ceil` of a DECIMAL(5,2) 999.50 overflows here, where
+//! Trino's DECIMAL(4,0) holds 1000. So, as in 0.3.1, the value itself can differ from Trino's
+//! there, as a quotient's digits do, or fail to evaluate, as that `ceil` does. Its DOUBLE can
+//! differ on the other side of the 18-digit line: short here and long in Trino, as a `sum` can
+//! be, it did in 0.3.1 as well; long here and short in Trino it is new, because 0.3.1 divided
+//! every decimal, as Trino divides a short one. `coalesce(amount, 0)` over a DECIMAL(18,8) is
+//! a long DECIMAL(28,8) here, correctly rounded, and a short DECIMAL(18,8) in Trino, divided;
+//! the literal in the decimal's type, `CAST(0 AS DECIMAL(18, 8))`, makes it a DECIMAL(18,8) in
+//! both. `avg` differs too, DECIMAL(p+4, s+4) against Trino's DECIMAL(p, s), but no model can
+//! use it: a transform aggregates nothing, and a publication only what a client can add up.
 //!
 //! What goes through it: a CAST or TRY_CAST in a model, including the casts DataFusion's
 //! coercion inserts (`dec * 1e0`), and the same in a lambda body; casts of a list of decimals
