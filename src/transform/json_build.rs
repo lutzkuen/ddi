@@ -40,10 +40,10 @@
 //!
 //! | value | as a member | under `CAST(.. AS JSON)` |
 //! |---|---|---|
-//! | text | string, escaped | string, escaped |
-//! | text after `FORMAT JSON` | embedded, re-read as Jackson's tree reader would | — |
+//! | text | string, escaped; an emoji as its surrogate pair, `\uD83D\uDE0A` | same |
+//! | text after `FORMAT JSON` | embedded, re-read as Jackson's tree reader would and written back escaped | — |
 //! | a nested constructor | embedded as built | — |
-//! | JSON-typed text | scalar as a string; object or array is an error | embedded verbatim |
+//! | JSON-typed text | scalar as a string; object or array is an error | embedded verbatim, spelt as it already is |
 //! | integers | number | number |
 //! | decimals | number at the declared scale, `12.3400`, as `BigDecimal` spells it | same |
 //! | doubles | as `Double.toString` spells it: `1.0`, `1.0E7`; `NaN` becomes the string `"NaN"` | same |
@@ -52,6 +52,14 @@
 //! | timestamp | `"2024-03-31 22:30:00.123456"`; zoned values render in UTC at millisecond precision with ` UTC` appended, the way Starburst reads a Delta `timestamp` | naive only; zoned is not castable there either |
 //! | array, row | an error naming the fix: Starburst would cast it to varchar text | array / object, recursively |
 //! | NULL | `null`, or absent | SQL NULL; `null` inside a container |
+//!
+//! Everything this module writes, it writes as Jackson's UTF-8 generator does in Trino, so a
+//! character outside the Basic Multilingual Plane is its two UTF-16 halves. A JSON-typed
+//! value under `CAST(.. AS JSON)` is the exception, because it is not written but copied as
+//! it is spelt — Trino copies it with `writeRawValue`. An element straight from `CAST(.. AS
+//! ARRAY(JSON))`, or a `json_array_get` container, holds the emoji itself, since Trino
+//! writes those through a Java `String`; one built by `json_parse`, `json_extract` or
+//! `json_query` holds the escape.
 //!
 //! # Where the JSON type is put back
 //!
@@ -92,7 +100,7 @@ use deltalake::datafusion::sql::sqlparser::ast::{
 
 use crate::error::{Error, Result};
 use crate::transform::json::{json_field, mark, marker_of, Marker};
-use crate::transform::jsonval::{self, Json, Members, Numbers};
+use crate::transform::jsonval::{self, Generator, Json, Members, Numbers};
 use crate::transform::validate::reject;
 
 /// `ddi_json_object(<nulls>, key, value, key, value, ...)` — what `json_object(...)` becomes.
@@ -358,7 +366,9 @@ fn may_be_json_typed(e: &Expr) -> bool {
 /// A branch that is JSON by shape makes the whole thing JSON, and `ddi_as_json(e)` says
 /// so. A branch that is a name is JSON exactly when that name is, which only the planner
 /// knows; the names are passed along as witnesses — `ddi_as_json(e, name, ...)` — and the
-/// result is JSON-typed when any of them is. A name costs nothing to evaluate twice.
+/// result is JSON-typed when any of them is. A name costs nothing to evaluate twice. When
+/// none is, the call is the identity, in the input's own type: `coalesce(amount, 0)` over a
+/// BIGINT stays a BIGINT.
 fn with_json_type(e: Expr) -> Expr {
     if json_typed_by_branches(&e) {
         return call(AS_JSON, vec![e]);
@@ -441,7 +451,7 @@ fn bare_name(name: &ObjectName) -> String {
 }
 
 /// Build a plain call to one of this engine's functions.
-fn call(name: &str, args: Vec<Expr>) -> Expr {
+pub(crate) fn call(name: &str, args: Vec<Expr>) -> Expr {
     Expr::Function(Function {
         name: ObjectName::from(vec![Ident::new(name)]),
         uses_odbc_syntax: false,
@@ -461,7 +471,8 @@ fn call(name: &str, args: Vec<Expr>) -> Expr {
     })
 }
 
-fn literal(text: &str) -> Expr {
+/// A string literal.
+pub(crate) fn literal(text: &str) -> Expr {
     Expr::Value(Value::SingleQuotedString(text.to_string()).into())
 }
 
@@ -763,14 +774,7 @@ impl ScalarUDFImpl for BuildFn {
                 let Some(input) = input else {
                     return Err(self.err("missing its argument"));
                 };
-                // With witnesses, the value is JSON exactly when one of them is; without,
-                // it is JSON by shape.
-                let witnesses = &args.arg_fields[1..];
-                let typed = witnesses.is_empty()
-                    || witnesses
-                        .iter()
-                        .any(|w| marker_of(w) == Some(Marker::Typed) || is_json_list(w));
-                if !typed {
+                if !as_json_typed(&args.arg_fields[1..]) {
                     return Ok(Arc::new(input.as_ref().clone().with_name(self.name())));
                 }
                 if !is_text(input.data_type()) && input.data_type() != &DataType::Null {
@@ -792,6 +796,14 @@ impl ScalarUDFImpl for BuildFn {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        // Not JSON after all, so the planner was promised the input's own field above, and
+        // that is what has to come back. Rendering it as text here handed a BIGINT column a
+        // string array: an internal error in a debug build, and in a release build a batch
+        // whose columns do not match its schema — on every batch, for every
+        // `coalesce(amount, 0)`.
+        if self.kind == Build::AsJson && !as_json_typed(&args.arg_fields[1..]) {
+            return Ok(args.args[0].clone());
+        }
         let rows = args.number_rows;
         let who = self.kind.spelling();
 
@@ -817,11 +829,14 @@ impl ScalarUDFImpl for BuildFn {
                         ))
                     })?;
                     // What Jackson's tree reader hands back: the order kept, a repeated key
-                    // resolved to its last value, whitespace gone, floats as doubles.
+                    // resolved to its last value, whitespace gone, floats as doubles. It is
+                    // written out with the rest of the constructor by `$json_to_varchar`,
+                    // which writes bytes, so an emoji comes out as its surrogate pair.
                     out.push(Some(jsonval::to_string(
                         &doc,
                         Members::LastWins,
                         Numbers::JavaDouble,
+                        Generator::Utf8,
                     )));
                 }
                 out
@@ -877,6 +892,15 @@ impl ScalarUDFImpl for BuildFn {
             Arc::new(StringArray::from(out)) as ArrayRef
         ))
     }
+}
+
+/// Whether `ddi_as_json(e, witnesses..)` is JSON-typed. With witnesses, the value is JSON
+/// exactly when one of them is; without, it is JSON by shape.
+fn as_json_typed(witnesses: &[FieldRef]) -> bool {
+    witnesses.is_empty()
+        || witnesses
+            .iter()
+            .any(|w| marker_of(w) == Some(Marker::Typed) || is_json_list(w))
 }
 
 fn scalar_of(v: &ColumnarValue) -> Option<&ScalarValue> {
@@ -1559,7 +1583,7 @@ mod tests {
         // Trino's own test: key_1, key_2 come out the other way round.
         assert_eq!(
             first("json_object('key_1' VALUE id, 'key_2' VALUE name)").await,
-            r#"{"key_2":"O\"Brien \\ 😀","key_1":7}"#
+            r#"{"key_2":"O\"Brien \\ \uD83D\uDE00","key_1":7}"#
         );
         assert_eq!(
             first("json_object('id' VALUE id, 'paid' VALUE paid, 'amount' VALUE amount)").await,
@@ -1604,7 +1628,7 @@ mod tests {
         assert_eq!(
             got[0].as_deref(),
             Some(
-                r#"{"country":8,"note":"O\"Brien \\ 😀","created":10,"type":2,"version":12,"price":5,"qty":4,"currency":6,"id":1,"sku":3,"updated":11,"customer":7,"status":9}"#
+                r#"{"country":8,"note":"O\"Brien \\ \uD83D\uDE00","created":10,"type":2,"version":12,"price":5,"qty":4,"currency":6,"id":1,"sku":3,"updated":11,"customer":7,"status":9}"#
             ),
             "thirteen keys: a 32-slot table"
         );
@@ -1833,7 +1857,10 @@ mod tests {
 
     #[tokio::test]
     async fn cast_to_json_follows_trinos_rules() {
-        assert_eq!(first("CAST(name AS JSON)").await, r#""O\"Brien \\ 😀""#);
+        assert_eq!(
+            first("CAST(name AS JSON)").await,
+            r#""O\"Brien \\ \uD83D\uDE00""#
+        );
         assert_eq!(first("CAST(id AS JSON)").await, "7");
         assert_eq!(first("CAST(amount AS JSON)").await, "12.3400");
         assert_eq!(first("CAST(ratio AS JSON)").await, "0.25");
@@ -1868,7 +1895,52 @@ mod tests {
         assert_eq!(first("json_array(ratio / 0.0)").await, r#"["Infinity"]"#);
         assert_eq!(
             first("json_array(name, chr(27))").await,
-            "[\"O\\\"Brien \\\\ 😀\",\"\\u001B\"]"
+            "[\"O\\\"Brien \\\\ \\uD83D\\uDE00\",\"\\u001B\"]"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_emoji_is_its_surrogate_pair_in_every_key_member_and_cast() {
+        assert_eq!(
+            first("json_object('naïve' VALUE 1, '😀' VALUE 2, 'a' VALUE 3, '日本' VALUE 4, 'b' VALUE 5)")
+                .await,
+            r#"{"a":3,"b":5,"naïve":1,"\uD83D\uDE00":2,"日本":4}"#
+        );
+        assert_eq!(
+            first("json_object('raw' VALUE '[\"😀\", \"\\ud83d\\ude00\"]' FORMAT JSON)").await,
+            r#"{"raw":["\uD83D\uDE00","\uD83D\uDE00"]}"#
+        );
+        assert_eq!(
+            first("json_object('s' VALUE CAST(name AS JSON))").await,
+            r#"{"s":"O\"Brien \\ \uD83D\uDE00"}"#
+        );
+        assert_eq!(
+            first("json_format(CAST(CAST(json_parse(json_array(name)) AS ARRAY(JSON)) AS JSON))")
+                .await,
+            r#"["O\"Brien \\ 😀"]"#
+        );
+        assert_eq!(
+            first(
+                "json_object('l' VALUE json_format(CAST(CAST(json_parse(json_array(name)) \
+                 AS ARRAY(JSON)) AS JSON)) FORMAT JSON)"
+            )
+            .await,
+            r#"{"l":["O\"Brien \\ \uD83D\uDE00"]}"#
+        );
+        // A json_query nested in a constructor is embedded as json_query wrote it, and
+        // Trino writes json_query as bytes: escaped, whether the emoji came in raw or not.
+        assert_eq!(
+            first("json_object('q' VALUE json_query('{\"s\":[\"😀\"]}', '$.s'))").await,
+            r#"{"q":["\uD83D\uDE00"]}"#
+        );
+        assert_eq!(
+            first("json_array(json_query(json_array(name), '$'))").await,
+            r#"[["O\"Brien \\ \uD83D\uDE00"]]"#
+        );
+        // An array of text under CAST: each element is text, and escaped.
+        assert_eq!(
+            first("CAST(ARRAY[name, 'x'] AS JSON)").await,
+            r#"["O\"Brien \\ \uD83D\uDE00","x"]"#
         );
     }
 
@@ -1881,7 +1953,7 @@ mod tests {
         // A key that is a column: checked per row, and ordered per row.
         assert_eq!(
             one("json_object(name VALUE id, 'x' VALUE 1)").await,
-            r#"{"O\"Brien \\ 😀":7,"x":1}"#
+            r#"{"O\"Brien \\ \uD83D\uDE00":7,"x":1}"#
         );
     }
 
@@ -1954,6 +2026,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_branch_over_names_that_are_not_json_keeps_its_own_type() {
+        // A projected branch over a name is wrapped as `ddi_as_json(e, name)` in case the
+        // name is JSON. When it is not, the planner is promised the input's own type, and
+        // the value has to arrive in it: rendered as text, it failed every batch.
+        let out = SqlTransform::new(
+            "SELECT coalesce(id, 0) AS x, CASE WHEN id > 7 THEN id END AS y, \
+             nullif(id, 7) AS z, CASE WHEN paid THEN zts END AS w, \
+             coalesce(zts, from_unixtime(id, 'UTC')) AS f FROM source",
+        )
+        .apply(vec![batch()])
+        .await
+        .unwrap_or_else(|e| panic!("a branch over non-JSON names must run: {e}"));
+        let b = &out[0];
+        let ints = |i: usize| {
+            let c = b.column(i).as_primitive::<Int64Type>();
+            (0..c.len())
+                .map(|r| c.is_valid(r).then(|| c.value(r)))
+                .collect::<Vec<_>>()
+        };
+        for i in 0..3 {
+            assert_eq!(b.schema().field(i).data_type(), &DataType::Int64);
+        }
+        assert_eq!(ints(0), vec![Some(7), Some(8)]);
+        assert_eq!(ints(1), vec![None, Some(8)]);
+        assert_eq!(ints(2), vec![None, Some(8)]);
+        assert_eq!(
+            b.schema().field(3).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        let w = b
+            .column(3)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>();
+        let w = w.expect("a timestamp, not its text");
+        assert_eq!(w.value(0), 1_711_924_200_123_456);
+        assert!(w.is_null(1));
+        assert_eq!(
+            b.schema().field(4).data_type(),
+            b.schema().field(3).data_type()
+        );
+        let f = b
+            .column(4)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>();
+        let f = f.expect("a timestamp, not its text");
+        assert_eq!(f.value(0), 1_711_924_200_123_456);
+        assert_eq!(
+            f.value(1),
+            8_000_000,
+            "the second row falls back to the epoch"
+        );
+    }
+
+    #[tokio::test]
     async fn the_json_type_follows_a_branch_over_a_column_and_through_a_projection() {
         // A CASE over a JSON-typed *column* is JSON-typed, which only the planner can know:
         // the column is passed along as the witness.
@@ -1990,7 +2116,7 @@ mod tests {
                 "SELECT json_object('n' VALUE CASE WHEN paid THEN name END) AS v FROM source"
             )
             .await,
-            r#"{"n":"O\"Brien \\ 😀"}"#
+            r#"{"n":"O\"Brien \\ \uD83D\uDE00"}"#
         );
     }
 

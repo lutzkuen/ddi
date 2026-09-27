@@ -13,13 +13,13 @@ use tracing::{debug, info, warn};
 
 use crate::config::ResolvedPipeline;
 use crate::dbt::watermark;
-use crate::dedup::{self, Dedup};
+use crate::dedup::{self, CoverageReason, Dedup, RecordedCutoff};
 use crate::dq::DataQuality;
 use crate::error::{Error, Result};
 use crate::offset::OffsetStore;
 use crate::schema::{Rejected, SchemaCoercer};
 use crate::sink::{Sink, UpsertStats};
-use crate::source::{LogBatch, LogStreamBuilder, StreamCursor, Version};
+use crate::source::{classify, CommitClass, LogBatch, LogStreamBuilder, StreamCursor, Version};
 use crate::transform::{Identity, SqlTransform, Transform};
 use crate::upsert::{self, MergePlan};
 
@@ -37,6 +37,14 @@ pub enum StepOutcome {
         upsert: Option<UpsertStats>,
         /// Rows the target would not take, written to the data-quality table instead.
         rejected: usize,
+        /// Of `rejected`, the rows the transform could not evaluate at all.
+        unevaluable: usize,
+        /// Runs of the transform it took to find them, after the first. Zero for a batch
+        /// the transform evaluated whole.
+        reevaluations: usize,
+        /// Rows dropped because the target was taken to hold them already. Zero outside a
+        /// coverage window — see [`Pipeline::coverage`].
+        covered: usize,
         /// What the realtime publisher did, when this pipeline has one. `None` otherwise.
         ///
         /// Reported rather than acted on: by the time this is set the commit is durable, so
@@ -52,11 +60,42 @@ pub enum StepOutcome {
         /// Rows the target would not take. Non-zero here is the loud case: the batch had
         /// rows and *none* of them made it, which is usually a schema change upstream.
         rejected: usize,
+        /// Of `rejected`, the rows the transform could not evaluate at all.
+        unevaluable: usize,
+        /// Runs of the transform it took to find them, after the first.
+        reevaluations: usize,
+        /// Rows dropped because the target was taken to hold them already. A batch the target
+        /// covered whole ends up here, with only this non-zero.
+        covered: usize,
         /// What the realtime publisher did. A zero-row batch still publishes: the offset
         /// moved, and staying silent would make the next message look like one the client
         /// lost.
         published: Option<crate::publish::PublishStats>,
     },
+}
+
+impl StepOutcome {
+    /// Whether this batch is the shape an upstream type change takes: rows went to the
+    /// data-quality table, and none reached the target or were dropped as already covered.
+    ///
+    /// Covered rows count against it because a coverage window can drop all but one row of a
+    /// batch: that one being bad is a bad row, not a schema change, and inside a rescan it
+    /// would otherwise say so on every batch that re-reads it. Counted in
+    /// `ddi_batches_fully_rejected_total`.
+    pub fn fully_rejected(&self) -> bool {
+        match *self {
+            Self::CaughtUp => false,
+            Self::Progressed {
+                rows,
+                rejected,
+                covered,
+                ..
+            } => rejected > 0 && rows == 0 && covered == 0,
+            Self::Skipped {
+                rejected, covered, ..
+            } => rejected > 0 && covered == 0,
+        }
+    }
 }
 
 /// Lookup snapshots selected for one source batch, plus table-id migrations that become true
@@ -74,6 +113,55 @@ struct LookupTableIdTransition {
     table_id: String,
 }
 
+/// A stretch of the source over which the pipeline has to infer from the target's data what
+/// the target already holds. See [`crate::dedup`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageWindow {
+    pub reason: CoverageReason,
+    /// The source version the window closes after once read, as well as on the first row
+    /// newer than the target's watermark. `None` when only such a row closes it: for a
+    /// replaced source, and for a staged upsert's apply half.
+    pub through: Option<Version>,
+    /// True when this window was opened by an earlier process and recorded in its commits,
+    /// rather than inferred just now.
+    pub resumed: bool,
+}
+
+/// A coverage window and the cut-off applied inside it.
+struct Cutoff {
+    dedup: Dedup,
+    window: CoverageWindow,
+    /// Rows dropped since it opened in this process, for the line that says it closed.
+    skipped: u64,
+}
+
+impl Cutoff {
+    fn recorded(&self) -> RecordedCutoff {
+        RecordedCutoff {
+            reason: self.window.reason,
+            source_through: self.window.through,
+        }
+    }
+}
+
+/// What ended a coverage window.
+#[derive(Clone, Copy)]
+enum Closed {
+    /// A batch carried a row newer than the target's watermark.
+    Beyond,
+    /// The source head the window was opened against has been read.
+    ReadThrough,
+}
+
+impl Closed {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Beyond => "a row newer than the target's watermark arrived",
+            Self::ReadThrough => "the source head it opened against has been read",
+        }
+    }
+}
+
 pub struct Pipeline {
     cfg: ResolvedPipeline,
     source: DeltaTable,
@@ -83,9 +171,13 @@ pub struct Pipeline {
     sink: Sink,
     offsets: OffsetStore,
     coercer: SchemaCoercer,
-    /// What the target already held when this pipeline opened. Rows it covers are
-    /// suppressed, because a rebuild already wrote them.
-    dedup: Dedup,
+    /// What the target already holds, while this pipeline has to infer that from its data.
+    ///
+    /// `None` on an ordinary resume, which is the usual case: the `txn` offset is exact on
+    /// its own, and a timestamp filter on top of it could only drop rows — every late row
+    /// older than the target's newest, at every restart. `Some` only inside a coverage window,
+    /// and cleared the moment the window closes. See [`crate::dedup`] and [`coverage_cutoff`].
+    cutoff: Option<Cutoff>,
     /// Where rows the target will not take are put. `None` when there is no such table, in
     /// which case a bad row still stops the pipeline — see [`crate::dq`].
     dq: Option<DataQuality>,
@@ -145,14 +237,19 @@ impl Pipeline {
             ))
         })?;
 
-        let lookup_validation = validate_lookup_tables(&cfg, &source, &target).await?;
+        // What our own last commit said about itself, read once for the three decisions that
+        // turn on it: which lookups it used, which source it read, and whether it was made
+        // inside a coverage window that is still open.
+        let ours =
+            watermark::our_last_commit(&target, &cfg.app_id, watermark::DEFAULT_MAX_SCAN).await?;
+
+        let lookup_validation = validate_lookup_tables(&cfg, &source, &target, &ours).await?;
 
         let offsets = OffsetStore::new(&cfg.app_id, cfg.starting_version);
         let resume = resume_cursor(&cfg, &offsets, &source, &target).await?;
 
-        let cursor =
-            adjust_for_replaced_source(&cfg, &source, &target, resume.cursor, resume.bootstrapping)
-                .await?;
+        let replaced = adjust_for_replaced_source(&cfg, &source, &ours, &resume).await?;
+        let cursor = replaced.unwrap_or(resume.cursor);
 
         // After the adjustment, because a replaced source restarts from `starting_version` and
         // it is the version actually about to be read that has to be readable. Before the
@@ -169,13 +266,34 @@ impl Pipeline {
             .snapshot()
             .read_schema();
 
+        // On every open, not only on one that reads the cut-off: this used to be checked by
+        // the cut-off every open built, and a misnamed column is a mistake whatever state the
+        // target is in — better named at this restart than at the next rebuild.
+        if let Some(ts) = cfg.dedup_timestamp.as_deref() {
+            dedup::require_columns(&target_schema, ts, cfg.dedup_key.as_deref())?;
+        }
+
+        let cutoff = coverage_cutoff(
+            &cfg,
+            &source,
+            &target,
+            &ours,
+            resume,
+            replaced.is_some(),
+            cursor,
+        )
+        .await?;
+
         let stream = LogStreamBuilder::new(&source)
             .with_starting_cursor(cursor)
             .with_source_uri(&cfg.source_uri)
             .with_change_policy(cfg.change_policy)
             .with_max_files_per_batch(cfg.max_files_per_batch)
             .with_max_bytes_per_batch(cfg.max_bytes_per_batch)
-            .with_pinned_lookup_snapshots(!cfg.lookups.is_empty());
+            .with_pinned_lookup_snapshots(!cfg.lookups.is_empty())
+            // Held at the head the window was opened against, so that no batch straddles the
+            // version at which the cut-off stops applying. See `retire_cutoff_if_read_through`.
+            .with_stop_after(cutoff.as_ref().and_then(|c| c.window.through));
         let amplification = stream.amplification();
 
         let lookup_names = cfg
@@ -188,8 +306,8 @@ impl Pipeline {
             None => Box::new(Identity),
         };
 
-        let sink =
-            Sink::new(&cfg.app_id, cfg.target_file_size).with_source_table_id(table_id(&source));
+        let sink = Sink::new(&cfg.app_id, cfg.target_file_size)
+            .with_source_identity(source.version().zip(table_id(&source)));
 
         info!(
             pipeline = %cfg.name,
@@ -199,21 +317,35 @@ impl Pipeline {
             "pipeline ready"
         );
 
-        let dedup = match &cfg.dedup_timestamp {
-            Some(ts) => {
-                let d = Dedup::read(&target, ts, cfg.dedup_key.as_deref()).await?;
-                info!(
-                    pipeline = %cfg.name,
-                    dedup_timestamp = %ts,
-                    dedup_key = ?cfg.dedup_key,
-                    watermark_known = d.watermark_is_known(),
-                    boundary_keys = d.boundary_key_count(),
-                    "rows the target already covers will be skipped"
-                );
-                d
-            }
-            None => Dedup::default(),
-        };
+        // Which of the two modes this open is in, said once rather than inferred from a
+        // counter: dropping rows by timestamp is exactly what an operator has to be able to
+        // see the start and the end of.
+        match (&cutoff, cfg.dedup_timestamp.as_deref()) {
+            (Some(cut), Some(ts)) => info!(
+                pipeline = %cfg.name,
+                reason = %cut.window.reason,
+                resumed = cut.window.resumed,
+                dedup_timestamp = %ts,
+                dedup_key = ?cfg.dedup_key,
+                watermark_known = cut.dedup.watermark_is_known(),
+                boundary_keys = cut.dedup.boundary_key_count(),
+                watermark = %watermark_display(&cut.dedup),
+                through_source_version = ?cut.window.through,
+                "rows the target already holds will be skipped until a newer row arrives{}",
+                cut.window
+                    .through
+                    .map(|h| format!(", or source version {h} has been read"))
+                    .unwrap_or_default()
+            ),
+            (None, Some(ts)) => info!(
+                pipeline = %cfg.name,
+                dedup_timestamp = %ts,
+                resume_from = %cursor,
+                "resuming from a position that is exact on its own; nothing is skipped by \
+                 timestamp"
+            ),
+            (_, None) => {}
+        }
 
         // Zero when this pipeline appends, which is not the same as "the check found
         // nothing": an appending target has no grain to hold.
@@ -271,12 +403,43 @@ impl Pipeline {
                 "rows the target will not take will be written here instead of stopping the \
                  pipeline"
             ),
+            // A row the transform cannot evaluate is promised to the table only where it
+            // would be set aside there: see the lines below for the two ways it would not be.
             None => info!(
                 pipeline = %cfg.name,
                 dq_uri = %dq_uri,
-                "no data-quality table; a row the target will not take stops this pipeline \
-                 (which then retries). Create the table to have such rows set aside instead."
+                "no data-quality table; a row the target will not take{} stops this pipeline \
+                 (which then retries). Create the table to have such rows set aside instead.",
+                match cfg.transform_sql.is_some()
+                    && transform.cross_row().is_none()
+                    && cfg.max_evaluation_rejects_per_batch > 0
+                {
+                    true => ", or the transform cannot evaluate,",
+                    false => "",
+                }
             ),
+        }
+        // And whether a row the transform cannot evaluate joins them, which depends on the
+        // transform too: only one that is row-local can be evaluated in parts.
+        if dq.is_some() && cfg.transform_sql.is_some() {
+            match (transform.cross_row(), cfg.max_evaluation_rejects_per_batch) {
+                (_, 0) => info!(
+                    pipeline = %cfg.name,
+                    "max_evaluation_rejects_per_batch = 0; a row the transform cannot evaluate \
+                     stops this pipeline"
+                ),
+                (Some(why), _) => info!(
+                    pipeline = %cfg.name,
+                    "a row the transform cannot evaluate stops this pipeline: the transform is \
+                     not row-local ({why}), so it cannot be evaluated in parts to find the row"
+                ),
+                (None, max) => info!(
+                    pipeline = %cfg.name,
+                    max_evaluation_rejects_per_batch = max,
+                    "rows the transform cannot evaluate will be written there too, up to this \
+                     many per batch"
+                ),
+            }
         }
 
         // Same reasoning as the data-quality line above: which mode this pipeline is in is
@@ -325,7 +488,7 @@ impl Pipeline {
             sink,
             offsets,
             coercer: SchemaCoercer::new(target_schema),
-            dedup,
+            cutoff,
             dq,
             amplification,
             grain_check_passes,
@@ -359,16 +522,34 @@ impl Pipeline {
         self.stream.last_known_head()
     }
 
+    /// The coverage window this pipeline is in, if it is in one: while it lasts, rows at or
+    /// below the target's watermark are dropped as already held. `None` on an ordinary resume,
+    /// and from the step a window closes on. Exported as `ddi_coverage_cutoff_active`.
+    pub fn coverage(&self) -> Option<CoverageWindow> {
+        self.cutoff.as_ref().map(|c| c.window)
+    }
+
     /// One iteration: pull, read, transform, coerce, commit — all or nothing.
     pub async fn step(&mut self) -> Result<StepOutcome> {
         let started = Instant::now();
 
-        // 1. Pull one bounded batch of new files from the source log.
-        let Some(batch) = self.stream.next_batch().await? else {
+        // 1. Pull one bounded batch of new files from the source log. A window whose head
+        // has been read is retired first — non-data commits can carry the cursor past it
+        // without a batch — and a stream that came back empty only because it was held at
+        // that head is asked again.
+        self.retire_cutoff_if_read_through();
+        let mut next = self.stream.next_batch().await?;
+        if next.is_none() && self.retire_cutoff_if_read_through() {
+            next = self.stream.next_batch().await?;
+        }
+        let Some(batch) = next else {
             return Ok(StepOutcome::CaughtUp);
         };
         let files = batch.files.len();
         let through = batch.through_version;
+        // The id this batch was read under, which is not the one at open once the stream has
+        // read across a table replaced in place: a reopen compares it with the log's.
+        self.sink.set_source_identity(self.stream.identity());
 
         // A lookup is selected from the source commit's timestamp before any input is read or
         // target write is attempted. If anything below fails, retrying this source version asks
@@ -387,11 +568,54 @@ impl Pipeline {
         let decoded: u64 = input.iter().map(|b| b.get_array_memory_size() as u64).sum();
         self.amplification.observe(batch.total_bytes(), decoded);
 
-        // 3. Transform. Stateless, row-local, validated at config load.
-        let output = self
+        // 3. Transform. Stateless, row-local, validated at config load. A row it cannot
+        // evaluate is set aside like one the target will not take, and for the same reason:
+        // retrying this source version would only fail on it again. Which is why it needs the
+        // same table, and without one the batch stops here as it always has.
+        let max_rejects = match self.dq {
+            Some(_) => self.cfg.max_evaluation_rejects_per_batch,
+            None => 0,
+        };
+        let isolated = match self
             .transform
-            .apply_with_lookups(input, &lookup_batch.snapshots)
-            .await?;
+            .apply_isolating(input, &lookup_batch.snapshots, max_rejects)
+            .await
+        {
+            Ok(isolated) => isolated,
+            // Only where the table would take the row: a row-local transform, and a cap the
+            // configuration has not set to zero.
+            Err(Error::Evaluation(m))
+                if self.dq.is_none()
+                    && self.transform.cross_row().is_none()
+                    && self.cfg.max_evaluation_rejects_per_batch > 0 =>
+            {
+                return Err(Error::Evaluation(format!(
+                    "{m}. If a row's value caused this, creating the data-quality table at {} \
+                     sets that row aside instead of stopping this pipeline.",
+                    self.cfg.dq_uri()
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+        let output = isolated.output;
+        let reevaluations = isolated.reevaluations;
+        // Unevaluable rows go first, and in the same list as the coercion rejects below, so
+        // the data-quality table still gets one write, and one commit, per source version.
+        let mut rejects: Vec<Rejected> = Vec::new();
+        let mut unevaluable = 0;
+        if let Some(bad) = isolated.unevaluable {
+            unevaluable = bad.len();
+            warn!(
+                pipeline = %self.cfg.name,
+                through_version = through,
+                rows = unevaluable,
+                reevaluations,
+                reason = bad.reasons.first().map(String::as_str).unwrap_or("unknown"),
+                "the transform could not evaluate these rows; they go to the data-quality \
+                 table and the rest of the batch goes on"
+            );
+            rejects.push(bad);
+        }
 
         // Which target columns the transform actually produced, read *before* coercion —
         // afterwards every target column is present, because that is what coercion does,
@@ -440,8 +664,12 @@ impl Pipeline {
         // or the rows that will not convert are set aside for the data-quality table and
         // the rest goes on. Which of those happens is decided once, at open, by whether
         // there is a table to set them aside in.
+        //
+        // Then, inside a coverage window, drop what the target already holds — after the
+        // cast, because the watermark was read from the target and is typed as it is.
         let mut coerced = Vec::with_capacity(output.len());
-        let mut rejects: Vec<Rejected> = Vec::new();
+        let mut covered = 0usize;
+        let mut beyond = 0usize;
         for b in &output {
             if b.num_rows() == 0 {
                 continue;
@@ -456,13 +684,54 @@ impl Pipeline {
                 }
                 false => self.coercer.coerce(b)?,
             };
-            let c = self.dedup.apply(c)?;
+            let c = match &self.cutoff {
+                Some(cut) => {
+                    let f = cut.dedup.filter(c)?;
+                    covered += f.covered;
+                    beyond += f.beyond;
+                    f.kept
+                }
+                None => {
+                    // The one check the cut-off made of every batch that is still needed
+                    // without it: a row with no timestamp, once written, is one the next
+                    // rebuild handover cannot place. Upsert has its own, about the merge.
+                    if let (Some(ts), false) = (
+                        self.cfg.dedup_timestamp.as_deref(),
+                        self.cfg.write_mode.is_upsert(),
+                    ) {
+                        dedup::require_timestamps(&c, ts)?;
+                    }
+                    c
+                }
+            };
             if c.num_rows() > 0 {
                 coerced.push(c);
             }
         }
         let out_rows: usize = coerced.iter().map(|b| b.num_rows()).sum();
         let rejected_rows: usize = rejects.iter().map(Rejected::len).sum();
+
+        // Whether this batch ends the window it was filtered in. One that does not is
+        // recorded with its commit, so a reopen before the next one carries on filtering
+        // rather than re-emitting what the target holds; the one that does records nothing,
+        // so a reopen after it does not.
+        let closes = self
+            .cutoff
+            .as_ref()
+            .map(|c| window_closes_after(c.window.through, batch.end, beyond));
+        self.sink.set_cutoff(match (&self.cutoff, closes) {
+            (Some(c), Some(false)) => Some(c.recorded()),
+            _ => None,
+        });
+        if covered > 0 {
+            info!(
+                pipeline = %self.cfg.name,
+                through_version = through,
+                covered,
+                reason = %self.cutoff.as_ref().map_or("none", |c| c.window.reason.as_str()),
+                "skipped rows the target already holds (at or below its watermark)"
+            );
+        }
 
         // Unnest amplification guard (plan §3): a 64 MB source file must not become 6 GB
         // of RAM downstream. Checked after the transform because that is when the real
@@ -489,10 +758,11 @@ impl Pipeline {
         // is already there. See `crate::dq`.
         if rejected_rows > 0 {
             let written = self.write_rejects(&rejects, txn_version).await?;
-            if in_rows > 0 && out_rows == 0 {
+            if in_rows > 0 && out_rows == 0 && covered == 0 {
                 // Every row failed. That is far more likely to be an upstream type change
                 // than a batch of uniformly bad data, and it is invisible in the target —
-                // which simply stops growing — so it is said out loud here.
+                // which simply stops growing — so it is said out loud here. Not when a
+                // coverage window dropped the rest: see `StepOutcome::fully_rejected`.
                 warn!(
                     pipeline = %self.cfg.name,
                     through_version = through,
@@ -551,6 +821,7 @@ impl Pipeline {
             let empty = RecordBatch::new_empty(self.coercer.target());
             self.commit(vec![empty], txn_version).await?;
             self.acknowledge_lookup_table_id_transitions(&lookup_batch.transitions);
+            self.settle_cutoff(closes, covered, beyond);
             // This commit moved the offset too, so it gets a message like any other. Staying
             // silent on a fully-filtered batch would leave a hole in the version chain and
             // make the *next* real message look like one the client had lost.
@@ -560,6 +831,9 @@ impl Pipeline {
             return Ok(StepOutcome::Skipped {
                 through_version: through,
                 rejected: rejected_rows,
+                unevaluable,
+                reevaluations,
+                covered,
                 published,
             });
         }
@@ -573,6 +847,7 @@ impl Pipeline {
             (out_rows, None)
         };
         self.acknowledge_lookup_table_id_transitions(&lookup_batch.transitions);
+        self.settle_cutoff(closes, covered, beyond);
 
         let target_version = self.target.version();
         info!(
@@ -581,6 +856,7 @@ impl Pipeline {
             files,
             in_rows,
             out_rows,
+            covered,
             target_version = ?target_version,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "committed"
@@ -601,8 +877,61 @@ impl Pipeline {
             target_version,
             upsert,
             rejected: rejected_rows,
+            unevaluable,
+            reevaluations,
+            covered,
             published,
         })
+    }
+
+    /// Account for a batch filtered inside a coverage window, once its commit is durable, and
+    /// retire the window if the batch ended it.
+    ///
+    /// Only after the commit, because a failed step is always followed by a fresh
+    /// `Pipeline::open`, which works the window out again from the last commit that landed —
+    /// so nothing this process believes about it can outlive a commit that did not.
+    fn settle_cutoff(&mut self, closes: Option<bool>, covered: usize, beyond: usize) {
+        if let Some(cut) = self.cutoff.as_mut() {
+            cut.skipped += covered as u64;
+        }
+        if closes == Some(true) {
+            self.retire(match beyond {
+                0 => Closed::ReadThrough,
+                _ => Closed::Beyond,
+            });
+        }
+    }
+
+    /// Stop dropping rows by timestamp, and let the stream read past the window's head.
+    fn retire(&mut self, closed: Closed) {
+        let Some(cut) = self.cutoff.take() else {
+            return;
+        };
+        info!(
+            pipeline = %self.cfg.name,
+            reason = %cut.window.reason,
+            through_source_version = ?cut.window.through,
+            closed_by = closed.describe(),
+            skipped = cut.skipped,
+            "coverage window closed: the target's coverage is behind the stream, so from here \
+             an older timestamp is a late row, not a covered one"
+        );
+        self.stream.release_stop();
+    }
+
+    /// Retire a window whose source head the stream has read past, and say whether it did.
+    ///
+    /// Usually a closing batch has done this already. This is for the cursor that got there
+    /// without one: a run of compactions up to the head moves it without producing a batch.
+    fn retire_cutoff_if_read_through(&mut self) -> bool {
+        let Some(through) = self.cutoff.as_ref().and_then(|c| c.window.through) else {
+            return false;
+        };
+        if cutoff_applies(through, self.stream.cursor()) {
+            return false;
+        }
+        self.retire(Closed::ReadThrough);
+        true
     }
 
     /// Write this batch's rejects to the data-quality table.
@@ -1193,6 +1522,7 @@ async fn validate_lookup_tables(
     cfg: &ResolvedPipeline,
     source: &DeltaTable,
     target: &DeltaTable,
+    recorded: &watermark::OurLastCommit,
 ) -> Result<LookupTableValidation> {
     let source_id = table_id(source).ok_or_else(|| {
         Error::Config(format!(
@@ -1213,9 +1543,6 @@ async fn validate_lookup_tables(
             cfg.name
         )));
     }
-
-    let recorded =
-        watermark::our_last_commit(target, &cfg.app_id, watermark::DEFAULT_MAX_SCAN).await?;
 
     let mut current = BTreeMap::new();
     for lookup in &cfg.lookups {
@@ -1262,7 +1589,7 @@ async fn validate_lookup_tables(
         )));
     }
     let mut use_current_on_open = BTreeSet::new();
-    for (name, recorded_id) in recorded.lookup_table_ids {
+    for (name, recorded_id) in recorded.lookup_table_ids.clone() {
         let Some(current_id) = current.get(&name) else {
             return Err(Error::Config(format!(
                 "pipeline {:?}: its most recent target commit used lookup {:?}, but that \
@@ -1316,17 +1643,30 @@ async fn validate_lookup_tables(
 /// already has more, we resume past its early commits and never read them at all. The
 /// second is the dangerous one, because nothing looks wrong.
 ///
+/// A table replaced in place — `CREATE OR REPLACE`, or delta-rs creating in overwrite mode —
+/// has a new id too, but it keeps its log, so our offset still means what it meant. It is told
+/// apart by the source version our last commit recorded with the id: the same log still gives
+/// that version the id it had then, and a table recreated at this path cannot. Such a source
+/// is read on from our own offset, as the running stream reads on across it.
+///
 /// Starting over is the obvious answer, and it is safe exactly when `dedup_timestamp` is
-/// set: the filter drops whatever the target already covers, so re-reading the table from
-/// the beginning re-emits only what is genuinely missing. Without it, starting over would
-/// append the whole table a second time, so it stops and says so instead.
+/// set: the target's coverage then has to be inferred from its data, so [`coverage_cutoff`]
+/// opens a window that drops whatever the target already holds and re-emits only what is
+/// genuinely missing. That window lasts until the new table delivers a row newer than the
+/// target's watermark — not until the head it was opened against, because a table recreated
+/// empty is usually re-seeded *after* this pipeline has reopened on it. Without
+/// `dedup_timestamp`, starting over would append the whole table a second time, so it stops
+/// and says so instead.
+///
+/// Returns the cursor to start over from, or `None` when the source is still the table this
+/// pipeline was reading.
 async fn adjust_for_replaced_source(
     cfg: &ResolvedPipeline,
     source: &DeltaTable,
-    target: &DeltaTable,
-    cursor: StreamCursor,
-    bootstrapping: bool,
-) -> Result<StreamCursor> {
+    ours: &watermark::OurLastCommit,
+    resume: &Resume,
+) -> Result<Option<StreamCursor>> {
+    let (cursor, bootstrapping) = (resume.cursor, resume.bootstrapping);
     // `source` is already loaded — `Storage::open` loads it — so its snapshot version *is*
     // the head, and asking the log store again would be both a second round trip and a
     // liability: `get_latest_version` floors the kernel's log segment at the version it is
@@ -1342,11 +1682,27 @@ async fn adjust_for_replaced_source(
 
     // Identity is the reliable signal. The log going backwards is the fallback for
     // targets written before we recorded it.
-    let recorded = watermark::our_last_commit(target, &cfg.app_id, watermark::DEFAULT_MAX_SCAN)
-        .await?
-        .source_table_id;
+    let recorded = &ours.source_table_id;
     let current = table_id(source);
-    let different_table = matches!((&recorded, &current), (Some(a), Some(b)) if a != b);
+    let mut different_table = matches!((recorded, &current), (Some(a), Some(b)) if a != b);
+    // A commit ddi 0.3.1 made names no version that had the recorded id, so our own offset is
+    // asked about instead: 0.3.1 recorded the id its source had when it opened, and so did the
+    // version it last committed, unless it read on across a replacement before that version.
+    let seen_at = ours.source_table_id_version.or(resume.committed);
+    if let (true, Some(was), Some(seen_at)) = (different_table, recorded, seen_at) {
+        if crate::source::log_stream::keeps_identity(source, seen_at, was).await? {
+            warn!(
+                pipeline = %cfg.name,
+                previous_table_id = %was,
+                current_table_id = ?current,
+                seen_at,
+                resume_from = %cursor,
+                "the source was replaced in place since this pipeline last committed; its log \
+                 is still the one it was reading, so it resumes there and reads on, as one table"
+            );
+            different_table = false;
+        }
+    }
     // "Backwards" is a comparison against a position this pipeline reached, so a pipeline
     // that has never committed has nothing for the log to have gone backwards *from*. Its
     // cursor is the configured `starting_version`, and a `starting_version` above the head is
@@ -1358,7 +1714,7 @@ async fn adjust_for_replaced_source(
         !bootstrapping && matches!(head, Some(h) if cursor.version > h.saturating_add(1));
 
     if !different_table && !log_went_backwards {
-        return Ok(cursor);
+        return Ok(None);
     }
 
     let why = if different_table {
@@ -1388,16 +1744,20 @@ async fn adjust_for_replaced_source(
         dedup_timestamp = ts,
         "source was replaced; starting over and skipping rows the target already holds"
     );
-    Ok(from)
+    Ok(Some(from))
 }
 
 /// Where to resume, accounting for a target that another writer may have rebuilt.
 ///
-/// Normally the answer is our own `txn` offset. But when dbt shares the target, that
-/// offset can describe rows that no longer exist: `txn` actions survive an overwrite, so
-/// after a nightly rebuild we would resume past everything we streamed while dbt was
-/// reading, and those rows would never come back. When the target has been rewritten
-/// since our last append, dbt's watermark is the authority instead.
+/// Normally the answer is our own `txn` offset, and it is exact: the `txn` action commits
+/// atomically with the rows it describes. But when dbt shares the target, that offset can
+/// describe rows that no longer exist: `txn` actions survive an overwrite, so after a nightly
+/// rebuild we would resume past everything we streamed while dbt was reading, and those rows
+/// would never come back. When the target has been rewritten since our last append, a pipeline
+/// with `dedup_timestamp` rescans, and the cut-off the rescan was bounded by is handed back with
+/// the position, for [`coverage_cutoff`] to hold until the rescan has caught up with what the
+/// rebuild covered. `watermark_uri` is then not read at all. Only a pipeline without a timestamp
+/// takes dbt's watermark as the authority instead.
 ///
 /// See [`crate::dbt::watermark`] for the full argument.
 async fn resume_cursor(
@@ -1422,6 +1782,8 @@ async fn resume_cursor(
         return Ok(Resume {
             cursor: own,
             bootstrapping,
+            rebuilt: None,
+            committed: stored,
         });
     }
 
@@ -1430,6 +1792,8 @@ async fn resume_cursor(
         return Ok(Resume {
             cursor: own,
             bootstrapping,
+            rebuilt: None,
+            committed: stored,
         });
     };
 
@@ -1437,7 +1801,10 @@ async fn resume_cursor(
     // rows to emit are those beyond the highest key the rebuild left behind, and the scan
     // has to start early enough to reach them. Our own offset is not early enough --- it
     // may already be past what the rebuild covered, which is the whole hazard --- so the
-    // scan restarts and the key filter suppresses everything already present.
+    // scan restarts and the key filter suppresses everything already present. With
+    // `dedup_timestamp` set this is the only answer: the watermark table is not read, whatever
+    // it holds, because a row there cannot say which rebuild recorded it, and the target's data
+    // can.
     if let Some(ts) = cfg.dedup_timestamp.as_deref() {
         // How far back the rescan has to reach is a question the source's own file
         // statistics can answer, so ask rather than re-reading history every night.
@@ -1462,6 +1829,12 @@ async fn resume_cursor(
             dedup_timestamp = ts,
             rescan_from = %from,
             bounded = (from.version > cfg.starting_version),
+            // Source versions between our own offset and the rescan's start, which the file
+            // statistics say the rebuild covered. Where another writer repaired the target
+            // with timestamps newer than rows not yet delivered, this is how many versions of
+            // them are never read — and the cut-off, which counts only what it reads, never
+            // sees them.
+            versions_not_reread = from.version.saturating_sub(own.version),
             "target was rebuilt by another writer; rescanning and skipping rows the target \
              already covers"
         );
@@ -1473,6 +1846,8 @@ async fn resume_cursor(
         return Ok(Resume {
             cursor: from,
             bootstrapping: false,
+            rebuilt: Some(dedup),
+            committed: stored,
         });
     }
 
@@ -1513,17 +1888,20 @@ async fn resume_cursor(
     Ok(Resume {
         cursor: reset,
         bootstrapping: false,
+        rebuilt: None,
+        committed: stored,
     })
 }
 
-/// Where a pipeline resumes, and whether it has ever committed.
+/// Where a pipeline resumes, whether it has ever committed, and what a rebuild left behind.
 ///
-/// The second half is carried rather than recomputed because two decisions downstream turn on
-/// it and both are unsafe to guess. `adjust_for_replaced_source` may only call a log
-/// "backwards" relative to a position this pipeline actually reached, and
+/// Whether it has ever committed is carried rather than recomputed because three decisions
+/// downstream turn on it and all are unsafe to guess. `adjust_for_replaced_source` may only
+/// call a log "backwards" relative to a position this pipeline actually reached,
 /// `refuse_an_unreachable_bootstrap` may only offer to move `starting_version` forward when
-/// nothing depends on the versions that would be skipped.
-#[derive(Clone, Copy, Debug)]
+/// nothing depends on the versions that would be skipped, and `coverage_cutoff` may only
+/// infer coverage from a populated target when this pipeline has no offset of its own there.
+#[derive(Debug)]
 struct Resume {
     cursor: StreamCursor,
     /// True only when the target holds no `txn` action for this `app_id` *and* the cursor is
@@ -1533,6 +1911,152 @@ struct Resume {
     /// target is populated and its watermark says which rows are missing — out of a recovery
     /// whose whole premise is that there is no such claim to honour.
     bootstrapping: bool,
+    /// The cut-off the rescan after a rebuild was bounded by, when `cursor` is that rescan's
+    /// start. Handed on rather than read again, because it is the same question of the same
+    /// target, and the answer is what the rescan has to be filtered by.
+    rebuilt: Option<Dedup>,
+    /// The last source version our own `txn` offset says this pipeline committed.
+    committed: Option<Version>,
+}
+
+/// The coverage window this open starts in, if the target's coverage has to be inferred.
+///
+/// Only four situations call for one, and an ordinary resume is not among them: the `txn`
+/// offset commits atomically with the data, so it is exact on its own. First match wins.
+///
+/// | Case | Watermark | Closes after |
+/// |---|---|---|
+/// | The source was replaced | the rebuild's, else read now | a newer row |
+/// | The target was rebuilt | the one the rescan was bounded by | a newer row, or head `H` |
+/// | First start, target populated | read now | a newer row, or head `H` |
+/// | Our last commit recorded an open window | read now | a newer row, or its `H` |
+///
+/// `H` is the source version this open loaded. That is loaded before the target, so a rebuild
+/// visible in the target can have read a little further: `H` can be a little low, never high,
+/// and low errs towards duplicates. A replaced source gets no `H`: its target was filled
+/// from the old table, and the new one is usually re-seeded after this open. Nor does a stage
+/// source — the apply half of a staged upsert — because the stage is filled at the ingest
+/// half's own pace, and a raw row a rebuild covered can be staged long after this head.
+///
+/// Recorded windows re-read the target rather than remembering its watermark: a commit made
+/// inside an open window holds only rows exactly at the watermark, so the target's newest
+/// is still the same one, and the keys at it now include ours, which our offset is already
+/// past. A recorded window whose remaining versions up to `H` hold no data is not resumed,
+/// so an idle pipeline whose window ended in compactions does not re-read its target on
+/// every restart.
+///
+/// `H` is fixed only once the window's first commit records it. A reopen before that infers
+/// the window again from whatever the head is then, which matters only where the newer-row
+/// rule has not fired — a source that breaks the ordering requirement, or a bogus watermark.
+async fn coverage_cutoff(
+    cfg: &ResolvedPipeline,
+    source: &DeltaTable,
+    target: &DeltaTable,
+    ours: &watermark::OurLastCommit,
+    resume: Resume,
+    replaced: bool,
+    cursor: StreamCursor,
+) -> Result<Option<Cutoff>> {
+    let Some(ts) = cfg.dedup_timestamp.as_deref() else {
+        return Ok(None);
+    };
+    let key = cfg.dedup_key.as_deref();
+    let head = match crate::stage::is_stage_uri(&cfg.source_uri) {
+        true => None,
+        false => source.version(),
+    };
+
+    let (reason, through, resumed, dedup) = if replaced {
+        let dedup = match resume.rebuilt {
+            Some(d) => d,
+            None => Dedup::read(target, ts, key).await?,
+        };
+        (CoverageReason::SourceReplaced, None, false, dedup)
+    } else if let Some(dedup) = resume.rebuilt {
+        (CoverageReason::Rebuilt, head, false, dedup)
+    } else if resume.bootstrapping {
+        let dedup = Dedup::read(target, ts, key).await?;
+        (CoverageReason::Bootstrap, head, false, dedup)
+    } else if let Some(recorded) = ours.cutoff {
+        if let Some(through) = recorded.source_through {
+            if !has_data_commit_between(source, cursor.version, through).await? {
+                return Ok(None);
+            }
+        }
+        let dedup = Dedup::read(target, ts, key).await?;
+        (recorded.reason, recorded.source_through, true, dedup)
+    } else {
+        return Ok(None);
+    };
+
+    // Nothing to hold back: an empty target covers nothing, and a rescan that starts past
+    // the head it would close at has nothing left to read under it — a rebuild that overtook
+    // the stream.
+    if dedup.is_inert() || matches!(through, Some(h) if !cutoff_applies(h, cursor)) {
+        return Ok(None);
+    }
+    Ok(Some(Cutoff {
+        dedup,
+        window: CoverageWindow {
+            reason,
+            through,
+            resumed,
+        },
+        skipped: 0,
+    }))
+}
+
+/// Whether any source version in `from..=through` adds or changes data.
+///
+/// Stops at the first that does. A commit the log no longer has, or a range too long to walk,
+/// counts as data: that keeps a window open that might have closed, which drops only what it
+/// would have dropped had it never been interrupted.
+async fn has_data_commit_between(
+    source: &DeltaTable,
+    from: Version,
+    through: Version,
+) -> Result<bool> {
+    use deltalake::logstore::get_actions;
+
+    let log = source.log_store();
+    for v in from..=through {
+        if v - from >= watermark::DEFAULT_MAX_SCAN {
+            return Ok(true);
+        }
+        let Some(raw) = log.read_commit_entry(v).await? else {
+            return Ok(true);
+        };
+        if matches!(
+            classify(&get_actions(v, &raw)?),
+            CommitClass::Data { .. } | CommitClass::Change { .. }
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a window that closes after source version `through` still holds at `cursor`.
+///
+/// A cursor part-way through `through` is still inside it.
+fn cutoff_applies(through: Version, cursor: StreamCursor) -> bool {
+    cursor.version <= through
+}
+
+/// Whether a batch ending at `end`, with `beyond` rows newer than the watermark, closes a
+/// window that would otherwise close after `through`.
+fn window_closes_after(through: Option<Version>, end: StreamCursor, beyond: usize) -> bool {
+    beyond > 0 || through.is_some_and(|h| !cutoff_applies(h, end))
+}
+
+/// The watermark as a value, for the startup line.
+fn watermark_display(dedup: &Dedup) -> String {
+    use deltalake::arrow::util::display::array_value_to_string;
+
+    dedup
+        .watermark()
+        .and_then(|w| array_value_to_string(w, 0).ok())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 /// Refuse to start a pipeline whose first version the source's log no longer holds.
@@ -1649,8 +2173,33 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        apply_lookup_table_id_transitions, lookup_table_id_changed, LookupTableIdTransition,
+        apply_lookup_table_id_transitions, lookup_table_id_changed, window_closes_after,
+        LookupTableIdTransition,
     };
+    use crate::source::StreamCursor;
+
+    #[test]
+    fn a_window_closes_after_a_newer_row_or_past_its_head() {
+        let at = StreamCursor::at_version;
+        assert!(
+            !window_closes_after(Some(5), at(5), 0),
+            "version 5 is still to be read"
+        );
+        assert!(window_closes_after(Some(5), at(6), 0), "5 has been read");
+        assert!(
+            !window_closes_after(Some(5), StreamCursor::new(5, 2), 0),
+            "part-way through 5 is still inside it"
+        );
+        assert!(
+            !window_closes_after(None, at(99), 0),
+            "with no head, however far the stream has read, only a newer row closes it"
+        );
+        assert!(window_closes_after(None, at(1), 1));
+        assert!(
+            window_closes_after(Some(5), at(2), 3),
+            "a newer row closes it before its head"
+        );
+    }
 
     #[test]
     fn failed_current_fallback_stays_pending_until_the_target_commit() {

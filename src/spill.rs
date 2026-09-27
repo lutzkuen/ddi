@@ -441,6 +441,14 @@ pub fn current() -> Arc<Spill> {
 /// in.
 const DISK_EXHAUSTED: &str = "used disk space during the spilling process";
 
+/// The sentence DataFusion writes when it cannot create a spill file.
+///
+/// Raised as a plain execution error — out of file descriptors, a directory that is missing
+/// or read-only — and so, by variant, indistinguishable from an error about a value. It is a
+/// fact about the machine, like a full directory, and gets the same handling. Matched as a
+/// substring because the path and the OS error are formatted in.
+const SPILL_FILE_CREATE: &str = "Failed to create partition file";
+
 /// The prefix `DataFusionError::ResourcesExhausted` renders with.
 ///
 /// Needed because delta-rs stringifies a DataFusion error it does not special-case into
@@ -454,10 +462,17 @@ const EXHAUSTED: &str = "Resources exhausted:";
 /// an OOM to the disk budget and tell the operator to raise the wrong knob. When the text does
 /// not name the disk, this says memory instead of guessing.
 pub fn classify(e: DataFusionError, context: &str) -> Error {
-    if !matches!(e.find_root(), DataFusionError::ResourcesExhausted(_)) {
+    if !is_capacity(&e) {
         return Error::Transform(format!("{context}: {e}"));
     }
     capacity(e.to_string(), context)
+}
+
+/// Whether `e` says the machine ran out of something — memory, spill space, or the means to
+/// create a spill file — rather than anything about the query or its data.
+pub(crate) fn is_capacity(e: &DataFusionError) -> bool {
+    matches!(e.find_root(), DataFusionError::ResourcesExhausted(_))
+        || e.to_string().contains(SPILL_FILE_CREATE)
 }
 
 /// Read a delta-rs failure as a capacity failure, or leave it as [`Error::Delta`].
@@ -479,6 +494,10 @@ pub fn classify_delta(e: deltalake::DeltaTableError, context: &str) -> Error {
 /// Say which budget ran out, given the message that says one did.
 fn capacity(s: String, context: &str) -> Error {
     let spill = current();
+    let directory = || match spill.directory() {
+        Some(d) => format!("{}", d.display()),
+        None => "the OS temporary directory".to_string(),
+    };
     let which = if s.contains(DISK_EXHAUSTED) {
         // The byte count as well as the human size, and deliberately: DataFusion renders the
         // same number in binary units inside the sentence above ("4.0 MB" for 4 MiB) and this
@@ -486,13 +505,17 @@ fn capacity(s: String, context: &str) -> Error {
         // message reads as two different numbers, so the exact one settles it.
         format!(
             "the process's spill budget ([runtime] max_temp_directory_size, currently {} \
-             ({} bytes){})",
+             ({} bytes), in {})",
             bytesize::ByteSize(spill.limit_bytes()),
             spill.limit_bytes(),
-            match spill.directory() {
-                Some(d) => format!(", in {}", d.display()),
-                None => ", in the OS temporary directory".to_string(),
-            }
+            directory()
+        )
+    } else if s.contains(SPILL_FILE_CREATE) {
+        format!(
+            "the spill directory ([runtime] temp_directory, currently {}): a spill file could \
+             not be created there — it is missing or read-only, or the process is out of file \
+             descriptors",
+            directory()
         )
     } else {
         "a memory pool ([runtime] max_memory, divided by the pipelines running)".to_string()
@@ -682,5 +705,37 @@ mod tests {
         // Everything else keeps the shape it always had.
         let other = DataFusionError::Plan("no such column".into());
         assert!(matches!(classify(other, "upsert"), Error::Transform(_)));
+    }
+
+    #[test]
+    fn a_spill_file_that_cannot_be_created_is_capacity() {
+        // DataFusion raises it as a plain execution error, the variant an error about a
+        // value has too. Read as one, a machine fault would be retried a second later, or
+        // blamed on the rows being evaluated.
+        let cannot_create = || {
+            DataFusionError::Execution(
+                "(Hint: you may increase the file descriptor limit with shell command 'ulimit \
+                 -n 4096') Failed to create partition file at \"/x/spill\": Os { code: 24, \
+                 kind: Uncategorized, message: \"Too many open files\" }"
+                    .into(),
+            )
+        };
+        assert!(is_capacity(&cannot_create()));
+        let e = classify(cannot_create(), "transform_sql failed to execute");
+        assert!(matches!(e, Error::Capacity(_)), "{e}");
+        let m = e.to_string();
+        assert!(m.contains("the spill directory"), "{m}");
+        assert!(m.contains("file descriptors"), "{m}");
+        assert!(
+            !m.contains("max_memory, divided"),
+            "not blamed on the memory pool: {m}"
+        );
+
+        assert!(is_capacity(&DataFusionError::ResourcesExhausted(
+            "Failed to allocate additional 1024 bytes".into()
+        )));
+        assert!(!is_capacity(&DataFusionError::Execution(
+            "Cast error: Cannot cast string 'n/a' to value of Int64 type".into()
+        )));
     }
 }

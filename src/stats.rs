@@ -19,6 +19,28 @@
 //! truncated value directly would rule out files that really do hold the value. Every
 //! comparison that can exclude data therefore goes through [`Bound::provably_below`],
 //! which answers only when the answer is provable. See [`ranges_can_overlap`].
+//!
+//! Timestamps are truncated too, to the millisecond, which the protocol allows and Spark
+//! does: a maximum of `10:00:00.000` can stand for a row at `10:00:00.000900`. That one is a
+//! number rather than a prefix, so it is allowed for by [`Slack`], as a DECIMAL's is.
+//!
+//! # Decimals
+//!
+//! A DECIMAL reaches a [`Bound`] only as a nearby double, and on both sides of the
+//! comparison. This side is Arrow's cast, which divides the unscaled integer by `10^scale`
+//! in floating point. The statistic's side is whatever its writer recorded: delta-rs writes
+//! that same division, and steps a fixed-length decimal one ULP toward zero when rounding
+//! gains it an integer digit; Spark writes the exact decimal text, which reads as the
+//! nearest double; a checkpoint's `stats_parsed`, re-serialised when the raw string is
+//! gone, has been truncated to the scale on the way in. The two sides do not agree bit for
+//! bit, and two different decimals can even share one double — DECIMAL(38,18)
+//! `0.403800000000000050` and `0.403800000000000051` do.
+//!
+//! So nothing is excluded, and no window drawn, on the assumption that they agree. Every
+//! decision taken from a DECIMAL bound goes through [`Slack`]: one unit of the column's
+//! scale, which covers a reader's truncation, plus [`Slack::ULPS`] representable doubles,
+//! which cover the few ULPs each conversion can be off by. That widens a range by one unit
+//! and about 4e-15 of its value: a cost in what is read, never in what is found.
 
 use deltalake::arrow::array::{Array, ArrayRef};
 use deltalake::arrow::compute::cast;
@@ -101,10 +123,103 @@ pub fn range_touches_any(file_min: &Bound, file_max: &Bound, wanted: &[Bound]) -
     }
 }
 
+/// How far a bound may lie from the value it stands for.
+///
+/// Two kinds of column get one. A DECIMAL, whose bounds are only near their value on either
+/// side — see the module's "Decimals" section. And a timestamp, whose statistics the protocol
+/// lets a writer truncate to the millisecond, and Spark does: a recorded maximum that is a
+/// whole millisecond can be up to 999 µs below the newest row it covers. One with digits
+/// below the millisecond was not truncated, and is exact. Truncation only ever lowers a
+/// timestamp, so its minimum is still a lower bound and needs nothing.
+///
+/// Integers, dates and text compare exactly, text's truncation aside, which
+/// [`Bound::provably_below`] already handles; a DOUBLE is written and read back as exactly the
+/// double it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Slack {
+    /// A DECIMAL: one unit of the column's scale — `0.01` for DECIMAL(10,2) — and
+    /// [`Slack::ULPS`] doubles beyond it, each way.
+    Decimal { unit: f64 },
+    /// A timestamp: a maximum that is a whole millisecond stands for up to
+    /// [`Slack::TRUNCATED_MICROS`] more.
+    Millisecond,
+}
+
+impl Slack {
+    /// Representable doubles added beyond the unit. The conversions on either side are off
+    /// by two or three ULPs up to scale 22; past it `10f64.powi(scale)` is itself rounded
+    /// and adds a few more, and delta-rs's fixed-length step and a reader without a
+    /// correctly rounded float parser add one each. Sixteen covers all of it with room.
+    pub const ULPS: u32 = 16;
+
+    /// What a timestamp statistic truncated to the millisecond can have lost.
+    pub const TRUNCATED_MICROS: i64 = 999;
+
+    /// `Some` for a DECIMAL or timestamp column, `None` for every type whose bounds are exact.
+    pub fn of(dtype: &DataType) -> Option<Self> {
+        match dtype {
+            DataType::Decimal32(_, s)
+            | DataType::Decimal64(_, s)
+            | DataType::Decimal128(_, s)
+            | DataType::Decimal256(_, s) => Some(Self::Decimal {
+                unit: 10f64.powi(-i32::from(*s)),
+            }),
+            DataType::Timestamp(_, _) => Some(Self::Millisecond),
+            _ => None,
+        }
+    }
+
+    /// The lowest value `b` could stand for.
+    pub fn below(&self, b: &Bound) -> Bound {
+        match (self, b) {
+            (Self::Decimal { unit }, Bound::Float(v)) => {
+                Bound::Float((0..Self::ULPS).fold(v - unit, |x, _| next_toward(x, false)))
+            }
+            (_, other) => other.clone(),
+        }
+    }
+
+    /// The highest value `b` could stand for.
+    pub fn above(&self, b: &Bound) -> Bound {
+        match (self, b) {
+            (Self::Decimal { unit }, Bound::Float(v)) => {
+                Bound::Float((0..Self::ULPS).fold(v + unit, |x, _| next_toward(x, true)))
+            }
+            (Self::Millisecond, Bound::Int(us)) if us.rem_euclid(1000) == 0 => {
+                Bound::Int(us.saturating_add(Self::TRUNCATED_MICROS))
+            }
+            (_, other) => other.clone(),
+        }
+    }
+}
+
+/// The next representable double above (`up`) or below `v`.
+///
+/// `f64::next_up` and `f64::next_down` would do, but they arrived in Rust 1.86 and this crate
+/// declares 1.85. NaN and the infinities come back unchanged.
+fn next_toward(v: f64, up: bool) -> f64 {
+    if v.is_nan() || v.is_infinite() {
+        return v;
+    }
+    if v == 0.0 {
+        let least = f64::from_bits(1);
+        return if up { least } else { -least };
+    }
+    // Stepping away from zero is one more in the bit pattern, whichever the sign.
+    let bits = v.to_bits();
+    f64::from_bits(if (v > 0.0) == up { bits + 1 } else { bits - 1 })
+}
+
 /// Reduce a one-element Arrow array to a comparable bound.
 ///
 /// `None` when its type is not one that can be lined up against Delta statistics — the
 /// caller then falls back to reading everything.
+///
+/// A DECIMAL becomes Arrow's own division of its unscaled integer by `10^scale`, which is
+/// not the nearest double but is what delta-rs records for the same value, bit for bit, so
+/// ddi's own files line up without help. Nothing rests on that match: other writers record
+/// other doubles, so every decision drawn from a DECIMAL bound allows for the difference
+/// through [`Slack`]. See the module's "Decimals" section.
 pub fn bound_of_scalar(value: &ArrayRef) -> Option<Bound> {
     use deltalake::arrow::array::{AsArray, Int64Array};
     use deltalake::arrow::datatypes::{Float64Type, TimeUnit, TimestampMicrosecondType};
@@ -146,6 +261,12 @@ pub fn bound_of_scalar(value: &ArrayRef) -> Option<Bound> {
 }
 
 /// Interpret a Delta statistic in the same shape as `like`.
+///
+/// A DOUBLE statistic reads back as exactly the double its writer recorded, which the upsert
+/// window depends on: a sequence minimum read one ULP high puts `>= lo` above the row it came
+/// from. That holds only because serde_json is built with `float_roundtrip`; its default
+/// parser is one ULP off for the 17-digit spellings such doubles are written with (issue
+/// #12). A DECIMAL statistic is only near its value however it is read; see [`Slack`].
 pub fn bound_of_stat(stat: &serde_json::Value, like: &Bound) -> Option<Bound> {
     match like {
         Bound::Int(_) => match stat {
@@ -192,6 +313,20 @@ pub fn parse_timestamp_micros(s: &str) -> Option<i64> {
 pub struct ColumnStats {
     pub min: Option<Bound>,
     pub max: Option<Bound>,
+}
+
+impl ColumnStats {
+    /// Widened by `slack`, when there is one: the minimum to the lowest value it could stand
+    /// for, the maximum to the highest.
+    pub fn loosened(self, slack: Option<Slack>) -> Self {
+        let Some(s) = slack else {
+            return self;
+        };
+        Self {
+            min: self.min.map(|b| s.below(&b)),
+            max: self.max.map(|b| s.above(&b)),
+        }
+    }
 }
 
 /// Pull one column's statistics out of a file's `stats` JSON, shaped like `like`.
@@ -351,5 +486,184 @@ mod tests {
             Some(Bound::Int(want)),
             "the Arrow side and the statistic side of a date column must agree"
         );
+    }
+
+    /// Doubles that need all 17 significant digits to round-trip, as a serialiser writes
+    /// them. The four from issue #12.
+    const SEVENTEEN_DIGITS: [&str; 4] = [
+        "0.49979999999999997",
+        "0.9017000000000001",
+        "0.45909999999999995",
+        "0.40380000000000005",
+    ];
+
+    fn float(b: Option<Bound>) -> f64 {
+        match b {
+            Some(Bound::Float(v)) => v,
+            other => panic!("expected a float bound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_float_statistic_reads_back_as_the_double_that_was_written() {
+        // A DOUBLE sequence's minimum read one ULP high draws the window's `>= lo` above the
+        // row it came from, and the key is inserted a second time. serde_json's default
+        // parser does exactly that for these spellings; `float_roundtrip` does not.
+        for text in SEVENTEEN_DIGITS {
+            let stat: serde_json::Value = serde_json::from_str(text).unwrap();
+            let got = float(bound_of_stat(&stat, &Bound::Float(0.0)));
+            let want: f64 = text.parse().unwrap();
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{text} read as {got:?}, not as the double that was written"
+            );
+        }
+
+        let stats: serde_json::Value = serde_json::from_str(
+            r#"{"minValues":{"seq":0.40380000000000005},"maxValues":{"seq":0.9017000000000001}}"#,
+        )
+        .unwrap();
+        let got = column_stats(&stats, "seq", &Bound::Float(0.0));
+        assert_eq!(
+            float(got.min).to_bits(),
+            "0.40380000000000005".parse::<f64>().unwrap().to_bits()
+        );
+        assert_eq!(
+            float(got.max).to_bits(),
+            "0.9017000000000001".parse::<f64>().unwrap().to_bits()
+        );
+    }
+
+    #[test]
+    fn a_decimal_statistic_from_any_writer_still_touches_its_key() {
+        // One DECIMAL(38,17) row per file, min = max, spelled as each writer spells it. The
+        // key is what ddi makes of the same value. Every spelling must still reach it.
+        use deltalake::arrow::array::Decimal128Array;
+        use std::sync::Arc;
+
+        let dtype = DataType::Decimal128(38, 17);
+        let slack = Slack::of(&dtype);
+        // The fraction written out to the scale, as a checkpoint's `stats_parsed` holds it
+        // after reading `text` as a decimal: extra digits truncated, missing ones zero.
+        let to_scale = |text: &str| {
+            let (int, frac) = text.split_once('.').unwrap();
+            let frac: String = frac
+                .chars()
+                .chain(std::iter::repeat('0'))
+                .take(17)
+                .collect();
+            format!("{int}.{frac}")
+        };
+
+        for (unscaled, exact) in [
+            (49979999999999997i128, "0.49979999999999997"),
+            (92030920993190389, "0.92030920993190389"),
+        ] {
+            let value: ArrayRef = Arc::new(
+                Decimal128Array::from(vec![unscaled])
+                    .with_precision_and_scale(38, 17)
+                    .unwrap(),
+            );
+            let key = bound_of_scalar(&value).unwrap();
+            let delta_rs = serde_json::to_string(&(unscaled as f64 / 1e17)).unwrap();
+            let checkpoint = to_scale(&delta_rs);
+            for (writer, text) in [
+                ("delta-rs", delta_rs.as_str()),
+                ("Spark", exact),
+                ("a checkpoint", checkpoint.as_str()),
+            ] {
+                let stat = serde_json::from_str::<serde_json::Value>(text).unwrap();
+                let stats =
+                    serde_json::json!({"minValues": {"k": stat.clone()}, "maxValues": {"k": stat}});
+                let file = column_stats(&stats, "k", &key).loosened(slack);
+                assert!(
+                    range_touches_any(
+                        file.min.as_ref().unwrap(),
+                        file.max.as_ref().unwrap(),
+                        std::slice::from_ref(&key)
+                    ),
+                    "{writer}'s {text} for {exact} no longer touches the key {key:?}"
+                );
+            }
+        }
+
+        // Why the slack is needed at all: Spark's exact text reads as the nearest double,
+        // one ULP below the one Arrow's division gives the key, and without the slack the
+        // file holding the key would be ruled out.
+        let value: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![49979999999999997i128])
+                .with_precision_and_scale(38, 17)
+                .unwrap(),
+        );
+        let key = bound_of_scalar(&value).unwrap();
+        let spark = Bound::Float("0.49979999999999997".parse().unwrap());
+        assert!(
+            !range_touches_any(&spark, &spark, std::slice::from_ref(&key)),
+            "the two sides agree after all, and this test no longer shows why Slack exists"
+        );
+    }
+
+    #[test]
+    fn a_slack_is_only_for_decimals_and_timestamps() {
+        use deltalake::arrow::datatypes::TimeUnit;
+
+        for exact in [
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Float32,
+            DataType::Date32,
+            DataType::Utf8,
+        ] {
+            assert_eq!(Slack::of(&exact), None, "{exact} compares exactly");
+        }
+        assert!(Slack::of(&DataType::Decimal128(38, 17)).is_some());
+        assert!(Slack::of(&DataType::Decimal256(76, 10)).is_some());
+
+        // A timestamp maximum Spark truncated to the millisecond still reaches the row it
+        // stands for, and a minimum, which truncation only lowers, is left alone.
+        let clock = Slack::of(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap();
+        let recorded = parse_timestamp_micros("2026-09-25T10:00:00.000Z").unwrap();
+        let newest = parse_timestamp_micros("2026-09-25T10:00:00.000999").unwrap();
+        assert_eq!(clock.above(&Bound::Int(recorded)), Bound::Int(newest));
+        assert_eq!(clock.below(&Bound::Int(recorded)), Bound::Int(recorded));
+        // Before the epoch too: truncating lowers it there as well.
+        assert_eq!(clock.above(&Bound::Int(-2_000)), Bound::Int(-1_001));
+        // A maximum with digits below the millisecond was not truncated.
+        let exact = parse_timestamp_micros("2026-09-25T10:00:00.000200Z").unwrap();
+        assert_eq!(clock.above(&Bound::Int(exact)), Bound::Int(exact));
+        assert_eq!(clock.above(&t("order")), t("order"));
+    }
+
+    #[test]
+    fn a_decimal_slack_moves_at_least_a_unit() {
+        let cents = Slack::of(&DataType::Decimal128(10, 2)).unwrap();
+        assert!(float(Some(cents.below(&Bound::Float(12.34)))) <= 12.33);
+        assert!(float(Some(cents.above(&Bound::Float(12.34)))) >= 12.35);
+
+        // Past the unit, which at this scale is less than one ULP of 0.4.
+        let fine = Slack::of(&DataType::Decimal128(38, 17)).unwrap();
+        let lowered = float(Some(fine.below(&Bound::Float(0.4))));
+        assert!(lowered.to_bits() + u64::from(Slack::ULPS) <= 0.4f64.to_bits());
+        let raised = float(Some(fine.above(&Bound::Float(0.4))));
+        assert!(raised.to_bits() >= 0.4f64.to_bits() + u64::from(Slack::ULPS));
+
+        // Only floats move.
+        assert_eq!(cents.below(&Bound::Int(7)), Bound::Int(7));
+        assert_eq!(cents.above(&t("order")), t("order"));
+
+        // Across zero and below it.
+        let whole = Slack::of(&DataType::Decimal128(10, 0)).unwrap();
+        assert!(float(Some(whole.below(&Bound::Float(0.0)))) < -1.0);
+        assert!(float(Some(whole.above(&Bound::Float(-1.0)))) > 0.0);
+        assert!(float(Some(whole.below(&Bound::Float(-7.0)))) < -8.0);
+        assert_eq!(next_toward(0.0, true), f64::from_bits(1));
+        assert_eq!(next_toward(0.0, false), -f64::from_bits(1));
+        assert_eq!(next_toward(f64::from_bits(1), false), 0.0);
+        assert_eq!(next_toward(-f64::from_bits(1), true), 0.0);
+        assert!(next_toward(-1.0, false) < -1.0 && next_toward(-1.0, true) > -1.0);
+        assert!(next_toward(1.0, false) < 1.0 && next_toward(1.0, true) > 1.0);
+        assert_eq!(next_toward(f64::INFINITY, true), f64::INFINITY);
+        assert!(next_toward(f64::NAN, true).is_nan());
     }
 }

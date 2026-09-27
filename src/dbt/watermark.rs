@@ -32,6 +32,17 @@
 //! INSERT INTO lake.meta.ddi_watermark VALUES ('ddi.silver.orders', 100)
 //! ```
 //!
+//! # Which pipelines read it
+//!
+//! Only those without `dedup_timestamp`. With one set — every dbt model, whose `ddi_timestamp`
+//! defaults to `_timestamp`, and every upsert — the handover after a rebuild is the timestamp
+//! rescan and its coverage window ([`crate::dedup`]), and this table is not read, whatever it
+//! holds. The target's data says what the rebuild left behind, where a row here cannot say
+//! which rebuild recorded it: the table only grows, and a rewrite that records nothing, or a
+//! post-hook still to run, leaves an earlier rebuild's row the newest. The rescan's price is
+//! its ordering requirement: a source written from a multi-partition Kafka topic can lose a
+//! lagging partition's late rows to its cut-off, as [`crate::dedup`] says.
+//!
 //! # Ordering
 //!
 //! Prefer a **pre-hook** that records the version and a model that pins its read to it
@@ -51,6 +62,7 @@ use deltalake::DeltaTable;
 use futures::TryStreamExt;
 use tracing::warn;
 
+use crate::dedup::RecordedCutoff;
 use crate::error::{Error, Result};
 use crate::source::Version;
 
@@ -255,11 +267,24 @@ pub struct OurLastCommit {
     /// The source table id we were reading. `None` for commits written before this was
     /// recorded, or when we have never written to this target.
     pub source_table_id: Option<String>,
+    /// A source version that had `source_table_id`. `None` for commits written before this
+    /// was recorded. See [`SOURCE_TABLE_ID_VERSION_KEY`].
+    pub source_table_id_version: Option<Version>,
     /// Delta identities of the pinned lookups that produced the commit. A table recreated at
     /// the same URI has a new id; resuming against it would silently change an old join.
     /// Empty for pre-lookup commits and for tables we have never written.
     pub lookup_table_ids: BTreeMap<String, String>,
+    /// The coverage window that commit was made inside, when the window was still open after
+    /// it. `None` outside one — and for the commit that closed one, which is what stops a
+    /// reopen from resuming a window that has already ended. See [`crate::dedup`].
+    pub cutoff: Option<RecordedCutoff>,
 }
+
+/// `commitInfo` key naming a source version that had the table id a commit of ours records
+/// (`ddi.sourceTableId`): the newest the stream had loaded. A reopen that finds another id
+/// loads that version again, and a log that still gives it the recorded id is the same log,
+/// replaced in place.
+pub const SOURCE_TABLE_ID_VERSION_KEY: &str = "ddi.sourceTableIdVersion";
 
 /// Walk the target log backwards for the most recent commit that carries our txn action,
 /// and report what it said about the source it came from.
@@ -290,14 +315,16 @@ pub async fn our_last_commit(
             .iter()
             .any(|a| matches!(a, Action::Txn(t) if t.app_id == app_id))
         {
-            let source_table_id = actions.iter().find_map(|a| match a {
-                Action::CommitInfo(ci) => ci
-                    .info
-                    .get("ddi.sourceTableId")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                _ => None,
-            });
+            let info = |key: &str| {
+                actions.iter().find_map(|a| match a {
+                    Action::CommitInfo(ci) => ci.info.get(key).cloned(),
+                    _ => None,
+                })
+            };
+            let source_table_id =
+                info("ddi.sourceTableId").and_then(|v| v.as_str().map(str::to_string));
+            let source_table_id_version =
+                info(SOURCE_TABLE_ID_VERSION_KEY).and_then(|v| v.as_u64());
             let lookup_table_ids = actions
                 .iter()
                 .filter_map(|a| match a {
@@ -311,10 +338,16 @@ pub async fn our_last_commit(
                     Some((name.to_string(), id.to_string()))
                 })
                 .collect();
+            let cutoff = actions.iter().find_map(|a| match a {
+                Action::CommitInfo(ci) => RecordedCutoff::from_commit_info(&ci.info),
+                _ => None,
+            });
             return Ok(OurLastCommit {
                 commit_version: Some(v),
                 source_table_id,
+                source_table_id_version,
                 lookup_table_ids,
+                cutoff,
             });
         }
 

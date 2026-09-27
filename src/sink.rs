@@ -19,19 +19,29 @@ use deltalake::protocol::SaveMode;
 use deltalake::DeltaTable;
 use tracing::debug;
 
+use crate::dbt::watermark::SOURCE_TABLE_ID_VERSION_KEY;
+use crate::dedup::RecordedCutoff;
 use crate::error::{Error, Result};
 use crate::lookup::LookupSnapshot;
+use crate::source::Version;
 use crate::upsert::MergePlan;
 
 pub struct Sink {
     app_id: String,
     target_file_size: Option<NonZeroU64>,
-    /// Which source table this pipeline is reading, so a later run can tell whether it is
-    /// still the same one. A dropped-and-recreated source keeps its path but gets a new
-    /// id, and nothing else in the log records that.
-    source_table_id: Option<String>,
+    /// Which source table this pipeline is reading, and a source version that had that id, so
+    /// a later run can tell whether it is still the same one. A dropped-and-recreated source
+    /// keeps its path but gets a new id, and nothing else in the log records that. A table
+    /// replaced in place gets a new id as well, but keeps its log, which still gives that
+    /// version the id it had there: the version is what tells the two apart.
+    source_identity: Option<(Version, String)>,
     /// The exact lookup snapshots that enriched the source batch currently being committed.
     lookup_snapshots: Vec<LookupCommit>,
+    /// The coverage window the batch being committed was filtered in, while that window stays
+    /// open past it. Recorded so that a reopen part-way through a window carries on filtering
+    /// where this commit left off, rather than re-emitting what the target already holds.
+    /// See [`crate::dedup`].
+    cutoff: Option<RecordedCutoff>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,14 +58,22 @@ impl Sink {
         Self {
             app_id: app_id.into(),
             target_file_size: NonZeroU64::new(target_file_size),
-            source_table_id: None,
+            source_identity: None,
             lookup_snapshots: Vec::new(),
+            cutoff: None,
         }
     }
 
-    pub fn with_source_table_id(mut self, id: Option<String>) -> Self {
-        self.source_table_id = id;
+    pub fn with_source_identity(mut self, identity: Option<(Version, String)>) -> Self {
+        self.source_identity = identity;
         self
+    }
+
+    /// Replace the source identity recorded with the next target commit: the id the batch was
+    /// read under, which differs from the one at open once the stream has read across a table
+    /// replaced in place.
+    pub fn set_source_identity(&mut self, identity: Option<(Version, String)>) {
+        self.source_identity = identity;
     }
 
     /// Replace the provenance recorded with the next target commit.
@@ -76,6 +94,12 @@ impl Sink {
             .collect();
     }
 
+    /// Replace the coverage window recorded with the next target commit. `None` records none,
+    /// which is what the commit that closes a window, and every commit outside one, carries.
+    pub fn set_cutoff(&mut self, cutoff: Option<RecordedCutoff>) {
+        self.cutoff = cutoff;
+    }
+
     /// The commit properties every write of ours carries, whatever its shape.
     fn properties(&self, source_version: i64) -> CommitProperties {
         let mut metadata = vec![
@@ -88,10 +112,14 @@ impl Sink {
                 serde_json::Value::from(self.app_id.clone()),
             ),
         ];
-        if let Some(id) = &self.source_table_id {
+        if let Some((version, id)) = &self.source_identity {
             metadata.push((
                 "ddi.sourceTableId".to_string(),
                 serde_json::Value::from(id.clone()),
+            ));
+            metadata.push((
+                SOURCE_TABLE_ID_VERSION_KEY.to_string(),
+                serde_json::Value::from(*version),
             ));
         }
         for lookup in &self.lookup_snapshots {
@@ -115,6 +143,12 @@ impl Sink {
             if lookup.used_current {
                 metadata.push((format!("{prefix}.current"), serde_json::Value::from(true)));
             }
+        }
+        // On every shape of commit, the offset-only ones included: an empty append after a
+        // no-op merge moves the offset exactly as far as a merge would have, so a reopen after
+        // it must find the window still open just the same.
+        if let Some(cutoff) = &self.cutoff {
+            metadata.extend(cutoff.to_commit_metadata());
         }
 
         CommitProperties::default()

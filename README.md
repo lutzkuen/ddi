@@ -139,6 +139,7 @@ directory*. Every accepted feature preserves it.
 | intra-row array agg | no | yes | **supported** (`array_sum` etc.) |
 | `transform` / `filter` over one row's array | no | yes | **supported**, in Trino's lambda spelling |
 | `json_object` / `json_array` / `CAST(.. AS JSON)` | no | yes | **supported**, with Trino's rules |
+| `from_unixtime` | no | yes | **supported**, in any zone Trino accepts — see [Epoch seconds](#epoch-seconds-from_unixtime) |
 | upsert on a key | no (the *target* holds it) | no | **supported**, opt-in — see [Upserting](#upserting) |
 | pinned Delta lookup via `LEFT JOIN` | no | yes | **supported**, declared and version-pinned per source commit |
 | `GROUP BY` aggregation | **yes** | **no** | **rejected — different product** |
@@ -212,8 +213,10 @@ Arrow has no cast from text to a list, so the cast becomes `json_array_elements(
 internally. Two consequences worth knowing:
 
 - A row whose path is missing, or is not an array, contributes **no rows** rather than
-  failing — a NULL array expands to nothing, as in Trino. Malformed JSON still stops the
-  pipeline, because the input is a typed column rather than arbitrary text.
+  failing — a NULL array expands to nothing, as in Trino. Malformed JSON is still an error,
+  because the input is a typed column rather than arbitrary text: with a data-quality table
+  the row is set aside as one the [transform cannot evaluate](#a-row-the-transform-cannot-evaluate),
+  and without one it stops the pipeline.
 - A JSON `null` element is the JSON value `null`, as it is in Trino — a row, not a NULL
   one; `json_extract_scalar` on it is NULL.
 
@@ -283,6 +286,59 @@ landing in two batches would emit two partial messages. A lambda has no such gap
 never leaves its row. (`array_sum` and friends are not Trino functions; a model that uses
 them streams but cannot be described or rebuilt by Starburst, which spells the reduction
 `reduce(arr, 0, (s, x) -> s + x, s -> s)`. `reduce` is not implemented.)
+
+### Epoch seconds: `from_unixtime`
+
+`from_unixtime(seconds)`, `from_unixtime(seconds, 'zone')` and `from_unixtime(seconds,
+hours, minutes)` return Trino's value: the instant rounded to the millisecond as Trino's
+`Math.round` rounds it, labelled with the zone. The zone is any id Trino accepts — an IANA
+name, `UTC` by any of Trino's names, an offset such as `'+05:30'` or `'GMT-3'` within
+±14:00 — spelt exactly, because the lookup is case-sensitive in Trino too. It is checked at
+config load, and it has to be a literal, as do the hours and minutes: an Arrow timestamp
+carries its zone in its type, so one column cannot hold a different zone on each row. The
+one-argument form is UTC. `from_unixtime(..) AT TIME ZONE 'zone'` means the same as passing
+the zone.
+
+The value is carried in microseconds, the unit of a Delta `timestamp`, so an epoch in the
+24th century converts as it does in Trino rather than overflowing the nanosecond range at
+2262, and landing it in a `timestamp` column changes nothing but the zone label.
+
+Instants agree with Trino. Wall clocks can differ:
+
+- a `TIMESTAMP` literal compared with the value is read in the value's zone, where Trino
+  reads it in the session's;
+- `CAST(.. AS TIMESTAMP)`, and a `timestamp_ntz` target column, get the UTC wall clock where
+  Trino gives the local one — and that cast is to nanoseconds, so past 2262 it fails;
+- as text the value reads `2024-04-01T00:30:00+02:00`, where Trino writes
+  `2024-04-01 00:30:00.000 Europe/Amsterdam`;
+- the zone database here tabulates daylight saving only up to 2099, and after that keeps the
+  zone's last offset, so for half of each year its local time is an hour off Trino's: in summer
+  where that offset is standard time, as in Europe/Amsterdam, and in winter where it is
+  daylight saving time, as in Australia/Sydney;
+- before 1970, a zone the tz database has since merged into another — `Europe/Amsterdam`
+  and `Europe/Luxembourg` into `Europe/Brussels`, `Asia/Kuala_Lumpur` into
+  `Asia/Singapore`, `Atlantic/Reykjavik` into `Africa/Abidjan`, among others — has the other
+  zone's offsets here, where Trino keeps the zone's own history, which the database moved
+  to its `backzone` file: at noon UTC on 14 July 1900 Amsterdam's clock reads 12:19 in Trino
+  and 12:00 here;
+- `NaN` fails where Trino returns 1970, and an epoch between about 71,000 and 292,000 years
+  converts here where Trino refuses it;
+- `date_trunc` to the hour or coarser fails on a value past 2262 where Trino truncates it.
+  DataFusion truncates in nanoseconds, and beyond their range it would return a wrong date
+  without a word, so `ddi` replaces its `date_trunc` with one that refuses such a value —
+  which also covers a Delta `timestamp` column holding one. With a data-quality table that
+  row is [set aside](#a-row-the-transform-cannot-evaluate) and the rest of the batch commits;
+- the one-argument form is UTC whatever a Trino session's zone is, so under a session in
+  another zone its local time differs, and near midnight so does its date.
+
+For a date, `CAST(from_unixtime(x, 'UTC') AS DATE)`, or the same with a fixed offset such as
+`'+02:00'`, gives Trino's answer wherever both convert. A zone with daylight saving can still
+differ after 2099, where `ddi`'s zone data ends and keeps the zone's last offset, for an
+instant within an hour of its local midnight: the hour after it where that offset is standard
+time, as in Europe/Amsterdam, and the hour before it where it is daylight saving time, as in
+Australia/Sydney. A merged zone can differ before 1970, within the gap between the two zones'
+offsets of its local midnight — `from_unixtime(-2208989400, 'Europe/Amsterdam')` is
+1900-01-01 in Trino and 1899-12-31 here — and so can the one-argument form.
 
 ### Pinned Delta lookups
 
@@ -478,6 +534,12 @@ pipeline "orders_header": target "..." was rewritten at version 41 by another wr
 row streamed while dbt was reading.
 ```
 
+That is the handover of a pipeline without `dedup_timestamp` (below). With one set — every
+dbt model, since `ddi_timestamp` defaults to `_timestamp`, and every upsert — the handover
+after a rebuild is the timestamp rescan, and `watermark_uri` is not read at all, whatever the
+table holds: a row in it cannot say which rebuild recorded it, where the target's own data
+says what the rebuild left behind.
+
 ### When the rebuild cannot be changed at all
 
 A watermark table means touching the dbt project. If the batch side must stay untouched —
@@ -516,9 +578,44 @@ models:
       ddi_key: order_id
 ```
 
-The timestamp **must be non-decreasing in the order rows reach the source** — a late row
-bearing an older timestamp is indistinguishable from one the rebuild already wrote, and
-will be dropped. That suits an append-only stream, not a table that gets backfilled.
+**The cut-off is used only while `ddi` has to infer what the target already holds** — a
+*coverage window*. One opens after a rebuild, on a first start against a target that already
+has rows, after the source was replaced, and on a restart part-way through any of those. An
+ordinary restart — a deploy, an OOM kill, a reopen after a failed step — resumes from the
+pipeline's own `txn` offset, which commits atomically with the rows it describes and is exact
+on its own, and filters nothing by timestamp.
+
+A window lasts until the first batch that carries a row newer than the target's watermark.
+Whatever filled the target read a prefix of the source, so a newer row lies past its read
+point, and from there an older timestamp is a late row rather than a covered one. After a
+rebuild or on a first start it also ends once the source head it opened against has been
+read, because a rebuild that read no further cannot have covered anything committed after it.
+A first start therefore assumes the target was filled from this source: one loaded from
+elsewhere while this source is still being backfilled gets what arrives after the open a
+second time. And that head is loaded before the target, so a rebuild that commits between
+the two can have read a little past it: what it read past the head is written again, a
+duplicate rather than a gap. While a window is open
+each commit records it (`ddi.cutoff.reason` in the commit's info), so a restart in the middle
+carries on where it left off. `ddi` 0.3.1 and earlier recorded nothing, so a pipeline upgraded
+from one part-way through a rebuild's rescan or a first start's catch-up resumes without the
+cut-off and writes again what it would have dropped; let that finish before upgrading.
+`ddi_coverage_cutoff_active` is 1 while one is open, and every row it drops is logged and
+counted in `ddi_rows_skipped_as_covered_total`.
+
+Inside a window the timestamp **must be non-decreasing in the order rows reach the source** —
+a late row bearing an older timestamp is indistinguishable from one the rebuild already wrote,
+and will be dropped. Append-only is not enough. A table written from a multi-partition Kafka
+topic (kafka-delta-ingest and its like) orders timestamps only within a partition, and each
+ingester commit carries a slice of every partition's backlog, so a later commit routinely
+holds a lagging partition's rows that are older than rows already delivered. Inside a window
+those are dropped with the covered ones — counted, but dropped — and the rescan bound below
+can start past them. So after a rebuild, on a first start against a populated target and
+after a replaced source, such a source can lose a lagging partition's late rows at or below the
+target's newest timestamp. That is a known limitation, and `watermark_uri` does not lift it:
+with `dedup_timestamp` set it is not read (above). A watermark per value of a partition column
+— the newest timestamp or offset per Kafka partition — would be exact there, and so would
+resuming from the source version a rebuild recorded, given a way to tell which rebuild
+recorded it; both are possible future options, not something `ddi` does today.
 
 The rescan is bounded by the source's own file statistics. Delta records `maxValues` per
 file, so the log itself says how far back the rebuild's contents reach: walking backwards
@@ -528,21 +625,24 @@ the last commit or two, not the history. Where statistics are missing or of a ty
 will not line up, it falls back to a full rescan — being slow is a cost, being wrong is
 not an option.
 
-`watermark_uri` remains the better choice where you can set it: exact, no rescan, and no
-ordering requirement on any column.
+`watermark_uri` is exact, needs no rescan and puts no ordering requirement on any column, but
+only a pipeline without `dedup_timestamp` reads it: one written out in TOML that appends, since
+a dbt model and an upsert always have a timestamp. With both set, the rescan answers the
+rebuild and the watermark table is not read.
 
 ### What the watermark costs to read
 
-Once per pipeline start, never per batch — and only two columns. The timestamp and the key
-are projected into the Delta scan, so the parquet reader never decodes the rest of the row,
-and the pass is streaming: the running answer is one timestamp plus the keys tied with it, so
-memory is bounded by that rather than by the table.
+Only on an open that has to infer coverage — an ordinary restart does not read it at all —
+and never per batch. And only two columns: the timestamp and the key are projected into the Delta scan,
+so the parquet reader never decodes the rest of the row, and the pass is streaming: the
+running answer is one timestamp plus the keys tied with it, so memory is bounded by that
+rather than by the table.
 
 This matters more than it sounds. Reading the whole row instead is gigabytes on a silver
-table whose rows carry JSON payloads, it is paid again on every restart, and it grows with
-the table — so a pipeline that had been starting fine gets slower until it cannot start at
-all, and a crash-loop makes it worse rather than better. The startup line reports
-`rows_scanned` at debug level if you want to see what a start is costing.
+table whose rows carry JSON payloads, it would be paid again on every open that needs it, and
+it grows with the table — so a pipeline that had been starting fine gets slower until it
+cannot start at all, and a crash-loop makes it worse rather than better. The startup line
+reports `rows_scanned` at debug level if you want to see what a start is costing.
 
 ### What else happens to a shared table
 
@@ -551,28 +651,53 @@ these and asserts the same invariant every time — no key missing, no key twice
 
 | Event | Behaviour |
 |---|---|
+| Restart, redeploy, reopen after a failure | Resumes from its own offset; nothing filtered by timestamp |
 | Full refresh of the target | Rescan; rows the rebuild covers are skipped |
 | Rows arrive while the batch runs | Re-emitted, by timestamp |
+| Rows appended to the target by another writer | Not treated as coverage |
+| `UPDATE`/`DELETE`/`MERGE` on the target by another writer | Treated as a rebuild. If it writes timestamps newer than rows not yet delivered, the source versions holding those rows are not re-read (logged as `versions_not_reread`) |
 | `OPTIMIZE` on either table | Ignored — `dataChange: false` |
 | `DELETE`/`UPDATE` upstream | Skipped per `change_policy`, never propagated |
 | `DELETE` behind the target's watermark | Left deleted |
 | Target dropped and recreated | Refilled from scratch |
 | Source dropped and recreated | Starts over, emitting only what is missing |
+| Source dropped and recreated while `ddi` is running | The step fails, and the reopen starts over |
+| Source replaced in place (`CREATE OR REPLACE`) | Read on as one table, running and across restarts |
 
-The last one is the trap, and not in the obvious direction. Dropping and recreating a
-table keeps its path and its name but gives it a new identity and a log that restarts at
-zero, so the carried-over offset means nothing. If the new table has *fewer* commits than
-were consumed, the pipeline waits for commits that will never arrive. If it already has
-*more* — the likelier case, and the dangerous one — the offset still lands comfortably
-inside the log, so nothing looks wrong while the new table's early commits are skipped and
-never read.
+The source being dropped and recreated is the trap, and not in the obvious direction.
+Dropping and recreating a table keeps its path and its name but gives it a new identity and
+a log that restarts at zero, so the carried-over offset means nothing. If the new table has
+*fewer* commits than were consumed, the pipeline waits for commits that will never arrive.
+If it already has *more* — the likelier case, and the dangerous one — the offset still lands
+comfortably inside the log, so nothing looks wrong while the new table's early commits are
+skipped and never read.
 
 Neither is detectable from the version alone, so `ddi` records the source's table id in
-each of its commits and compares it on restart. When the source turns out to be a
-different table, it starts over from the beginning; `dedup_timestamp` then drops whatever
-the target already holds, so only genuinely missing rows are emitted. Without a
-`dedup_timestamp` there is nothing to filter on and starting over would append the whole
-table a second time, so it stops and says so.
+each of its commits, with a source version that had it, and compares it on restart. When the
+source turns out to be a different table, it starts over from the beginning;
+`dedup_timestamp` then drops whatever the target already holds, so only genuinely missing
+rows are emitted. Without a `dedup_timestamp` there is nothing to filter on and starting over
+would append the whole table a second time, so it stops and says so.
+
+The filter holds until the new table delivers a row newer than the target's watermark — not
+until the head it reopened against — so a re-seed that lands after `ddi` has reopened is
+still filtered, across restarts too. That is the usual order: opening fails until the new
+table exists, and the retry starts at a second. It relies on the re-seed carrying the
+original timestamps. A running pipeline notices a replacement as well — a head that went
+below a version it had read, or a snapshot with a different id where the log no longer gives
+a version it read the id it had there — and fails the step rather than reading the new table
+from the old one's position; the reopen then does the rest.
+
+A table replaced in place — `CREATE OR REPLACE`, or delta-rs creating in overwrite mode — gets
+a new id too, but keeps its log, so the offset still means what it did. Its versions before
+the replacing commit carry the old id and those after it the new one, and the log still gives
+the recorded version the recorded id, which a table recreated at the path cannot. So it is
+read on as one table, by a running pipeline and by a restart alike, from the pipeline's own
+offset. The replacing commit removes every file, so reading across it takes a
+`change_policy` of `skip_change_commits` or `ignore_changes`. `ddi` 0.3.1 recorded the id with
+no version, so a pipeline upgraded from it asks about the version its own offset is at: where
+0.3.1 had already read on across the replacement that version has the new id, and the upgrade
+takes the source for one dropped and recreated, as 0.3.1's own next restart would have.
 
 ## Bad rows, and broken streams
 
@@ -602,9 +727,11 @@ CREATE TABLE silver.orders__ddi_dq (
   app_id          VARCHAR,
   pipeline        VARCHAR,
   source_version  BIGINT,   -- the batch's last source version, not the row's
-  column_name     VARCHAR,  -- the column that rejected it
+  column_name     VARCHAR,  -- the column that rejected it; NULL when the transform
+                            -- could not evaluate the row
   reason          VARCHAR,
-  payload         VARCHAR,  -- the row as it arrived, as JSON
+  payload         VARCHAR,  -- the row as it arrived, as JSON: the source row when the
+                            -- transform could not evaluate it
   _timestamp      TIMESTAMP(6)
 ) WITH (location = 'abfss://.../silver/orders__ddi_dq')
 ```
@@ -621,8 +748,9 @@ WHERE _timestamp > now() - interval '1' day GROUP BY reason
 Two things are deliberately *not* quarantined:
 
 - **A structural mismatch** — a target column the transform does not produce at all, a
-  transform that will not plan. It is identical on every batch and belongs to no row, so
-  setting rows aside would leave a target that silently never grows. It fails the pipeline.
+  transform that will not plan, or one that fails with no row to blame. It is identical on
+  every batch and belongs to no row, so setting rows aside would leave a target that silently
+  never grows. It fails the pipeline.
 - **A bad value inside a `struct`, `list` or `map`.** Arrow pushes a lenient cast down into
   the *children* and keeps the parent's null buffer, so an unconvertible element becomes a
   `NULL` inside a row that still looks valid from the outside — undetectable per row, and it
@@ -634,6 +762,59 @@ share one Delta commit, so the ordering is the guarantee: a crash in between rep
 batch, which can duplicate a reject but can never lose one. Even that is usually avoided —
 the data-quality commit carries a `txn` action of its own under `<app_id>.dq`, and a replay
 of the same batch finds it and skips.
+
+That skip is keyed on the batch alone, so "never lose one" holds while a replay rejects the
+same rows the first attempt did — which a deterministic model over pinned lookups always
+does. A model that feeds `now()` or `random()` into a value that can fail, or a lookup on
+`use_current` whose head moved in between, can reject a different row the second time, and
+that row then reaches neither table.
+
+### A row the transform cannot evaluate
+
+The cast can also be the model's: `CAST(amount AS BIGINT)` in `transform_sql` meets `"n/a"`
+inside DataFusion, before any row reaches the target. So does a division by zero, a
+`from_unixtime` of `NaN`, or a [`date_trunc` past 2262](#epoch-seconds-from_unixtime). One
+such value fails the whole batch, and retrying that source version fails it the same way —
+so with a data-quality table, `ddi` finds the row instead. The batch is evaluated in halves,
+left before right, until the rows that fail on their own are found; those go to the
+data-quality table with `column_name` NULL, the source row as `payload` (there is no output
+row to show) and the error as `reason`, and the rest of the batch commits in its original
+order:
+
+```sql
+SELECT reason, payload FROM silver.orders__ddi_dq WHERE column_name IS NULL
+```
+
+A batch that evaluates costs nothing extra, which is nearly every batch. One that does not
+costs about `2·log2(rows)` runs of the transform per bad row, and each run plans the query
+again and re-scans any lookup the model joins. That cost is what
+`max_evaluation_rejects_per_batch` bounds — 100 by default, in `[runtime]` or on a
+pipeline. One more bad row than that fails the batch as before, naming the setting, because
+that many is far more likely a model or an upstream type change than bad data. `0` turns
+isolation off.
+
+Some failures are never blamed on a row, and stop the pipeline as they always did:
+
+- **A failure that needs no row.** `1/0` in the projection, or a `date_trunc` granularity
+  that does not exist, fails on an empty batch too, and `ddi` tries one before searching.
+  Behind a `WHERE` that check sees nothing — the filter passes no rows on — so there such a
+  failure is attributed to every row that reaches it: the whole batch goes to the
+  data-quality table and counts in `ddi_batches_fully_rejected_total` while it is within the
+  limit, and fails naming the setting beyond it. The same stance coercion takes on an
+  upstream type change.
+- **A transform that is not row-local.** Evaluated in parts it would commit a different
+  answer, so `LIMIT`/`OFFSET`/`FETCH`/`TOP`, `UNION` without `ALL`, `INTERSECT`, `EXCEPT`
+  and subqueries turn isolation off for that pipeline, and its startup line says which.
+- **Anything about the machine or the query**: running out of memory or spill, a spill file
+  that cannot be created, storage and I/O errors, a query that does not plan — including a
+  constant the optimiser cannot fold, such as `CAST('x' AS BIGINT)`.
+
+A batch that fails as a whole while every part of it evaluates has no row to blame either;
+its parts' output is committed, with a warning, because under row-locality it is the batch's
+answer.
+
+In an upsert, a newer delivery the transform cannot evaluate is set aside like one that will
+not coerce: the row already stored, or an older delivery in the same batch, stands.
 
 ### A stream that cannot make progress
 
@@ -663,13 +844,23 @@ Because the process no longer exits when a stream dies, metrics stop being optio
 | `ddi_bootstrap_unreachable` | 1 while a pipeline that has never committed cannot start, because its `starting_version` has aged out of the source's log. Recoverable by setting a version the log still holds. |
 | `ddi_resume_unreachable` | 1 while a pipeline that *has* committed cannot read the version it must resume at. Not recoverable by configuration. |
 | `ddi_rows_rejected_total` | Rows sent to the data-quality table. |
-| `ddi_batches_fully_rejected_total` | Batches where *every* row was rejected. |
+| `ddi_rows_rejected_by_transform_total` | Of those, rows the transform could not evaluate. |
+| `ddi_transform_reevaluations_total` | Extra runs of the transform spent finding them. |
+| `ddi_batches_fully_rejected_total` | Batches where *every* row was rejected. A batch whose other rows a coverage window dropped is not counted. |
+| `ddi_coverage_cutoff_active` | 1 while a coverage window is dropping rows the target is taken to hold already. |
+| `ddi_rows_skipped_as_covered_total` | Rows it dropped. They reach neither the target nor the data-quality table. |
 
 Alert on `ddi_pipeline_up == 0 for 10m`, on `ddi_source_file_vacuumed == 1`, on
 `ddi_bootstrap_unreachable == 1` and `ddi_resume_unreachable == 1`, and on
 `increase(ddi_batches_fully_rejected_total[15m]) > 0`. The last one matters more than it
-looks: there is no bad-row threshold, so an upstream type change quarantines the whole batch
-and the target simply stops growing — no error, no lag, nothing else to notice it by.
+looks: there is no threshold on rows the target will not take, so an upstream type change
+quarantines the whole batch and the target simply stops growing — no error, no lag, nothing
+else to notice it by. `increase(ddi_rows_rejected_by_transform_total[1h]) > 0` is worth a
+ticket rather than a page: a value the model cannot handle usually wants a change to the
+model. So is `ddi_coverage_cutoff_active == 1` for longer than a rebuild takes to catch up:
+after a replaced source, or on a staged apply half, only a row newer than the target's
+watermark closes the window, and one somebody pushed into the future holds it open while it
+drops everything below.
 `ddi_errors_total` is now a *rate* of retried attempts, not a page: a pipeline that lost one
 commit race and recovered a second later increments it.
 
@@ -813,6 +1004,19 @@ default), a writer that recorded none, a type that will not line up — the wind
 whole target. Slow, and correct. Truncated string statistics are handled rather than trusted:
 a `maxValues` of `"ord"` may stand for `"ordz"`, so it never rules a file out.
 
+Numeric statistics are read as the number that was written. A DOUBLE key or sequence reads
+back as exactly its double: `0.40380000000000005` stays that, not its neighbour. `ddi` 0.3.1
+and earlier read some 17-digit values one ULP off, which could put `<lo>` above the row it
+came from and insert a key a second time. A DECIMAL cannot be read exactly, because it is
+compared as a double and writers disagree about which one: delta-rs divides in floating point,
+Spark writes the exact decimal, and a checkpoint may have truncated it to the scale. Two
+decimals can even share one double. So a DECIMAL's statistics are widened by one unit of its
+scale plus 16 ULPs on each side before anything is ruled out, and `<lo>` is rounded down to
+the scale rather than to the nearest unit. The cost is a window that much wider. In `ddi`
+0.3.1 and earlier a DECIMAL sequence could skip the file holding its key and insert the key
+again, and a rescan after a rebuild could skip a commit whose maximum shared the watermark's
+double.
+
 ### `upsert_lookback`
 
 A floor: the window will not open below `min(batch timestamp) - upsert_lookback` however far
@@ -893,6 +1097,12 @@ Read the two halves' lag separately: `ddi_source_lag_versions{pipeline="style__i
 how far behind the raw stream is, and `{pipeline="style__apply"}` is how much has been staged
 but not yet merged.
 
+The handover after a rebuild, or on a first start against a populated target, runs on the
+apply half, because its target is the one those touch. Its cut-off lasts until a staged row
+newer than the target's watermark arrives rather than until the stage's head, since the stage
+fills at the ingest half's pace: a raw row the rebuild covered can be staged long after the
+apply half opened.
+
 #### What it costs
 
 **The target is eventually consistent**, by up to `apply_max_latency_secs`. That is the
@@ -957,8 +1167,9 @@ FROM source
 Paths support `$`, `.field`, `["field"]` and `[0]`. Wildcards are rejected rather than
 quietly returning one of several matches. A missing path is NULL, and so is a container
 under `json_extract_scalar` — that is Trino's rule, and it is what stops `{"id":42}`
-landing in a column somebody casts to a number. Malformed JSON stops the pipeline: input
-is a typed column, not arbitrary text.
+landing in a column somebody casts to a number. Malformed JSON is an error, not a NULL:
+input is a typed column, not arbitrary text. With a data-quality table the row is [set
+aside](#a-row-the-transform-cannot-evaluate), and without one it stops the pipeline.
 
 The text these produce is what Starburst produces, byte for byte: `json_extract` copies a
 value in its source order, integers as written and floats re-spelt as doubles (`1.10`
@@ -967,6 +1178,90 @@ becomes `1.1`, as Jackson's copy does); `json_parse` stores the canonical form T
 `json_format(json_parse(x))` agrees between the two engines; `json_array_get` returns a
 string element without its quotes, as its Trino documentation warns; a JSON `null` at a
 path is the value `null`, only a missing path is SQL NULL.
+
+An emoji, or any other character outside the Basic Multilingual Plane, is where Jackson's
+two writers part ways, and Starburst uses both. Where it writes JSON as bytes —
+`json_parse`, `json_extract`, `json_query`, `json_object`, `json_array`, and `CAST(.. AS
+JSON)` of text — the character goes out as its UTF-16 surrogate pair in upper-case hex:
+`json_format(json_parse('"😊"'))` is `"\uD83D\uDE0A"`. Where it writes through a Java
+string — a container from `json_array_get`, each element of `CAST(.. AS ARRAY(JSON))` — the
+character stays as it is. `CAST(.. AS JSON)` copies a value that is already JSON as it is
+spelt, and `json_format` returns its input as it is, so
+`json_format(CAST(CAST(x AS ARRAY(JSON)) AS JSON))` holds the character too.
+`json_extract_scalar` and `json_value` always return the character itself. `ddi` follows
+each of these; `ddi` 0.3.1 and earlier wrote the character everywhere, so a target written
+by both holds both spellings until a full refresh. One difference is left: Jackson accepts
+a `\u` escape of half a surrogate pair on its own, and `ddi` refuses it as malformed JSON.
+
+A number cast out of JSON, `CAST(json_extract_scalar(data, '$.rate') AS DOUBLE)` or `AS
+REAL`, is read from its text straight into the nearest double or real, as Trino's
+`Double.parseDouble` and `Float.parseFloat` read it. So is one reached through `json_value`,
+`json_extract`, `json_array_get` or a lambda over `CAST(.. AS ARRAY(JSON))`: a 17-digit
+`0.49979999999999997` stays `0.49979999999999997`.
+
+A DECIMAL of more than 18 digits cast to DOUBLE or REAL is correctly rounded too, as Trino's
+`DecimalConversions` does it, where Arrow's own cast divides in floating point and can land
+one ULP off. One of 18 digits or fewer Trino divides in floating point itself — the unscaled
+integer over the power of ten, as doubles — and so do Arrow and `ddi` for a DOUBLE:
+DECIMAL(17,17) `0.49979999999999997` is `0.4998` in both. For a REAL Trino divides the two
+as floats, and `ddi` does not yet: it narrows that double, as `ddi` 0.3.1 did, which can be
+an ULP of the float off Trino's where its division of floats rounds twice. Over a
+DECIMAL(9,2), 1413830.04 cast to REAL is 1413830.125 in Trino and 1413830.0 here. That
+covers `CAST` and `TRY_CAST`, the casts DataFusion's coercion inserts (`dec * 1e0`), lambda
+bodies, a list of decimals cast to a list of doubles, a DECIMAL column landing in a DOUBLE or
+REAL target, and the `array_*` aggregates over decimals.
+It does not yet cover `log` and `power` over a DECIMAL, which DataFusion computes on the
+decimal itself and not as Trino does; a decimal inside a ROW or MAP being cast; or
+`arrow_cast`. Those keep Arrow's arithmetic.
+
+Which way a decimal converts follows its type, and a decimal a model computes has
+DataFusion's type, which is not always Trino's: `ddi` does not yet type it as Trino does. So,
+as in 0.3.1, a computed decimal can have another type here than in Trino, and with it another
+value. Where the type falls on the other side of the 18-digit line its DOUBLE can differ too.
+Short here and long in Trino, as a `sum` can be, it did in 0.3.1 as well. Long here and short
+in Trino, as `coalesce(amount, 0)` can be, the difference is new: 0.3.1 divided every
+decimal, as Trino divides a short one, and so gave Trino's DOUBLE there, where `ddi` now
+rounds the long type correctly. A product has the same type in both engines, and `min` and
+`max` keep their argument's; `avg`, a DECIMAL(p+4,s+4) in DataFusion and a DECIMAL(p,s) in
+Trino, is refused in every model. These differ:
+
+- an integer literal beside a decimal — `coalesce(amount, 0)`, `CASE .. ELSE 0 END`,
+  `amount + 1` — is a BIGINT in DataFusion and an INTEGER in Trino, ten digits narrower, and
+  so is an integer expression over an INTEGER that a literal makes a BIGINT in DataFusion,
+  `nullif(qty, 0)` or `qty + 1`. `coalesce(amount, 0)` over a DECIMAL(18,8) is a
+  DECIMAL(28,8) here, correctly rounded to a DOUBLE, and a DECIMAL(18,8) in Trino, divided as
+  0.3.1 divided it: past 2^53 unscaled, above about 90 million at that scale, the two can be
+  an ULP apart. The literal in the decimal's type means the same in both engines,
+  `coalesce(amount, CAST(0 AS DECIMAL(18, 8)))` or `ELSE CAST(0 AS DECIMAL(18, 8))`. The
+  other way about, `length`, `strpos` and `extract` return an INTEGER in DataFusion and a
+  BIGINT in Trino;
+- `sum` over a decimal, in a publication, is a DECIMAL(p+10,s) in DataFusion and a
+  DECIMAL(38,s) in Trino, so over a DECIMAL of 8 digits or fewer it is divided here and
+  correctly rounded in Trino;
+- a quotient of decimals has four digits of scale more than its dividend in DataFusion, and
+  the dividend's scale plus the divisor's precision plus one, at least six, in Trino:
+  DECIMAL(9,2) / DECIMAL(9,2) is a DECIMAL(15,6) here and a DECIMAL(21,12) there. So its
+  digits differ, and DataFusion truncates the last where Trino rounds it;
+- `floor`, `ceil` and `round(x)` keep their argument's precision in DataFusion, where Trino
+  narrows it — `floor` of a DECIMAL(9,2) is a DECIMAL(8,0) there — and `round(x, n)` narrows
+  the scale to `n` here, where Trino keeps it. `floor` and `ceil` keep the scale too, so where
+  rounding carries into a digit the type has no room for they fail here, and Trino's narrower
+  type holds the answer: `ceil` of a DECIMAL(5,2) 999.50 is 1000 in Trino and a decimal
+  overflow here, and so are `floor` of -999.50 and `ceil` of any positive DECIMAL(2,2). Such
+  a row is one [the transform cannot evaluate](#a-row-the-transform-cannot-evaluate). Widened
+  by a digit first, `ceil(CAST(amount AS DECIMAL(6, 2)))`, it gives Trino's value.
+
+Two more types are decided otherwise than in Trino, whatever the conversion does. A literal
+with a decimal point, `0.5`, is a DECIMAL in Trino and a DOUBLE in DataFusion, which reads
+it as it reads `0.5e0`. And a decimal beside a DOUBLE or REAL — compared with it, or with it
+in a `CASE`, `coalesce`, `nullif`, `greatest`, `least`, `IN` or `BETWEEN` — is converted to
+that float in Trino, where DataFusion casts the float to a DECIMAL, a DOUBLE to
+DECIMAL(30,15), and compares or returns a decimal. So over a DECIMAL(17,17)
+0.49979999999999997, `amount = 0.4998e0` and `amount = 0.49979999999999997` are both true in
+Trino and false here, and `coalesce(amount, 0.0)` is a DECIMAL(17,17) there and a
+DECIMAL(32,17) here, which in a DOUBLE column is 0.4998 there and 0.49979999999999997 here.
+Spell what Trino means: `CAST(amount AS DOUBLE) = 0.4998e0`, and a literal beside a decimal
+in the decimal's type, `coalesce(amount, CAST(0.0 AS DECIMAL(17, 17)))`.
 
 #### Building JSON: `json_object`, `json_array`, `CAST(.. AS JSON)`
 
@@ -998,8 +1293,9 @@ nobody would design that way, because a model has to produce the same bytes in b
   engines agree. A repeated key is an error, as it is there.
 - **`json_object` defaults to `NULL ON NULL`, `json_array` to `ABSENT ON NULL`**, and an
   absent member takes no part in the duplicate check or the ordering. Text is escaped as
-  Jackson escapes it, numbers are numbers, decimals keep their scale (`12.3400`), doubles
-  are spelt as `Double.toString` spells them, timestamps as `2024-03-31 22:30:00.123 UTC`.
+  Jackson escapes it (an emoji as its surrogate pair, `\uD83D\uDE0A`), numbers are
+  numbers, decimals keep their scale (`12.3400`), doubles are spelt as `Double.toString`
+  spells them, timestamps as `2024-03-31 22:30:00.123 UTC`.
   An array or row as a member is refused with the fix named, because Starburst would cast
   it to varchar text, which is never what a message wants.
 
@@ -1189,7 +1485,10 @@ temporary directory, logging what was abandoned and counting it in
 Watch `ddi_spill_bytes` against `ddi_spill_limit_bytes`; a ratio near one means the next merge
 fails. `ddi_capacity_exhausted` says which pipeline it failed for — and a capacity failure
 stops that pipeline only, waits the full backoff rather than retrying every second, and leaves
-its target untouched.
+its target untouched. A spill file that cannot be created at all — the directory went away or
+read-only, or the process ran out of file descriptors — is a capacity failure too, and says
+so: DataFusion reports it as an ordinary execution error, which would otherwise have been
+retried every second like a query that is wrong.
 
 ## The startup uniqueness check
 
@@ -1447,6 +1746,11 @@ than written out by hand, so an alias like `mean` cannot slip past it. That narr
 model is the delta, over the whole table it is the running total, so **the same view is the
 baseline a client reloads after a gap**.
 
+A DOUBLE in the payload is the double the model computed, bit for bit: it is spelt with the
+shortest digits that read back as the same double. `ddi` 0.3.1 and earlier re-read that text
+with a parser that is one ULP off for some 17-digit values, and sent `0.4998` where the model
+said `0.49979999999999997`.
+
 Delta stays authoritative and the realtime path cannot touch it:
 
 - The payload is built **before** the commit, from the already-coerced batch, and sent
@@ -1566,7 +1870,11 @@ correctness still holds (the `txn` action prevents double-apply) — it just was
 | `ddi_spill_stranded_bytes_total` | counter | Spill bytes abandoned because DataFusion left them charged after a capacity failure. Above zero means this process hit its cap and recovered. |
 | `ddi_pipeline_restarts_total` | counter | Reopens after a failure. |
 | `ddi_rows_rejected_total` | counter | Rows written to the data-quality table. |
-| `ddi_batches_fully_rejected_total` | counter | Batches where every row was rejected. |
+| `ddi_rows_rejected_by_transform_total` | counter | Of those, rows the transform could not evaluate. Also in `ddi_rows_rejected_total`. |
+| `ddi_transform_reevaluations_total` | counter | Runs of a transform beyond the first, spent finding the rows it could not evaluate. Each re-plans the query and re-scans the lookups it joins. |
+| `ddi_batches_fully_rejected_total` | counter | Batches where every row was rejected, and none dropped as covered. |
+| `ddi_rows_skipped_as_covered_total` | counter | Rows dropped because the target was taken to hold them already, while a rebuild, a first start against a populated target, or a replaced source was being caught up. Never moves on an ordinary restart. |
+| `ddi_coverage_cutoff_active` | gauge | 1 while this pipeline is dropping rows the target is taken to hold already; 0 otherwise. See [When the rebuild cannot be changed at all](#when-the-rebuild-cannot-be-changed-at-all). |
 
 Upsert pipelines export five more. All stay at zero in append mode, which is the honest
 reading: it never updates a row and never reads the target back.

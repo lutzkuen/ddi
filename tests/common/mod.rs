@@ -77,6 +77,16 @@ pub async fn append(path: &str, ids: &[i64]) -> DeltaTable {
         .unwrap()
 }
 
+/// Replace the table's contents with one commit containing `ids`, as a batch job's full
+/// refresh does.
+pub async fn overwrite(path: &str, ids: &[i64]) -> DeltaTable {
+    let t = open(path).await;
+    t.write(vec![batch(ids)])
+        .with_save_mode(SaveMode::Overwrite)
+        .await
+        .unwrap()
+}
+
 /// Read every `id` currently in the table.
 pub async fn read_ids(path: &str) -> Vec<i64> {
     let t = open(path).await;
@@ -102,6 +112,73 @@ pub async fn read_ids(path: &str) -> Vec<i64> {
 pub fn has_duplicates(v: &[i64]) -> bool {
     let mut seen = HashSet::new();
     v.iter().any(|x| !seen.insert(*x))
+}
+
+/// Doubles that need all 17 significant digits to round-trip, spelt the way a serialiser
+/// writes them. The four rows of issue #12, which a parser that is merely close reads one ULP
+/// off.
+pub const SEVENTEEN_DIGIT_DOUBLES: [&str; 4] = [
+    "0.49979999999999997",
+    "0.9017000000000001",
+    "0.45909999999999995",
+    "0.40380000000000005",
+];
+
+/// One column of a transform's output, across however many batches it came back in.
+pub fn column_of(out: &[RecordBatch], name: &str) -> ArrayRef {
+    let parts: Vec<&dyn deltalake::arrow::array::Array> = out
+        .iter()
+        .map(|b| b.column(b.schema().index_of(name).unwrap()).as_ref())
+        .collect();
+    deltalake::arrow::compute::concat(&parts).unwrap()
+}
+
+/// `col` must be a DOUBLE column holding, bit for bit, the nearest double to each of
+/// `texts` — what Trino's `Double.parseDouble` and Rust's `str::parse` both return.
+pub fn assert_nearest_doubles(col: &ArrayRef, texts: &[&str]) {
+    use deltalake::arrow::array::{Array, AsArray};
+    use deltalake::arrow::datatypes::Float64Type;
+
+    let got = col
+        .as_primitive_opt::<Float64Type>()
+        .unwrap_or_else(|| panic!("expected a DOUBLE column, got {}", col.data_type()));
+    assert_eq!(got.len(), texts.len(), "one value per text");
+    for (i, text) in texts.iter().enumerate() {
+        let want: f64 = text.parse().unwrap();
+        assert!(got.is_valid(i), "row {i} ({text}) came back null");
+        let v = got.value(i);
+        assert_eq!(
+            v.to_bits(),
+            want.to_bits(),
+            "row {i}: {text} became {v:?} ({:#018x}), not the nearest double {want:?} ({:#018x})",
+            v.to_bits(),
+            want.to_bits()
+        );
+    }
+}
+
+/// As [`assert_nearest_doubles`], for a REAL column: the nearest float, read straight from
+/// the text as Trino's `Float.parseFloat` does, never rounded through a double first.
+pub fn assert_nearest_reals(col: &ArrayRef, texts: &[&str]) {
+    use deltalake::arrow::array::{Array, AsArray};
+    use deltalake::arrow::datatypes::Float32Type;
+
+    let got = col
+        .as_primitive_opt::<Float32Type>()
+        .unwrap_or_else(|| panic!("expected a REAL column, got {}", col.data_type()));
+    assert_eq!(got.len(), texts.len(), "one value per text");
+    for (i, text) in texts.iter().enumerate() {
+        let want: f32 = text.parse().unwrap();
+        assert!(got.is_valid(i), "row {i} ({text}) came back null");
+        let v = got.value(i);
+        assert_eq!(
+            v.to_bits(),
+            want.to_bits(),
+            "row {i}: {text} became {v:?} ({:#010x}), not the nearest real {want:?} ({:#010x})",
+            v.to_bits(),
+            want.to_bits()
+        );
+    }
 }
 
 /// A pipeline config wired to two local paths.
@@ -131,6 +208,7 @@ pub fn pipeline_cfg(name: &str, source: &str, target: &str) -> ResolvedPipeline 
         upsert_grain_check: Default::default(),
         stage_for: None,
         dq_uri: None,
+        max_evaluation_rejects_per_batch: 100,
         source_relation: None,
         target_relation: None,
         publish: None,

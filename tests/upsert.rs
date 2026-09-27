@@ -278,7 +278,9 @@ async fn a_redelivery_of_older_data_does_not_roll_the_target_back() {
     lake.arrive(&[ev(1, "shipped", 30)]).await;
     lake.stream().await;
 
-    // The same key arrives again bearing an older timestamp.
+    // The same key arrives again bearing an older timestamp. An ordinary reopen has no
+    // coverage to infer and filters nothing, so this reaches the merge — and it is the merge's
+    // newer-than-stored rule that refuses it.
     lake.arrive(&[ev(1, "placed", 10)]).await;
     lake.stream().await;
 
@@ -310,10 +312,11 @@ async fn a_merge_that_changes_nothing_still_advances_the_offset() {
     // action goes down with it — so without the empty-append fallback in `Sink::upsert` the
     // pipeline re-reads the same source commits forever.
     //
-    // Getting there takes a little care, because `Dedup` catches the easy version: it is
-    // read once when the pipeline opens, so a row below *that* watermark never reaches the
-    // merge at all. The row here is above the open-time watermark and still older than what
-    // the first step stored, which is precisely the gap between the two mechanisms.
+    // Getting there takes a little care, because `Dedup` catches the easy version: the seeded
+    // silver makes this open infer its coverage, so a row at or below the seed's watermark
+    // never reaches the merge at all. The first delivery is above it, which closes that
+    // window; the second is older than what the first stored, and reaches the merge as a
+    // no-op — precisely the gap between the two mechanisms.
     let lake = Lake::new().await;
     lake.seed_silver(&[(1, "placed", 10, None)], SaveMode::Append)
         .await;
@@ -520,6 +523,165 @@ async fn a_generous_lookback_leaves_the_statistics_in_charge() {
         vec![(1, "shipped".to_string())],
         "the floor was below the stored row, so nothing was clamped away"
     );
+}
+
+// ---------------------------------------------------------------- numeric sequences
+
+/// A lake of its own, sequenced by a number rather than a clock: `(id, seq, status)` in
+/// bronze and silver alike, with `seq` of whatever numeric type the test is about.
+struct NumericLake {
+    _dir: tempfile::TempDir,
+    raw: String,
+    stg: String,
+    schema: SchemaRef,
+}
+
+impl NumericLake {
+    async fn new(seq: DataType) -> Self {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("seq", seq, false),
+            Field::new("status", DataType::Utf8, false),
+        ]));
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let raw = root.join("raw").to_str().unwrap().to_string();
+        let stg = root.join("stg").to_str().unwrap().to_string();
+        create(&raw, schema.clone()).await;
+        create(&stg, schema.clone()).await;
+        Self {
+            _dir: dir,
+            raw,
+            stg,
+            schema,
+        }
+    }
+
+    /// One delivery of order `id`, one commit. `seq` is a one-element array of the lake's
+    /// sequence type.
+    async fn arrive(&self, id: i64, seq: ArrayRef, status: &str) {
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![id])) as ArrayRef,
+                seq,
+                Arc::new(StringArray::from(vec![status])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        open_table(ensure_table_uri(&self.raw).unwrap())
+            .await
+            .unwrap()
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+    }
+
+    async fn stream(&self) {
+        let mut c = pipeline_cfg("numeric_seq", &self.raw, &self.stg);
+        c.transform_sql = Some("SELECT id, seq, status FROM source".to_string());
+        c.dedup_timestamp = Some("seq".to_string());
+        c.dedup_key = Some("id".to_string());
+        c.write_mode = WriteMode::Upsert;
+        c.upsert_key = Some("id".to_string());
+        Pipeline::open(c)
+            .await
+            .expect("pipeline should open")
+            .run_until_caught_up()
+            .await
+            .expect("streaming should succeed");
+    }
+
+    /// Silver as `(id, seq, status)`, with the sequence as Arrow spells it as text.
+    async fn silver(&self) -> Vec<(i64, String, String)> {
+        let (_t, stream) = open_table(ensure_table_uri(&self.stg).unwrap())
+            .await
+            .unwrap()
+            .scan_table()
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let mut out = Vec::new();
+        for b in batches {
+            let text = |n: &str| {
+                deltalake::arrow::compute::cast(
+                    b.column(b.schema().index_of(n).unwrap()),
+                    &DataType::Utf8,
+                )
+                .unwrap()
+            };
+            let ids = b.column(b.schema().index_of("id").unwrap()).clone();
+            let ids = ids.as_any().downcast_ref::<Int64Array>().unwrap();
+            let seq = text("seq");
+            let seq = seq.as_any().downcast_ref::<StringArray>().unwrap();
+            let status = text("status");
+            let status = status.as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                out.push((
+                    ids.value(i),
+                    seq.value(i).to_string(),
+                    status.value(i).to_string(),
+                ));
+            }
+        }
+        out.sort();
+        out
+    }
+}
+
+#[tokio::test]
+async fn a_float_sequence_whose_statistic_needs_seventeen_digits_still_matches() {
+    // Issue #12. delta-rs records the stored row's sequence as 0.40380000000000005, and
+    // serde_json's default parser read that back one ULP high. The window's `seq >= lo` then
+    // sat above the row it was drawn from, the row went unmatched, and order 1 was inserted
+    // a second time instead of updated.
+    use deltalake::arrow::array::Float64Array;
+
+    let lake = NumericLake::new(DataType::Float64).await;
+    let seq = |v: f64| Arc::new(Float64Array::from(vec![v])) as ArrayRef;
+    lake.arrive(1, seq("0.40380000000000005".parse().unwrap()), "placed")
+        .await;
+    lake.stream().await;
+    lake.arrive(1, seq(0.9), "paid").await;
+    lake.stream().await;
+
+    assert_eq!(
+        lake.silver().await,
+        vec![(1, "0.9".to_string(), "paid".to_string())],
+        "one row for order 1, and it is the newer one"
+    );
+}
+
+#[tokio::test]
+async fn a_decimal_sequence_whose_statistic_is_rounded_still_matches() {
+    // A DECIMAL(38,17) sequence is recorded by delta-rs as a double, printed short:
+    // 0.92030920993190389 becomes 0.9203092099319038, which delta-rs reads back as …380 when
+    // it decides whether to open the file. A window literal rounded to the nearest was …384,
+    // so the file was skipped and the key inserted again. For 0.80307554181721740 the
+    // literal was above the row itself.
+    use deltalake::arrow::array::Decimal128Array;
+
+    let dec = |unscaled: i128| {
+        Arc::new(
+            Decimal128Array::from(vec![unscaled])
+                .with_precision_and_scale(38, 17)
+                .unwrap(),
+        ) as ArrayRef
+    };
+    for first in [92030920993190389i128, 80307554181721740] {
+        let lake = NumericLake::new(DataType::Decimal128(38, 17)).await;
+        lake.arrive(1, dec(first), "placed").await;
+        lake.stream().await;
+        lake.arrive(1, dec(95000000000000000), "paid").await;
+        lake.stream().await;
+
+        assert_eq!(
+            lake.silver().await,
+            vec![(1, "0.95000000000000000".to_string(), "paid".to_string())],
+            "order 1 first stored at {first}e-17 must be updated, not inserted again"
+        );
+    }
 }
 
 // ---------------------------------------------------------------- living with others

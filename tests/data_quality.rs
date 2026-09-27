@@ -13,9 +13,13 @@ mod common;
 use std::sync::Arc;
 
 use common::pipeline_cfg;
-use delta_delta_ingest::config::ResolvedPipeline;
+use delta_delta_ingest::config::{ResolvedPipeline, WriteMode};
 use delta_delta_ingest::dedup::DEFAULT_TIMESTAMP_COLUMN;
+use delta_delta_ingest::dq::DataQuality;
 use delta_delta_ingest::pipeline::{Pipeline, StepOutcome};
+use delta_delta_ingest::schema::Rejected;
+use delta_delta_ingest::storage::Storage;
+use delta_delta_ingest::Error;
 use deltalake::arrow::array::{
     Array, ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
@@ -135,10 +139,70 @@ impl Lake {
             .unwrap();
     }
 
+    /// What a batch job that filled silver before this pipeline ever started leaves there.
+    async fn fill_silver(&self, rows: &[(i64, i64, i64)]) {
+        let batch = RecordBatch::try_new(
+            stg_schema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        open_table(ensure_table_uri(&self.stg).unwrap())
+            .await
+            .unwrap()
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+    }
+
     fn cfg(&self) -> ResolvedPipeline {
         // No transform: the coercer is what casts text to number, which is the code under
         // test. A CAST in transform_sql would fail in DataFusion instead.
         pipeline_cfg("orders_stg", &self.raw, &self.stg)
+    }
+
+    /// A pipeline whose transform does the cast, so a value that will not convert fails in
+    /// DataFusion rather than in the coercer.
+    fn casting_cfg(&self) -> ResolvedPipeline {
+        let mut cfg = self.cfg();
+        cfg.transform_sql = Some(
+            "SELECT order_id, CAST(amount AS BIGINT) AS amount, _timestamp FROM source".into(),
+        );
+        cfg
+    }
+
+    /// Record raw row 2 as a reject of the first batch (txn version 1), as the data-quality
+    /// write does just before the target's commit — which is the crash window this leaves
+    /// open: the pipeline has not committed, so it will read the batch again.
+    async fn record_before_a_crash(&self, column: Option<&str>) {
+        let cfg = self.cfg();
+        let mut dq = DataQuality::open(&Storage::default(), &self.dq, &cfg.app_id, &cfg.name)
+            .await
+            .unwrap()
+            .expect("created");
+        let written = dq
+            .write(
+                &[Rejected {
+                    rows: raw_batch(&[(2, Some("n/a"), 11)]),
+                    reasons: vec!["seeded".into()],
+                    columns: vec![column.map(str::to_string)],
+                }],
+                1,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(written, 1);
     }
 
     async fn stream(&self) -> delta_delta_ingest::Result<usize> {
@@ -171,7 +235,7 @@ impl Lake {
     }
 
     /// Rejected rows as `(source_version, column_name, reason, payload)`.
-    async fn rejects(&self) -> Vec<(i64, String, String, String)> {
+    async fn rejects(&self) -> Vec<(i64, Option<String>, String, String)> {
         let (_t, stream) = open_table(ensure_table_uri(&self.dq).unwrap())
             .await
             .unwrap()
@@ -201,7 +265,7 @@ impl Lake {
             for i in 0..b.num_rows() {
                 out.push((
                     version.value(i),
-                    column.value(i).to_string(),
+                    (!column.is_null(i)).then(|| column.value(i).to_string()),
                     reason.value(i).to_string(),
                     payload.value(i).to_string(),
                 ));
@@ -235,7 +299,11 @@ async fn a_row_that_will_not_cast_is_set_aside_and_the_rest_commits() {
 
     let rejects = lake.rejects().await;
     assert_eq!(rejects.len(), 1, "exactly the one bad row: {rejects:?}");
-    assert_eq!(rejects[0].1, "amount", "names the column that did it");
+    assert_eq!(
+        rejects[0].1.as_deref(),
+        Some("amount"),
+        "names the column that did it"
+    );
     assert!(
         rejects[0].2.contains("amount"),
         "reason names it too: {}",
@@ -290,6 +358,7 @@ async fn the_offset_advances_past_a_batch_whose_rows_were_all_rejected() {
         panic!("expected a skipped step that consumed the batch, got {first:?}");
     };
     assert_eq!(rejected, 2);
+    assert!(first.fully_rejected(), "the shape an alert is raised on");
 
     assert_eq!(
         p.step().await.unwrap(),
@@ -306,31 +375,68 @@ async fn the_offset_advances_past_a_batch_whose_rows_were_all_rejected() {
 }
 
 #[tokio::test]
+async fn a_bad_row_among_covered_ones_is_not_a_fully_rejected_batch() {
+    // Inside a coverage window every good row of a batch can be one the target already holds.
+    // The bad row left over is one bad row, not the upstream type change a batch whose every
+    // row failed is taken for — and a rescan would otherwise raise that alarm on every batch
+    // that re-reads it.
+    let lake = Lake::new().await;
+    lake.create_dq().await;
+    lake.arrive(&[
+        (1, Some("100"), 10),
+        (2, Some("n/a"), 11),
+        (3, Some("300"), 12),
+    ])
+    .await;
+    // Filled by the batch job before this pipeline first started.
+    lake.fill_silver(&[(1, 100, 10), (3, 300, 12)]).await;
+
+    let mut cfg = lake.cfg();
+    cfg.dedup_timestamp = Some(DEFAULT_TIMESTAMP_COLUMN.into());
+    cfg.dedup_key = Some("order_id".into());
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    assert!(
+        p.coverage().is_some(),
+        "a first start against a populated target"
+    );
+
+    let step = p.step().await.unwrap();
+    let StepOutcome::Skipped {
+        rejected, covered, ..
+    } = step.clone()
+    else {
+        panic!("expected a skipped step, got {step:?}");
+    };
+    assert_eq!((rejected, covered), (1, 2));
+    assert!(
+        !step.fully_rejected(),
+        "one bad row, with the rest already in the target"
+    );
+    assert_eq!(lake.rejects().await.len(), 1);
+}
+
+#[tokio::test]
 async fn replaying_a_batch_does_not_record_its_rejects_twice() {
     // The data-quality table cannot share the target's commit, so a crash between the two
     // replays the batch. The DQ table's own txn action is what stops that becoming a
-    // duplicate.
+    // duplicate. The crash is simulated by recording the batch's reject before the pipeline
+    // ever runs: the DQ write committed, the target's did not.
     let lake = Lake::new().await;
     lake.create_dq().await;
     lake.arrive(&[(1, Some("100"), 10), (2, Some("n/a"), 11)])
         .await;
+    lake.record_before_a_crash(Some("amount")).await;
 
     lake.stream().await.unwrap();
-    assert_eq!(lake.rejects().await.len(), 1);
 
-    // A second pipeline with the same app_id replays nothing, but one that starts over —
-    // as it would after a rebuild — re-reads the same source commit.
-    let mut cfg = lake.cfg();
-    cfg.starting_version = 0;
-    cfg.dedup_timestamp = Some(DEFAULT_TIMESTAMP_COLUMN.to_string());
-    let mut p = Pipeline::open(cfg).await.unwrap();
-    while !matches!(p.step().await.unwrap(), StepOutcome::CaughtUp) {}
-
+    assert_eq!(lake.silver().await, vec![(1, Some(100))]);
+    let rejects = lake.rejects().await;
     assert_eq!(
-        lake.rejects().await.len(),
+        rejects.len(),
         1,
-        "the same reject must not be recorded a second time"
+        "the same reject must not be recorded a second time: {rejects:?}"
     );
+    assert_eq!(rejects[0].2, "seeded", "the one written before the crash");
 }
 
 #[tokio::test]
@@ -375,7 +481,7 @@ async fn a_null_in_a_not_null_target_column_is_rejected_per_row() {
     assert_eq!(lake.silver().await, vec![(1, Some(100)), (3, Some(300))]);
     let rejects = lake.rejects().await;
     assert_eq!(rejects.len(), 1);
-    assert_eq!(rejects[0].1, "order_id");
+    assert_eq!(rejects[0].1.as_deref(), Some("order_id"));
     assert!(
         rejects[0].2.contains("NOT NULL"),
         "the reason should say so: {}",
@@ -436,4 +542,278 @@ async fn the_data_quality_table_is_found_next_to_the_target_without_configuring_
         lake.dq
     );
     assert_eq!(lake.cfg().dq_uri(), lake.dq);
+}
+
+// ---------------------------------------------------------------- the transform itself
+
+#[tokio::test]
+async fn a_row_the_transform_cannot_evaluate_is_set_aside_and_the_rest_commits() {
+    // The cast happens in the transform now, so "n/a" fails the batch in DataFusion, before
+    // the coercer could set it aside. Before #11 that stopped the pipeline on every retry.
+    let lake = Lake::new().await;
+    lake.create_dq().await;
+    lake.arrive(&[
+        (1, Some("100"), 10),
+        (2, Some("n/a"), 11),
+        (3, Some("300"), 12),
+    ])
+    .await;
+
+    let mut p = Pipeline::open(lake.casting_cfg()).await.unwrap();
+    let outcome = p.step().await.expect("one bad value must not stop this");
+    let StepOutcome::Progressed {
+        rows,
+        rejected,
+        unevaluable,
+        reevaluations,
+        ..
+    } = outcome
+    else {
+        panic!("expected a commit, got {outcome:?}");
+    };
+    assert_eq!((rows, rejected, unevaluable), (2, 1, 1));
+    assert!(reevaluations > 0, "finding the row took runs");
+
+    assert_eq!(lake.silver().await, vec![(1, Some(100)), (3, Some(300))]);
+    let rejects = lake.rejects().await;
+    assert_eq!(rejects.len(), 1, "{rejects:?}");
+    let (version, column, reason, payload) = &rejects[0];
+    assert_eq!(
+        *version, 1,
+        "the batch's own txn version; the CREATE is version 0"
+    );
+    assert_eq!(*column, None, "no one column is to blame");
+    assert!(reason.contains("could not evaluate"), "{reason}");
+    assert!(reason.contains("n/a"), "{reason}");
+    assert!(
+        payload.contains("\"order_id\":2"),
+        "the source row: {payload}"
+    );
+    assert!(payload.contains("\"amount\":\"n/a\""), "{payload}");
+}
+
+#[tokio::test]
+async fn a_row_of_malformed_json_is_set_aside_like_any_the_transform_cannot_evaluate() {
+    // The JSON functions raise a document that does not parse rather than read it as NULL,
+    // because the column is typed text. With a data-quality table that is one row's failure,
+    // as the README says, not the pipeline's.
+    let lake = Lake::new().await;
+    lake.create_dq().await;
+    lake.arrive(&[
+        (1, Some(r#"{"n":100}"#), 10),
+        (2, Some("{not json"), 11),
+        (3, Some(r#"{"n":300}"#), 12),
+    ])
+    .await;
+
+    let mut cfg = lake.cfg();
+    cfg.transform_sql = Some(
+        "SELECT order_id, CAST(json_extract_scalar(amount, '$.n') AS BIGINT) AS amount, \
+         _timestamp FROM source"
+            .into(),
+    );
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    let outcome = p
+        .step()
+        .await
+        .expect("one malformed document must not stop this");
+    let StepOutcome::Progressed {
+        rows, unevaluable, ..
+    } = outcome
+    else {
+        panic!("expected a commit, got {outcome:?}");
+    };
+    assert_eq!((rows, unevaluable), (2, 1));
+
+    assert_eq!(lake.silver().await, vec![(1, Some(100)), (3, Some(300))]);
+    let rejects = lake.rejects().await;
+    assert_eq!(rejects.len(), 1, "{rejects:?}");
+    let (_, column, reason, payload) = &rejects[0];
+    assert_eq!(*column, None, "no one column is to blame");
+    assert!(reason.contains("is not valid JSON"), "{reason}");
+    assert!(
+        payload.contains("\"order_id\":2"),
+        "the source row: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn without_a_data_quality_table_a_row_the_transform_cannot_evaluate_still_stops_the_pipeline()
+{
+    let lake = Lake::new().await;
+    lake.arrive(&[(1, Some("100"), 10), (2, Some("n/a"), 11)])
+        .await;
+
+    let e = Pipeline::open(lake.casting_cfg())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .expect_err("nowhere to set the row aside");
+    assert!(matches!(e, Error::Evaluation(_)), "{e:?}");
+    let m = e.to_string();
+    assert!(m.contains("transform_sql failed to execute"), "{m}");
+    assert!(
+        m.contains(&lake.dq),
+        "says which table would set it aside: {m}"
+    );
+    assert!(lake.silver().await.is_empty());
+
+    // With isolation turned off, creating the table would change nothing, so the error must
+    // not say it would.
+    let mut cfg = lake.casting_cfg();
+    cfg.max_evaluation_rejects_per_batch = 0;
+    let m = Pipeline::open(cfg)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .expect_err("isolation is off")
+        .to_string();
+    assert!(m.contains("transform_sql failed to execute"), "{m}");
+    assert!(!m.contains(&lake.dq), "promises nothing: {m}");
+}
+
+#[tokio::test]
+async fn a_batch_the_transform_cannot_evaluate_at_all_is_skipped_and_the_offset_advances() {
+    let lake = Lake::new().await;
+    lake.create_dq().await;
+    lake.arrive(&[(1, Some("n/a"), 10), (2, Some("also bad"), 11)])
+        .await;
+
+    let mut p = Pipeline::open(lake.casting_cfg()).await.unwrap();
+    let first = p.step().await.unwrap();
+    let StepOutcome::Skipped {
+        rejected,
+        unevaluable,
+        ..
+    } = first
+    else {
+        panic!("expected a skipped step that consumed the batch, got {first:?}");
+    };
+    assert_eq!((rejected, unevaluable), (2, 2));
+    assert_eq!(p.step().await.unwrap(), StepOutcome::CaughtUp);
+    let mut restarted = Pipeline::open(lake.casting_cfg()).await.unwrap();
+    assert_eq!(restarted.step().await.unwrap(), StepOutcome::CaughtUp);
+    assert_eq!(lake.rejects().await.len(), 2);
+}
+
+#[tokio::test]
+async fn an_unevaluable_reject_already_recorded_before_a_crash_is_not_written_twice() {
+    let lake = Lake::new().await;
+    lake.create_dq().await;
+    lake.arrive(&[
+        (1, Some("100"), 10),
+        (2, Some("n/a"), 11),
+        (3, Some("300"), 12),
+    ])
+    .await;
+    lake.record_before_a_crash(None).await;
+
+    let mut p = Pipeline::open(lake.casting_cfg()).await.unwrap();
+    p.step().await.unwrap();
+    assert_eq!(p.step().await.unwrap(), StepOutcome::CaughtUp);
+
+    assert_eq!(lake.silver().await, vec![(1, Some(100)), (3, Some(300))]);
+    let rejects = lake.rejects().await;
+    assert_eq!(rejects.len(), 1, "{rejects:?}");
+    assert_eq!(rejects[0].2, "seeded");
+}
+
+#[tokio::test]
+async fn a_failure_no_row_causes_is_not_quarantined() {
+    // Division by a constant zero fails on an empty batch too, so it is the query that is
+    // wrong. Setting every row aside for it would empty the target into the DQ table.
+    let lake = Lake::new().await;
+    lake.create_dq().await;
+    lake.arrive(&[(1, Some("100"), 10), (2, Some("200"), 11)])
+        .await;
+
+    let mut cfg = lake.cfg();
+    cfg.transform_sql = Some("SELECT order_id, 1/0 AS amount, _timestamp FROM source".into());
+    let e = Pipeline::open(cfg)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .expect_err("no row is to blame");
+    assert!(matches!(e, Error::Transform(_)), "{e:?}");
+    assert!(lake.silver().await.is_empty());
+    assert!(lake.rejects().await.is_empty());
+}
+
+#[tokio::test]
+async fn more_unevaluable_rows_than_the_limit_stop_the_batch() {
+    let lake = Lake::new().await;
+    lake.create_dq().await;
+    lake.arrive(&[
+        (1, Some("100"), 10),
+        (2, Some("n/a"), 11),
+        (3, Some("also bad"), 12),
+    ])
+    .await;
+
+    let mut cfg = lake.casting_cfg();
+    cfg.max_evaluation_rejects_per_batch = 1;
+    let e = Pipeline::open(cfg)
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .expect_err("two bad rows against a limit of one");
+    assert!(
+        e.to_string().contains("max_evaluation_rejects_per_batch"),
+        "names the knob: {e}"
+    );
+    assert!(lake.silver().await.is_empty());
+    assert!(lake.rejects().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_upsert_pipeline_sets_aside_the_row_it_cannot_evaluate() {
+    let lake = Lake::new().await;
+    lake.create_dq().await;
+    lake.arrive(&[
+        (1, Some("100"), 10),
+        (2, Some("n/a"), 11),
+        (3, Some("300"), 12),
+    ])
+    .await;
+    lake.arrive(&[(1, Some("oops"), 13), (3, Some("301"), 14)])
+        .await;
+
+    let mut cfg = lake.casting_cfg();
+    cfg.write_mode = WriteMode::Upsert;
+    cfg.upsert_key = Some("order_id".into());
+    cfg.dedup_key = Some("order_id".into());
+    cfg.dedup_timestamp = Some(DEFAULT_TIMESTAMP_COLUMN.into());
+    cfg.max_files_per_batch = 1;
+    let mut p = Pipeline::open(cfg).await.unwrap();
+
+    let first = p.step().await.unwrap();
+    let StepOutcome::Progressed {
+        upsert, rejected, ..
+    } = first
+    else {
+        panic!("expected a merge, got {first:?}");
+    };
+    assert!(upsert.is_some());
+    assert_eq!(rejected, 1);
+
+    let second = p.step().await.unwrap();
+    let StepOutcome::Progressed {
+        upsert: Some(upsert),
+        unevaluable,
+        ..
+    } = second
+    else {
+        panic!("expected a merge, got {second:?}");
+    };
+    assert_eq!((upsert.updated, unevaluable), (1, 1));
+
+    // Key 1's newer delivery could not be evaluated, so the stored row stands — as it does
+    // when a newer delivery will not coerce.
+    assert_eq!(lake.silver().await, vec![(1, Some(100)), (3, Some(301))]);
+    let versions: Vec<i64> = lake.rejects().await.iter().map(|r| r.0).collect();
+    assert_eq!(versions, vec![1, 2], "one per arrive commit");
 }

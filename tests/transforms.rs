@@ -1,5 +1,7 @@
 //! Plan Milestones 5 & 6 — unnest and the intra-row array UDFs, on real nested data.
 
+mod common;
+
 use std::sync::Arc;
 
 use delta_delta_ingest::transform::{SqlTransform, Transform};
@@ -280,4 +282,142 @@ async fn a_non_array_argument_is_rejected_with_a_pointer_to_the_right_tool() {
         err.to_string().contains("aggregate downstream"),
         "got: {err}"
     );
+}
+
+// ---------------------------------------------------------------- DECIMAL to DOUBLE
+
+/// `SEVENTEEN_DIGIT_DOUBLES` as DECIMAL(38,17) values, unscaled.
+const UNSCALED: [i128; 4] = [
+    49979999999999997,
+    90170000000000010,
+    45909999999999995,
+    40380000000000005,
+];
+
+/// One row per value: `dec` is it as a DECIMAL(38,17), `doc` as a JSON number.
+fn decimals() -> RecordBatch {
+    use deltalake::arrow::array::Decimal128Array;
+
+    let docs: Vec<String> = common::SEVENTEEN_DIGIT_DOUBLES
+        .iter()
+        .map(|t| format!("{{\"x\":{t}}}"))
+        .collect();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("dec", DataType::Decimal128(38, 17), false),
+            Field::new("doc", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(
+                Decimal128Array::from(UNSCALED.to_vec())
+                    .with_precision_and_scale(38, 17)
+                    .unwrap(),
+            ) as ArrayRef,
+            Arc::new(StringArray::from(docs)) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_decimal_casts_to_the_double_trino_gives() {
+    // Arrow divides the unscaled integer by 10^17 in floating point, which rounds twice:
+    // 0.49979999999999997 came out as 0.4998. Trino's DecimalConversions reads a long
+    // decimal exactly, and so does every spelling here — except a short decimal, of 18
+    // digits or fewer, which Trino divides just as Arrow does.
+    let texts = common::SEVENTEEN_DIGIT_DOUBLES;
+    let sql = "SELECT CAST(dec AS DOUBLE) AS cast, \
+                      TRY_CAST(dec AS DOUBLE) AS try_cast, \
+                      dec * CAST(1 AS DOUBLE) AS coerced, \
+                      CAST(CAST(json_extract_scalar(doc, '$.x') AS DECIMAL(38,17)) AS DOUBLE) \
+                          AS from_json, \
+                      CAST(CAST(json_extract_scalar(doc, '$.x') AS DECIMAL(18,17)) AS DOUBLE) \
+                          AS short, \
+                      CAST(ARRAY[dec] AS ARRAY(DOUBLE))[1] AS element, \
+                      CAST(dec AS REAL) AS real \
+               FROM source";
+    let out = run_on(decimals(), sql).await;
+    for name in ["cast", "try_cast", "coerced", "from_json", "element"] {
+        common::assert_nearest_doubles(&common::column_of(&out, name), &texts);
+    }
+    common::assert_nearest_reals(&common::column_of(&out, "real"), &texts);
+    // What Trino 480 returns for `CAST(CAST(x AS DECIMAL(18,17)) AS DOUBLE)`: not the nearest
+    // double, but its own `(double) unscaled / 1e17`.
+    common::assert_nearest_doubles(
+        &common::column_of(&out, "short"),
+        &[
+            "0.4998",
+            "0.9017000000000002",
+            "0.4590999999999999",
+            "0.4038000000000001",
+        ],
+    );
+
+    // Through a derived table, whose projection is planned as a node of its own.
+    let out = run_on(
+        decimals(),
+        "SELECT v FROM (SELECT CAST(dec AS DOUBLE) AS v FROM source) AS t",
+    )
+    .await;
+    common::assert_nearest_doubles(&common::column_of(&out, "v"), &texts);
+
+    // Unaliased, the column keeps the name DataFusion gives a cast.
+    let out = run_on(decimals(), "SELECT CAST(dec AS DOUBLE) FROM source").await;
+    let name = out[0].schema().field(0).name().clone();
+    assert_eq!(name, "source.dec");
+    common::assert_nearest_doubles(&common::column_of(&out, &name), &texts);
+}
+
+#[tokio::test]
+async fn array_sum_over_decimals_starts_from_the_nearest_doubles() {
+    // The array aggregates read their elements as doubles, and a decimal element becomes the
+    // nearest one: a one-element array sums to exactly it.
+    use deltalake::arrow::array::Decimal128Array;
+
+    let dec = DataType::Decimal128(38, 17);
+    let values = || {
+        Arc::new(
+            Decimal128Array::from(UNSCALED.to_vec())
+                .with_precision_and_scale(38, 17)
+                .unwrap(),
+        ) as ArrayRef
+    };
+    let one_each = || OffsetBuffer::new(vec![0, 1, 2, 3, 4].into());
+    let plain = ListArray::new(
+        Arc::new(Field::new("item", dec.clone(), true)),
+        one_each(),
+        values(),
+        None,
+    );
+    let item_fields: Fields = vec![Arc::new(Field::new("price", dec.clone(), true))].into();
+    let items = ListArray::new(
+        Arc::new(Field::new(
+            "item",
+            DataType::Struct(item_fields.clone()),
+            true,
+        )),
+        one_each(),
+        Arc::new(StructArray::new(item_fields, vec![values()], None)),
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("prices", plain.data_type().clone(), false),
+            Field::new("items", items.data_type().clone(), false),
+        ])),
+        vec![Arc::new(plain) as ArrayRef, Arc::new(items) as ArrayRef],
+    )
+    .unwrap();
+
+    let out = run_on(
+        batch,
+        "SELECT array_sum(prices) AS plain, array_sum(items, 'price') AS field FROM source",
+    )
+    .await;
+    for name in ["plain", "field"] {
+        common::assert_nearest_doubles(
+            &common::column_of(&out, name),
+            &common::SEVENTEEN_DIGIT_DOUBLES,
+        );
+    }
 }

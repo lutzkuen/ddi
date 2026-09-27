@@ -133,8 +133,18 @@ DuckDB's `json_extract_string` and Spark's `get_json_object` work as aliases of
 
 Paths support `$`, `.field`, `["field"]` and `[0]`. Following Trino,
 `json_extract_scalar` returns **NULL for an object or array** — only `json_extract`
-returns those. A missing path is NULL; malformed JSON stops the pipeline, because the
-input is a typed column rather than arbitrary text.
+returns those. A missing path is NULL; malformed JSON is an error, because the input is a
+typed column rather than arbitrary text: with a data-quality table the row is set aside
+(§9), and without one it stops the pipeline.
+
+The JSON text they write matches Starburst's byte for byte, down to how an emoji is spelt.
+`json_parse`, `json_extract`, `json_query`, the constructors below and `CAST(<text> AS
+JSON)` write it as its escaped surrogate pair, `\uD83D\uDE0A`. A container from
+`json_array_get` and each element of `CAST(.. AS ARRAY(JSON))` keep the character, and
+`CAST(.. AS JSON)` and `json_format` keep the spelling of a value that is already JSON.
+`json_extract_scalar` and `json_value` return the character. `ddi` 0.3.1 and earlier wrote
+the character everywhere, so a target written by both versions holds both spellings until
+a full refresh.
 
 ### Building JSON, and lambdas over arrays
 
@@ -276,11 +286,17 @@ its first batch.
 
 `ddi run --metrics-addr 0.0.0.0:9100` serves Prometheus text on `/metrics`, labelled by
 pipeline: `ddi_pipeline_up`, `ddi_rows_written_total`, `ddi_source_lag_versions`,
-`ddi_last_source_version`, `ddi_errors_total`, and others.
+`ddi_last_source_version`, `ddi_errors_total`, and others. Two of them concern §7:
+`ddi_coverage_cutoff_active` is 1 while a pipeline is dropping rows because the target is
+taken to hold them already, and `ddi_rows_skipped_as_covered_total` counts the rows it
+dropped. Outside such a window the gauge is 0 and the counter does not move, but it keeps
+what earlier windows dropped until the process restarts: alert on its `increase(..)`, not on
+its value.
 
 Alert on `ddi_pipeline_up == 0` for a down stream, `ddi_source_lag_versions` for backlog and `increase(ddi_errors_total[5m])` for a
-stopped pipeline. There is no dead-letter queue by design, so any error means a pipeline
-has stopped and needs a human.
+stopped pipeline. A bad row need not stop one: with a data-quality table beside the target
+it is set aside and the rest of the batch commits (§9). Whatever does stop a pipeline is
+retried with backoff, and one that stays down needs a human.
 
 ---
 
@@ -311,23 +327,50 @@ schedule stops mattering, because coverage became a property of the row.
 `ddi_key` resolves rows sharing *exactly* the boundary instant, which a plain `>` would
 drop and a `>=` would duplicate. Set it.
 
-**The one requirement:** the timestamp must never go backwards relative to arrival order.
-A late row bearing an older timestamp is indistinguishable from one the rebuild already
-wrote, and will be dropped. That suits an append-only stream; it does not suit a table
-that gets backfilled.
+This cut-off is used only while `ddi` has to work out from the table's data what it already
+holds: after a rebuild, on a first start against a table that already has rows, after the
+source was dropped and recreated, and on a restart part-way through one of those. It lasts
+until a row newer than the table's `max(_timestamp)` arrives, or — after a rebuild or on a
+first start — until the source head it started against has been read, and a restart in the
+middle carries on with it. An ordinary restart, deploy or crash resumes from `ddi`'s own
+offset, which is exact on its own, and skips nothing by timestamp. Watch
+`ddi_coverage_cutoff_active` and `ddi_rows_skipped_as_covered_total` (§6) to see it at work.
+
+`ddi` 0.3.1 and earlier did not record the cut-off in their commits, so a pipeline upgraded
+from one part-way through a rescan or a first start's catch-up resumes without it, and writes
+again the rows it would have dropped. Let that finish — `ddi_source_lag_versions` at 0 —
+before upgrading.
+
+**The one requirement**, and only while that cut-off is in use: the timestamp must never go
+backwards relative to arrival order. A late row bearing an older timestamp is
+indistinguishable from one the rebuild already wrote, and will be dropped. Append-only is not
+enough: a table written from a multi-partition Kafka topic (kafka-delta-ingest and similar)
+orders timestamps only within each partition, so a lagging partition's rows routinely land
+after newer ones from another. So after a rebuild, on a first start against a table that
+already has rows, and after the source was replaced, such a source can lose a lagging
+partition's late rows at or below the table's `max(_timestamp)`: counted in
+`ddi_rows_skipped_as_covered_total`, but dropped. That is a known limitation. A watermark table
+(`watermark_uri`, in the README's
+[handover section](README.md#the-handover-and-why-it-needs-a-watermark)) does not help here: a
+model always has `_timestamp`, and with it set `ddi` never reads that table. A watermark per
+Kafka partition would be exact; `ddi` does not offer one yet.
 
 ### What else can happen to a shared table
 
 | Event | What `ddi` does |
 |---|---|
-| dbt full-refresh | Rescans from the batch's high-water mark; no gaps, no duplicates |
+| Restart, redeploy, crash | Resumes from its own offset; nothing is skipped by timestamp |
+| dbt full-refresh | Rescans from the batch's high-water mark, whose `_timestamp` cut-off can drop a lagging partition's late rows (above), and can write again a version the rebuild read past the head `ddi` loaded |
 | Rows arrive while dbt runs | Re-emitted afterwards, by timestamp |
+| Another writer appends to the target | Not taken as coverage; nothing is skipped because of it |
+| Another writer updates, deletes or merges in the target | Treated as a rebuild. Timestamps it writes newer than rows `ddi` has not delivered yet make it skip the source versions holding them (logged as `versions_not_reread`) |
 | `OPTIMIZE` on either table | Ignored — those commits carry `dataChange: false` |
-| `DELETE`/`UPDATE` upstream | Skipped, never propagated (see `change_policy`) |
+| `DELETE`/`UPDATE` upstream | Stops the model at that commit: a model reads with `change_policy = fail`. Only a pipeline written out in TOML can skip such commits (see [Deletes and updates upstream](#deletes-and-updates-upstream)) |
 | `DELETE` of old rows in the target | Left deleted |
 | Same key delivered again with changes | Appended as a second row — or, under `ddi_write_mode: upsert`, replaces the stored one |
 | Target dropped and recreated | Refilled from scratch |
-| Source dropped and recreated | Starts over, emitting only what is missing |
+| Source dropped and recreated | Starts over, emitting only what is missing — including rows re-seeded after `ddi` reopened, provided they carry their original timestamps |
+| Source replaced in place (`CREATE OR REPLACE`) | The replacing commit removes every file, so a model stops at it as at a `DELETE`. A TOML pipeline that skips such commits reads on as one table from `ddi`'s own offset, while running and after a restart: the log is the one it was reading |
 
 The rescan after a rebuild is bounded by the source's own file statistics — Delta records
 `maxValues` per file — so a rebuild costs a read of the last commit or two, not the whole
@@ -434,6 +477,12 @@ turns it off for a whole process.
 }
 ```
 
+`rows` holds the model's values. A DOUBLE is spelt with the shortest digits that round-trip,
+so `JSON.parse` recovers exactly the double the model computed: `0.49979999999999997`
+arrives as that, where `ddi` 0.3.1 and earlier sent `0.4998`. A DECIMAL is sent as a JSON
+number too, so it reads as the nearest double; cast it to VARCHAR in the model where every
+digit matters.
+
 Because delivery is best-effort, every message says where it sits in the sequence so a
 client can tell when it has missed one:
 
@@ -522,9 +571,11 @@ What it does not do, because doing it right needs a committed batch to anchor to
 * **No rebuild suppression.** The ordinary path's dedup (rows a prior rebuild already wrote)
   runs against the target; this reader never touches the target, so a rebuild can make it
   transiently republish rows the commit path goes on to suppress.
-* **No data-quality quarantine.** A row that fails to coerce to the target schema is
-  dropped from that message and logged, not written to the data-quality table — there is no
-  commit for that write to ride along with.
+* **No data-quality quarantine.** A row that fails to coerce to the target schema, or that
+  the model cannot evaluate, costs that message: it is skipped and logged, not written to
+  the data-quality table — there is no commit for that write to ride along with. The next
+  message still names the skipped one's version as its predecessor, so a client sees the gap
+  and reloads.
 * **No lookups**, for now. Refused at config load (`ddi_publish_near_time` on a model whose
   host pipeline has any `lookups` configured is a rejection, the same as the write-mode
   checks above) rather than silently running without them.
@@ -596,6 +647,26 @@ Nothing is nulled and nothing is dropped — `payload` holds the row as it arriv
 see what broke and replay it once the upstream is fixed. A *structural* problem (a column the
 model never selects, a transform that will not plan) is not quarantined: it is the same on
 every batch, so it fails the pipeline instead of leaving a target that quietly never grows.
+
+**So does a row the model itself cannot evaluate** — `CAST(amount AS BIGINT)` meeting
+`'n/a'`, a division by zero, a `date_trunc` past the year 2262. That fails in DataFusion,
+before anything reaches the target, and would fail again on every retry; with the table
+there, `ddi` evaluates the batch in halves until it has the rows that fail on their own,
+sets those aside with `column_name` NULL and the *source* row as `payload`, and commits the
+rest. A clean batch costs nothing; each bad row costs about `2·log2(rows)` extra runs of the
+model, each re-scanning any lookup it joins. `max_evaluation_rejects_per_batch` (default
+100, in `[runtime]` or per pipeline) caps it: one more bad row fails the batch, naming the
+setting, and `0` turns this off. It never applies to a failure no row causes (`1/0`, checked
+against an empty batch first — though behind a `WHERE` it is blamed on every row that
+reaches it, up to the cap), to a model that is not row-local (`LIMIT`, `UNION` without
+`ALL`, `INTERSECT`, `EXCEPT`, a subquery — the startup line says so), or to capacity,
+storage and planning errors. `ddi_rows_rejected_by_transform_total` counts these rows and
+`ddi_transform_reevaluations_total` what finding them cost.
+
+One gap is worth knowing: a replay after a crash skips the data-quality write when that
+batch's rejects are already recorded, so a model that is not deterministic (`now()`,
+`random()`, a `use_current` lookup whose head moved) can reject a different row the second
+time, and that row reaches neither table.
 
 **A pipeline that fails no longer takes the others down.** It backs off and reopens, its
 peers keep running, and `ddi_pipeline_up` says which of them are healthy. That makes metrics
@@ -736,7 +807,9 @@ above the longest gap you intend to allow between declaring a pipeline and first
 ### Deletes and updates upstream
 
 By default a `DELETE`, `UPDATE` or `MERGE` on the source stops the pipeline rather than
-guessing. To carry on, set a policy per pipeline:
+guessing, and so does a source replaced in place, whose replacing commit removes every file.
+A dbt model has no meta key for anything else, and always runs with `fail`. To carry on, write
+the pipelines out with `ddi dbt convert` and set a policy per pipeline there:
 
 - `fail` (default) — stop on any change commit
 - `skip_change_commits` — consume and ignore those commits
@@ -799,7 +872,10 @@ column in silver, an upsert will not blank it.
 | `upserts into ... which pipeline ... reads as its source` | A downstream pipeline cannot read an upserted target unless it also upserts on the same key with `ignore_changes` |
 | `write_mode = "upsert" needs upsert_key` | Set `ddi_key` on the model (or `upsert_key` in the TOML) |
 | `adds ... and the object store no longer has that file` | The source vacuumed a file this pipeline had not read yet; restore the file, or rebuild the target and resume past that version |
-| `out of capacity: ...` | This pipeline ran out of spill space or memory. It stopped alone; nothing was written to its target |
+| `transform_sql failed to execute: ...` | The model could not evaluate a value. With a data-quality table that row is set aside; without one, create the table the message names, or fix the model |
+| `More than ... rows of this batch cannot be evaluated` | Too many rows failed the model to be bad data; most likely the model or the upstream schema changed. Fix that, or raise `max_evaluation_rejects_per_batch` to set them aside anyway |
+| `It fails on an empty batch too` | The model fails whatever the rows are (`1/0`, an unknown `date_trunc` unit); fix the model |
+| `out of capacity: ...` | This pipeline ran out of spill space or memory, or could not create a spill file at all (a missing or read-only `temp_directory`, or no file descriptors left). It stopped alone; nothing was written to its target |
 | `used disk space during the spilling process` | The process's spill budget is full — raise `[runtime] max_temp_directory_size`, or run fewer merges and preflights at once |
 | `is zero bytes` | A spill cap of `0` is refused: "unbounded" and "never spill" are both plausible readings and they point in opposite directions |
 | `is not usable` | `[runtime] temp_directory` cannot be created or written to, checked with a real probe file at startup — in Kubernetes this is usually an unmounted volume |

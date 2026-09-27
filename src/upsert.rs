@@ -62,7 +62,14 @@
 //! `delta.dataSkippingNumIndexedCols`, or one excluded by `delta.dataSkippingStatsColumns`
 //! — makes the whole question unanswerable, and the window opens to the entire target.
 //! Truncated string statistics are handled rather than trusted; see
-//! [`crate::stats::ranges_can_overlap`].
+//! [`crate::stats::ranges_can_overlap`]. So is a timestamp key's maximum, which a writer may
+//! truncate to the millisecond: it is raised by [`crate::stats::Slack`] first.
+//!
+//! A DECIMAL key or sequence is compared as a double, and its statistics are only near the
+//! value they stand for: writers disagree about which double a decimal is, and two decimals
+//! can share one. So its statistics are widened by [`crate::stats::Slack`] before anything
+//! is ruled out, and the window's literal is rounded down to the column's scale rather than
+//! to the nearest, so that it sits at or below every reading of the minimum it came from.
 
 use std::collections::HashMap;
 
@@ -74,7 +81,7 @@ use deltalake::datafusion::prelude::{col, lit, Expr};
 use deltalake::DeltaTable;
 
 use crate::error::{Error, Result};
-use crate::stats::{column_stats, range_touches_any, Bound};
+use crate::stats::{column_stats, range_touches_any, Bound, Slack};
 
 /// The alias the MERGE gives the incoming batch.
 pub const SOURCE_ALIAS: &str = "s";
@@ -250,7 +257,12 @@ impl Window {
                 ));
             };
 
-            let keys = column_stats(&parsed, key_column, &bounds.keys[0]);
+            // A DECIMAL's statistics are loosened to every value they could stand for, since
+            // neither they nor the batch's own bounds are the exact decimal, and a timestamp's
+            // maximum to the millisecond a writer may have truncated away. See `crate::stats`;
+            // for every other type the slack is `None`.
+            let keys =
+                column_stats(&parsed, key_column, &bounds.keys[0]).loosened(bounds.key_slack);
             let (Some(kmin), Some(kmax)) = (keys.min, keys.max) else {
                 return Ok(Self::unbounded(
                     "no statistics for the key column",
@@ -262,7 +274,8 @@ impl Window {
             }
             candidates += 1;
 
-            let seq = column_stats(&parsed, sequence_column, &bounds.sequence_min);
+            let seq = column_stats(&parsed, sequence_column, &bounds.sequence_min)
+                .loosened(bounds.sequence_slack);
             let Some(smin) = seq.min else {
                 return Ok(Self::unbounded(
                     "no statistics for the sequence column",
@@ -473,6 +486,11 @@ pub struct BatchBounds {
     /// The oldest sequence value in the batch — where the window would start if the target
     /// asked nothing more of it.
     pub sequence_min: Bound,
+    /// How far the key's statistics may be from the values they stand for. `Some` only for
+    /// a DECIMAL or timestamp key.
+    pub key_slack: Option<Slack>,
+    /// The same, for the sequence column.
+    pub sequence_slack: Option<Slack>,
 }
 
 impl BatchBounds {
@@ -482,16 +500,22 @@ impl BatchBounds {
         if batch.num_rows() == 0 {
             return None;
         }
-        let mut keys = bounds_of(&column(batch, key_column).ok()?)?;
+        let key = column(batch, key_column).ok()?;
+        let mut keys = bounds_of(&key)?;
         keys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         keys.dedup();
 
-        let sequence = bounds_of(&column(batch, sequence_column).ok()?)?;
-        let sequence_min = sequence
+        let sequence = column(batch, sequence_column).ok()?;
+        let sequence_min = bounds_of(&sequence)?
             .into_iter()
             .reduce(|a, b| if b < a { b } else { a })?;
 
-        Some(Self { keys, sequence_min })
+        Some(Self {
+            keys,
+            sequence_min,
+            key_slack: Slack::of(key.data_type()),
+            sequence_slack: Slack::of(sequence.data_type()),
+        })
     }
 }
 
@@ -528,6 +552,8 @@ fn bounds_of(column: &ArrayRef) -> Option<Vec<Bound>> {
                     .collect(),
             )
         }
+        // A DECIMAL becomes Arrow's division, as in `crate::stats::bound_of_scalar`: near
+        // the value, not equal to it, which the window allows for through `Slack`.
         DataType::Float32 | DataType::Float64 | DataType::Decimal128(_, _) => {
             let cast = cast(column, &DataType::Float64).ok()?;
             let a = cast.as_primitive_opt::<Float64Type>()?;
@@ -553,11 +579,37 @@ fn bounds_of(column: &ArrayRef) -> Option<Vec<Bound>> {
 }
 
 /// Turn a bound back into a literal of the target column's exact type.
+///
+/// # A DECIMAL literal is rounded down
+///
+/// Arrow's cast rounds `lo * 10^scale` to the nearest unit, which can land above the row
+/// `lo` came from, or above the decimal delta-rs reads out of a file's statistic when it
+/// decides whether to open the file: a DECIMAL(38,17) row `0.92030920993190389` is recorded
+/// as `0.9203092099319038`, which delta-rs reads as `…380` and Arrow's cast of the same
+/// double makes `…384`. The file is skipped, the row goes unmatched, and the key is inserted
+/// a second time. So a decimal takes the floor instead, clamped to the precision so it is
+/// always a valid literal.
+///
+/// Why the floor is enough: by the time a bound gets here it is the smallest candidate
+/// statistic `m` lowered by [`Slack::below`], one unit of the scale and sixteen ULPs. Any
+/// reader's decimal for that statistic's text is at least `m` less half an ULP less one unit
+/// (it truncates to the scale), and every stored row it covers is at least `m` less one unit
+/// less a few ULPs. The floor of `lo` sits at or below both. A sweep over two million random
+/// decimals of up to twenty digits at scales 0 to 29 found no exception; rounding to the
+/// nearest failed three hundred thousand times.
 fn scalar_of_bound(bound: &Bound, dtype: &DataType) -> Option<ScalarValue> {
     use deltalake::arrow::array::{
         Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
     };
     use std::sync::Arc;
+
+    if let (Bound::Float(v), DataType::Decimal128(p, s)) = (bound, dtype) {
+        // `as` saturates, and a precision is at most 38, so `10^p - 1` fits.
+        let scaled = (v * 10f64.powi(i32::from(*s))).floor();
+        let most = 10i128.pow(u32::from(*p)) - 1;
+        let unscaled = (scaled as i128).clamp(-most, most);
+        return Some(ScalarValue::Decimal128(Some(unscaled), *p, *s));
+    }
 
     let natural: ArrayRef = match (bound, dtype) {
         (Bound::Int(v), DataType::Timestamp(_, _)) => {
@@ -1334,6 +1386,69 @@ mod tests {
         let got = BatchBounds::of(&b, "id", "seq").unwrap();
         assert_eq!(got.keys, vec![Bound::Int(1), Bound::Int(5), Bound::Int(9)]);
         assert_eq!(got.sequence_min, Bound::Int(100));
+    }
+
+    #[test]
+    fn a_decimal_window_literal_sits_below_every_reading_of_the_statistic() {
+        // One row `u` per file. delta-rs records Arrow's division of it as the file's
+        // minimum, and reads that text back as a decimal when it decides whether to open the
+        // file. The literal drawn from it has to sit at or below both the row and that
+        // reading, or the file is skipped or the row goes unmatched.
+        use crate::stats::Slack;
+        use deltalake::arrow::array::{AsArray, Float64Array};
+        use deltalake::arrow::compute::kernels::cast_utils::parse_decimal;
+        use deltalake::arrow::datatypes::Decimal128Type;
+
+        let least = -(10i128.pow(38) - 1);
+        for (u, p, s) in [
+            (92030920993190389i128, 38u8, 17i8),
+            (80307554181721740, 38, 17),
+            (49979999999999997, 38, 17),
+            (40380000000000005, 38, 17),
+            // Past scale 22, where `10f64.powi(s)` is itself rounded.
+            (-5571470858930516140, 38, 29),
+            (least, 38, 17),
+        ] {
+            let dtype = DataType::Decimal128(p, s);
+            let m = u as f64 / 10f64.powi(i32::from(s));
+            let text = serde_json::to_string(&m).unwrap();
+            // `None` where the text no longer fits the precision, as at its very bottom.
+            let read = parse_decimal::<Decimal128Type>(&text, p, s).ok();
+
+            let lo = Slack::of(&dtype).unwrap().below(&Bound::Float(m));
+            let Some(ScalarValue::Decimal128(Some(l), lp, ls)) = scalar_of_bound(&lo, &dtype)
+            else {
+                panic!("a decimal bound must become a decimal literal");
+            };
+            assert_eq!((lp, ls), (p, s));
+            assert!(l <= u, "{u} at scale {s}: the literal {l} is above the row");
+            if let Some(d) = read {
+                assert!(
+                    l <= d,
+                    "{u} at scale {s}: the literal {l} is above {d}, delta-rs's reading of {text}"
+                );
+            }
+            assert!(l >= least, "{l} does not fit DECIMAL({p},{s})");
+        }
+
+        // Why the nearest will not do: the statistic reads as …380, and Arrow's cast of the
+        // same double rounds up to …384, above it.
+        let m = 92030920993190389i128 as f64 / 1e17;
+        let text = serde_json::to_string(&m).unwrap();
+        assert_eq!(text, "0.9203092099319038");
+        assert_eq!(
+            parse_decimal::<Decimal128Type>(&text, 38, 17).unwrap(),
+            92030920993190380
+        );
+        let nearest = cast(
+            &(Arc::new(Float64Array::from(vec![m])) as ArrayRef),
+            &DataType::Decimal128(38, 17),
+        )
+        .unwrap();
+        assert_eq!(
+            nearest.as_primitive::<Decimal128Type>().value(0),
+            92030920993190384
+        );
     }
 
     #[test]

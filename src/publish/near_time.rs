@@ -29,8 +29,9 @@
 //! What this deliberately does not do, because doing it right needs a committed batch to
 //! anchor to: no [`crate::dedup::Dedup`] (a dbt rebuild can make this transiently republish
 //! rows the target ends up suppressing), no data-quality quarantine (a row that fails to
-//! coerce is dropped from that message and logged, not routed to a table), and no lookups
-//! (refused at config resolve — see `resolve_publish` in [`crate::config`]).
+//! coerce, or that the transform cannot evaluate, costs that message, which is skipped and
+//! logged rather than routed to a table), and no lookups (refused at config resolve — see
+//! `resolve_publish` in [`crate::config`]).
 
 use std::collections::BTreeSet;
 
@@ -161,7 +162,22 @@ impl NearTimeReader {
         let from = batch.start.version;
 
         let input = scan_source(&self.source, &self.cfg.source_uri, &batch).await?;
-        let output = self.transform.apply_with_lookups(input, &[]).await?;
+        let output = match self.transform.apply_with_lookups(input, &[]).await {
+            Ok(output) => output,
+            // A value the transform cannot evaluate would fail this message on every retry,
+            // and there is no table to set its row aside in, so it is skipped for the same
+            // reason, and in the same way, as a row that will not coerce below.
+            Err(Error::Evaluation(e)) => {
+                warn!(
+                    pipeline = %self.cfg.name,
+                    "near-time: the transform could not evaluate a row in this batch, so this \
+                     message is skipped: {e}"
+                );
+                self.prev_published_through = Some(through);
+                return Ok(NearTimeOutcome::Polled { published: None });
+            }
+            Err(e) => return Err(e),
+        };
 
         let mut coerced = Vec::with_capacity(output.len());
         for b in &output {

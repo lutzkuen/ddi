@@ -13,7 +13,8 @@ use std::sync::Arc;
 use common::*;
 use delta_delta_ingest::config::ResolvedPipeline;
 use delta_delta_ingest::dbt::watermark::{target_state, TargetState, WatermarkStore};
-use delta_delta_ingest::pipeline::Pipeline;
+use delta_delta_ingest::dedup::CoverageReason;
+use delta_delta_ingest::pipeline::{CoverageWindow, Pipeline};
 use deltalake::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use deltalake::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use deltalake::kernel::engine::arrow_conversion::TryIntoKernel;
@@ -297,6 +298,66 @@ async fn the_watermark_store_reads_the_highest_version_for_its_own_app_id() {
         None,
         "an unknown app_id has no watermark, rather than borrowing someone else's"
     );
+}
+
+#[tokio::test]
+async fn with_a_timestamp_set_a_rebuild_is_answered_by_the_rescan_and_not_the_watermark() {
+    // Both set, as every dbt model has them: `ddi_timestamp` defaults to `_timestamp`, and
+    // `[storage].watermark_uri` applies to every model. The timestamp answers the rebuild, and
+    // the watermark table is not read, whatever it holds: here a row that would resume from
+    // version 3 and infer nothing, where the rescan opens a coverage window instead. `id`
+    // plays the timestamp.
+    let lake = lake().await;
+    let mut cfg = cfg_with_watermark(&lake, "copy");
+    cfg.dedup_timestamp = Some("id".into());
+    cfg.dedup_key = Some("id".into());
+    // Open before the source grows, as a pipeline runs before dbt reads.
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    for i in 1..=3 {
+        append(&lake.f.source, &[i]).await; // versions 1, 2, 3
+    }
+    p.run_until_caught_up().await.unwrap();
+
+    // dbt rebuilds from source version 2, and records that. Row 3 is gone.
+    dbt_rebuild(&lake.f.target, &[1, 2]).await;
+    record_watermark(&lake.watermark, &cfg.app_id, 2).await;
+    append(&lake.f.source, &[4]).await; // version 4
+
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    assert_eq!(
+        p.coverage(),
+        Some(CoverageWindow {
+            reason: CoverageReason::Rebuilt,
+            through: Some(4),
+            resumed: false,
+        }),
+        "the rescan's window, not a resume from dbt's watermark"
+    );
+    p.run_until_caught_up().await.unwrap();
+    assert_eq!(
+        read_ids(&lake.f.target).await,
+        vec![1, 2, 3, 4],
+        "3 recovered by the rescan, 4 streamed after it"
+    );
+
+    // Nor does it need the table: one that was never created stops nothing at a rebuild,
+    // where without a timestamp it is a hard error.
+    cfg.watermark_uri = Some(format!("{}_never_created", lake.watermark));
+    dbt_rebuild(&lake.f.target, &[1, 2, 3]).await;
+    let mut without_a_timestamp = cfg.clone();
+    without_a_timestamp.dedup_timestamp = None;
+    without_a_timestamp.dedup_key = None;
+    let Err(e) = Pipeline::open(without_a_timestamp).await else {
+        panic!("without a timestamp, a rebuild with no watermark table to read must refuse");
+    };
+    assert!(e.to_string().contains("must exist"), "got: {e}");
+    Pipeline::open(cfg)
+        .await
+        .expect("a pipeline with a timestamp does not read the watermark table")
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    assert_eq!(read_ids(&lake.f.target).await, vec![1, 2, 3, 4]);
 }
 
 // ------------------------------------------------------- zero-cooperation dedup

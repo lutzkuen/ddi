@@ -24,8 +24,10 @@
 //! returns text — rides on a field marker instead, see [`JSON_MARKER`]; it is what lets
 //! `json_object` embed one and quote the other, as Starburst does. `json_format` is
 //! identity, and `json_parse` stores what Trino stores: the value re-serialised with its
-//! keys sorted and its floats spelt by `BigDecimal` — see [`crate::transform::jsonval`],
-//! which reads and writes JSON the way Jackson does so the two engines agree to the byte.
+//! keys sorted, its floats spelt by `BigDecimal` and a character outside the Basic
+//! Multilingual Plane escaped as its UTF-16 surrogate pair — see
+//! [`crate::transform::jsonval`], which reads and writes JSON the way Jackson does so the
+//! two engines agree to the byte.
 //!
 //! DuckDB's `json_extract_string` and Spark's `get_json_object` are registered as aliases
 //! of `json_extract_scalar`, so a model written against either streams unchanged.
@@ -44,7 +46,7 @@ use deltalake::datafusion::logical_expr::{
 };
 use deltalake::datafusion::prelude::SessionContext;
 
-use crate::transform::jsonval::{self, Json, Members, Numbers};
+use crate::transform::jsonval::{self, Generator, Json, Members, Numbers};
 
 /// One step of a JSON path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,14 +156,21 @@ fn resolve<'a>(doc: &'a Json, steps: &[Step]) -> Option<&'a Json> {
 /// as written, repeats included, integers verbatim — and floats re-spelt as doubles,
 /// because Jackson's `copyCurrentStructure` reads a float token as a `double`.
 fn extract_text(v: &Json) -> String {
-    jsonval::to_string(v, Members::Verbatim, Numbers::JavaDouble)
+    jsonval::to_string(v, Members::Verbatim, Numbers::JavaDouble, Generator::Utf8)
 }
 
-/// A value read into a tree and written back, which is what `json_query`, `json_array_get`
-/// and `CAST(.. AS ARRAY(JSON))` do in Trino: a repeated key keeps its first position and
-/// its last value, floats are doubles.
+/// What `json_query` returns: the value read into a tree — a repeated key keeps its first
+/// position and its last value, floats are doubles — and written out as bytes by
+/// `$json_to_varchar`, so an astral character is its surrogate pair.
+fn query_text(v: &Json) -> String {
+    jsonval::to_string(v, Members::LastWins, Numbers::JavaDouble, Generator::Utf8)
+}
+
+/// The same tree written as a Java `String`, which is how Trino writes a container from
+/// `json_array_get` (`JsonNode.toString()`) and each element of `CAST(.. AS ARRAY(JSON))`
+/// (`writeValueAsString`): an astral character is left as the character.
 fn tree_text(v: &Json) -> String {
-    jsonval::to_string(v, Members::LastWins, Numbers::JavaDouble)
+    jsonval::to_string(v, Members::LastWins, Numbers::JavaDouble, Generator::Chars)
 }
 
 /// Every function this module provides.
@@ -448,12 +457,14 @@ impl ScalarUDFImpl for JsonFn {
             let doc: Json = jsonval::parse(raw).map_err(|e| self.bad_json(i, e))?;
 
             match self.kind {
-                // What Trino stores for its JSON type: keys sorted, whitespace gone, and
-                // floats re-spelt by `BigDecimal` — `json_format(json_parse(x))` is that.
+                // What Trino stores for its JSON type: keys sorted, whitespace gone,
+                // floats re-spelt by `BigDecimal` and an emoji escaped, `\uD83D\uDE0A` —
+                // `json_format(json_parse(x))` is that.
                 Kind::Parse => text.push(Some(jsonval::to_string(
                     &doc,
                     Members::Sorted,
                     Numbers::BigDecimal,
+                    Generator::Utf8,
                 ))),
                 Kind::Format => text.push(Some(raw.to_string())),
                 Kind::IsScalar => bools.push(Some(!doc.is_container())),
@@ -463,6 +474,8 @@ impl ScalarUDFImpl for JsonFn {
                 // A JSON null element is the JSON value `null`, not a NULL slot — Trino's
                 // cast keeps it — and a non-array is NULL rather than an error, matching
                 // every other path lookup in this module; malformed JSON already errored.
+                // Trino writes each element through a Java `String`, so an emoji in one
+                // stays the character.
                 Kind::ArrayElements => lists.push(
                     doc.as_array()
                         .map(|a| a.iter().map(|v| Some(tree_text(v))).collect()),
@@ -491,7 +504,8 @@ impl ScalarUDFImpl for JsonFn {
                     };
                     // Trino reads the element with `getValueAsString`, so a string comes
                     // back without its quotes — invalid JSON, as its documentation warns —
-                    // a scalar as its text, and a container as a tree.
+                    // a scalar as its text, and a container as a tree written through a
+                    // Java `String`, which leaves an emoji as the character.
                     text.push(got.and_then(|v| match v {
                         Json::Null => None,
                         Json::String(s) => Some(s.clone()),
@@ -509,7 +523,7 @@ impl ScalarUDFImpl for JsonFn {
                         // what `json_extract_scalar` is for. A JSON null at the path is the
                         // JSON value `null`; only a missing path is SQL NULL.
                         Kind::Extract => text.push(found.map(extract_text)),
-                        Kind::Query => text.push(found.map(tree_text)),
+                        Kind::Query => text.push(found.map(query_text)),
                         Kind::ExtractScalar => text.push(found.and_then(Json::scalar_text)),
                         Kind::Size => nums.push(found.map(|v| v.size() as i64)),
                         Kind::Exists => bools.push(Some(found.is_some())),
@@ -842,6 +856,99 @@ mod tests {
         .await
         .unwrap_err();
         assert!(e.to_string().contains("wildcards"), "got: {e}");
+    }
+
+    fn texts(out: &[RecordBatch], i: usize) -> Vec<Option<String>> {
+        let mut got = Vec::new();
+        for b in out {
+            let c = b.column(i).as_any().downcast_ref::<StringArray>().unwrap();
+            for r in 0..c.len() {
+                got.push((!c.is_null(r)).then(|| c.value(r).to_string()));
+            }
+        }
+        got
+    }
+
+    #[tokio::test]
+    async fn an_emoji_is_its_surrogate_pair_wherever_trino_writes_json_as_bytes() {
+        let out = SqlTransform::new(
+            "SELECT json_format(json_parse(data)) AS p, json_extract(data, '$') AS e, \
+                    json_extract(data, '$.s') AS es, json_format(json_extract(data, '$.s')) AS fs, \
+                    json_query(data, '$') AS q, json_extract_scalar(data, '$.s') AS xs, \
+                    json_value(data, '$.s') AS v, json_extract_scalar(json_parse(data), '$.s') AS ps, \
+                    json_extract_scalar(data, '$[\"😊\"][0]') AS k, \
+                    json_format(json_parse('\"😊\"')) AS lit, \
+                    json_format(json_parse('\"\\ud83d\\ude0a\"')) AS low \
+             FROM source",
+        )
+        .apply(vec![batch(&[r#"{"！":1,"😊":["😊"],"s":"😊"}"#])])
+        .await
+        .unwrap();
+        let col = |i: usize| texts(&out, i).remove(0);
+        assert_eq!(
+            col(0).as_deref(),
+            Some(r#"{"s":"\uD83D\uDE0A","\uD83D\uDE0A":["\uD83D\uDE0A"],"！":1}"#)
+        );
+        assert_eq!(
+            col(1).as_deref(),
+            Some(r#"{"！":1,"\uD83D\uDE0A":["\uD83D\uDE0A"],"s":"\uD83D\uDE0A"}"#)
+        );
+        assert_eq!(col(2).as_deref(), Some(r#""\uD83D\uDE0A""#));
+        assert_eq!(col(3).as_deref(), Some(r#""\uD83D\uDE0A""#));
+        assert_eq!(
+            col(4).as_deref(),
+            Some(r#"{"！":1,"\uD83D\uDE0A":["\uD83D\uDE0A"],"s":"\uD83D\uDE0A"}"#)
+        );
+        assert_eq!(col(5).as_deref(), Some("😊"));
+        assert_eq!(col(6).as_deref(), Some("😊"));
+        assert_eq!(col(7).as_deref(), Some("😊"));
+        assert_eq!(col(8).as_deref(), Some("😊"));
+        assert_eq!(col(9).as_deref(), Some(r#""\uD83D\uDE0A""#));
+        assert_eq!(col(10).as_deref(), Some(r#""\uD83D\uDE0A""#));
+    }
+
+    #[tokio::test]
+    async fn json_array_get_and_array_json_elements_keep_an_emoji_as_the_character() {
+        let doc = r#"[{"a":"\uD83D\uDE0A"},"\uD83D\uDE0A"]"#;
+        let out = SqlTransform::new(
+            "SELECT json_array_get(data, 0) AS c, json_array_get(data, 1) AS s, \
+                    json_query(data, '$[0]') AS q, json_extract(data, '$[0]') AS e, \
+                    CAST(json_array_get(data, 0) AS JSON) AS cc FROM source",
+        )
+        .apply(vec![batch(&[doc])])
+        .await
+        .unwrap();
+        let col = |i: usize| texts(&out, i).remove(0);
+        assert_eq!(col(0).as_deref(), Some(r#"{"a":"😊"}"#));
+        assert_eq!(col(1).as_deref(), Some("😊"));
+        assert_eq!(col(2).as_deref(), Some(r#"{"a":"\uD83D\uDE0A"}"#));
+        assert_eq!(col(3).as_deref(), Some(r#"{"a":"\uD83D\uDE0A"}"#));
+        // CAST copies a JSON value as it is spelt, so the character survives it.
+        assert_eq!(col(4).as_deref(), Some(r#"{"a":"😊"}"#));
+        let out = SqlTransform::new(
+            "SELECT json_format(e) AS f FROM source o \
+             CROSS JOIN UNNEST(CAST(o.data AS ARRAY(JSON))) AS t(e)",
+        )
+        .apply(vec![batch(&[doc])])
+        .await
+        .unwrap();
+        assert_eq!(
+            texts(&out, 0),
+            vec![
+                Some(r#"{"a":"😊"}"#.to_string()),
+                Some(r#""😊""#.to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpaired_surrogate_escape_stops_the_pipeline() {
+        let e = SqlTransform::new("SELECT json_extract_scalar(data, '$.a') AS v FROM source")
+            .apply(vec![batch(&[r#"{"a":"\ud83d"}"#])])
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("not valid JSON"), "got: {e}");
+        assert!(e.to_string().contains("surrogate"), "got: {e}");
     }
 
     #[test]

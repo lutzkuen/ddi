@@ -147,7 +147,7 @@ jobs:
           docker logs trino | tail -50
           exit 1
 
-      - name: Converted SQL parses in Trino
+      - name: Converted SQL parses in Trino, and what it computes matches Trino
         env:
           DDI_TEST_TRINO: http://127.0.0.1:8080
         run: cargo test --test trino_dialect -- --ignored --nocapture

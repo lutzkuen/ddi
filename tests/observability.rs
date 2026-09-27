@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 
 use common::*;
 use delta_delta_ingest::metrics::Metrics;
-use delta_delta_ingest::pipeline::Pipeline;
+use delta_delta_ingest::pipeline::{Pipeline, StepOutcome};
 
 /// Mirror of what `drive()` in the binary records after every step.
 fn record(m: &delta_delta_ingest::metrics::PipelineMetrics, p: &Pipeline) {
@@ -136,5 +136,59 @@ async fn compaction_on_the_source_does_not_read_as_backlog() {
         read_ids(&f.target).await,
         vec![1, 2],
         "and no rows replayed"
+    );
+}
+
+#[tokio::test]
+async fn rows_the_cut_off_drops_are_counted_and_the_window_is_visible() {
+    // The rows a coverage window drops reach neither the target nor the data-quality table,
+    // and the offset moves past them. These two series are the only trace they leave, so
+    // they are fed here exactly the way the supervisor feeds them.
+    let f = Fixture::new().await;
+    append(&f.source, &[1, 2, 3]).await;
+    append(&f.source, &[4, 5, 6]).await;
+    let mut cfg = f.cfg("copy");
+    cfg.dedup_timestamp = Some("id".into());
+    cfg.dedup_key = Some("id".into());
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+
+    // A rebuild that read as far as 5.
+    overwrite(&f.target, &[1, 2, 3, 4, 5]).await;
+
+    let metrics = Metrics::new();
+    let m = metrics.pipeline("copy");
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    m.coverage_cutoff_active
+        .store(p.coverage().is_some() as i64, Ordering::Relaxed);
+    assert_eq!(m.coverage_cutoff_active.load(Ordering::Relaxed), 1);
+
+    loop {
+        let outcome = p.step().await.unwrap();
+        m.coverage_cutoff_active
+            .store(p.coverage().is_some() as i64, Ordering::Relaxed);
+        match outcome {
+            StepOutcome::CaughtUp => break,
+            StepOutcome::Progressed { covered, .. } | StepOutcome::Skipped { covered, .. } => {
+                m.rows_skipped_as_covered
+                    .fetch_add(covered as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
+    assert_eq!(read_ids(&f.target).await, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(m.rows_skipped_as_covered.load(Ordering::Relaxed), 2);
+    let rendered = metrics.render();
+    assert!(
+        rendered.contains("ddi_rows_skipped_as_covered_total{pipeline=\"copy\"} 2"),
+        "4 and 5 were the rebuild's: {rendered}"
+    );
+    assert!(
+        rendered.contains("ddi_coverage_cutoff_active{pipeline=\"copy\"} 0"),
+        "and 6 closed the window: {rendered}"
     );
 }

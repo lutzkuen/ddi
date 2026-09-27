@@ -11,7 +11,7 @@ mod common;
 use common::{append, FakeHub, Fixture, HubBehaviour};
 use delta_delta_ingest::config::{PublishModel, PublisherConfig, PublisherKind, ResolvedPipeline};
 use delta_delta_ingest::pipeline::{Pipeline, StepOutcome};
-use delta_delta_ingest::publish::near_time::NearTimeReader;
+use delta_delta_ingest::publish::near_time::{NearTimeOutcome, NearTimeReader};
 
 /// A pipeline that publishes near-time to `hub`, from a plain `count`/`sum` over `id`.
 fn near_time_cfg(f: &Fixture, name: &str, hub: &FakeHub) -> ResolvedPipeline {
@@ -134,4 +134,41 @@ async fn a_restart_may_resend_a_window_already_published() {
         total, 13,
         "1 + 2 counted twice (once per reader) plus 3 + 4 once: {delivered:?}"
     );
+}
+
+#[tokio::test]
+async fn a_row_the_transform_cannot_evaluate_skips_that_message() {
+    // No data-quality table on this path, so a value the transform cannot evaluate costs its
+    // message, exactly as a row that will not coerce does — not the reader, which would
+    // otherwise fail on it at every poll.
+    let f = Fixture::new().await;
+    append(&f.source, &[1, 2, 3]).await; // version 1: id 2 divides by zero
+    append(&f.source, &[4, 5]).await; // version 2
+
+    let hub = FakeHub::start(HubBehaviour::Accept).await;
+    let mut cfg = near_time_cfg(&f, "copy", &hub);
+    cfg.transform_sql = Some("SELECT id, name FROM source WHERE 10 / (id - 2) <> 0".into());
+    cfg.max_files_per_batch = 1;
+
+    let mut reader = NearTimeReader::open(&cfg).await.unwrap().unwrap();
+    let skipped = reader
+        .poll()
+        .await
+        .expect("a bad value must not fail the reader");
+    assert!(
+        matches!(skipped, NearTimeOutcome::Polled { published: None }),
+        "{skipped:?}"
+    );
+    reader.run_until_caught_up().await.unwrap();
+
+    let delivered = hub.delivered();
+    assert_eq!(delivered.len(), 1, "only the second commit: {delivered:?}");
+    let e = &delivered[0];
+    assert_eq!(e.source_version, 2);
+    assert_eq!(
+        e.prev_source_version,
+        Some(1),
+        "the chain still names the skipped message, so a client sees the gap"
+    );
+    assert_eq!(e.rows.as_array().unwrap()[0]["id_delta"], 9);
 }

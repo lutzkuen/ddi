@@ -34,6 +34,12 @@ fn default_max_output_rows() -> usize {
     // are bounded on estimated *output* rows, not just input bytes. Plan §3.
     5_000_000
 }
+fn default_max_evaluation_rejects() -> usize {
+    // Enough for a burst of bad values; few enough that a batch where every row fails — a
+    // model or upstream-schema problem, not bad data — is given up on after a couple of
+    // hundred runs rather than evaluated one row at a time.
+    100
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +58,23 @@ pub struct Defaults {
     pub max_files_per_batch: usize,
     #[serde(default = "default_max_output_rows")]
     pub max_output_rows_per_batch: usize,
+
+    /// How many rows of one batch the transform may fail to evaluate and still commit the
+    /// rest, with those rows set aside in the data-quality table.
+    ///
+    /// A value the transform cannot evaluate — a string that will not cast, a division by
+    /// zero, a date past what the engine represents — fails the whole batch, and without
+    /// this every retry of that source version would fail the same way. With a data-quality
+    /// table, the batch is instead evaluated in halves until the rows that fail on their own
+    /// are found: nothing extra while a batch evaluates, and about `2·log2(rows)` runs of the
+    /// transform per bad row when one does not, each scanning the lookups the model joins.
+    /// One more than this many fails the batch as before, because that many is far more
+    /// likely a model or upstream-schema problem than bad data.
+    ///
+    /// `0` turns it off: a row the transform cannot evaluate stops the pipeline, as one does
+    /// wherever there is no data-quality table. See [`crate::transform::Transform::apply_isolating`].
+    #[serde(default = "default_max_evaluation_rejects")]
+    pub max_evaluation_rejects_per_batch: usize,
 
     /// How much memory the whole process may use, divided across the pipelines in it.
     ///
@@ -157,6 +180,7 @@ impl Default for Defaults {
             target_file_size: default_target_file_size(),
             max_files_per_batch: default_max_files(),
             max_output_rows_per_batch: default_max_output_rows(),
+            max_evaluation_rejects_per_batch: default_max_evaluation_rejects(),
             max_memory: None,
             max_concurrent_upsert_merges: None,
             max_concurrent_upsert_preflights: None,
@@ -272,9 +296,14 @@ pub struct PipelineConfig {
 
     /// Delta table where dbt records the source version it last rebuilt this target from.
     ///
-    /// Set this whenever dbt also writes `target_uri`. Without it, a dbt overwrite
-    /// silently strands every row this pipeline streamed after dbt began its read — see
-    /// [`crate::dbt::watermark`]. Defaults to `[dbt].watermark_uri`.
+    /// Set this whenever dbt also writes `target_uri` and there is no `dedup_timestamp`.
+    /// Without either, a dbt overwrite silently strands every row this pipeline streamed after
+    /// dbt began its read — see [`crate::dbt::watermark`]. Defaults to
+    /// `[storage].watermark_uri`.
+    ///
+    /// Read only by a pipeline without `dedup_timestamp`. With one set — every dbt model, and
+    /// every upsert — the handover after a rebuild is the timestamp rescan, and this table is
+    /// not read, whatever it holds.
     #[serde(default)]
     pub watermark_uri: Option<String>,
 
@@ -284,8 +313,17 @@ pub struct PipelineConfig {
     /// us where it got to, we read `max(dedup_timestamp)` out of the target and emit only
     /// rows beyond it. The batch needs to know nothing about this tool.
     ///
-    /// Must be non-decreasing in the order rows arrive in the source. See
-    /// [`crate::dedup`].
+    /// It is read beyond the cut-off too, where the order rows arrive in does not matter:
+    /// every open checks the target has the column, an appending pipeline refuses a row
+    /// without a timestamp on every batch, and for `write_mode = "upsert"` or
+    /// `"staged_upsert"` it is the merge's sequence, which decides on every batch which of two
+    /// rows for a key is newer. As the cut-off that recognises covered rows, though, it is
+    /// consulted only where what the target holds has to be inferred — after a rebuild, on a
+    /// first start against a populated target, after the source was replaced — and only
+    /// there must it be non-decreasing in the order rows arrive in the source. A table
+    /// written from a multi-partition Kafka topic is append-only and still does not meet
+    /// that, and `watermark_uri` does not help it: where this is set, the watermark table is
+    /// not read. See [`crate::dedup`].
     #[serde(default)]
     pub dedup_timestamp: Option<String>,
 
@@ -311,6 +349,11 @@ pub struct PipelineConfig {
     /// failing the pipeline (which now retries rather than giving up). See [`crate::dq`].
     #[serde(default)]
     pub dq_uri: Option<String>,
+
+    /// Overrides `[runtime] max_evaluation_rejects_per_batch` for this pipeline. See
+    /// [`Defaults::max_evaluation_rejects_per_batch`].
+    #[serde(default)]
+    pub max_evaluation_rejects_per_batch: Option<usize>,
 
     /// The furthest back the merge window is allowed to reach — `"48h"`, `"90m"`, or a
     /// bare number for a numeric sequence column.
@@ -421,6 +464,10 @@ pub struct StorageConfig {
 
     /// Optional table where a cooperating batch job records the source version it
     /// consumed. See [`crate::dbt::watermark`]; `meta.ddi_timestamp` needs no such thing.
+    ///
+    /// The default for every pipeline, but read only by one without `dedup_timestamp`: never
+    /// by a dbt model, whose `ddi_timestamp` defaults to `_timestamp`. See
+    /// [`PipelineConfig::watermark_uri`].
     #[serde(default)]
     pub watermark_uri: Option<String>,
 
@@ -450,7 +497,10 @@ pub struct ResolvedPipeline {
     pub target_file_size: u64,
     /// Where dbt records its rebuild watermark for this target, if dbt shares it.
     pub watermark_uri: Option<String>,
-    /// Timestamp column used to skip rows a rebuild already covered.
+    /// Timestamp column used to recognise rows a rebuild, a populated target or a replaced
+    /// source already covers, which it recognises only inside a coverage window; see
+    /// [`crate::dedup`]. Also an upsert's merge sequence on every batch, and required of every
+    /// row an appending pipeline writes.
     pub dedup_timestamp: Option<String>,
     /// Row identity, for resolving ties at the watermark instant.
     pub dedup_key: Option<String>,
@@ -479,6 +529,10 @@ pub struct ResolvedPipeline {
     /// An explicit data-quality table, when the derived one will not do. Kept unresolved
     /// so that a target which moves takes its rejects with it — see [`Self::dq_uri`].
     pub dq_uri: Option<String>,
+    /// Rows of one batch the transform may fail to evaluate and still commit the rest, when
+    /// there is a data-quality table to set them aside in. `0` turns that off. See
+    /// [`Defaults::max_evaluation_rejects_per_batch`].
+    pub max_evaluation_rejects_per_batch: usize,
     /// How to reach object storage. The one thing a dbt project cannot tell us.
     pub storage: crate::storage::Storage,
     /// Fully qualified catalog name of the source, when there is a catalog to ask.
@@ -904,9 +958,12 @@ fn staged_problem(p: &PipelineConfig) -> Option<String> {
 ///   the FX rate applied to a row would depend on when the apply half happened to run.
 /// - The **merge key, timestamp and tie-breaker** belong to the apply half, which is the
 ///   only one that merges.
-/// - The **rebuild watermark** belongs to the ingest half. Rows a dbt rebuild already covers
-///   are dropped before they are staged, so applying it again downstream would be asking a
-///   question already answered.
+/// - The **rebuild handover** happens on the apply half, because its target is the one a
+///   rebuild touches. Its `dedup_timestamp` cut-off is what keeps a replay of the stage from
+///   merging rows a rebuild, or a target populated before the first start, already holds —
+///   and since the stage is filled at the ingest half's pace, that cut-off lasts until a
+///   staged row newer than the target's watermark arrives. The ingest half's only ever reads
+///   its own stage, which nothing else writes.
 fn expand_staged(pipelines: &[PipelineConfig]) -> Vec<PipelineConfig> {
     let mut out = Vec::with_capacity(pipelines.len());
     for p in pipelines {
@@ -1687,6 +1744,9 @@ impl Config {
             upsert_grain_check: p.upsert_grain_check,
             stage_for: p.stage_for.clone(),
             dq_uri: p.dq_uri.clone(),
+            max_evaluation_rejects_per_batch: p
+                .max_evaluation_rejects_per_batch
+                .unwrap_or(d.max_evaluation_rejects_per_batch),
             storage: crate::storage::Storage::new(self.storage.options.clone()),
             source_relation: p.source_relation.clone(),
             target_relation: p.target_relation.clone(),
@@ -1894,6 +1954,21 @@ transform_sql = "SELECT customer_id, sum(total) FROM source GROUP BY customer_id
     }
 
     #[test]
+    fn a_from_unixtime_zone_that_does_not_exist_refuses_the_pipeline_at_load() {
+        let toml = r#"
+[[pipeline]]
+name = "x"
+app_id = "ddi.x"
+source_uri = "/tmp/a"
+target_uri = "/tmp/b"
+transform_sql = "SELECT from_unixtime(epoch, 'Mars/Olympus') AS t FROM source"
+"#;
+        let e = Config::from_toml_str(toml).unwrap().resolve().unwrap_err();
+        assert!(matches!(e, Error::Config(_)), "got: {e}");
+        assert!(e.to_string().contains("Mars/Olympus"), "got: {e}");
+    }
+
+    #[test]
     fn source_equal_to_target_is_rejected() {
         let toml = r#"
 [[pipeline]]
@@ -1956,6 +2031,28 @@ target_uri = "/tmp/d"
             r[1].max_bytes_per_batch,
             64 * 1000 * 1000,
             "falls back to defaults"
+        );
+    }
+
+    #[test]
+    fn max_evaluation_rejects_per_batch_has_a_default_a_runtime_value_and_a_pipeline_override() {
+        let resolved = |toml: &str| Config::from_toml_str(toml).unwrap().resolve().unwrap();
+        assert_eq!(resolved(BASE)[0].max_evaluation_rejects_per_batch, 100);
+        assert_eq!(
+            resolved(&format!(
+                "[runtime]\nmax_evaluation_rejects_per_batch = 7\n{BASE}"
+            ))[0]
+                .max_evaluation_rejects_per_batch,
+            7
+        );
+        assert_eq!(
+            resolved(&format!(
+                "[runtime]\nmax_evaluation_rejects_per_batch = 7\n{BASE}\
+                 max_evaluation_rejects_per_batch = 0\n"
+            ))[0]
+                .max_evaluation_rejects_per_batch,
+            0,
+            "the pipeline's own value wins, including the one that turns it off"
         );
     }
 

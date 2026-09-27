@@ -14,9 +14,10 @@ use std::sync::Arc;
 
 use common::pipeline_cfg;
 use delta_delta_ingest::config::ResolvedPipeline;
-use delta_delta_ingest::dedup::DEFAULT_TIMESTAMP_COLUMN;
-use delta_delta_ingest::pipeline::Pipeline;
+use delta_delta_ingest::dedup::{CoverageReason, DEFAULT_TIMESTAMP_COLUMN};
+use delta_delta_ingest::pipeline::{CoverageWindow, Pipeline};
 use delta_delta_ingest::source::ChangePolicy;
+use delta_delta_ingest::Error;
 use deltalake::arrow::array::{
     Array, ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
@@ -149,6 +150,44 @@ async fn create(path: &str, schema: SchemaRef) {
         .with_save_mode(SaveMode::ErrorIfExists)
         .await
         .unwrap();
+}
+
+/// What `CREATE OR REPLACE TABLE` does at `path`: the same log, carrying on with a commit that
+/// removes every file and gives the table a new id.
+async fn replace_in_place(path: &str, schema: SchemaRef) {
+    let delta: StructType = schema.as_ref().try_into_kernel().unwrap();
+    let url = ensure_table_uri(path).unwrap();
+    DeltaTable::try_from_url(url)
+        .await
+        .unwrap()
+        .create()
+        .with_columns(delta.fields().cloned().collect::<Vec<_>>())
+        .with_save_mode(SaveMode::Overwrite)
+        .await
+        .unwrap();
+}
+
+/// `VACUUM` as an operator runs it, once the files a commit removed are past the default
+/// seven-day retention. The clock moves rather than the retention, so its safety check stays on.
+async fn vacuum(path: &str) {
+    #[derive(Debug)]
+    struct EightDaysLater;
+    impl deltalake::operations::vacuum::Clock for EightDaysLater {
+        fn current_timestamp_millis(&self) -> i64 {
+            chrono::Utc::now().timestamp_millis() + 8 * 86_400_000
+        }
+    }
+    let (_t, m) = open_table(ensure_table_uri(path).unwrap())
+        .await
+        .unwrap()
+        .vacuum()
+        .with_clock(Arc::new(EightDaysLater))
+        .await
+        .unwrap();
+    assert!(
+        !m.files_deleted.is_empty(),
+        "VACUUM deleted nothing, so this proves nothing"
+    );
 }
 
 impl Lake {
@@ -491,6 +530,115 @@ async fn bronze_dropped_and_recreated_simply_starts_over() {
 }
 
 #[tokio::test]
+async fn bronze_recreated_empty_and_reseeded_after_the_reopen_is_not_duplicated() {
+    // The order a real drop-and-recreate happens in. Opening fails until the new table
+    // exists and the retry starts at a second, so the pipeline reopens on an empty table and
+    // the re-seed lands afterwards — over several commits and, here, a restart. A window
+    // that ended at the head it opened against would be over before the first re-seeded row,
+    // and let every one of them through a second time.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=5)).await;
+    lake.arrive(&orders(6..=9)).await;
+    lake.stream().await;
+
+    std::fs::remove_dir_all(&lake.raw).unwrap();
+    create(&lake.raw, raw_schema()).await;
+
+    let mut p = Pipeline::open(lake.cfg()).await.unwrap();
+    assert_eq!(
+        p.coverage(),
+        Some(CoverageWindow {
+            reason: CoverageReason::SourceReplaced,
+            through: None,
+            resumed: false,
+        })
+    );
+    assert_eq!(
+        p.run_until_caught_up().await.unwrap(),
+        0,
+        "nothing to read yet"
+    );
+
+    lake.arrive(&orders(1..=3)).await;
+    p.run_until_caught_up().await.unwrap();
+    drop(p);
+
+    let mut p = Pipeline::open(lake.cfg()).await.unwrap();
+    assert_eq!(
+        p.coverage(),
+        Some(CoverageWindow {
+            reason: CoverageReason::SourceReplaced,
+            through: None,
+            resumed: true,
+        }),
+        "the restart carries on with the window its last commit recorded"
+    );
+    lake.arrive(&orders(4..=6)).await;
+    lake.arrive(&orders(7..=9)).await;
+    lake.arrive(&orders(10..=12)).await;
+    p.run_until_caught_up().await.unwrap();
+
+    lake.assert_exactly(&orders(1..=12)).await;
+    assert_eq!(
+        p.coverage(),
+        None,
+        "closed by 10, the first order the old table never had"
+    );
+}
+
+#[tokio::test]
+async fn bronze_replaced_under_a_running_pipeline_fails_the_step_and_the_reopen_starts_over() {
+    // The same replacement with no restart to notice it. The new table has already grown past
+    // the old cursor, so its log reads as nothing more than further commits — and reading
+    // them from there would skip the ones it wrote first.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=5)).await;
+    lake.arrive(&orders(6..=9)).await;
+    let mut p = Pipeline::open(lake.cfg()).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+
+    std::fs::remove_dir_all(&lake.raw).unwrap();
+    create(&lake.raw, raw_schema()).await;
+    lake.arrive(&orders(1..=3)).await;
+    lake.arrive(&orders(4..=6)).await;
+    lake.arrive(&orders(7..=9)).await;
+    lake.arrive(&orders(10..=12)).await;
+
+    let e = p.step().await.unwrap_err();
+    assert!(matches!(e, Error::SourceReplaced { .. }), "got: {e}");
+    lake.assert_exactly(&orders(1..=9)).await;
+
+    // What the supervisor does next: back off, and reopen.
+    lake.stream().await;
+    lake.assert_exactly(&orders(1..=12)).await;
+}
+
+#[tokio::test]
+async fn bronze_recreated_shorter_under_a_running_pipeline_is_noticed() {
+    // The other shape: fewer commits than were consumed. The head is now below a version the
+    // stream has seen exist, which log retention never does — and polling on would report
+    // "caught up" until the new table happened to grow past the old cursor.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=5)).await;
+    lake.arrive(&orders(6..=9)).await;
+    let mut p = Pipeline::open(lake.cfg()).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+
+    std::fs::remove_dir_all(&lake.raw).unwrap();
+    create(&lake.raw, raw_schema()).await;
+    lake.arrive(&orders(1..=3)).await;
+
+    let e = p.step().await.unwrap_err();
+    assert!(matches!(e, Error::SourceReplaced { .. }), "got: {e}");
+
+    let mut p = Pipeline::open(lake.cfg()).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+    lake.arrive(&orders(4..=12)).await;
+    p.run_until_caught_up().await.unwrap();
+    lake.assert_exactly(&orders(1..=12)).await;
+}
+
+#[tokio::test]
 async fn a_recreated_bronze_that_is_already_ahead_does_not_skip_its_early_commits() {
     // The dangerous shape, and the reason identity is checked rather than just the
     // version. If the new table has *more* commits than the old offset, nothing looks
@@ -514,6 +662,180 @@ async fn a_recreated_bronze_that_is_already_ahead_does_not_skip_its_early_commit
     let mut expected = orders(1..=2);
     expected.extend(orders(10..=17));
     lake.assert_exactly(&expected).await;
+}
+
+#[tokio::test]
+async fn bronze_replaced_in_place_is_read_on_as_one_table() {
+    // `CREATE OR REPLACE` keeps the log and changes the id inside it, so bronze's versions
+    // before that commit carry one id and those after it another. Neither a pipeline reading
+    // across the commit nor one reading bronze's history from the start may take that for a
+    // table dropped and recreated: a reopen would meet the same batch again, and never move.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=3)).await;
+    lake.arrive(&orders(4..=6)).await;
+    // One commit per batch, so that batches end on both sides of the replacement.
+    let mut cfg = lake.cfg();
+    cfg.max_files_per_batch = 1;
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+    p.run_until_caught_up().await.unwrap();
+
+    // Skipped as a change commit: it removes every file.
+    replace_in_place(&lake.raw, raw_schema()).await;
+    lake.arrive(&orders(7..=9)).await;
+    p.run_until_caught_up()
+        .await
+        .expect("reading across the replacement");
+    lake.assert_exactly(&orders(1..=9)).await;
+
+    // Its commits since record the new id, so a restart resumes from its own offset. It used
+    // to find the new id where they recorded the old one and start over from
+    // `starting_version`, through the files the replacement removed — which, once VACUUM had
+    // deleted them, failed on every retry.
+    vacuum(&lake.raw).await;
+    drop(p);
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    assert_eq!(p.coverage(), None, "the offset is exact; nothing to infer");
+    lake.arrive(&orders(10..=12)).await;
+    p.run_until_caught_up()
+        .await
+        .expect("resuming after the replacement");
+    lake.assert_exactly(&orders(1..=12)).await;
+}
+
+#[tokio::test]
+async fn a_restart_after_bronze_was_replaced_in_place_reads_on_from_its_own_offset() {
+    // The replacement lands while the pipeline is stopped, part-way through bronze, so its last
+    // commit recorded the old id. Bronze's log still gives the version that commit recorded the
+    // old id, which a table dropped and recreated could not: the reopen reads on from its own
+    // offset, through the old id's last versions and across the replacement. It used to take
+    // bronze for a new table and, without a dedup_timestamp, refuse to start.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=3)).await;
+    let mut cfg = lake.cfg();
+    cfg.dedup_timestamp = None;
+    cfg.dedup_key = None;
+    cfg.max_files_per_batch = 1;
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+
+    lake.arrive(&orders(4..=6)).await;
+    replace_in_place(&lake.raw, raw_schema()).await;
+    lake.arrive(&orders(7..=9)).await;
+
+    let mut p = Pipeline::open(cfg)
+        .await
+        .expect("the same log, replaced in place");
+    p.run_until_caught_up()
+        .await
+        .expect("reading on across the replacement");
+    lake.assert_exactly(&orders(1..=9)).await;
+}
+
+/// Take out of each commit of a table what ddi 0.3.1 did not record: a source version that had
+/// the source's table id.
+fn as_ddi_0_3_1_wrote_it(table_path: &str) {
+    for entry in std::fs::read_dir(format!("{table_path}/_delta_log")).unwrap() {
+        let commit = entry.unwrap().path();
+        if commit.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let mut lines = Vec::new();
+        for line in std::fs::read_to_string(&commit).unwrap().lines() {
+            let mut action: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(info) = action.get_mut("commitInfo").and_then(|i| i.as_object_mut()) {
+                info.remove("ddi.sourceTableIdVersion");
+            }
+            lines.push(action.to_string());
+        }
+        std::fs::write(&commit, lines.join("\n") + "\n").unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_restart_after_bronze_was_replaced_in_place_reads_on_from_a_commit_ddi_0_3_1_made() {
+    // ddi 0.3.1 recorded bronze's table id with no version that had it, so the upgraded ddi
+    // could not tell bronze replaced in place while it was stopped from bronze dropped and
+    // recreated: without a dedup_timestamp it refused to start, for good, as nothing would
+    // ever commit the new id. The version its own offset is at had the id, as the last one
+    // 0.3.1 read, and bronze's log still gives it that id.
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=3)).await;
+    let mut cfg = lake.cfg();
+    cfg.dedup_timestamp = None;
+    cfg.dedup_key = None;
+    Pipeline::open(cfg.clone())
+        .await
+        .unwrap()
+        .run_until_caught_up()
+        .await
+        .unwrap();
+    as_ddi_0_3_1_wrote_it(&lake.stg);
+
+    lake.arrive(&orders(4..=6)).await;
+    replace_in_place(&lake.raw, raw_schema()).await;
+    lake.arrive(&orders(7..=9)).await;
+
+    let mut p = Pipeline::open(cfg)
+        .await
+        .expect("the same log, replaced in place");
+    p.run_until_caught_up()
+        .await
+        .expect("reading on across the replacement");
+    lake.assert_exactly(&orders(1..=9)).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_version_before_bronze_was_replaced_that_cannot_be_read_stops_the_reopen() {
+    // The reopen after bronze was replaced in place loads the version its last commit
+    // recorded, to see whether bronze's log is still the one it read. A read of it that failed
+    // — a timeout, throttling, a credential gone stale — says nothing about that, and was taken
+    // for a log without that version: bronze counted as dropped and recreated, and the reopen
+    // started over from `starting_version`, for good once it committed. Here the commits
+    // before the replacement cannot be opened, while the checkpoint after it lets bronze's head
+    // load all the same; the open fails, to be retried, and the retry reads on.
+    use std::os::unix::fs::PermissionsExt;
+
+    let lake = Lake::new().await;
+    lake.arrive(&orders(1..=3)).await; // version 1
+    let cfg = lake.cfg();
+    lake.stream().await;
+    replace_in_place(&lake.raw, raw_schema()).await; // version 2
+    lake.arrive(&orders(4..=6)).await; // version 3
+    let bronze = open_table(ensure_table_uri(&lake.raw).unwrap())
+        .await
+        .unwrap();
+    deltalake::checkpoints::create_checkpoint(&bronze, None)
+        .await
+        .unwrap();
+
+    let before: Vec<_> = (0..2)
+        .map(|v| format!("{}/_delta_log/{v:020}.json", lake.raw))
+        .collect();
+    for commit in &before {
+        std::fs::set_permissions(commit, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let unreadable = std::fs::File::open(&before[1]).is_err();
+    let outcome = Pipeline::open(cfg.clone()).await;
+    for commit in &before {
+        std::fs::set_permissions(commit, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    if !unreadable {
+        return; // running as root, where the mode bits do not bite. Nothing to pin.
+    }
+    let Err(e) = outcome else {
+        panic!("a version that could not be read must not be taken for one the log lacks");
+    };
+    assert!(!e.to_string().contains("recreated"), "got: {e}");
+
+    let mut p = Pipeline::open(cfg).await.expect("the retry");
+    assert_eq!(p.coverage(), None, "the offset is exact; nothing to infer");
+    p.run_until_caught_up().await.unwrap();
+    lake.assert_exactly(&orders(1..=6)).await;
 }
 
 #[tokio::test]
@@ -617,10 +939,14 @@ async fn the_rescan_after_a_rebuild_is_bounded_by_file_statistics() {
     .await
     .unwrap();
 
-    // Orders 1..=18 landed in commits 1..=18, so everything needed is at 19 and beyond.
+    // Orders 1..=18 landed in commits 1..=18, so everything needed is at 19 and beyond. The
+    // rescan starts at 18 all the same: that commit's maximum is the watermark itself, a
+    // whole millisecond, which a writer that truncates to the millisecond would also record
+    // for a row up to 999 us later. Re-reading it costs nothing — the cut-off drops what the
+    // target holds.
     assert_eq!(
-        start, 19,
-        "the rescan should start just past the last commit the rebuild covered, not at 0"
+        start, 18,
+        "the rescan should start at the last commit the rebuild covered, not at 0"
     );
 
     // And the pipeline built on it still gets the right answer.
@@ -660,4 +986,113 @@ async fn an_unbounded_rescan_is_still_correct_when_statistics_are_missing() {
     .await
     .unwrap();
     assert_eq!(start, 0, "no usable statistics must mean a full rescan");
+}
+
+/// Rewrite the `maxValues` of `column` in commit `version`'s adds the way Spark writes them:
+/// truncated to the millisecond, which the protocol allows. delta-rs keeps every digit.
+fn truncate_timestamp_max_to_millis(table_path: &str, version: u64, column: &str) {
+    let commit = format!("{table_path}/_delta_log/{version:020}.json");
+    let mut lines = Vec::new();
+    for line in std::fs::read_to_string(&commit).unwrap().lines() {
+        let mut action: serde_json::Value = serde_json::from_str(line).unwrap();
+        if let Some(add) = action.get_mut("add") {
+            let mut stats: serde_json::Value =
+                serde_json::from_str(add["stats"].as_str().unwrap()).unwrap();
+            let max = stats["maxValues"][column].as_str().unwrap().to_string();
+            let (whole, fraction) = max.split_once('.').unwrap();
+            stats["maxValues"][column] = serde_json::json!(format!("{whole}.{}Z", &fraction[..3]));
+            add["stats"] = serde_json::json!(stats.to_string());
+        }
+        lines.push(action.to_string());
+    }
+    std::fs::write(&commit, lines.join("\n") + "\n").unwrap();
+}
+
+#[tokio::test]
+async fn a_rescan_does_not_skip_a_commit_whose_timestamp_max_was_truncated_to_the_millisecond() {
+    // Spark records a timestamp's maximum to the millisecond, so a commit whose newest row is
+    // 10:00:00.000900 says 10:00:00.000. Taken at its word against a watermark of
+    // 10:00:00.000200, that commit is covered, the rescan starts after it, and its row newer
+    // than the watermark is never read again.
+    use delta_delta_ingest::dedup::bounded_rescan_start;
+
+    const W: i64 = 1_790_330_400_000_200; // 2026-09-25T10:00:00.000200Z
+    let lake = Lake::new().await;
+    for (id, ts) in [(1, W - 3_600_000_000), (2, W), (3, W + 700)] {
+        lake.arrive(&[Order { id, ts }]).await; // versions 1, 2, 3
+    }
+    truncate_timestamp_max_to_millis(&lake.raw, 3, DEFAULT_TIMESTAMP_COLUMN);
+
+    let source = open_table(ensure_table_uri(&lake.raw).unwrap())
+        .await
+        .unwrap();
+    let watermark: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![W]));
+    let start = bounded_rescan_start(&source, DEFAULT_TIMESTAMP_COLUMN, &watermark, 0, 10_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        start, 3,
+        "the commit whose maximum was truncated to a whole millisecond could hold rows up to \
+         999 us past it, so it is read again; the watermark's own, recorded to the \
+         microsecond, is covered"
+    );
+}
+
+#[tokio::test]
+async fn a_rescan_does_not_skip_a_commit_whose_decimal_max_shares_the_watermarks_double() {
+    // A DECIMAL is compared as a double, and two decimals can share one: DECIMAL(38,18)
+    // 0.403800000000000050 and …051 both become 0x3fd9d7dbf487fcba. A commit whose maximum
+    // is …051 is newer than a watermark of …050, and has to be re-read; taking the equal
+    // doubles for "already covered" would skip it and lose its row.
+    use delta_delta_ingest::dedup::bounded_rescan_start;
+    use deltalake::arrow::array::Decimal128Array;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("raw")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "seq",
+        DataType::Decimal128(38, 18),
+        false,
+    )]));
+    create(&path, schema.clone()).await;
+    let dec = |unscaled: i128| {
+        Arc::new(
+            Decimal128Array::from(vec![unscaled])
+                .with_precision_and_scale(38, 18)
+                .unwrap(),
+        ) as ArrayRef
+    };
+    for unscaled in [
+        100000000000000000i128,
+        403800000000000050,
+        403800000000000051,
+    ] {
+        let batch = RecordBatch::try_new(schema.clone(), vec![dec(unscaled)]).unwrap();
+        open_table(ensure_table_uri(&path).unwrap())
+            .await
+            .unwrap()
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        (403800000000000050i128 as f64 / 1e18).to_bits(),
+        (403800000000000051i128 as f64 / 1e18).to_bits(),
+        "the premise: both decimals are the same double"
+    );
+
+    let source = open_table(ensure_table_uri(&path).unwrap()).await.unwrap();
+    let start = bounded_rescan_start(&source, "seq", &dec(403800000000000050), 0, 10_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        start, 2,
+        "only the commit of 0.1 is provably covered; the next two must be re-read"
+    );
 }

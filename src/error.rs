@@ -211,8 +211,39 @@ pub enum Error {
         path: String,
     },
 
+    /// The source stopped being the table this pipeline opened, while it was reading it.
+    ///
+    /// Raised from the stream, which otherwise has no way to tell: a recreated table at the
+    /// same path simply reads as a head that went backwards, or — once it has grown past the
+    /// old cursor — as more commits, read from a position that meant something only in the
+    /// old table's log. Failing the step hands it to `Pipeline::open`, which is where a
+    /// replaced source is recognised and dealt with.
+    #[error(
+        "source {source_uri} was dropped and recreated, or relocated, while this pipeline was \
+         reading it: {detail}. Nothing was written for it. Reopening starts over from \
+         starting_version under the dedup_timestamp filter, which skips what the target \
+         already holds — or, without dedup_timestamp, refuses and names the fix."
+    )]
+    SourceReplaced {
+        // Not `source`: thiserror reads a field of that name as the error's cause.
+        source_uri: String,
+        detail: String,
+    },
+
     #[error("transform error: {0}")]
     Transform(String),
+
+    /// The transform could not evaluate a value, rather than failing for any other reason.
+    ///
+    /// The one transform failure a single row can cause: a cast that does not parse, a
+    /// division by zero, a date past what the engine represents. Its own variant because it
+    /// alone may be answered by finding that row and setting it aside — see
+    /// [`crate::transform::Transform::apply_isolating`]. A plan that does not type-check, a
+    /// full spill directory or an unreadable file are none of those, and are never blamed on a
+    /// row. Displayed exactly as [`Self::Transform`] is, because to whoever reads the log it
+    /// is still a transform that failed.
+    #[error("transform error: {0}")]
+    Evaluation(String),
 
     /// Something ran out of a resource rather than being wrong.
     ///

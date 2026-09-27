@@ -140,6 +140,7 @@ fn pipeline(declared_source: &str, declared_target: &str) -> ResolvedPipeline {
         upsert_grain_check: Default::default(),
         stage_for: None,
         dq_uri: None,
+        max_evaluation_rejects_per_batch: 100,
         storage: Default::default(),
     }
 }
