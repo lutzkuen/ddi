@@ -51,6 +51,10 @@ const COLUMN_MAPPING_MODE: &str = "delta.columnMapping.mode";
 /// How many commit files the backward walk keeps in flight.
 const IN_FLIGHT: usize = 4;
 
+/// How many commits below a checkpoint [`read_txns`] reads, at most, for the marks the
+/// checkpoint answered without.
+const BELOW_CHECKPOINT_READS: u64 = 256;
+
 /// How far below the handle's version the first listing for a checkpoint reaches, when
 /// `_last_checkpoint` does not say where to look. The kernel scans backwards in windows of
 /// the same size.
@@ -164,7 +168,9 @@ pub fn offset_may_have_expired(
 }
 
 /// What reading offsets has cost, for `ddi_kafka_offset_lookups_total`,
-/// `ddi_kafka_offset_lookup_seconds_total` and `ddi_kafka_offset_lookup_fallbacks_total`.
+/// `ddi_kafka_offset_lookup_seconds_total`, `ddi_kafka_offset_lookup_fallbacks_total`,
+/// `ddi_kafka_offset_lookup_below_checkpoint_reads_total` and
+/// `ddi_kafka_offset_lookup_marks_unfound_total`.
 ///
 /// Shared rather than returned, so that whoever renders the metrics can hold the same
 /// counters the readers add to.
@@ -173,6 +179,8 @@ pub struct LookupCounters {
     lookups: AtomicU64,
     micros: AtomicU64,
     fallbacks: AtomicU64,
+    below_checkpoint_reads: AtomicU64,
+    marks_unfound: AtomicU64,
 }
 
 impl LookupCounters {
@@ -192,6 +200,20 @@ impl LookupCounters {
     pub fn fallbacks(&self) -> u64 {
         self.fallbacks.load(Ordering::Relaxed)
     }
+
+    /// Commits [`read_txns`] read below a checkpoint, for the marks it answered without: at
+    /// most [`BELOW_CHECKPOINT_READS`] per call.
+    pub fn below_checkpoint_reads(&self) -> u64 {
+        self.below_checkpoint_reads.load(Ordering::Relaxed)
+    }
+
+    /// appIds a checkpoint or the kernel answered whose commit those reads did not reach,
+    /// because they met a commit log cleanup had removed, or read as many as they may. Each
+    /// is a partition whose resume cannot be checked against its mark (docs/kafka-design.md
+    /// §4.4, Unverifiable).
+    pub fn marks_unfound(&self) -> u64 {
+        self.marks_unfound.load(Ordering::Relaxed)
+    }
 }
 
 /// Every appId in `app_ids`, with its newest `txn` as of `table`'s version, read in one pass.
@@ -207,11 +229,21 @@ impl LookupCounters {
 ///    answers comes with its `lastUpdated` but no mark: a checkpoint keeps no commitInfo.
 /// 5. Only if that checkpoint cannot be read here: the kernel, one appId at a time, counted
 ///    in [`LookupCounters::fallbacks`]. It answers with the version alone.
+/// 6. For what steps 4 and 5 answered, the commits below the checkpoint, newest first,
+///    [`IN_FLIGHT`] at a time, until each of those appIds has been met: the newest commit
+///    with its `txn` gives back the mark beside it, and for a kernel answer its `lastUpdated`,
+///    when that `txn` holds the version answered. Without them the re-read check of a resume
+///    (docs/kafka-design.md §4.4, I19) is off for the partition until it carries data again.
+///    Bounded twice: by [`BELOW_CHECKPOINT_READS`] commits, counted in
+///    [`LookupCounters::below_checkpoint_reads`], and by the first commit log cleanup has
+///    removed, below which a `txn` is not known to be the newest. An appId neither reached
+///    keeps no mark, counted in [`LookupCounters::marks_unfound`].
 ///
 /// The walk is contiguous, so what it finds is the newest; what it does not find is as the
 /// checkpoint at its bottom says, or absent when it reached version 0. A commit missing from
 /// the middle is an error, never a reason to look further down: an answer older than the
-/// truth would move an offset backwards.
+/// truth would move an offset backwards. Step 6 only ever adds a mark to an answer, so it
+/// stops at a missing commit instead.
 ///
 /// Refuses a table that sets `delta.setTransactionRetentionDuration`, as
 /// [`refuse_txn_retention`] does, so that nothing read here has to be filtered for expiry.
@@ -224,28 +256,49 @@ pub async fn read_txns(
     counters: &LookupCounters,
 ) -> Result<BTreeMap<String, TxnState>> {
     refuse_txn_retention(table)?;
-    read_own_txns(table, app_ids, counters).await
+    read(table, app_ids, counters, Below::Marks).await
 }
 
 /// [`read_txns`] on a table every `txn` of which is ddi's own, without its refusal of
-/// `delta.setTransactionRetentionDuration`.
+/// `delta.setTransactionRetentionDuration`, and without its step 6.
 ///
 /// The refusal is there because a `txn` with a `lastUpdated`, as kafka-delta-ingest wrote
 /// them, can expire under the property, and the walk does not filter for that. ddi's own
 /// carry none and never expire, so on a table only ddi writes `txn`s to — the data-quality
 /// table's marks ([`crate::dq::DataQuality::write_kafka`]) — the property changes nothing
-/// read here, and refusing it would stop rejects being recorded for nothing.
+/// read here, and refusing it would stop rejects being recorded for nothing. Its marks are
+/// read on every write, where a mark a checkpoint answered is simply not skipped by, so the
+/// commits below the checkpoint are not worth reading.
 pub(crate) async fn read_own_txns(
     table: &DeltaTable,
     app_ids: &[String],
     counters: &LookupCounters,
+) -> Result<BTreeMap<String, TxnState>> {
+    read(table, app_ids, counters, Below::Nothing).await
+}
+
+/// Whether [`read_txns`]' step 6 reads below the checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Below {
+    /// It does: the caller keeps the marks.
+    Marks,
+    /// It does not: the caller wants the versions alone.
+    Nothing,
+}
+
+/// Steps 1-6 of [`read_txns`], counted as one lookup.
+async fn read(
+    table: &DeltaTable,
+    app_ids: &[String],
+    counters: &LookupCounters,
+    below: Below,
 ) -> Result<BTreeMap<String, TxnState>> {
     let wanted: BTreeSet<&str> = app_ids.iter().map(String::as_str).collect();
     let mut found = BTreeMap::new();
     if !wanted.is_empty() {
         let head = table.version().ok_or_else(|| not_loaded(table))?;
         let started = Instant::now();
-        let walked = walk(table, head, &wanted, &mut found, counters).await;
+        let walked = walk(table, head, &wanted, &mut found, counters, below).await;
         counters.lookups.fetch_add(1, Ordering::Relaxed);
         counters
             .micros
@@ -261,13 +314,14 @@ pub(crate) async fn read_own_txns(
         .collect())
 }
 
-/// Steps 1-5 of [`read_txns`], filling `found` with every `txn` it finds.
+/// Steps 1-6 of [`read_txns`], filling `found` with every `txn` it finds.
 async fn walk(
     table: &DeltaTable,
     head: u64,
     wanted: &BTreeSet<&str>,
     found: &mut BTreeMap<String, TxnState>,
     counters: &LookupCounters,
+    below: Below,
 ) -> Result<()> {
     let log_store = table.log_store();
     let all_found = |found: &BTreeMap<String, TxnState>| found.len() == wanted.len();
@@ -295,7 +349,7 @@ async fn walk(
     }
 
     // The commit at the checkpoint's version is read too when it is still there: it repeats
-    // what the checkpoint says, and adds the marks and the writer the checkpoint cannot.
+    // what the checkpoint says, and adds the marks the checkpoint cannot.
     let mut commits = futures::stream::iter((bottom..head).rev())
         .map(|v| {
             let log_store = log_store.clone();
@@ -349,6 +403,72 @@ async fn walk(
             kernel_lookups(table, &rest, found, counters).await?;
         }
     }
+    let answered: BTreeSet<&str> = rest
+        .into_iter()
+        .filter(|id| found.contains_key(*id))
+        .collect();
+    if below == Below::Marks && !answered.is_empty() {
+        below_checkpoint(table, checkpoint.version, answered, found, counters).await?;
+    }
+    Ok(())
+}
+
+/// Step 6 of [`read_txns`]: for the appIds in `answered`, which the checkpoint at `bottom` or
+/// the kernel answered, what the commit below `bottom` that wrote each one's `txn` says.
+async fn below_checkpoint(
+    table: &DeltaTable,
+    bottom: u64,
+    mut answered: BTreeSet<&str>,
+    found: &mut BTreeMap<String, TxnState>,
+    counters: &LookupCounters,
+) -> Result<()> {
+    let log_store = table.log_store();
+    let floor = bottom.saturating_sub(BELOW_CHECKPOINT_READS);
+    let mut commits = futures::stream::iter((floor..bottom).rev())
+        .map(|v| {
+            let log_store = log_store.clone();
+            async move {
+                // Counted as it is sent: one the walk stops before it is ever polled is not.
+                counters
+                    .below_checkpoint_reads
+                    .fetch_add(1, Ordering::Relaxed);
+                (v, log_store.read_commit_entry(v).await)
+            }
+        })
+        .buffered(IN_FLIGHT);
+    while let Some((v, read)) = commits.next().await {
+        // Removed by log cleanup: below a gap, a txn is not known to be the newest.
+        let Some(bytes) = read? else { break };
+        let mut met = BTreeMap::new();
+        record_commit(table, v, &bytes, &answered, &mut met)?;
+        for (id, written) in met {
+            answered.remove(id.as_str());
+            let Some(answer) = found.get_mut(&id) else {
+                continue;
+            };
+            // Another version is an older txn than the one answered, which the commit that
+            // moved it on — at or above `bottom`, and gone — wrote. Its mark is not this one's.
+            if written.version == answer.version {
+                answer.mark = written.mark;
+                if answer.last_updated == LastUpdated::Unknown {
+                    answer.last_updated = written.last_updated;
+                }
+            }
+        }
+        if answered.is_empty() {
+            return Ok(());
+        }
+    }
+    counters
+        .marks_unfound
+        .fetch_add(answered.len() as u64, Ordering::Relaxed);
+    debug!(
+        table = %table.table_url(),
+        checkpoint_version = bottom,
+        app_ids = answered.len(),
+        "the commits below this checkpoint that wrote these offsets are gone or too far down; \
+         their resume cannot be checked against a mark"
+    );
     Ok(())
 }
 
@@ -868,7 +988,9 @@ impl Fence {
     }
 
     /// Own exactly `owned`, with each partition's offset as of `table`'s version, read in one
-    /// pass ([`read_txns`]).
+    /// pass ([`read_txns`]), and the mark beside it: from below a checkpoint too, when the
+    /// checkpoint answered the offset (step 6). A partition left without one resumes
+    /// Unverifiable (docs/kafka-design.md §4.4) until it carries data again.
     ///
     /// Every owned partition is then carried: all of them were just read at the handle's
     /// version. On an error nothing is carried, so that no offset is trusted until a reset
@@ -925,7 +1047,9 @@ impl Fence {
             .iter()
             .map(|p| txn_app_id(&self.app_id, *p))
             .collect();
-        let txns = read_txns(table, &ids, &self.lookups).await?;
+        // [`read_txns`] without its step 6: only the versions are compared.
+        refuse_txn_retention(table)?;
+        let txns = read(table, &ids, &self.lookups, Below::Nothing).await?;
         for (p, id) in unverified.iter().zip(&ids) {
             let expected = self.base[p].0;
             let found = txns.get(id).and_then(|t| t.version);
@@ -948,6 +1072,11 @@ impl Fence {
     /// from `marks`. Every other carried partition with a known offset at that offset, with
     /// its mark. A partition that is not carried is not re-asserted: its offset is not known
     /// at the handle's version, and asserting a stale one would move it.
+    ///
+    /// Every partition with a known offset is carried (a reset carries all, and every commit
+    /// asserts and so carries again each one it had), so every commit of an owner holds the
+    /// mark of every partition it owns whose mark is known: its newest commit is all a
+    /// [`read_txns`] below a checkpoint needs to find.
     ///
     /// A mark is kept only where it describes the offset it sits beside.
     pub fn assert_map(
@@ -1786,10 +1915,16 @@ mod tests {
         );
         assert_eq!(got, kernel_versions(&table, 0..5).await);
 
-        // Back to the checkpoint and no further: 1 and 2 came out of its txn column.
+        // Back to the checkpoint for the versions: 1 and 2 came out of its txn column. Then
+        // below it for their marks, as far as commit 1, which wrote them; commit 0 at most in
+        // flight when it was read.
         let mut read = store.commits_read();
         read.sort_unstable();
-        assert_eq!(read, vec![3, 4, 5, 6, 7, 8]);
+        read.retain(|v| *v != 0);
+        assert_eq!(read, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let below = counters.below_checkpoint_reads();
+        assert!((2..=3).contains(&below), "{below}");
+        assert_eq!(counters.marks_unfound(), 0);
         assert!(store
             .gets()
             .iter()
@@ -1802,6 +1937,14 @@ mod tests {
         assert!(in_flight <= IN_FLIGHT, "{in_flight} GETs in flight at once");
         assert_eq!(counters.lookups(), 1, "one walk, for five appIds");
         assert_eq!(counters.fallbacks(), 0);
+
+        // Where only the versions are wanted, the walk goes no further than the checkpoint.
+        store.reset();
+        read_own_txns(&table, &ids(0..5), &counters).await.unwrap();
+        let mut read = store.commits_read();
+        read.sort_unstable();
+        assert_eq!(read, vec![3, 4, 5, 6, 7, 8]);
+        assert_eq!(counters.below_checkpoint_reads(), below, "unchanged");
 
         // An appId the newer commits answer stops the walk before the checkpoint is read.
         store.reset();
@@ -2238,13 +2381,44 @@ mod tests {
         );
         assert_eq!(counters.lookups(), 1);
 
-        // The kernel gives the version alone, so whether those txns can expire is not known,
-        // and counts as if they could.
+        // The kernel gives the version alone; commit 1, below the checkpoint it stood in for,
+        // gives back the lastUpdated of the two txns it wrote.
         let txns = read_txns(&table, &ids(0..4), &counters).await.unwrap();
         assert_eq!(txns["app-0"].writer(), Writer::Ddi, "read from commit 3");
-        assert_eq!(txns["app-1"].last_updated, LastUpdated::Unknown);
-        assert_eq!(txns["app-1"].writer(), Writer::Unknown);
-        assert!(offset_may_have_expired(&txns, true), "{txns:?}");
+        assert_eq!(txns["app-1"].last_updated, LastUpdated::Absent);
+        assert_eq!(txns["app-2"].writer(), Writer::Ddi);
+        assert!(!offset_may_have_expired(&txns, true), "{txns:?}");
+    }
+
+    /// A txn whose `lastUpdated` could not be seen — the kernel answered it, and the commit
+    /// that wrote it was not found — counts as one that can expire, and as nobody's.
+    #[test]
+    fn a_txn_whose_last_updated_is_not_known_may_expire() {
+        let state = |version: Option<i64>, last_updated| TxnState {
+            version,
+            mark: None,
+            last_updated,
+        };
+        let cases = [
+            (state(Some(1), LastUpdated::Absent), Writer::Ddi, false),
+            (state(Some(1), LastUpdated::At(5)), Writer::Other, true),
+            (state(Some(1), LastUpdated::Unknown), Writer::Unknown, true),
+            (state(None, LastUpdated::Unknown), Writer::Unknown, false),
+        ];
+        for (txn, writer, may_expire) in cases {
+            assert_eq!(txn.writer(), writer, "{txn:?}");
+            assert_eq!(txn.may_expire(), may_expire, "{txn:?}");
+        }
+        let one = |txn: TxnState| BTreeMap::from([("app-0".to_string(), txn)]);
+        assert!(offset_may_have_expired(
+            &one(state(Some(1), LastUpdated::Unknown)),
+            true
+        ));
+        assert!(!offset_may_have_expired(
+            &one(state(Some(1), LastUpdated::Absent)),
+            true
+        ));
+        assert!(!kdi_era(&one(state(Some(1), LastUpdated::Unknown))));
     }
 
     #[tokio::test]
@@ -2387,9 +2561,10 @@ mod tests {
             txns["app-0"],
             TxnState {
                 version: Some(9),
-                mark: None,
+                mark: Some(mark),
                 last_updated: LastUpdated::Absent,
-            }
+            },
+            "and its mark comes back from commit 1, below the checkpoint"
         );
         assert_eq!(txns["app-1"].version, Some(4));
         assert_eq!(txns["app-1"].writer(), Writer::Ddi);
@@ -2533,6 +2708,214 @@ mod tests {
         assert!(offset_may_have_expired(&txns, true), "{txns:?}");
         // Without the property in the table's history, nothing can have expired.
         assert!(!offset_may_have_expired(&txns, false), "{txns:?}");
+    }
+
+    /// The mark of the message at `offset`, made up for a test.
+    fn mark_at(offset: i64) -> MessageMark {
+        MessageMark {
+            offset,
+            timestamp_ms: 1_700_000_000_000 + offset,
+            value_len: 40 + offset as u32,
+        }
+    }
+
+    /// Write commit `version` by hand, as ddi writes one: `txns` (appId, version) without
+    /// `lastUpdated`, and a commitInfo with `ddi.appId` and `ddi.kafka.marks` for `marks`.
+    fn ddi_commit(dir: &std::path::Path, version: u64, txns: &[(&str, i64)], marks: &[(i32, i64)]) {
+        let marks: serde_json::Map<String, serde_json::Value> = marks
+            .iter()
+            .map(|(p, o)| {
+                let m = mark_at(*o);
+                (
+                    p.to_string(),
+                    serde_json::json!([m.offset, m.timestamp_ms, m.value_len]),
+                )
+            })
+            .collect();
+        let mut commit = serde_json::json!({"commitInfo": {
+            "timestamp": 1_700_000_000_000i64, "operation": "WRITE",
+            "ddi.appId": APP, "ddi.kafka.marks": marks
+        }})
+        .to_string();
+        commit.push('\n');
+        for (app_id, v) in txns {
+            commit.push_str(&format!(
+                "{{\"txn\":{{\"appId\":\"{app_id}\",\"version\":{v}}}}}\n"
+            ));
+        }
+        std::fs::write(log_file(dir, &commit_name(version)), commit).unwrap();
+    }
+
+    /// A rebalance hands partitions 0 and 1 to a new owner after the other members' commits
+    /// pushed a checkpoint above the previous owner's last commit. The checkpoint answers
+    /// their offsets and drops the marks beside them; the commit below it still has them, and
+    /// the re-read check (I19) needs them.
+    #[tokio::test]
+    async fn reset_recovers_marks_from_below_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let table = create_with(path, &[("delta.checkpointInterval", "10")]).await;
+        let empty = RecordBatch::new_empty(schema_of(&table));
+        Sink::new(APP, 0)
+            .commit_kafka(
+                table,
+                vec![empty],
+                &offsets(
+                    &[(0, (5, 9)), (1, (4, 4))],
+                    &BTreeMap::from([(0, 9), (1, 4)]),
+                    &BTreeMap::from([(0, mark_at(9)), (1, mark_at(4))]),
+                ),
+            )
+            .await
+            .unwrap(); // 1
+        let mut table = open(path).await;
+        for i in 0..11 {
+            table = assert_txns(table, &[(2, 100 + i)]).await; // 2..=12
+        }
+        assert!(log_file(dir.path(), "00000000000000000009.checkpoint.parquet").exists());
+
+        let (table, store) = counted(path).await;
+        let mut fence = Fence::new(APP);
+        fence.reset(&table, &[0, 1]).await.unwrap();
+        assert_eq!(fence.base(0), Some((Some(9), Some(mark_at(9)))));
+        assert_eq!(fence.base(1), Some((Some(4), Some(mark_at(4)))));
+        // Down to commit 1, which wrote both; commit 0 at most in flight when it was read.
+        let mut read = store.commits_read();
+        read.sort_unstable();
+        read.retain(|v| *v != 0);
+        assert_eq!(read, (1..=12).collect::<Vec<_>>());
+        assert_eq!(fence.lookups().marks_unfound(), 0);
+    }
+
+    /// An owner's commit of a batch that read one partition carries the marks of all it owns:
+    /// [`Fence::assert_map`] re-asserts every other base with its mark. So its newest commit
+    /// alone resumes any of them with the re-read check, also when a checkpoint lands above it.
+    #[tokio::test]
+    async fn every_commit_carries_every_owned_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let table = create(path).await;
+        let empty = RecordBatch::new_empty(schema_of(&table));
+        Sink::new(APP, 0)
+            .commit_kafka(
+                table,
+                vec![empty],
+                &offsets(
+                    &[(0, (5, 9)), (1, (4, 4)), (2, (7, 7))],
+                    &BTreeMap::from([(0, 9), (1, 4), (2, 7)]),
+                    &BTreeMap::from([(0, mark_at(9)), (1, mark_at(4)), (2, mark_at(7))]),
+                ),
+            )
+            .await
+            .unwrap(); // 1
+
+        let table = open(path).await;
+        let mut fence = Fence::new(APP);
+        fence.reset(&table, &[0, 1, 2]).await.unwrap();
+        let ranges = BTreeMap::from([(0, (10, 12))]);
+        fence.verify(&table, &ranges).await.unwrap();
+        let (assert, marks) = fence.assert_map(&ranges, &BTreeMap::from([(0, mark_at(12))]));
+        let expected = BTreeMap::from([(0, mark_at(12)), (1, mark_at(4)), (2, mark_at(7))]);
+        assert_eq!(marks, expected);
+        let batch = offsets(&[(0, (10, 12))], &assert, &marks);
+        let empty = RecordBatch::new_empty(schema_of(&table));
+        Sink::new(APP, 0)
+            .commit_kafka(table, vec![empty], &batch)
+            .await
+            .unwrap(); // 2
+        fence.committed(&batch);
+        assert_eq!(fence.base(1), Some((Some(4), Some(mark_at(4)))));
+
+        let (table, store) = counted(path).await;
+        let counters = LookupCounters::default();
+        let txns = read_txns(&table, &ids(0..3), &counters).await.unwrap();
+        let read: BTreeMap<i32, MessageMark> = (0..3)
+            .filter_map(|p| Some((p, txns[&txn_app_id(APP, p)].mark?)))
+            .collect();
+        assert_eq!(read, expected);
+        assert_eq!(store.commits_read(), vec![2], "the head alone");
+    }
+
+    /// The walk below a checkpoint stops at the first commit log cleanup removed: what lies
+    /// below a gap is not known to be the newest. Here commit 3 is gone, so partition 1's mark
+    /// in commit 1 is not taken, though commit 1 is still there; partition 0's above the gap
+    /// is. A txn below the checkpoint that holds another version than the checkpoint's is not
+    /// the one it answered, and its mark is not taken either (partition 3: commit 9, at the
+    /// checkpoint, moved it on, and is gone).
+    #[tokio::test]
+    async fn reset_below_the_checkpoint_stops_at_a_missing_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        ddi_commit(dir.path(), 1, &[("app-1", 40)], &[(1, 40)]);
+        ddi_commit(dir.path(), 2, &[("app-9", 2)], &[]);
+        ddi_commit(dir.path(), 3, &[("app-9", 3)], &[]);
+        ddi_commit(
+            dir.path(),
+            4,
+            &[("app-0", 90), ("app-3", 50)],
+            &[(0, 90), (3, 50)],
+        );
+        for v in 5..=8 {
+            ddi_commit(dir.path(), v, &[("app-9", v as i64)], &[]);
+        }
+        ddi_commit(dir.path(), 9, &[("app-3", 55)], &[]);
+        deltalake::checkpoints::create_checkpoint(&open(path).await, None)
+            .await
+            .unwrap();
+        ddi_commit(dir.path(), 10, &[("app-9", 10)], &[]);
+        for v in [3, 9] {
+            std::fs::remove_file(log_file(dir.path(), &commit_name(v))).unwrap();
+        }
+
+        let table = open(path).await;
+        let mut fence = Fence::new(APP);
+        fence.reset(&table, &[0, 1, 3]).await.unwrap();
+        assert_eq!(fence.base(0), Some((Some(90), Some(mark_at(90)))));
+        assert_eq!(fence.base(1), Some((Some(40), None)), "below the gap");
+        assert_eq!(
+            fence.base(3),
+            Some((Some(55), None)),
+            "not the txn it answered"
+        );
+        assert_eq!(fence.lookups().marks_unfound(), 1, "partition 1");
+    }
+
+    /// The walk below a checkpoint reads at most [`BELOW_CHECKPOINT_READS`] commits: a mark
+    /// within them is recovered, one further down is not, and the reset goes on without it.
+    #[tokio::test]
+    async fn reset_below_the_checkpoint_reads_at_most_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        ddi_commit(dir.path(), 1, &[("app-1", 40)], &[(1, 40)]);
+        for v in 2..300 {
+            if v == 290 {
+                ddi_commit(dir.path(), v, &[("app-0", 90)], &[(0, 90)]);
+            } else {
+                ddi_commit(dir.path(), v, &[("app-9", v as i64)], &[]);
+            }
+        }
+        ddi_commit(dir.path(), 300, &[("app-9", 300)], &[]);
+        deltalake::checkpoints::create_checkpoint(&open(path).await, None)
+            .await
+            .unwrap();
+        ddi_commit(dir.path(), 301, &[("app-9", 301)], &[]);
+
+        let (table, store) = counted(path).await;
+        let mut fence = Fence::new(APP);
+        fence.reset(&table, &[0, 1]).await.unwrap();
+        assert_eq!(fence.base(0), Some((Some(90), Some(mark_at(90)))));
+        assert_eq!(fence.base(1), Some((Some(40), None)), "beyond the cap");
+        let below: Vec<u64> = store
+            .commits_read()
+            .into_iter()
+            .filter(|v| *v < 300)
+            .collect();
+        assert_eq!(below.len(), 256, "{below:?}");
+        assert_eq!(below.iter().min(), Some(&44));
+        assert_eq!(fence.lookups().below_checkpoint_reads(), 256);
+        assert_eq!(fence.lookups().marks_unfound(), 1, "partition 1");
     }
 
     #[tokio::test]

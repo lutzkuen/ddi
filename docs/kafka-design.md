@@ -758,7 +758,7 @@ This replaces kdi's `--ends_at_latest_offsets` (bug #228) and `position()`, whic
 | I16 | With the feature off, Kafka config parses, the pipeline is held back (`config_valid = 0`) and Delta pipelines run | `kafka_config_without_feature_is_held_back` |
 | I17 | An ambiguous commit error never produces a duplicate | `ambiguous_commit_error_no_duplicate` |
 | I18 | The target's table id at every refresh equals its id at open | `replaced_target_blocks` |
-| I19 | A partition resumed on a recreated topic is blocked, even when the new topic has more data than the stored offset | `topic_recreated_with_more_data_detected` |
+| I19 | A partition resumed on a recreated topic is blocked, even when the new topic has more data than the stored offset, whenever ddi recorded a mark for that offset and the mark can still be read (otherwise it is Unverifiable, §4.4) | `topic_recreated_with_more_data_detected` |
 | I20 | No member's transient or operator-action error causes a rebalance, and a member that keeps failing never stops the others committing | `transient_storage_outage_stays_in_group`, `blocked_partition_others_progress`, `liveness_under_churn` |
 | I21 | Two members never contend on a DQ appId | `two_members_dq_rejects_concurrently` |
 | I22 | `Waiting` is not progress while fenced, blocked or retrying | `waiting_not_progress_when_fenced` |
@@ -797,6 +797,12 @@ pub fn offset_may_have_expired(txns: &BTreeMap<String, TxnState>, retention_ever
 ///     Those come with their `lastUpdated`, which the column keeps, and no mark.
 ///  3. Only if that checkpoint cannot be read (a foreign format): per-id kernel lookups, counted in
 ///     ddi_kafka_offset_lookup_fallbacks_total. The kernel gives the version alone: `LastUpdated::Unknown`.
+///  4. For what steps 2 and 3 answered, the commits below the checkpoint, newest first, 4 in flight, until each
+///     appId is met: the newest commit with its txn gives back its mark (and, for a kernel answer, its
+///     `lastUpdated`) when that txn holds the version answered. At most 256 GETs
+///     (ddi_kafka_offset_lookup_below_checkpoint_reads_total), and never past a commit log cleanup removed;
+///     an appId not met keeps no mark (ddi_kafka_offset_lookup_marks_unfound_total): Unverifiable, §4.4.
+///     Fence::verify and the DQ marks (§5.7) skip this step: they need the versions alone.
 /// Refuses when delta.setTransactionRetentionDuration is set, so no expiry filter is needed.
 pub async fn read_txns(table: &DeltaTable, app_ids: &[String]) -> Result<BTreeMap<String, TxnState>>;
 
@@ -806,11 +812,12 @@ pub struct Fence {
     carried: BTreeSet<i32>,                                    // verified at the handle's version and re-asserted since
 }
 impl Fence {
-    pub async fn reset(&mut self, table: &DeltaTable, owned: &[i32]) -> Result<()>;        // one read_txns; carried = owned
+    pub async fn reset(&mut self, table: &DeltaTable, owned: &[i32]) -> Result<()>;        // one read_txns, marks too; carried = owned
     /// Before a commit: batch partitions not in `carried` are looked up on `table` (this commit's read snapshot,
     /// since write() plans from the handle) and must equal base[p] (None == None).
     pub async fn verify(&mut self, table: &DeltaTable, ranges: &BTreeMap<i32, (i64, i64)>) -> Result<Result<(), Fenced>>;
-    /// last_p for batch partitions; base_p for every other owned partition with Some(base). Marks likewise.
+    /// last_p for batch partitions; base_p for every other owned partition with Some(base). Marks likewise:
+    /// each re-asserted base carries its mark, so an owner's newest commit holds the marks of all it owns.
     pub fn assert_map(&self, ranges: &BTreeMap<i32, (i64, i64)>, marks: &BTreeMap<i32, MessageMark>) -> (BTreeMap<i32, i64>, BTreeMap<i32, MessageMark>);
     pub fn committed(&mut self, offsets: &KafkaOffsets);      // base[p] = assert[p]; carried = keys of assert
     pub fn forget(&mut self, p: i32);                         // revoke (I6)
@@ -838,8 +845,8 @@ Blind appends on disjoint appIds rebase cleanly (conflict_checker.rs:461-463), s
 
 **Cost.**
 - **Steady state:** zero lookups. Every owned partition with a known base is carried; only a partition with no txn needs one walk before its first data.
-- **Assign, reset, aging:** one walk. That is one GET when our newest commit is the head, since it carries every owned partition; otherwise at most `head − checkpoint` GETs plus one checkpoint read, bounded by `checkpointInterval` (10 after cutover). Never one lookup per partition. The checkpoint is found and read through the table's unfiltered store, also on a handle `Storage::open` built by replaying the log past a Trino checkpoint, whose own store hides every checkpoint from the kernel; otherwise that handle's walk would read every commit down to version 0.
-- **Metrics:** `ddi_kafka_offset_lookups_total`, `ddi_kafka_offset_lookup_seconds_total` and `ddi_kafka_offset_lookup_fallbacks_total`.
+- **Assign, reset, aging:** one walk. That is one GET when our newest commit is the head, since it carries every owned partition; otherwise at most `head − checkpoint` GETs plus one checkpoint read, bounded by `checkpointInterval` (10 after cutover). When the checkpoint answers some partition, the walk goes on below it for the marks, down to the previous owner's last commit, which carries every partition it owned (`assert_map`): usually a few versions, never more than 256 GETs. Never one lookup per partition. The checkpoint is found and read through the table's unfiltered store, also on a handle `Storage::open` built by replaying the log past a Trino checkpoint, whose own store hides every checkpoint from the kernel; otherwise that handle's walk would read every commit down to version 0.
+- **Metrics:** `ddi_kafka_offset_lookups_total`, `ddi_kafka_offset_lookup_seconds_total`, `ddi_kafka_offset_lookup_fallbacks_total`, `ddi_kafka_offset_lookup_below_checkpoint_reads_total` and `ddi_kafka_offset_lookup_marks_unfound_total`.
 
 **Aging (EO-m8).** A quiet member's handle can trail the head by thousands of versions. The conflict loop would then read them one by one, and fail with a missing file if log cleanup has removed any. `commit_batch` therefore refreshes and resets when the handle is older than `handle_max_age` (10 min). A missing commit file during the conflict check is classified Replan, not supervisor-fatal.
 
@@ -852,7 +859,7 @@ Blind appends on disjoint appIds rebase cleanly (conflict_checker.rs:461-463), s
 3. `refuse_txn_retention`, `refuse_unwritable_protocol`; record the table id.
 4. **Partition columns** (§5.6 step 0): refuse with `KafkaPartitionColumnUnmapped` when the target's partition columns cannot be produced.
 5. **`kdi_compat` unset on a kdi-written table** (`kdi_era`, or the newest commit carrying our txns lacks `ddi.appId`) → `KafkaCompatUnset`: "this table was written by kafka-delta-ingest; set `kdi_compat = true` to keep its STRING rendering ("null" text, raw-number timestamps, sorted-key JSON), or `false` to accept the documented break". Unset elsewhere means false.
-   - When every txn's writer is `Unknown` (every one was answered by the kernel, §4.3 step 3), step 2 cannot tell: it refuses with `KafkaCompatUnset` worded as "cannot tell who wrote this table's offsets", never as "written by kafka-delta-ingest".
+   - When every txn's writer is `Unknown` (every one was answered by the kernel, §4.3 step 3, and the commits below that checkpoint did not give its `lastUpdated` back, step 4), step 2 cannot tell: it refuses with `KafkaCompatUnset` worded as "cannot tell who wrote this table's offsets", never as "written by kafka-delta-ingest".
 6. **Typo guard.** Refuse with `KafkaAppIdUnknown` when all of these hold:
    - `fresh`;
    - the target has data files (snapshot file count; accessor **verify (M3)**);
@@ -874,7 +881,7 @@ Blind appends on disjoint appIds rebase cleanly (conflict_checker.rs:461-463), s
 
 | Stored txn | Condition | Start |
 |---|---|---|
-| `Some(b)` | `low ≤ b < high` | Assign at **b** and re-read it. If our commits recorded a mark for b, timestamp and length must match, otherwise **Blocked `KafkaTopicReplaced{p}`** (I19). b itself is dropped; consumption continues at b+1. kdi did the same seek-and-drop (lib.rs:1065-1115). |
+| `Some(b)` | `low ≤ b < high` | Assign at **b** and re-read it. If our commits recorded a mark for b, timestamp and length must match, otherwise **Blocked `KafkaTopicReplaced{p}`** (I19). b itself is dropped; consumption continues at b+1. kdi did the same seek-and-drop (lib.rs:1065-1115). With no mark for b the partition is **Unverifiable**: b is re-read and dropped unchecked, as kdi did, until the partition carries data again; the `b ≥ high` row still applies. That is a kdi-written offset, or one a checkpoint answered whose commit the walk below it did not reach within 256 GETs or before a commit log cleanup removed (§4.3 step 4). |
 | `Some(b)` | `b + 1 == low` (b itself already trimmed) | Assign at b+1, no verification |
 | `Some(b)` | `b + 1 < low` | **Blocked `KafkaOffsetsUnavailable{p, wanted: b+1, low}`**: a retention gap (I4). Recover with `set-offsets --next <low> --acknowledge-skip "<reason>"`. |
 | `Some(b)` | `b ≥ high` | **Blocked `KafkaOffsetsRegressed{p, stored: b, high}`**: topic recreated, or the wrong cluster |
@@ -1307,7 +1314,7 @@ FROM source
 | `ddi_kafka_brokers_up`, `ddi_kafka_retrying` | gauge | — |
 | `ddi_kafka_offsets_unavailable`, `ddi_kafka_offsets_regressed`, `ddi_kafka_offset_missing`, `ddi_kafka_topic_replaced`, `ddi_kafka_undecodable_blocking`, `ddi_kafka_schema_conflict`, `ddi_kafka_target_columns_unmatched`, `ddi_kafka_null_text_approximate` | gauge, held until the cause clears (like `ddi_source_file_vacuumed`, metrics.rs:245) | — |
 | `ddi_kafka_null_partition_values_total` | counter | — |
-| `ddi_kafka_offset_lookups_total`, `ddi_kafka_offset_lookup_seconds_total`, `ddi_kafka_offset_lookup_fallbacks_total` | counter | — |
+| `ddi_kafka_offset_lookups_total`, `ddi_kafka_offset_lookup_seconds_total`, `ddi_kafka_offset_lookup_fallbacks_total`, `ddi_kafka_offset_lookup_below_checkpoint_reads_total`, `ddi_kafka_offset_lookup_marks_unfound_total` (Unverifiable partitions, §4.4) | counter | — |
 | `ddi_kafka_dq_rows_skipped_total`, `ddi_kafka_dq_conflict_retries_total` | counter | — |
 | `ddi_kafka_schema_registry_requests_total{outcome}`, `ddi_kafka_client_errors_total{code}` | counter | — |
 
@@ -1409,7 +1416,8 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
   - `read_txns_walks_back_to_checkpoint`, `read_txns_reads_checkpoint_txn_column`, `read_txns_multipart_checkpoint`;
   - `read_txns_foreign_checkpoint_falls_back_to_kernel`, `read_txns_on_a_replayed_handle_still_reads_the_checkpoint`;
   - `read_txns_returns_marks_and_writer`, `read_txns_checkpoint_above_our_last_commit_still_reads_as_ddis`, `read_txns_foreign_checkpoint_at_the_head_still_reads_as_ddis`, `kdi_txns_answered_by_a_checkpoint_guard_a_missing_offset`;
-  - `read_txns_missing_commit_zero_is_an_error_at_version_zero`, `read_txns_commit_removed_by_cleanup_is_a_typed_error`.
+  - `read_txns_missing_commit_zero_is_an_error_at_version_zero`, `read_txns_commit_removed_by_cleanup_is_a_typed_error`;
+  - `reset_recovers_marks_from_below_the_checkpoint`, `reset_below_the_checkpoint_stops_at_a_missing_commit`, `reset_below_the_checkpoint_reads_at_most_the_cap`, `every_commit_carries_every_owned_mark`, `a_txn_whose_last_updated_is_not_known_may_expire`.
 - DQ:
   - `dq_marks_skip_recorded_offsets`, `dq_schema_not_found_never_skipped`, `dq_without_coordinates_written`;
   - `dq_two_writers_disjoint_partitions_no_conflict`, `dq_same_partition_conflict_retried_in_place`;
