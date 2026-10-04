@@ -30,9 +30,10 @@
 //! ddi resumes offsets kafka-delta-ingest wrote, under the same appIds. The first commit ddi
 //! makes under an app_id also writes the takeover marker ([`takeover_marker_app_id`]), a
 //! `txn` nothing removes, so from then on the table says for good that ddi has taken them
-//! over ([`era`]). Before that, [`takeover_check`] is the one check a takeover needs. Every
-//! `txn` ddi writes for Kafka carries [`KAFKA_TXN_LAST_UPDATED`], a `lastUpdated` no engine
-//! expires.
+//! over ([`era`]). Before that, [`takeover_check`] is the one check a takeover needs, and
+//! [`takeover_baseline`] the commit that records it with every acknowledgment the check
+//! accepted. Every `txn` ddi writes for Kafka carries [`KAFKA_TXN_LAST_UPDATED`], a
+//! `lastUpdated` no engine expires.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -120,9 +121,10 @@ pub const KAFKA_TXN_LAST_UPDATED: i64 = 253_402_300_799_999;
 /// One sequence can still lose it: a checkpoint by a writer that nulls the field, then the
 /// property set and a Spark checkpoint written under it, then the property removed. A
 /// [`Fence`] that sees the property refused reads the marker again ([`Fence::reset`]), so a
-/// running member writes it once more; an open after such a loss that reads
-/// kafka-delta-ingest's era goes through the takeover check again ([`takeover_check`]), which
-/// refuses a partition it cannot account for rather than read it twice.
+/// running member writes it once more; an open after such a loss reads kafka-delta-ingest's
+/// era, or a fresh one on a target with rows, and goes through the takeover check again
+/// ([`takeover_check`]), which refuses a partition it cannot account for rather than read it
+/// twice.
 ///
 /// Never the appId of a partition's offset, `<a>-<p>`, of any app_id `a`: it ends in `.ddi`,
 /// not in digits.
@@ -170,34 +172,49 @@ pub fn era(app_id: &str, txns: &BTreeMap<String, TxnState>) -> Era {
     }
 }
 
-/// The one check taking over kafka-delta-ingest's offsets needs, made when a pipeline opens,
-/// before it joins its group (docs/kafka-design.md §4.4 step 3).
+/// The one check taking over offsets kafka-delta-ingest may have written needs, made when a
+/// pipeline opens, before it joins its group (docs/kafka-design.md §4.4 step 3).
 ///
 /// `partitions` holds every partition of the topic, from metadata, with its offset in the
 /// target (`None`: no `txn`) and its high watermark; `acknowledged` the partitions an explicit
-/// `starting_offsets` entry names (a `"*"` names none).
+/// per-partition `starting_offsets` entry names (`"*"`, `earliest` and `latest` name none).
+/// `holds_rows` says whether the target holds rows that may be this topic's: it has data
+/// files, and nothing shows that none of them is (docs/kafka-design.md §4.4 step 2).
 ///
-/// In [`Era::Kdi`] a partition without an offset whose topic holds messages is one
-/// kafka-delta-ingest never wrote a row for, or one whose offset expired under
-/// `delta.setTransactionRetentionDuration` while it ran, and the table cannot tell which.
-/// Reading the second from offset 0 would duplicate it, so unless every such partition is
-/// acknowledged this refuses with [`Error::KafkaOffsetMissing`], naming all of them. A
-/// partition whose topic held nothing had no message, so no offset of it can have expired.
+/// It applies in [`Era::Kdi`], and in [`Era::Fresh`] on a target that `holds_rows`:
+/// - In kafka-delta-ingest's era, a partition without an offset whose topic holds messages is
+///   one it never wrote a row for, or one whose offset expired under
+///   `delta.setTransactionRetentionDuration` while it ran, and the table cannot tell which.
+/// - A fresh app_id on a target with rows may be kafka-delta-ingest's era with every offset
+///   expired, which is how they expire where one instance ran: it re-stamps every partition in
+///   every commit, so all of them go once the whole topic has been quiet for the duration. The
+///   rows may as well be another pipeline's, or a backfill's; the table cannot tell which
+///   either.
 ///
-/// In [`Era::Ddi`] there is nothing to check. The member whose commit wrote the marker passed
-/// this check while the marker was absent, under the same acknowledgments (every member reads
-/// one config), and no offset has gone missing since, because ddi's never expire. A partition
-/// without one is new, or one nothing of is in the table ([`start_without_offset`]).
-/// [`Era::Fresh`] starts where `starting_offsets` says.
+/// Reading such a partition from offset 0 could duplicate what is in the table, so unless
+/// every such partition is acknowledged this refuses with [`Error::KafkaOffsetMissing`],
+/// naming all of them. A partition whose topic held nothing had no message, so nothing of it
+/// can be in the table.
+///
+/// In [`Era::Ddi`] there is nothing to check. The commit that wrote the marker was made by an
+/// open that passed this check while the marker was absent: in kafka-delta-ingest's era its
+/// takeover baseline ([`takeover_baseline`]), which made every acknowledgment an offset; in a
+/// fresh one its baseline or first commit. And ddi's offsets do not expire
+/// ([`KAFKA_TXN_LAST_UPDATED`]). A partition without one is new, or one nothing of is in the
+/// table ([`start_without_offset`]). [`Era::Fresh`] on a target without rows starts where
+/// `starting_offsets` says.
 pub fn takeover_check(
     app_id: &str,
     era: Era,
+    holds_rows: bool,
     partitions: &BTreeMap<i32, (Option<i64>, i64)>,
     acknowledged: &BTreeSet<i32>,
 ) -> Result<()> {
-    if era != Era::Kdi {
-        return Ok(());
-    }
+    let fresh = match era {
+        Era::Kdi => false,
+        Era::Fresh if holds_rows => true,
+        Era::Fresh | Era::Ddi => return Ok(()),
+    };
     let missing: Vec<i32> = partitions
         .iter()
         .filter(|(p, (stored, high))| stored.is_none() && *high > 0 && !acknowledged.contains(p))
@@ -209,7 +226,49 @@ pub fn takeover_check(
     Err(Error::KafkaOffsetMissing {
         app_id: app_id.to_string(),
         partitions: missing,
+        fresh,
     })
+}
+
+/// The txn-only commit an open in [`Era::Kdi`] makes once every check of the open has passed,
+/// just before it joins its group: the takeover baseline (docs/kafka-design.md §4.4 step 8),
+/// committed with the takeover marker and `ddi.kafka.baseline`. `None` in any other era.
+///
+/// `stored` holds every partition of the topic with its offset in the target, `explicit` the
+/// per-partition `starting_offsets` entries. It asserts every partition that has an offset
+/// at that offset, and every partition without one that an entry `s > 0` acknowledges at
+/// `s − 1`:
+/// - The acknowledgments become offsets in the very commit that ends kafka-delta-ingest's era.
+///   After it, a partition without an offset starts at offset 0 unless an entry says
+///   otherwise, so an acknowledgment held only by the config would last only as long as the
+///   config keeps it: a partition whose owner has not committed yet, with its entry removed as
+///   done, would be read again from 0. Each start is the one the entry gives
+///   ([`start_without_offset`] against the `Some` rows of §4.4): `s − 1` with `s` in the topic
+///   resumes at `s`, below its low watermark blocks as unavailable, past its high one as
+///   regressed. An entry of 0 needs no offset, as none starts at 0 too.
+/// - Every offset kafka-delta-ingest wrote is asserted again at its value, now with
+///   [`KAFKA_TXN_LAST_UPDATED`], so none of its stamps is left in ddi's era for the property to
+///   expire, an idle partition's included.
+/// - It carries every partition's `txn`, so a commit to any of them since the open read them
+///   makes it fail (`ConcurrentTransaction`), as another member's takeover baseline does,
+///   through the marker. The open then reads again, and finds ddi's era.
+pub fn takeover_baseline(
+    era: Era,
+    stored: &BTreeMap<i32, Option<i64>>,
+    explicit: &BTreeMap<i32, i64>,
+) -> Option<BTreeMap<i32, i64>> {
+    if era != Era::Kdi {
+        return None;
+    }
+    let assert = stored
+        .iter()
+        .filter_map(|(p, stored)| match (stored, explicit.get(p)) {
+            (Some(offset), _) => Some((*p, *offset)),
+            (None, Some(next)) if *next > 0 => Some((*p, next - 1)),
+            (None, _) => None,
+        })
+        .collect();
+    Some(assert)
 }
 
 /// Where a partition without an offset starts reading, in a target that is not fresh
@@ -230,8 +289,9 @@ pub enum NoTxnStart {
 /// `starting_offsets` entry, if it has one: there, if the topic holds it; otherwise at
 /// exactly offset 0, unless messages ddi never read were trimmed (EO-M4a).
 ///
-/// The same in both eras of a target that is not fresh: in [`Era::Kdi`], [`takeover_check`]
-/// has refused at open every partition this would start at 0 when it may have had an offset.
+/// The same in both eras of a target that is not fresh. In [`Era::Kdi`], [`takeover_check`]
+/// has refused at open every partition this would start at 0 when it may have had an offset,
+/// and [`takeover_baseline`] has made every acknowledgment an offset.
 pub fn start_without_offset(low: i64, high: i64, explicit: Option<i64>) -> NoTxnStart {
     match explicit {
         Some(wanted) if wanted < low => NoTxnStart::Unavailable { wanted, low },
@@ -3044,12 +3104,20 @@ mod tests {
             .into_iter()
             .map(|(p, high)| (p, (txns[&txn_app_id(APP, p)].version, high)))
             .collect();
-        let e = takeover_check(APP, era(APP, &txns), &partitions, &BTreeSet::new()).unwrap_err();
+        let e =
+            takeover_check(APP, era(APP, &txns), true, &partitions, &BTreeSet::new()).unwrap_err();
         assert!(
             matches!(&e, Error::KafkaOffsetMissing { partitions, .. } if partitions == &vec![0, 2]),
             "{e:?}"
         );
-        takeover_check(APP, era(APP, &txns), &partitions, &BTreeSet::from([0, 2])).unwrap();
+        takeover_check(
+            APP,
+            era(APP, &txns),
+            true,
+            &partitions,
+            &BTreeSet::from([0, 2]),
+        )
+        .unwrap();
     }
 
     /// The mark of the message at `offset`, made up for a test.
@@ -3537,10 +3605,12 @@ mod tests {
 
     /// The one check a takeover of kafka-delta-ingest's offsets makes, at open, over every
     /// partition of the topic: a partition without an offset whose topic holds messages may
-    /// be one whose offset expired, and needs an explicit `starting_offsets` entry. Once ddi
-    /// has taken over, a partition without an offset is one nothing of is in the table.
+    /// be one whose offset expired, and needs an explicit `starting_offsets` entry. So does
+    /// every such partition of a fresh app_id on a target that holds rows, which may be
+    /// kafka-delta-ingest's with every offset expired. Once ddi has taken over, a partition
+    /// without an offset is one nothing of is in the table.
     #[test]
-    fn takeover_check_needs_an_acknowledgment_only_in_kdis_era() {
+    fn takeover_check_needs_an_acknowledgment_until_ddi_took_over() {
         // (stored, high) per partition.
         let partitions = BTreeMap::from([
             (0, (Some(41), 50)),
@@ -3549,25 +3619,47 @@ mod tests {
             (3, (None, 12)),
         ]);
         let none = BTreeSet::new();
-        let e = takeover_check(APP, Era::Kdi, &partitions, &none).unwrap_err();
-        assert!(
-            matches!(&e, Error::KafkaOffsetMissing { app_id, partitions }
-                if app_id == APP && partitions == &vec![1, 3]),
-            "every such partition, named: {e:?}"
-        );
-        assert!(e.to_string().contains("[1, 3]"), "{e}");
+        for holds_rows in [true, false] {
+            let e = takeover_check(APP, Era::Kdi, holds_rows, &partitions, &none).unwrap_err();
+            assert!(
+                matches!(&e, Error::KafkaOffsetMissing { app_id, partitions, fresh: false }
+                    if app_id == APP && partitions == &vec![1, 3]),
+                "every such partition, named: {e:?}"
+            );
+            assert!(e.to_string().contains("[1, 3]"), "{e}");
 
-        // One acknowledged is not enough.
-        let e = takeover_check(APP, Era::Kdi, &partitions, &BTreeSet::from([1])).unwrap_err();
+            // One acknowledged is not enough.
+            let e = takeover_check(APP, Era::Kdi, holds_rows, &partitions, &BTreeSet::from([1]))
+                .unwrap_err();
+            assert!(
+                matches!(&e, Error::KafkaOffsetMissing { partitions, .. } if partitions == &vec![3]),
+                "{e:?}"
+            );
+            takeover_check(
+                APP,
+                Era::Kdi,
+                holds_rows,
+                &partitions,
+                &BTreeSet::from([1, 3]),
+            )
+            .unwrap();
+
+            // ddi's era asks nothing.
+            takeover_check(APP, Era::Ddi, holds_rows, &partitions, &none).unwrap();
+        }
+
+        // A fresh app_id: nothing on a target without rows, every partition with messages on
+        // one with rows.
+        let fresh = BTreeMap::from([(0, (None, 50)), (1, (None, 0)), (2, (None, 12))]);
+        takeover_check(APP, Era::Fresh, false, &fresh, &none).unwrap();
+        let e = takeover_check(APP, Era::Fresh, true, &fresh, &none).unwrap_err();
         assert!(
-            matches!(&e, Error::KafkaOffsetMissing { partitions, .. } if partitions == &vec![3]),
+            matches!(&e, Error::KafkaOffsetMissing { partitions, fresh: true, .. }
+                if partitions == &vec![0, 2]),
             "{e:?}"
         );
-        takeover_check(APP, Era::Kdi, &partitions, &BTreeSet::from([1, 3])).unwrap();
-
-        // ddi's era and a fresh app_id ask nothing.
-        takeover_check(APP, Era::Ddi, &partitions, &none).unwrap();
-        takeover_check(APP, Era::Fresh, &partitions, &none).unwrap();
+        assert!(e.to_string().contains("may all have expired"), "{e}");
+        takeover_check(APP, Era::Fresh, true, &fresh, &BTreeSet::from([0, 2])).unwrap();
 
         // Where a partition without an offset starts then, in either era.
         assert_eq!(start_without_offset(0, 7, None), NoTxnStart::Zero);
@@ -3945,5 +4037,137 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(era(APP, &txns), Era::Ddi);
+    }
+
+    /// The takeover baseline an open in kafka-delta-ingest's era commits: the marker, every
+    /// offset kafka-delta-ingest wrote at its value, now stamped, and every acknowledgment
+    /// `s > 0` as `s - 1`. So once ddi's era begins, no start depends on the config still
+    /// holding an entry: a partition whose owner has not committed yet resumes from its
+    /// offset even after the entry is removed as done.
+    #[tokio::test]
+    async fn takeover_baseline_makes_every_acknowledgment_an_offset() {
+        // Partition 0 has an offset; 1 was acknowledged at 4200; 2 at 0, which needs none; 3
+        // had no message; 4 is acknowledged though it has an offset, which is ignored.
+        let stored = BTreeMap::from([(0, Some(41)), (1, None), (2, None), (3, None), (4, Some(8))]);
+        let explicit = BTreeMap::from([(1, 4200), (2, 0), (4, 99)]);
+        assert_eq!(
+            takeover_baseline(Era::Kdi, &stored, &explicit),
+            Some(BTreeMap::from([(0, 41), (1, 4199), (4, 8)]))
+        );
+        assert_eq!(takeover_baseline(Era::Ddi, &stored, &explicit), None);
+        assert_eq!(takeover_baseline(Era::Fresh, &stored, &explicit), None);
+
+        // On a table: kafka-delta-ingest's offset of partition 0; partition 1's has expired,
+        // and its topic holds 4200 messages it wrote. Two members open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        kdi_commit(dir.path(), 1, "app-0", 41, 1_000);
+        let read_era = |table: DeltaTable| async move {
+            let mut wanted = ids(0..2);
+            wanted.push(takeover_marker_app_id(APP));
+            let counters = LookupCounters::default();
+            let txns = read_txns(&table, &wanted, &counters).await.unwrap();
+            let stored: BTreeMap<i32, Option<i64>> = (0..2)
+                .map(|p| (p, txns[&txn_app_id(APP, p)].version))
+                .collect();
+            (era(APP, &txns), stored)
+        };
+        let baseline_commit = |table: DeltaTable, assert: BTreeMap<i32, i64>| async move {
+            let mut baseline = offsets(&[], &assert, &BTreeMap::new());
+            baseline.baseline = true;
+            baseline.takeover_marker = true;
+            let empty = RecordBatch::new_empty(schema_of(&table));
+            Sink::new(APP, 0)
+                .commit_kafka(table, vec![empty], &baseline)
+                .await
+        };
+        let explicit = BTreeMap::from([(1, 4200)]);
+        let partitions = BTreeMap::from([(0, (Some(41), 50)), (1, (None, 4200))]);
+        let (a_table, b_table) = (open(path).await, open(path).await);
+        let (a_era, a_stored) = read_era(a_table.clone()).await;
+        let (b_era, b_stored) = read_era(b_table.clone()).await;
+        assert_eq!((a_era, b_era), (Era::Kdi, Era::Kdi));
+        let acknowledged: BTreeSet<i32> = explicit.keys().copied().collect();
+        takeover_check(APP, a_era, true, &partitions, &acknowledged).unwrap();
+        takeover_check(APP, b_era, true, &partitions, &acknowledged).unwrap();
+
+        let a_baseline = takeover_baseline(a_era, &a_stored, &explicit).unwrap();
+        baseline_commit(a_table, a_baseline).await.unwrap(); // 2
+        assert_eq!(
+            stamps_in_commit(dir.path(), 2),
+            BTreeMap::from([
+                ("app-0".to_string(), Some(KAFKA_TXN_LAST_UPDATED)),
+                ("app-1".to_string(), Some(KAFKA_TXN_LAST_UPDATED)),
+                (takeover_marker_app_id(APP), Some(KAFKA_TXN_LAST_UPDATED)),
+            ])
+        );
+        assert_eq!(
+            txns_in_commit(dir.path(), 2),
+            vec![
+                ("app-0".to_string(), 41),
+                ("app-1".to_string(), 4199),
+                (takeover_marker_app_id(APP), TAKEOVER_MARKER_VERSION),
+            ]
+        );
+        // The other member's takeover baseline loses on the marker, and its open reads again.
+        let b_baseline = takeover_baseline(b_era, &b_stored, &explicit).unwrap();
+        let e = baseline_commit(b_table, b_baseline).await.unwrap_err();
+        assert!(is_concurrent_transaction(&e), "{e}");
+        let (b_era, b_stored) = read_era(open(path).await).await;
+        assert_eq!(b_era, Era::Ddi);
+        assert_eq!(takeover_baseline(b_era, &b_stored, &explicit), None);
+
+        // With the entry gone from the config, partition 1 still resumes where it was
+        // acknowledged: it has an offset now, and the takeover check has nothing to ask.
+        assert_eq!(b_stored, BTreeMap::from([(0, Some(41)), (1, Some(4199))]));
+        let partitions = BTreeMap::from([(0, (Some(41), 50)), (1, (Some(4199), 4200))]);
+        takeover_check(APP, b_era, true, &partitions, &BTreeSet::new()).unwrap();
+    }
+
+    /// One kafka-delta-ingest instance re-stamps every partition in every commit, so its
+    /// offsets expire together once the whole topic has been quiet for the duration: then no
+    /// partition of the app_id has an offset, there is no marker, and the era reads fresh. On
+    /// a target that holds rows that may be the topic's, the takeover check asks for an entry
+    /// per partition all the same, as for any partition of kafka-delta-ingest's era.
+    #[tokio::test]
+    async fn all_expired_kdi_offsets_are_caught_by_the_takeover_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        kdi_commit(dir.path(), 1, "app-0", 7, 1_000);
+        kdi_commit(dir.path(), 2, "app-1", 9, 1_000);
+        set_retention(path, "interval 1 days").await; // 3
+        deltalake::checkpoints::create_checkpoint(&open(path).await, None)
+            .await
+            .unwrap();
+        unset_property(dir.path(), 3, 4, TXN_RETENTION); // 4
+        let table = open(path).await;
+        deltalake::checkpoints::create_checkpoint(&table, None)
+            .await
+            .unwrap();
+        for v in 0..=3 {
+            std::fs::remove_file(log_file(dir.path(), &commit_name(v))).unwrap();
+        }
+
+        let mut wanted = ids(0..2);
+        wanted.push(takeover_marker_app_id(APP));
+        let counters = LookupCounters::default();
+        let txns = read_txns(&open(path).await, &wanted, &counters)
+            .await
+            .unwrap();
+        assert!(txns.values().all(|t| t.version.is_none()), "{txns:?}");
+        assert_eq!(era(APP, &txns), Era::Fresh);
+
+        let partitions = BTreeMap::from([(0, (None, 8)), (1, (None, 10))]);
+        let e = takeover_check(APP, Era::Fresh, true, &partitions, &BTreeSet::new()).unwrap_err();
+        assert!(
+            matches!(&e, Error::KafkaOffsetMissing { partitions, fresh: true, .. }
+                if partitions == &vec![0, 1]),
+            "{e:?}"
+        );
+        takeover_check(APP, Era::Fresh, true, &partitions, &BTreeSet::from([0, 1])).unwrap();
+        // Where nothing shows rows that may be the topic's, a fresh app_id is just that.
+        takeover_check(APP, Era::Fresh, false, &partitions, &BTreeSet::new()).unwrap();
     }
 }

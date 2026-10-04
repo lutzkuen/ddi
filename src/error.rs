@@ -369,27 +369,42 @@ pub enum Error {
         found: String,
     },
 
-    /// kafka-delta-ingest wrote this app_id's offsets, ddi has not taken them over yet, and
-    /// partitions whose topic holds messages have no offset among them.
+    /// ddi has not taken this app_id's offsets over yet, the target may hold rows of its
+    /// topic, and partitions whose topic holds messages have no offset.
     ///
-    /// Each is a partition kafka-delta-ingest never wrote a row for, or one whose offset
-    /// expired under `delta.setTransactionRetentionDuration` while it ran; the table cannot
-    /// tell the two apart, and reading the second again from offset 0 would duplicate it.
-    /// Raised once, when a pipeline opens, before it joins its group: an explicit
-    /// `starting_offsets` entry per partition is the acknowledgment
-    /// (docs/kafka-design.md §4.4).
+    /// When kafka-delta-ingest wrote some of the app_id's offsets, each is a partition it never
+    /// wrote a row for, or one whose offset expired under
+    /// `delta.setTransactionRetentionDuration` while it ran. When none has an offset at all
+    /// (`fresh`) but the target holds rows, they may all have expired, which is how they expire
+    /// where one instance of kafka-delta-ingest ran; or the rows are another pipeline's. The
+    /// table cannot tell these apart, and reading an expired one again from offset 0 would
+    /// duplicate it. Raised once, when a pipeline opens, before it joins its group: an explicit
+    /// `starting_offsets` entry per partition is the acknowledgment (docs/kafka-design.md
+    /// §4.4 step 3).
     #[error(
-        "app_id {app_id:?}: kafka-delta-ingest wrote this table's offsets, and partition(s) \
-         {partitions:?} have none although their topic holds messages. Each is either a \
-         partition kafka-delta-ingest never wrote a row for, or one whose offset expired under \
-         delta.setTransactionRetentionDuration, which reading from offset 0 would duplicate; \
-         the table cannot tell which. Check the data (`ddi kafka plan` prints the evidence) and \
-         give each an explicit starting_offsets entry, the next offset to read. Nothing was \
-         read or written, and the pipeline has not joined its group."
+        "app_id {app_id:?}: partition(s) {partitions:?} have no offset in the target although \
+         their topic holds messages, {}. Reading one from offset 0 could duplicate its rows; \
+         the table cannot tell. Check the data (`ddi kafka plan` prints the evidence) and give \
+         each an explicit starting_offsets entry, the next offset to read (\"*\", earliest and \
+         latest acknowledge none). Nothing was read or written, and the pipeline has not joined \
+         its group.",
+        if *fresh {
+            "and no partition of this app_id has one while the target already holds rows: \
+             kafka-delta-ingest's offsets for it may all have expired under \
+             delta.setTransactionRetentionDuration, or the rows are another pipeline's (if \
+             the app_id is mistyped, fix it instead)"
+        } else {
+            "while kafka-delta-ingest wrote this table's offsets for others: each is a \
+             partition it never wrote a row for, or one whose offset expired under \
+             delta.setTransactionRetentionDuration"
+        }
     )]
     KafkaOffsetMissing {
         app_id: String,
         partitions: Vec<i32>,
+        /// No partition of the app_id has an offset, and the target holds rows that may be its
+        /// topic's.
+        fresh: bool,
     },
 
     /// A partition this writer held at an offset no longer has one in the target.
@@ -857,6 +872,15 @@ mod tests {
                 Error::KafkaOffsetMissing {
                     app_id: "orders".into(),
                     partitions: vec![1, 3],
+                    fresh: false,
+                },
+                OpenRefusal,
+            ),
+            (
+                Error::KafkaOffsetMissing {
+                    app_id: "orders".into(),
+                    partitions: vec![0, 1],
+                    fresh: true,
                 },
                 OpenRefusal,
             ),
