@@ -25,7 +25,34 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       # Everything except the tests that need a service listening; those are `#[ignore]`d
       # and run by the `object-store` and `trino-dialect` jobs below.
+      #
+      # Without features, this is also the proof that a Delta-only build is untouched by the
+      # Kafka source (docs/kafka-design.md I13) and holds Kafka pipelines back by name (I16).
       - run: cargo test --all-targets
+
+  check-kafka:
+    name: clippy, tests (kafka feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: kafka
+      # rdkafka-sys builds librdkafka from C against the system's OpenSSL 3 and zlib, and the
+      # zstd-sys this tree locks runs bindgen, which needs libclang. The runner has them today;
+      # naming them keeps a runner-image change from removing one silently.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev zlib1g-dev make libclang-dev
+      - run: cargo clippy --all-targets --features kafka -- -D warnings
+      # The whole suite again, with the feature on: the Delta pipelines must behave exactly as
+      # they do without it (I13), and the Kafka unit tests need no broker.
+      - run: cargo test --all-targets --features kafka
+      # The librdkafka a build links, which the image's own `--version` also prints.
+      - run: cargo run --features kafka --bin ddi -- --version
 
   image:
     name: container image
@@ -36,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # A release tag (`vX.Y.Z`) asserts a version; the binary itself asserts one too, via
-      # `#[command(version)]` in main.rs, which prints Cargo.toml's version at compile time.
+      # `version()` in main.rs, which prints Cargo.toml's version at compile time.
       # Nothing else keeps those in sync — catch a mismatch here, before it ships as an
       # image whose `--version` output contradicts the tag it was pushed under.
       - name: Verify tag matches Cargo.toml version
