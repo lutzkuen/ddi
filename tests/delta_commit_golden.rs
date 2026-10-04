@@ -8,7 +8,7 @@
 //! give a zero-row commit a file, and stay green. This file records every `_delta_log/*.json`
 //! of the target and its data-quality table, and compares them with tests/golden/delta_commit/.
 //!
-//! Seven shapes, one test each:
+//! Eight shapes, one test each:
 //! - a plain append;
 //! - a batch whose every row is rejected, with a data-quality table: a zero-row commit that
 //!   carries the offset, after the data-quality table's own commit;
@@ -17,11 +17,12 @@
 //! - an append to a target partitioned by a string column;
 //! - the same partitioned target with a batch whose every row is rejected;
 //! - a coverage window: zero-row commits that record the window (`ddi.cutoff.*`), then the
-//!   commit that closes it and records none.
+//!   commit that closes it and records none;
+//! - two batches committed by one pipeline, the second with every row rejected: what one
+//!   batch leaves in the sink, read by the next commit.
 //!
-//! The first six are the ones docs/kafka-design.md §1.3 names. The coverage window was added
-//! after the refactor, from a golden file the code before it wrote, and passes unchanged
-//! after it.
+//! The first six are the ones docs/kafka-design.md §1.3 names. The last two were added after
+//! the refactor, from golden files the code before it wrote, and pass unchanged after it.
 //!
 //! # What is compared
 //!
@@ -458,6 +459,39 @@ async fn bootstrap_window() {
     );
     assert_eq!(p.step().await.unwrap(), StepOutcome::CaughtUp);
     lake.check("bootstrap_window");
+}
+
+#[tokio::test]
+async fn two_batches_in_one_process() {
+    // Every other shape opens a pipeline per commit, so what one batch leaves in the sink
+    // never reaches a second commit of the same pipeline. Here one pipeline commits twice: a
+    // batch with a reject, then one whose every row is rejected, so a zero-row commit follows
+    // a commit with rows, in both tables.
+    let lake = Lake::new(Layout { dq: true, ..PLAIN }).await;
+    lake.arrive(&[(1, "eu", "100", 10), (2, "us", "n/a", 11)])
+        .await;
+    let mut p = Pipeline::open(lake.cfg()).await.unwrap();
+    let first = p.step().await.unwrap();
+    assert!(
+        matches!(
+            first,
+            StepOutcome::Progressed {
+                rows: 1,
+                rejected: 1,
+                ..
+            }
+        ),
+        "{first:?}"
+    );
+
+    lake.arrive(&[(3, "eu", "bad", 20)]).await;
+    let second = p.step().await.unwrap();
+    assert!(
+        matches!(second, StepOutcome::Skipped { rejected: 1, .. }),
+        "{second:?}"
+    );
+    assert_eq!(p.step().await.unwrap(), StepOutcome::CaughtUp);
+    lake.check("two_batches_in_one_process");
 }
 
 // ---------------------------------------------------------------- reading the log
