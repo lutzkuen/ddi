@@ -215,6 +215,7 @@ pub fn pipeline_cfg(name: &str, source: &str, target: &str) -> ResolvedPipeline 
         publish: None,
         publish_to: None,
         storage: delta_delta_ingest::storage::Storage::default(),
+        kafka: None,
     }
 }
 

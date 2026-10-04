@@ -212,6 +212,7 @@ fn pipeline(source: &str, target: &str) -> ResolvedPipeline {
         target_relation: None,
         publish: None,
         publish_to: None,
+        kafka: None,
     }
 }
 

@@ -178,6 +178,7 @@ mod tests {
             dq_uri: None,
             max_evaluation_rejects_per_batch: 100,
             storage: Default::default(),
+            kafka: None,
         }
     }
 

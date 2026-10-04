@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +12,9 @@ use crate::error::{Error, Result};
 use crate::lookup::{LookupConfig, ResolvedLookup};
 use crate::source::{ChangePolicy, Version};
 use crate::transform::validate::{normalise_publish_sql, normalise_sql_with_lookups};
+
+pub mod kafka;
+pub use kafka::{KafkaConfig, KafkaPipelineConfig, ResolvedKafka, SchemaRegistryConfig};
 
 fn default_allowed_latency() -> u64 {
     30
@@ -583,6 +587,11 @@ pub struct ResolvedPipeline {
     pub publish: Option<PublishModel>,
     /// Where that payload goes. Paired with `publish`: both or neither.
     pub publish_to: Option<PublisherConfig>,
+    /// The Kafka topic this pipeline reads, when it reads one instead of a Delta table.
+    ///
+    /// `None` for every Delta pipeline. For a Kafka one, `source_uri` is `kafka://<topic>`, for
+    /// logs only, and the Delta-only fields are empty. See [`kafka`].
+    pub kafka: Option<Arc<ResolvedKafka>>,
 }
 
 impl ResolvedPipeline {
@@ -626,6 +635,14 @@ pub struct Config {
     /// Where realtime payloads go. Omit it and nothing publishes, whatever dbt asks for.
     #[serde(default)]
     pub publish: Option<PublisherConfig>,
+
+    /// Pipelines that read a Kafka topic (`[[kafka.pipeline]]`), and what they share.
+    ///
+    /// Run whether or not `manifest` is set: dbt never describes the leg from Kafka into
+    /// bronze. Parsed on every build; one without the `kafka` feature holds each entry back by
+    /// name. See [`kafka`].
+    #[serde(default, skip_serializing_if = "KafkaConfig::is_empty")]
+    pub kafka: KafkaConfig,
 
     /// Set by `--no-publish`, not by the file. Disables publication for the whole process
     /// without touching the dbt project or the deployment's own config.
@@ -1369,7 +1386,19 @@ impl Config {
     ///
     /// Only what cannot be attributed to a single pipeline is still fatal: an unreadable
     /// manifest, or nothing to run at all.
+    ///
+    /// `[[kafka.pipeline]]` entries are resolved after the Delta pipelines and appended to
+    /// them, whichever set those came from. A build without the `kafka` feature holds every
+    /// one of them back by name (I16).
     pub fn resolve_all(&self) -> Result<Resolved> {
+        self.resolve_all_with(cfg!(feature = "kafka"))
+    }
+
+    /// [`Self::resolve_all`] for a build that can run Kafka pipelines or not, so both halves
+    /// of I16 are tested in either build.
+    fn resolve_all_with(&self, kafka_built: bool) -> Result<Resolved> {
+        let has_kafka = !self.kafka.pipelines.is_empty();
+
         // The dbt project is the source of truth whenever there is one.
         let derived;
         let pipelines: &[PipelineConfig] = match &self.manifest {
@@ -1377,16 +1406,24 @@ impl Config {
                 let manifest = crate::dbt::Manifest::from_path(std::path::Path::new(path))?;
                 derived = crate::dbt::convert::pipelines(&manifest, &self.storage)?;
                 if derived.is_empty() {
-                    return Err(Error::Config(format!(
-                        "no streamable models in {path:?}. Run `ddi dbt check` to see why                          each model was rejected."
-                    )));
+                    // dbt never describes the Kafka leg, so a project with nothing to stream
+                    // yet is no reason to keep the Kafka pipelines off the air.
+                    if !has_kafka {
+                        return Err(Error::Config(format!(
+                            "no streamable models in {path:?}. Run `ddi dbt check` to see why                          each model was rejected."
+                        )));
+                    }
+                    warn!(
+                        "no streamable models in {path:?}; running the [[kafka.pipeline]] \
+                         entries only. Run `ddi dbt check` to see why each model was rejected."
+                    );
                 }
                 &derived
             }
             None => &self.pipelines,
         };
 
-        if pipelines.is_empty() {
+        if pipelines.is_empty() && !has_kafka {
             return Err(Error::Config(
                 "nothing to run: set `manifest` to a dbt target/manifest.json, or declare                  [[pipeline]] entries."
                     .into(),
@@ -1457,6 +1494,14 @@ impl Config {
         for (name, reason) in &stages {
             condemned
                 .entry(name.as_str())
+                .or_insert_with(|| reason.clone());
+        }
+        // The rules between a Kafka entry and any other pipeline (docs/kafka-design.md §2.5,
+        // rules 3-6). Delta pipelines among themselves keep the checks above, unchanged.
+        let kafka_conflicts = kafka::conflicts(&self.kafka.pipelines, pipelines);
+        for (j, reason) in &kafka_conflicts.delta {
+            condemned
+                .entry(pipelines[*j].name.as_str())
                 .or_insert_with(|| reason.clone());
         }
 
@@ -1532,6 +1577,11 @@ impl Config {
                 ),
             }
         }
+
+        let (kafka_ok, kafka_rejected) =
+            kafka::resolve_entries(self, &kafka_conflicts, kafka_built);
+        ok.extend(kafka_ok);
+        rejected.extend(kafka_rejected);
 
         Ok(Resolved {
             pipelines: ok,
@@ -1882,6 +1932,7 @@ impl Config {
             target_relation: p.target_relation.clone(),
             publish,
             publish_to,
+            kafka: None,
         })
     }
 }
