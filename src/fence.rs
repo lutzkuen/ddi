@@ -75,30 +75,92 @@ pub struct TxnState {
     /// different offset, and when the `txn` was found only in a checkpoint, which keeps no
     /// commit metadata.
     pub mark: Option<MessageMark>,
-    /// Who wrote the commit the `txn` was read from.
-    pub writer: Writer,
+    /// The `txn`'s `lastUpdated`, which says who wrote it ([`Self::writer`]) and whether it
+    /// can expire ([`Self::may_expire`]).
+    pub last_updated: LastUpdated,
 }
 
-/// Who wrote the commit an appId's newest `txn` was read from.
+impl TxnState {
+    /// Who wrote this `txn`, as its `lastUpdated` says.
+    pub fn writer(&self) -> Writer {
+        match (self.version, self.last_updated) {
+            (Some(_), LastUpdated::Absent) => Writer::Ddi,
+            (Some(_), LastUpdated::At(_)) => Writer::Other,
+            (Some(_), LastUpdated::Unknown) | (None, _) => Writer::Unknown,
+        }
+    }
+
+    /// Whether this `txn` can expire under `delta.setTransactionRetentionDuration`: it has a
+    /// `lastUpdated`, or it was read where its `lastUpdated` could not be seen.
+    pub fn may_expire(&self) -> bool {
+        self.version.is_some() && self.last_updated != LastUpdated::Absent
+    }
+}
+
+/// A `txn`'s `lastUpdated`.
 ///
-/// Three answers rather than two, because the third is common: a `txn` read out of a
-/// checkpoint comes without the commit that wrote it. On a table only ddi has written
-/// offsets to, that happens whenever a checkpoint lands above ddi's last commit — another
-/// pipeline sharing the target, or another engine's OPTIMIZE at a checkpoint-interval version.
-/// Taking it for another writer would make such a table look like kafka-delta-ingest's
-/// (docs/kafka-design.md §4.4); taking it for ddi would let a kafka-delta-ingest table whose
-/// commits are below a checkpoint pass for ddi's. So it is neither.
+/// The protocol expires a `txn` under `delta.setTransactionRetentionDuration` by this field
+/// alone, and one without it never (set_transaction.rs:10-21). It is also what tells the two
+/// writers of a Kafka pipeline's offsets apart: kafka-delta-ingest stamps every `txn` with
+/// the time it wrote it (delta_helpers.rs:29-40), ddi never stamps one (`Transaction::new`).
+/// A checkpoint keeps it with the `txn`, so the answer is the same whether the `txn` was read
+/// from the commit that wrote it or from a checkpoint above that commit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Writer {
-    /// ddi: the commit's commitInfo carries `ddi.appId`.
-    Ddi,
-    /// Another writer, kafka-delta-ingest above all: the commit is in the log, and its
-    /// commitInfo carries no `ddi.appId`.
-    Other,
-    /// Not known: the `txn` was read from a checkpoint, which keeps no commitInfo, or there is
-    /// no `txn` at all.
+pub enum LastUpdated {
+    /// The `txn` has none.
+    Absent,
+    /// The `txn` has one: milliseconds since the epoch.
+    At(i64),
+    /// Not known: there is no `txn`, or the kernel answered for a checkpoint this cannot read,
+    /// and the kernel gives the version alone.
     #[default]
     Unknown,
+}
+
+/// Who wrote an appId's newest `txn`, as its `lastUpdated` says.
+///
+/// ddi and a stopped kafka-delta-ingest are the only writers of a Kafka pipeline's offsets
+/// (docs/kafka-design.md §4.3), and [`LastUpdated`] tells them apart exactly, wherever the
+/// `txn` was read. Who wrote the *commit* is not asked: a `txn` read from a checkpoint has no
+/// commit, and on a table only ddi has written offsets to that happens whenever a checkpoint
+/// lands above ddi's last commit — another pipeline sharing the target, or another engine's
+/// OPTIMIZE at a checkpoint-interval version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Writer {
+    /// ddi: the `txn` has no `lastUpdated`, and never expires.
+    Ddi,
+    /// kafka-delta-ingest: the `txn` has a `lastUpdated`, and can expire.
+    Other,
+    /// Not known: there is no `txn`, or its `lastUpdated` could not be seen.
+    Unknown,
+}
+
+/// Whether kafka-delta-ingest wrote these offsets: some `txn` among them is its, and none is
+/// ddi's (docs/kafka-design.md §4.4 step 2).
+///
+/// `txns` are one app_id's, as [`read_txns`] returns them for every partition of its topic.
+pub fn kdi_era(txns: &BTreeMap<String, TxnState>) -> bool {
+    let writers: Vec<Writer> = txns.values().map(TxnState::writer).collect();
+    writers.contains(&Writer::Other) && !writers.contains(&Writer::Ddi)
+}
+
+/// Whether a partition that has no offset among `txns` may have had one that expired, so
+/// that reading it again from offset 0 could duplicate it (docs/kafka-design.md §4.4, the
+/// `None` row; EO-M4b).
+///
+/// Only a `txn` with a `lastUpdated` can expire, and the writer that stamps one stamps every
+/// `txn` it writes. So it may when some `txn` of this app_id can expire ([`TxnState::may_expire`],
+/// a `lastUpdated` not seen counting as one), and the table's history ever set
+/// `delta.setTransactionRetentionDuration`, which `retention_ever_set` says. Who wrote the
+/// commits does not enter into it: kafka-delta-ingest's offsets read from a checkpoint alone
+/// can have lost a sibling exactly as those read from its commits can.
+///
+/// `txns` are one app_id's, as [`read_txns`] returns them for every partition of its topic.
+pub fn offset_may_have_expired(
+    txns: &BTreeMap<String, TxnState>,
+    retention_ever_set: bool,
+) -> bool {
+    retention_ever_set && txns.values().any(TxnState::may_expire)
 }
 
 /// What reading offsets has cost, for `ddi_kafka_offset_lookups_total`,
@@ -140,11 +202,11 @@ impl LookupCounters {
 ///    says where to list from, and the listing says what is really there (§4.3).
 /// 3. The commits from the handle's version back to that checkpoint, [`IN_FLIGHT`] at a
 ///    time, stopping as soon as every appId has been found. Each found `txn` takes its mark
-///    from `ddi.kafka.marks` and its writer from `ddi.appId` in the same commit.
+///    from `ddi.kafka.marks` in the same commit, when that commit is ddi's (`ddi.appId`).
 /// 4. For the appIds still missing, the checkpoint's `txn` column, read once. What it
-///    answers comes with no mark and an unknown writer: a checkpoint keeps no commitInfo.
+///    answers comes with its `lastUpdated` but no mark: a checkpoint keeps no commitInfo.
 /// 5. Only if that checkpoint cannot be read here: the kernel, one appId at a time, counted
-///    in [`LookupCounters::fallbacks`].
+///    in [`LookupCounters::fallbacks`]. It answers with the version alone.
 ///
 /// The walk is contiguous, so what it finds is the newest; what it does not find is as the
 /// checkpoint at its bottom says, or absent when it reached version 0. A commit missing from
@@ -264,12 +326,13 @@ async fn walk(
         .collect();
     match checkpoint_txns(store, &checkpoint, &rest).await {
         Ok(txns) => {
-            for (id, version) in txns {
+            for (id, (version, last_updated)) in txns {
                 found.insert(
                     id,
                     TxnState {
                         version: Some(version),
-                        ..TxnState::default()
+                        mark: None,
+                        last_updated,
                     },
                 );
             }
@@ -339,6 +402,16 @@ struct LogLine {
 struct TxnAction {
     app_id: String,
     version: i64,
+    /// Absent and `null` alike mean the `txn` has none.
+    #[serde(default)]
+    last_updated: Option<i64>,
+}
+
+impl TxnAction {
+    fn last_updated(&self) -> LastUpdated {
+        self.last_updated
+            .map_or(LastUpdated::Absent, LastUpdated::At)
+    }
 }
 
 /// The two keys of a commitInfo this module reads. ddi writes them at its top level, beside
@@ -385,15 +458,13 @@ fn record_commit(
     let marks = info.as_ref().and_then(|i| i.marks.as_ref());
     for txn in txns {
         let mark = ddi_app_id.and_then(|app_id| mark_for(marks, app_id, &txn));
+        let last_updated = txn.last_updated();
         found.insert(
             txn.app_id,
             TxnState {
                 version: Some(txn.version),
                 mark,
-                writer: match ddi_app_id {
-                    Some(_) => Writer::Ddi,
-                    None => Writer::Other,
-                },
+                last_updated,
             },
         );
     }
@@ -580,7 +651,11 @@ fn complete(version: u64, files: Vec<(CheckpointFile, ObjectMeta)>) -> Option<Ch
         })
 }
 
-/// The version each wanted appId has in `checkpoint`, or why the checkpoint cannot be read.
+/// One `txn` of a checkpoint: its appId, version and `lastUpdated`.
+type CheckpointTxn = (String, i64, LastUpdated);
+
+/// The version and `lastUpdated` each wanted appId has in `checkpoint`, or why the checkpoint
+/// cannot be read.
 ///
 /// Reads the `txn` column and nothing else: a parquet checkpoint is projected to it, so the
 /// columns another engine writes in its own way (`stats_parsed` above all) are never decoded.
@@ -590,7 +665,7 @@ async fn checkpoint_txns(
     store: Arc<dyn ObjectStore>,
     checkpoint: &Checkpoint,
     wanted: &BTreeSet<&str>,
-) -> std::result::Result<BTreeMap<String, i64>, String> {
+) -> std::result::Result<BTreeMap<String, (i64, LastUpdated)>, String> {
     let mut txns = BTreeMap::new();
     for file in &checkpoint.files {
         let in_file = if file.location.as_ref().ends_with(".json") {
@@ -598,16 +673,17 @@ async fn checkpoint_txns(
         } else {
             parquet_txns(store.clone(), file).await?
         };
-        for (id, version) in in_file {
+        for (id, version, last_updated) in in_file {
             if !wanted.contains(id.as_str()) {
                 continue;
             }
             // A checkpoint is the reconciled state: one txn per appId. Two that disagree mean
             // it is not a checkpoint this can read.
-            if let Some(other) = txns.insert(id.clone(), version) {
-                if other != version {
+            if let Some(other) = txns.insert(id.clone(), (version, last_updated)) {
+                if other != (version, last_updated) {
                     return Err(format!(
-                        "it holds two txns for appId {id:?}, at {other} and {version}"
+                        "it holds two txns for appId {id:?}, {other:?} and {:?}",
+                        (version, last_updated)
                     ));
                 }
             }
@@ -620,7 +696,7 @@ async fn checkpoint_txns(
 async fn json_txns(
     store: &dyn ObjectStore,
     file: &ObjectMeta,
-) -> std::result::Result<Vec<(String, i64)>, String> {
+) -> std::result::Result<Vec<CheckpointTxn>, String> {
     let bytes = store
         .get(&file.location)
         .await
@@ -631,7 +707,8 @@ async fn json_txns(
     let mut txns = Vec::new();
     for line in serde_json::Deserializer::from_slice(&bytes).into_iter::<LogLine>() {
         if let Some(txn) = line.map_err(|e| e.to_string())?.txn {
-            txns.push((txn.app_id, txn.version));
+            let last_updated = txn.last_updated();
+            txns.push((txn.app_id, txn.version, last_updated));
         }
     }
     Ok(txns)
@@ -641,7 +718,7 @@ async fn json_txns(
 async fn parquet_txns(
     store: Arc<dyn ObjectStore>,
     file: &ObjectMeta,
-) -> std::result::Result<Vec<(String, i64)>, String> {
+) -> std::result::Result<Vec<CheckpointTxn>, String> {
     use deltalake::parquet::arrow::async_reader::{
         ParquetObjectReader, ParquetRecordBatchStreamBuilder,
     };
@@ -693,6 +770,15 @@ async fn parquet_txns(
         let app_ids = app_ids.as_string::<i32>();
         let versions = cast(versions, &DataType::Int64)?;
         let versions = versions.as_primitive::<Int64Type>();
+        // The protocol's checkpoint schema has it. A checkpoint without it, or with it in a
+        // shape that is no timestamp, does not say whether its txns can expire.
+        let last_updated = match txn.column_by_name("lastUpdated") {
+            Some(a) if matches!(a.data_type(), DataType::Int64 | DataType::Int32) => {
+                Some(cast(a, &DataType::Int64)?)
+            }
+            _ => None,
+        };
+        let last_updated = last_updated.as_ref().map(|a| a.as_primitive::<Int64Type>());
         for row in 0..txn.len() {
             if txn.is_null(row) || app_ids.is_null(row) {
                 continue; // a row for another kind of action
@@ -703,7 +789,12 @@ async fn parquet_txns(
                     app_ids.value(row)
                 ));
             }
-            txns.push((app_ids.value(row).to_string(), versions.value(row)));
+            let stamp = match last_updated {
+                None => LastUpdated::Unknown,
+                Some(a) if a.is_null(row) => LastUpdated::Absent,
+                Some(a) => LastUpdated::At(a.value(row)),
+            };
+            txns.push((app_ids.value(row).to_string(), versions.value(row), stamp));
         }
     }
     Ok(txns)
@@ -1941,12 +2032,14 @@ mod tests {
             .map(|p| (p, txns[&txn_app_id(APP, p)].version))
             .collect();
         assert_eq!(got, expected);
-        assert_eq!(txns["app-0"].writer, Writer::Ddi);
+        assert_eq!(txns["app-0"].writer(), Writer::Ddi);
         assert_eq!(
-            txns["app-1"].writer,
-            Writer::Unknown,
-            "a checkpoint keeps no commitInfo, so its writer is not known"
+            txns["app-1"].last_updated,
+            LastUpdated::Absent,
+            "a checkpoint keeps the txn's lastUpdated, and ddi's has none"
         );
+        assert_eq!(txns["app-1"].writer(), Writer::Ddi);
+        assert_eq!(txns["app-9"].writer(), Writer::Unknown);
 
         // And with no `_last_checkpoint` at all.
         std::fs::remove_file(log_file(dir.path(), "_last_checkpoint")).unwrap();
@@ -2144,6 +2237,14 @@ mod tests {
             "the three appIds the walk did not find went to the kernel, one each"
         );
         assert_eq!(counters.lookups(), 1);
+
+        // The kernel gives the version alone, so whether those txns can expire is not known,
+        // and counts as if they could.
+        let txns = read_txns(&table, &ids(0..4), &counters).await.unwrap();
+        assert_eq!(txns["app-0"].writer(), Writer::Ddi, "read from commit 3");
+        assert_eq!(txns["app-1"].last_updated, LastUpdated::Unknown);
+        assert_eq!(txns["app-1"].writer(), Writer::Unknown);
+        assert!(offset_may_have_expired(&txns, true), "{txns:?}");
     }
 
     #[tokio::test]
@@ -2184,7 +2285,7 @@ mod tests {
             TxnState {
                 version: Some(9),
                 mark: Some(mark),
-                writer: Writer::Ddi
+                last_updated: LastUpdated::Absent,
             }
         );
         assert_eq!(
@@ -2192,7 +2293,7 @@ mod tests {
             TxnState {
                 version: Some(4),
                 mark: None,
-                writer: Writer::Ddi
+                last_updated: LastUpdated::Absent,
             }
         );
         assert_eq!(
@@ -2200,10 +2301,14 @@ mod tests {
             TxnState {
                 version: Some(7),
                 mark: None,
-                writer: Writer::Other
+                last_updated: LastUpdated::At(1_700_000_000_000),
             }
         );
         assert_eq!(txns["app-3"], TxnState::default());
+        assert_eq!(
+            [0, 1, 2, 3].map(|p| txns[&txn_app_id(APP, p)].writer()),
+            [Writer::Ddi, Writer::Ddi, Writer::Other, Writer::Unknown]
+        );
 
         // The fence takes the marks with the offsets.
         let mut fence = Fence::new(APP);
@@ -2211,13 +2316,6 @@ mod tests {
         assert_eq!(fence.base(0), Some((Some(9), Some(mark))));
         let (_, asserted_marks) = fence.assert_map(&BTreeMap::new(), &BTreeMap::new());
         assert_eq!(asserted_marks, BTreeMap::from([(0, mark)]));
-    }
-
-    /// docs/kafka-design.md §4.4 step 2: offsets exist, and another writer's are among them
-    /// where ddi's are not.
-    fn kdi_era(txns: &BTreeMap<String, TxnState>) -> bool {
-        let writers: Vec<Writer> = txns.values().map(|t| t.writer).collect();
-        writers.contains(&Writer::Other) && !writers.contains(&Writer::Ddi)
     }
 
     /// `rows` ids in `table`'s shape, for a commit with data in it.
@@ -2237,10 +2335,11 @@ mod tests {
 
     /// A table only ddi has written offsets to, where another pipeline sharing it as a target
     /// commits often enough for delta-rs to checkpoint above ddi's last commit. The offsets are
-    /// then read from the checkpoint, which keeps no commitInfo: who wrote them is not known,
-    /// and must not read as somebody else, or the table would look like kafka-delta-ingest's.
+    /// then read from the checkpoint, which keeps no commitInfo but keeps each txn's
+    /// `lastUpdated`: they are still ddi's, and must not read as somebody else's, or the table
+    /// would look like kafka-delta-ingest's.
     #[tokio::test]
-    async fn read_txns_checkpoint_above_our_last_commit_leaves_the_writer_unknown() {
+    async fn read_txns_checkpoint_above_our_last_commit_still_reads_as_ddis() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         let table = create_with(path, &[("delta.checkpointInterval", "10")]).await;
@@ -2289,27 +2388,33 @@ mod tests {
             TxnState {
                 version: Some(9),
                 mark: None,
-                writer: Writer::Unknown
+                last_updated: LastUpdated::Absent,
             }
         );
         assert_eq!(txns["app-1"].version, Some(4));
-        assert_eq!(txns["app-1"].writer, Writer::Unknown);
+        assert_eq!(txns["app-1"].writer(), Writer::Ddi);
         assert!(!kdi_era(&txns), "ddi wrote every offset here: {txns:?}");
+        assert!(
+            !offset_may_have_expired(&txns, true),
+            "and none of them can expire: {txns:?}"
+        );
 
         // A txn kafka-delta-ingest wrote, in a commit still in the log, is another writer's.
         kdi_commit(dir.path(), 13, "kdi-0", 7, 1_700_000_000_000);
         let kdi = read_txns(&open(path).await, &["kdi-0".to_string()], &counters)
             .await
             .unwrap();
-        assert_eq!(kdi["kdi-0"].writer, Writer::Other);
+        assert_eq!(kdi["kdi-0"].writer(), Writer::Other);
         assert!(kdi_era(&kdi), "{kdi:?}");
+        assert!(offset_may_have_expired(&kdi, true), "{kdi:?}");
+        assert!(!offset_may_have_expired(&kdi, false), "{kdi:?}");
     }
 
     /// The same when the commit at the checkpoint is another engine's own, as when Trino's
     /// OPTIMIZE lands at a checkpoint-interval version and checkpoints there: the walk reads
     /// that commit, which carries no txn, and then the checkpoint.
     #[tokio::test]
-    async fn read_txns_foreign_checkpoint_at_the_head_leaves_the_writer_unknown() {
+    async fn read_txns_foreign_checkpoint_at_the_head_still_reads_as_ddis() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         let mut table = create(path).await;
@@ -2341,11 +2446,93 @@ mod tests {
             .unwrap();
         assert_eq!(txns["app-0"].version, Some(2));
         assert_eq!(txns["app-1"].version, Some(102));
-        assert!(
-            txns.values().all(|t| t.writer == Writer::Unknown),
+        assert!(txns.values().all(|t| t.writer() == Writer::Ddi), "{txns:?}");
+        assert!(!kdi_era(&txns), "ddi wrote every offset here: {txns:?}");
+        assert!(!offset_may_have_expired(&txns, true), "{txns:?}");
+    }
+
+    /// Commit `version` by hand: commit `from`'s `metaData`, without the table property `key`,
+    /// as an engine that unsets a property writes it. delta-rs has no operation for that.
+    fn unset_property(dir: &std::path::Path, from: u64, version: u64, key: &str) {
+        let commit = std::fs::read_to_string(log_file(dir, &commit_name(from))).unwrap();
+        let mut metadata = commit
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|l| l.get("metaData").is_some())
+            .unwrap();
+        let removed = metadata["metaData"]["configuration"]
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        assert!(removed.is_some(), "{key} was set");
+        let info = serde_json::json!({"commitInfo": {
+            "timestamp": 1_700_000_000_000i64, "operation": "UNSET TBLPROPERTIES"
+        }});
+        std::fs::write(
+            log_file(dir, &commit_name(version)),
+            format!("{info}\n{metadata}\n"),
+        )
+        .unwrap();
+    }
+
+    /// kafka-delta-ingest's offsets, answered by a checkpoint alone, on a table whose history
+    /// set `delta.setTransactionRetentionDuration`: two partitions' offsets expired under it,
+    /// and the checkpoint written meanwhile dropped them. Who wrote the one left is in that
+    /// checkpoint, as its `lastUpdated`, and so a partition without an offset is one whose
+    /// offset may have expired (docs/kafka-design.md §4.4), not one to read again from 0.
+    #[tokio::test]
+    async fn kdi_txns_answered_by_a_checkpoint_guard_a_missing_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        kdi_commit(dir.path(), 1, "app-0", 7, 1_000);
+        kdi_commit(dir.path(), 2, "app-1", 9, now);
+        kdi_commit(dir.path(), 3, "app-2", 4, 1_000);
+        let table = open(path)
+            .await
+            .set_tbl_properties()
+            .with_properties(std::collections::HashMap::from([(
+                TXN_RETENTION.to_string(),
+                "interval 1 days".to_string(),
+            )]))
+            .await
+            .unwrap(); // 4
+        deltalake::checkpoints::create_checkpoint(&table, None)
+            .await
+            .unwrap();
+        unset_property(dir.path(), 4, 5, TXN_RETENTION); // 5
+        let table = open(path).await;
+        assert_eq!(table.version(), Some(5));
+        deltalake::checkpoints::create_checkpoint(&table, None)
+            .await
+            .unwrap();
+        // Log cleanup took kafka-delta-ingest's commits; the one that set the property is
+        // still there for M3's history scan.
+        for v in 0..=3 {
+            std::fs::remove_file(log_file(dir.path(), &commit_name(v))).unwrap();
+        }
+
+        let table = open(path).await;
+        let counters = LookupCounters::default();
+        let txns = read_txns(&table, &ids(0..3), &counters).await.unwrap();
+        assert_eq!(
+            [0, 1, 2].map(|p| txns[&txn_app_id(APP, p)].version),
+            [None, Some(9), None],
             "{txns:?}"
         );
-        assert!(!kdi_era(&txns), "ddi wrote every offset here: {txns:?}");
+        assert_eq!(counters.fallbacks(), 0);
+        assert_eq!(
+            txns["app-1"].last_updated,
+            LastUpdated::At(now),
+            "the checkpoint keeps lastUpdated"
+        );
+        assert_eq!(txns["app-1"].writer(), Writer::Other);
+        assert!(kdi_era(&txns), "{txns:?}");
+        // Partitions 0 and 2 have no offset; a read from 0 would duplicate them.
+        assert!(offset_may_have_expired(&txns, true), "{txns:?}");
+        // Without the property in the table's history, nothing can have expired.
+        assert!(!offset_may_have_expired(&txns, false), "{txns:?}");
     }
 
     #[tokio::test]
