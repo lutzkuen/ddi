@@ -271,9 +271,9 @@ pub async fn read_txns(
 /// them, can expire under the property, and the walk does not filter for that. ddi's own
 /// carry none and never expire, so on a table only ddi writes `txn`s to — the data-quality
 /// table's marks ([`crate::dq::DataQuality::write_kafka`]) — the property changes nothing
-/// read here, and refusing it would stop rejects being recorded for nothing. Its marks are
-/// read on every write, where a mark a checkpoint answered is simply not skipped by, so the
-/// commits below the checkpoint are not worth reading.
+/// read here, and refusing it would stop rejects being recorded for nothing. The marks are
+/// read on every write, and one a checkpoint answered skips nothing there (it comes without
+/// the decoder that set it), so the commits below the checkpoint are not worth reading.
 pub(crate) async fn read_own_txns(
     table: &DeltaTable,
     app_ids: &[String],
@@ -452,8 +452,8 @@ async fn below_checkpoint(
             let Some(answer) = found.get_mut(&id) else {
                 continue;
             };
-            // Another version is an older txn than the one answered, which the commit that
-            // moved it on — at or above `bottom`, and gone — wrote. Its mark is not this one's.
+            // Another version is an older txn than the one answered, which the commit at
+            // `bottom` moved on before log cleanup took it. Its mark is not this one's.
             if written.version == answer.version {
                 answer.mark = written.mark;
                 answer.decoder = written.decoder;
