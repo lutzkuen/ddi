@@ -498,6 +498,102 @@ const FORCED_KEYS: &[(&str, &str)] = &[
     ("enable.partition.eof", "ddi sets it to false"),
 ];
 
+// ------------------------------------------------------------------- librdkafka's names
+//
+// One setting can be written under several names, and rdkafka's `ClientConfig` keeps them as
+// separate keys of a `HashMap`, which it hands to librdkafka in iteration order (rdkafka 0.39
+// config.rs:197, 296-300): two names for one setting are applied in an order that changes
+// from one client to the next. So ddi compares names as the setting librdkafka 2.12.1 sets for
+// them, from its property table (rdkafka-sys 4.10.0, librdkafka/src/rdkafka_conf.c), which
+// `librdkafka_reads_names_as_ddi_does` checks against the library itself.
+
+/// Global properties whose own name starts with `topic.`: librdkafka finds them among the
+/// global ones before it would strip that prefix.
+const GLOBAL_TOPIC_NAMES: &[&str] = &[
+    "topic.blacklist",
+    "topic.metadata.propagation.max.ms",
+    "topic.metadata.refresh.fast.cnt",
+    "topic.metadata.refresh.fast.interval.ms",
+    "topic.metadata.refresh.interval.ms",
+    "topic.metadata.refresh.sparse",
+];
+
+/// librdkafka's global aliases (`_RK_C_ALIAS`), each with the property it sets.
+const GLOBAL_ALIASES: &[(&str, &str)] = &[
+    ("bootstrap.servers", "metadata.broker.list"),
+    ("compression.type", "compression.codec"),
+    ("linger.ms", "queue.buffering.max.ms"),
+    ("max.in.flight", "max.in.flight.requests.per.connection"),
+    ("max.partition.fetch.bytes", "fetch.message.max.bytes"),
+    ("retries", "message.send.max.retries"),
+    ("sasl.mechanism", "sasl.mechanisms"),
+    (
+        "sasl.oauthbearer.client.credentials.client.id",
+        "sasl.oauthbearer.client.id",
+    ),
+    (
+        "sasl.oauthbearer.client.credentials.client.secret",
+        "sasl.oauthbearer.client.secret",
+    ),
+];
+
+/// Topic-level properties (and aliases) with no global property of the same name, so that
+/// librdkafka sets them on the default topic config also when written without `topic.`.
+const TOPIC_ONLY_NAMES: &[&str] = &[
+    "acks",
+    "auto.commit.enable",
+    "auto.offset.reset",
+    "compression.level",
+    "consume.callback.max.messages",
+    "delivery.timeout.ms",
+    "message.timeout.ms",
+    "msg_order_cmp",
+    "offset.store.path",
+    "offset.store.sync.interval.ms",
+    "partitioner",
+    "partitioner_cb",
+    "produce.offset.report",
+    "queuing.strategy",
+    "request.required.acks",
+    "request.timeout.ms",
+];
+
+/// librdkafka's topic-level aliases, each with the property it sets.
+const TOPIC_ALIASES: &[(&str, &str)] = &[
+    ("acks", "request.required.acks"),
+    ("compression.type", "compression.codec"),
+    ("delivery.timeout.ms", "message.timeout.ms"),
+    ("enable.auto.commit", "auto.commit.enable"),
+];
+
+/// The setting librdkafka sets for `key`, one name per setting: a global property by its
+/// name, a topic-level one as `topic.<name>`, an alias as the property it stands for.
+///
+/// `rd_kafka_conf_set` looks a name up among the global properties first, following an alias
+/// to its property; a name it does not find there it sets on the default topic config, after
+/// stripping one leading `topic.` (rdkafka_conf.c:1903-1907, 2544-2580). So
+/// `topic.auto.offset.reset` is `auto.offset.reset`, `topic.enable.auto.commit` is the
+/// topic-level `auto.commit.enable` (not the global `enable.auto.commit`), and
+/// `sasl.mechanism` is `sasl.mechanisms`. A name librdkafka does not know is itself, and
+/// fails when the client is created.
+fn librdkafka_property(key: &str) -> std::borrow::Cow<'_, str> {
+    let alias = |table: &[(&str, &'static str)], name: &str| {
+        table.iter().find(|(a, _)| *a == name).map(|(_, p)| *p)
+    };
+    if let Some(property) = alias(GLOBAL_ALIASES, key) {
+        return property.into();
+    }
+    let topic_level = match key.strip_prefix("topic.") {
+        Some(name) if !GLOBAL_TOPIC_NAMES.contains(&key) => Some(name),
+        Some(_) => None,
+        None => TOPIC_ONLY_NAMES.contains(&key).then_some(key),
+    };
+    match topic_level {
+        Some(name) => format!("topic.{}", alias(TOPIC_ALIASES, name).unwrap_or(name)).into(),
+        None => key.into(),
+    }
+}
+
 /// The values [`FORCED_KEYS`] get, in the order they are applied.
 fn forced_values(brokers: &str, group_id: &str) -> [(&'static str, String); 7] {
     [
@@ -614,11 +710,24 @@ fn scram_identity(var: &str, json: &str) -> Result<(String, String)> {
 
 // --------------------------------------------------------------------------- validation
 
-/// A forced key, refused wherever the user set it (§2.5 rule 7).
+/// A forced key, refused wherever the user set it, under any name librdkafka reads as it
+/// (§2.5 rule 7): `topic.auto.offset.reset = "earliest"` beside ddi's `auto.offset.reset =
+/// "error"` would otherwise win in some clients and not in others, and jump past a retention
+/// gap without the -140 that blocks it.
 fn refuse_forced_key(key: &str, place: &str) -> Result<()> {
-    match FORCED_KEYS.iter().find(|(k, _)| *k == key) {
-        Some((k, why)) => Err(Error::Config(format!(
+    let property = librdkafka_property(key);
+    let forced = FORCED_KEYS.iter().find(|(k, _)| *k == key).or_else(|| {
+        FORCED_KEYS
+            .iter()
+            .find(|(k, _)| librdkafka_property(k) == property)
+    });
+    match forced {
+        Some((k, why)) if *k == key => Err(Error::Config(format!(
             "{place}: {k:?} is ddi's to set: {why}"
+        ))),
+        Some((k, why)) => Err(Error::Config(format!(
+            "{place}: {key:?} is librdkafka's {k:?} under another name, which is ddi's to \
+             set: {why}"
         ))),
         None => Ok(()),
     }
@@ -2508,5 +2617,174 @@ url = "http://my-sr:8081"
             "{warnings:?}"
         );
         assert_eq!(running(&cfg.resolve_all_with(true).unwrap()), ["events"]);
+    }
+
+    // ------------------------------------------------- one setting under librdkafka's names
+
+    #[test]
+    fn a_forced_key_under_its_topic_name_is_refused() {
+        // librdkafka sets a name it does not know globally on the default topic config, with
+        // one leading `topic.` stripped (rdkafka_conf.c:2544-2580): these three are
+        // auto.offset.reset and the topic-level auto.commit.enable, both ddi's.
+        for key in [
+            "topic.auto.offset.reset",
+            "topic.enable.auto.commit",
+            "topic.auto.commit.enable",
+        ] {
+            for (section, pipeline) in [
+                (
+                    format!("[kafka.settings]\n{key:?} = \"earliest\"\n"),
+                    String::new(),
+                ),
+                (
+                    String::new(),
+                    format!("[kafka.pipeline.settings]\n{key:?} = \"earliest\""),
+                ),
+                (
+                    format!("[kafka.settings_env]\n{key:?} = \"X\"\n"),
+                    String::new(),
+                ),
+                (
+                    String::new(),
+                    format!("[kafka.pipeline.settings_env]\n{key:?} = \"X\""),
+                ),
+            ] {
+                let reason = refused(&section, &pipeline);
+                assert!(
+                    reason.contains(&format!("{key:?}")) && reason.contains("ddi's to set"),
+                    "{key}: {reason}"
+                );
+            }
+        }
+        let reason = refused(
+            "[kafka.settings]\n\"topic.auto.offset.reset\" = \"earliest\"\n",
+            "",
+        );
+        assert!(
+            reason.contains("\"auto.offset.reset\""),
+            "names the setting it is: {reason}"
+        );
+        // A global setting whose own name starts with `topic.` is found before any stripping.
+        let r = resolve(&format!(
+            "{SECTION}{}",
+            entry(
+                "events",
+                "[kafka.pipeline.settings]\n\"topic.metadata.refresh.interval.ms\" = \"60000\""
+            )
+        ));
+        assert_eq!(running(&r), ["events"], "{r:?}");
+    }
+
+    /// [`librdkafka_property`] against librdkafka itself: a value set under one name is what
+    /// librdkafka reads under the other, every name in the tables is one it knows, and every
+    /// forced key spelt with `topic.` is refused here exactly when librdkafka would take it.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn librdkafka_reads_names_as_ddi_does() {
+        use rdkafka::config::{ClientConfig, NativeClientConfig};
+        let native = |pairs: &[(&str, &str)]| -> rdkafka::error::KafkaResult<NativeClientConfig> {
+            let mut c = ClientConfig::new();
+            for (k, v) in pairs {
+                c.set(*k, *v);
+            }
+            c.create_native_config()
+        };
+        // (written, read back under, value, what librdkafka reports)
+        for (written, read, value, reads) in [
+            (
+                "topic.auto.offset.reset",
+                "auto.offset.reset",
+                "earliest",
+                "smallest",
+            ),
+            (
+                "auto.offset.reset",
+                "auto.offset.reset",
+                "latest",
+                "largest",
+            ),
+            (
+                "topic.enable.auto.commit",
+                "auto.commit.enable",
+                "false",
+                "false",
+            ),
+            (
+                "topic.auto.commit.enable",
+                "auto.commit.enable",
+                "false",
+                "false",
+            ),
+            (
+                "sasl.mechanism",
+                "sasl.mechanisms",
+                "SCRAM-SHA-512",
+                "SCRAM-SHA-512",
+            ),
+            (
+                "bootstrap.servers",
+                "metadata.broker.list",
+                "h:9092",
+                "h:9092",
+            ),
+            (
+                "max.partition.fetch.bytes",
+                "fetch.message.max.bytes",
+                "4242",
+                "4242",
+            ),
+            (
+                "topic.metadata.refresh.interval.ms",
+                "topic.metadata.refresh.interval.ms",
+                "60000",
+                "60000",
+            ),
+        ] {
+            assert_eq!(
+                librdkafka_property(written),
+                librdkafka_property(read),
+                "{written}"
+            );
+            let got = native(&[(written, value)]).unwrap().get(read).unwrap();
+            assert_eq!(got, reads, "{written} = {value:?}, read as {read}");
+        }
+
+        // The global enable.auto.commit is not the topic-level auto.commit.enable.
+        assert_ne!(
+            librdkafka_property("enable.auto.commit"),
+            librdkafka_property("auto.commit.enable")
+        );
+        let n = native(&[
+            ("enable.auto.commit", "false"),
+            ("auto.offset.reset", "error"),
+        ]);
+        assert_eq!(n.unwrap().get("auto.commit.enable").unwrap(), "true");
+
+        let unknown = |name: &str| match native(&[(name, "x")]) {
+            Err(e) => e.to_string().contains("No such configuration property"),
+            Ok(_) => false,
+        };
+        let topic_level = TOPIC_ONLY_NAMES
+            .iter()
+            .chain(TOPIC_ALIASES.iter().map(|(a, _)| a))
+            .map(|n| format!("topic.{n}"));
+        for name in GLOBAL_TOPIC_NAMES
+            .iter()
+            .chain(TOPIC_ONLY_NAMES)
+            .chain(GLOBAL_ALIASES.iter().map(|(a, _)| a))
+            .chain(TOPIC_ALIASES.iter().map(|(a, _)| a))
+            .map(|n| n.to_string())
+            .chain(topic_level)
+        {
+            assert!(!unknown(&name), "librdkafka does not know {name:?}");
+        }
+        for (key, _) in FORCED_KEYS {
+            let spelt = format!("topic.{key}");
+            assert_eq!(
+                refuse_forced_key(&spelt, "settings").is_err(),
+                !unknown(&spelt),
+                "{spelt}"
+            );
+        }
     }
 }
