@@ -75,12 +75,30 @@ pub struct TxnState {
     /// different offset, and when the `txn` was found only in a checkpoint, which keeps no
     /// commit metadata.
     pub mark: Option<MessageMark>,
-    /// Whether the commit that wrote the `txn` was ddi's: its commitInfo carries `ddi.appId`.
-    ///
-    /// False as well when that commit is unknown, because the `txn` came out of a checkpoint.
-    /// "Not known to be ours" is the cautious reading of that: it is what makes a
-    /// kafka-delta-ingest table's history count against starting without a decision.
-    pub written_by_ddi: bool,
+    /// Who wrote the commit the `txn` was read from.
+    pub writer: Writer,
+}
+
+/// Who wrote the commit an appId's newest `txn` was read from.
+///
+/// Three answers rather than two, because the third is common: a `txn` read out of a
+/// checkpoint comes without the commit that wrote it. On a table only ddi has written
+/// offsets to, that happens whenever a checkpoint lands above ddi's last commit — another
+/// pipeline sharing the target, or another engine's OPTIMIZE at a checkpoint-interval version.
+/// Taking it for another writer would make such a table look like kafka-delta-ingest's
+/// (docs/kafka-design.md §4.4); taking it for ddi would let a kafka-delta-ingest table whose
+/// commits are below a checkpoint pass for ddi's. So it is neither.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Writer {
+    /// ddi: the commit's commitInfo carries `ddi.appId`.
+    Ddi,
+    /// Another writer, kafka-delta-ingest above all: the commit is in the log, and its
+    /// commitInfo carries no `ddi.appId`.
+    Other,
+    /// Not known: the `txn` was read from a checkpoint, which keeps no commitInfo, or there is
+    /// no `txn` at all.
+    #[default]
+    Unknown,
 }
 
 /// What reading offsets has cost, for `ddi_kafka_offset_lookups_total`,
@@ -123,7 +141,8 @@ impl LookupCounters {
 /// 3. The commits from the handle's version back to that checkpoint, [`IN_FLIGHT`] at a
 ///    time, stopping as soon as every appId has been found. Each found `txn` takes its mark
 ///    from `ddi.kafka.marks` and its writer from `ddi.appId` in the same commit.
-/// 4. For the appIds still missing, the checkpoint's `txn` column, read once.
+/// 4. For the appIds still missing, the checkpoint's `txn` column, read once. What it
+///    answers comes with no mark and an unknown writer: a checkpoint keeps no commitInfo.
 /// 5. Only if that checkpoint cannot be read here: the kernel, one appId at a time, counted
 ///    in [`LookupCounters::fallbacks`].
 ///
@@ -352,7 +371,10 @@ fn record_commit(
             TxnState {
                 version: Some(txn.version),
                 mark,
-                written_by_ddi: ddi_app_id.is_some(),
+                writer: match ddi_app_id {
+                    Some(_) => Writer::Ddi,
+                    None => Writer::Other,
+                },
             },
         );
     }
@@ -1900,9 +1922,10 @@ mod tests {
             .map(|p| (p, txns[&txn_app_id(APP, p)].version))
             .collect();
         assert_eq!(got, expected);
-        assert!(txns["app-0"].written_by_ddi);
-        assert!(
-            !txns["app-1"].written_by_ddi,
+        assert_eq!(txns["app-0"].writer, Writer::Ddi);
+        assert_eq!(
+            txns["app-1"].writer,
+            Writer::Unknown,
             "a checkpoint keeps no commitInfo, so its writer is not known"
         );
 
@@ -2092,7 +2115,7 @@ mod tests {
             TxnState {
                 version: Some(9),
                 mark: Some(mark),
-                written_by_ddi: true
+                writer: Writer::Ddi
             }
         );
         assert_eq!(
@@ -2100,7 +2123,7 @@ mod tests {
             TxnState {
                 version: Some(4),
                 mark: None,
-                written_by_ddi: true
+                writer: Writer::Ddi
             }
         );
         assert_eq!(
@@ -2108,7 +2131,7 @@ mod tests {
             TxnState {
                 version: Some(7),
                 mark: None,
-                written_by_ddi: false
+                writer: Writer::Other
             }
         );
         assert_eq!(txns["app-3"], TxnState::default());
@@ -2119,6 +2142,141 @@ mod tests {
         assert_eq!(fence.base(0), Some((Some(9), Some(mark))));
         let (_, asserted_marks) = fence.assert_map(&BTreeMap::new(), &BTreeMap::new());
         assert_eq!(asserted_marks, BTreeMap::from([(0, mark)]));
+    }
+
+    /// docs/kafka-design.md §4.4 step 2: offsets exist, and another writer's are among them
+    /// where ddi's are not.
+    fn kdi_era(txns: &BTreeMap<String, TxnState>) -> bool {
+        let writers: Vec<Writer> = txns.values().map(|t| t.writer).collect();
+        writers.contains(&Writer::Other) && !writers.contains(&Writer::Ddi)
+    }
+
+    /// `rows` ids in `table`'s shape, for a commit with data in it.
+    fn rows(table: &DeltaTable, ids: &[i64]) -> RecordBatch {
+        use deltalake::arrow::array::{ArrayRef, Int64Array, StringArray};
+        RecordBatch::try_new(
+            schema_of(table),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+                Arc::new(StringArray::from_iter_values(
+                    ids.iter().map(|i| format!("row-{i}")),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A table only ddi has written offsets to, where another pipeline sharing it as a target
+    /// commits often enough for delta-rs to checkpoint above ddi's last commit. The offsets are
+    /// then read from the checkpoint, which keeps no commitInfo: who wrote them is not known,
+    /// and must not read as somebody else, or the table would look like kafka-delta-ingest's.
+    #[tokio::test]
+    async fn read_txns_checkpoint_above_our_last_commit_leaves_the_writer_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let table = create_with(path, &[("delta.checkpointInterval", "10")]).await;
+        let mark = MessageMark {
+            offset: 9,
+            timestamp_ms: 1_700_000_000_000,
+            value_len: 42,
+        };
+        let empty = RecordBatch::new_empty(schema_of(&table));
+        Sink::new(APP, 0)
+            .commit_kafka(
+                table,
+                vec![empty],
+                &offsets(
+                    &[(0, (5, 9)), (1, (4, 4))],
+                    &BTreeMap::from([(0, 9), (1, 4)]),
+                    &BTreeMap::from([(0, mark)]),
+                ),
+            )
+            .await
+            .unwrap(); // 1
+
+        // The other pipeline, on a topic of its own: delta-rs checkpoints at 9 by itself.
+        let mut table = open(path).await;
+        for i in 0..11 {
+            let assert = BTreeMap::from([(0, 100 + i)]);
+            let empty = RecordBatch::new_empty(schema_of(&table));
+            table = Sink::new("other", 0)
+                .commit_kafka(
+                    table,
+                    vec![empty],
+                    &offsets(&[(0, (100 + i, 100 + i))], &assert, &BTreeMap::new()),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(table.version(), Some(12));
+        assert!(log_file(dir.path(), "00000000000000000009.checkpoint.parquet").exists());
+
+        let counters = LookupCounters::default();
+        let txns = read_txns(&open(path).await, &ids(0..2), &counters)
+            .await
+            .unwrap();
+        assert_eq!(
+            txns["app-0"],
+            TxnState {
+                version: Some(9),
+                mark: None,
+                writer: Writer::Unknown
+            }
+        );
+        assert_eq!(txns["app-1"].version, Some(4));
+        assert_eq!(txns["app-1"].writer, Writer::Unknown);
+        assert!(!kdi_era(&txns), "ddi wrote every offset here: {txns:?}");
+
+        // A txn kafka-delta-ingest wrote, in a commit still in the log, is another writer's.
+        kdi_commit(dir.path(), 13, "kdi-0", 7, 1_700_000_000_000);
+        let kdi = read_txns(&open(path).await, &["kdi-0".to_string()], &counters)
+            .await
+            .unwrap();
+        assert_eq!(kdi["kdi-0"].writer, Writer::Other);
+        assert!(kdi_era(&kdi), "{kdi:?}");
+    }
+
+    /// The same when the commit at the checkpoint is another engine's own, as when Trino's
+    /// OPTIMIZE lands at a checkpoint-interval version and checkpoints there: the walk reads
+    /// that commit, which carries no txn, and then the checkpoint.
+    #[tokio::test]
+    async fn read_txns_foreign_checkpoint_at_the_head_leaves_the_writer_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut table = create(path).await;
+        for i in 0..3i64 {
+            let assert = BTreeMap::from([(0, i), (1, 100 + i)]);
+            let batch = rows(&table, &[i]);
+            table = Sink::new(APP, 0)
+                .commit_kafka(
+                    table,
+                    vec![batch],
+                    &offsets(
+                        &[(0, (i, i)), (1, (100 + i, 100 + i))],
+                        &assert,
+                        &BTreeMap::new(),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let (table, _) = open(path).await.optimize().await.unwrap();
+        assert_eq!(table.version(), Some(4));
+        deltalake::checkpoints::create_checkpoint(&table, None)
+            .await
+            .unwrap();
+
+        let counters = LookupCounters::default();
+        let txns = read_txns(&open(path).await, &ids(0..2), &counters)
+            .await
+            .unwrap();
+        assert_eq!(txns["app-0"].version, Some(2));
+        assert_eq!(txns["app-1"].version, Some(102));
+        assert!(
+            txns.values().all(|t| t.writer == Writer::Unknown),
+            "{txns:?}"
+        );
+        assert!(!kdi_era(&txns), "ddi wrote every offset here: {txns:?}");
     }
 
     #[tokio::test]

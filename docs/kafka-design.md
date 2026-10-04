@@ -777,14 +777,16 @@ There is one `table.write()` per batch, through `Sink::commit_kafka` and the sam
 ```rust
 pub fn txn_app_id(app_id: &str, p: i32) -> String { format!("{app_id}-{p}") }       // kdi delta_helpers.rs:70-72
 
-pub struct TxnState { pub version: Option<i64>, pub mark: Option<MessageMark>, pub written_by_ddi: bool }
+pub struct TxnState { pub version: Option<i64>, pub mark: Option<MessageMark>, pub writer: Writer }
+pub enum Writer { Ddi, Other, Unknown }   // Unknown: read from a checkpoint, which keeps no commitInfo
 
 /// Every wanted appId's newest txn as of `table`'s version, in ONE pass (EO-M6):
 ///  1. Walk `_delta_log/<v>.json` backwards from the handle's version (log_store.read_commit_entry + get_actions,
 ///     the pattern dbt/watermark.rs:207-245 already uses), 4 GETs in flight, until every wanted appId is
 ///     found or the newest checkpoint version (from `_last_checkpoint`) is reached. The mark comes from
-///     `ddi.kafka.marks` in the same commit; `written_by_ddi` from `ddi.appId` in its commitInfo.
+///     `ddi.kafka.marks` in the same commit; `writer` from `ddi.appId` in its commitInfo.
 ///  2. For the rest, read the checkpoint's `txn` column once (parquet projection; single- or multi-part).
+///     Those come with no mark and `Writer::Unknown`.
 ///  3. Only if that checkpoint cannot be read (a foreign format): per-id kernel lookups, counted in
 ///     ddi_kafka_offset_lookup_fallbacks_total.
 /// Refuses when delta.setTransactionRetentionDuration is set, so no expiry filter is needed.
@@ -835,10 +837,12 @@ Blind appends on disjoint appIds rebase cleanly (conflict_checker.rs:461-463), s
 
 **At open,** before subscribing (run mode) or assigning (once-mode):
 1. Read the topic's partitions from metadata (`fetch_metadata`, `spawn_blocking`).
-2. `read_txns` over every partition → `known`, `fresh` (fresh = no partition has a txn), `kdi_era` (txns exist and none was written by ddi).
+2. `read_txns` over every partition → `known`, `fresh` (fresh = no partition has a txn), `kdi_era` (some txn was written by another writer, `Writer::Other`, and none by ddi).
+   - A txn read from a checkpoint has `Writer::Unknown`, and counts for neither side. A table only ddi has written offsets to reads that way whenever a checkpoint lands above ddi's last commit (another pipeline sharing the target, or Trino's OPTIMIZE at a checkpoint-interval version); a kdi table whose commits are all below a checkpoint reads that way too.
 3. `refuse_txn_retention`, `refuse_unwritable_protocol`; record the table id.
 4. **Partition columns** (§5.6 step 0): refuse with `KafkaPartitionColumnUnmapped` when the target's partition columns cannot be produced.
 5. **`kdi_compat` unset on a kdi-written table** (`kdi_era`, or the newest commit carrying our txns lacks `ddi.appId`) → `KafkaCompatUnset`: "this table was written by kafka-delta-ingest; set `kdi_compat = true` to keep its STRING rendering ("null" text, raw-number timestamps, sorted-key JSON), or `false` to accept the documented break". Unset elsewhere means false.
+   - When every txn's writer is `Unknown`, step 2 cannot tell. M3 reads the commits below the checkpoint while log retention still keeps them, and takes the writer of the newest one carrying our txns; the same read gives back the marks a checkpoint drops, without which the re-read check (I19) is off for those partitions until they carry data again. If they are gone, it refuses with `KafkaCompatUnset` worded as "cannot tell who wrote this table's offsets", never as "written by kafka-delta-ingest".
 6. **Typo guard.** Refuse with `KafkaAppIdUnknown` when all of these hold:
    - `fresh`;
    - the target has data files (snapshot file count; accessor **verify (M3)**);
