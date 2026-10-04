@@ -771,8 +771,11 @@ impl Pipeline {
         };
         let output = isolated.output;
         let reevaluations = isolated.reevaluations;
-        // Unevaluable rows go first, and in the same list as the coercion rejects below, so
-        // the data-quality table still gets one write, and one commit, per source version.
+        // Every row this batch sets aside goes into one list, so the data-quality table still
+        // gets one write, and one commit, per batch: the rows the source could not read
+        // first, then those `conform` cannot fit, then the rows the transform could not
+        // evaluate, then the coercion rejects below. A Delta source has none of the first
+        // two, so for it the list starts with the unevaluable rows, as it always did.
         let mut rejects: Vec<Rejected> = batch.rejects;
         let output = self.conform(output, &mut rejects)?;
         let mut unevaluable = 0;
