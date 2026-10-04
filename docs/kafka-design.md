@@ -1441,9 +1441,9 @@ FROM source
 **Settled today** (§0.3.21): the C build works on this laptop with the chosen features, and no libsasl2 or libzstd is needed. The M1 build in ddi is a regression check, not an experiment. **M1:** libclang is, through zstd-sys 2.0.16's default `bindgen` (§0.3.21); this laptop has libclang-18 but not clang's resource headers, so its `kafka` builds set `BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include"`.
 
 **Cargo.** As in §3.1. `kafka` is ddi's first `[features]` section. `Cargo.lock` lists the optional crates even with the feature off, and `--locked` builds without features still work. **Do not run `cargo update`.** Add the crates with `cargo add`/targeted resolution, so zstd-sys stays at the locked 2.0.16. New crates:
-- rdkafka, rdkafka-sys, openssl-sys, libz-sys, num_enum (+derive), slab, vcpkg (build only);
+- rdkafka, rdkafka-sys, openssl-sys, libz-sys, num_enum (+derive), vcpkg (build only); slab, which rdkafka also uses, was locked already (0.4.12);
 - arrow-avro, strum_macros 0.28;
-- **M1, from zstd-sys's `bindgen`:** bindgen 0.72.1, clang-sys, cexpr, nom 7, minimal-lexical, libloading, itertools 0.13, shlex 1.3; and proc-macro-crate with toml_edit 0.25, toml_datetime 1.1, toml_parser and winnow 1.0 for num_enum_derive. 22 entries in all; none of the 436 before changed;
+- **M1, from zstd-sys's `bindgen`:** bindgen 0.72.1, clang-sys, cexpr, nom 7, minimal-lexical, libloading, itertools 0.13, shlex 1.3; and proc-macro-crate with toml_edit 0.25, toml_datetime 1.1, toml_parser and winnow 1.0 for num_enum_derive. 22 entries in all (436 → 458); no version of the 436 before changed;
 - apache-avro (the production version) and its tree, dev only.
 
 **Laptop.**
@@ -1484,7 +1484,7 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
 - **Nightly `kdi-parity`** (`schedule` + `workflow_dispatch`): `kdi_and_ddi_race` and `kdi_ddi_alternate` (§9.4), using the production kdi image.
 
 **Licensing.**
-- `deny.toml` gains `[graph]\nall-features = true`, so the `licenses` job sees the optional crates. All new crates are MIT, Apache-2.0 or BSD, already allowed (deny.toml:11-31).
+- `deny.toml` gains `[graph]\nall-features = true`, so that a plain local `cargo deny check` sees the optional crates as CI does: the `licenses` job's EmbarkStudios/cargo-deny-action@v2 already passes `--all-features` by default (its action.yml). All new crates are MIT, Apache-2.0, BSD or ISC (libloading 0.8.9), already allowed (deny.toml:18-38).
 - cargo-deny cannot see statically linked C. `scripts/third-party-notices.py` appends `rdkafka-sys-*/librdkafka/LICENSES.txt` when rdkafka-sys is in the lockfile:
   - librdkafka is BSD-2-Clause;
   - its bundled third parties are cJSON, crc32c, fnv1a, hdrhistogram, lz4, murmur2, nanopb, opentelemetry protos, pycrc, queue, regexp, snappy, tinycthread and wingetopt;

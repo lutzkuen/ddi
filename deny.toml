@@ -8,7 +8,8 @@
 [graph]
 # Optional dependencies are part of what ddi ships: the `kafka` feature's crates (rdkafka,
 # arrow-avro and theirs) are in the published binary from the day the image builds with it.
-# Without this, cargo-deny checks the default feature set only and never sees them.
+# CI's cargo-deny-action already passes --all-features by default; this makes a plain local
+# `cargo deny check`, which would otherwise check the default feature set only, see them too.
 all-features = true
 
 [licenses]
