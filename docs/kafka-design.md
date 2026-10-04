@@ -828,7 +828,7 @@ Blind appends on disjoint appIds rebase cleanly (conflict_checker.rs:461-463), s
 
 **Cost.**
 - **Steady state:** zero lookups. Every owned partition with a known base is carried; only a partition with no txn needs one walk before its first data.
-- **Assign, reset, aging:** one walk. That is one GET when our newest commit is the head, since it carries every owned partition; otherwise at most `head − checkpoint` GETs plus one checkpoint read, bounded by `checkpointInterval` (10 after cutover). Never one lookup per partition.
+- **Assign, reset, aging:** one walk. That is one GET when our newest commit is the head, since it carries every owned partition; otherwise at most `head − checkpoint` GETs plus one checkpoint read, bounded by `checkpointInterval` (10 after cutover). Never one lookup per partition. The checkpoint is found and read through the table's unfiltered store, also on a handle `Storage::open` built by replaying the log past a Trino checkpoint, whose own store hides every checkpoint from the kernel; otherwise that handle's walk would read every commit down to version 0.
 - **Metrics:** `ddi_kafka_offset_lookups_total`, `ddi_kafka_offset_lookup_seconds_total` and `ddi_kafka_offset_lookup_fallbacks_total`.
 
 **Aging (EO-m8).** A quiet member's handle can trail the head by thousands of versions. The conflict loop would then read them one by one, and fail with a missing file if log cleanup has removed any. `commit_batch` therefore refreshes and resets when the handle is older than `handle_max_age` (10 min). A missing commit file during the conflict check is classified Replan, not supervisor-fatal.

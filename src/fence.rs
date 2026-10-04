@@ -202,7 +202,10 @@ async fn walk(
         }
     }
 
-    let store = log_store.object_store(None);
+    // Checkpoints are found and read where all of them can be seen, which the handle's own
+    // store is not when it was opened by replaying the log; commits are read as the handle
+    // reads them.
+    let store = crate::storage::with_every_checkpoint(log_store.as_ref());
     let checkpoint = newest_checkpoint(store.as_ref(), log_store.log_path(), head).await?;
     // Without a checkpoint the walk has to reach version 0, which must therefore still be
     // there. The head's own commit may be missing only where a checkpoint at the head stands
@@ -2031,6 +2034,56 @@ mod tests {
             .gets()
             .iter()
             .any(|p| p.contains("00000000000000000003.checkpoint")));
+        assert_eq!(counters.fallbacks(), 0);
+    }
+
+    /// A handle `Storage::open` built by replaying the log, past a checkpoint it could not
+    /// read, hides every checkpoint from its own store: the one that was there, and every one
+    /// written since through any other handle. The offsets are still read back to the newest
+    /// checkpoint and out of its `txn` column, rather than from every commit down to version 0.
+    /// Here the commits below each checkpoint are cleaned up, so a walk that did not see it
+    /// would fail on the first of them.
+    #[tokio::test]
+    async fn read_txns_on_a_replayed_handle_still_reads_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        let table = assert_txns(open(path).await, &[(0, 10), (1, 20)]).await; // 1
+        let table = assert_txns(table, &[(0, 11)]).await; // 2
+        deltalake::checkpoints::create_checkpoint(&table, None)
+            .await
+            .unwrap();
+        assert_txns(table, &[(0, 12)]).await; // 3
+
+        let url = ensure_table_uri(path).unwrap();
+        let mut replayed = crate::storage::Storage::default()
+            .open_replaying_the_log(&url)
+            .await
+            .unwrap();
+        assert_eq!(replayed.version(), Some(3));
+        for v in 0..=1 {
+            std::fs::remove_file(log_file(dir.path(), &commit_name(v))).unwrap();
+        }
+        let counters = LookupCounters::default();
+        assert_eq!(
+            versions(&replayed, 0..3, &counters).await,
+            BTreeMap::from([(0, Some(12)), (1, Some(20)), (2, None)])
+        );
+
+        // A checkpoint another handle writes later, and the handle moved on to it.
+        let other = assert_txns(open(path).await, &[(1, 21)]).await; // 4
+        deltalake::checkpoints::create_checkpoint(&other, None)
+            .await
+            .unwrap();
+        for v in 2..=3 {
+            std::fs::remove_file(log_file(dir.path(), &commit_name(v))).unwrap();
+        }
+        replayed.update_incremental(None).await.unwrap();
+        assert_eq!(replayed.version(), Some(4));
+        assert_eq!(
+            versions(&replayed, 0..3, &counters).await,
+            BTreeMap::from([(0, Some(12)), (1, Some(21)), (2, None)])
+        );
         assert_eq!(counters.fallbacks(), 0);
     }
 
