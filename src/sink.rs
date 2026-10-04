@@ -817,6 +817,48 @@ mod tests {
         empty_commit_carries_txns_only(true).await;
     }
 
+    /// How many files one commit of 6000 rows adds, written by a sink with
+    /// `target_file_size`, as a Delta batch or as a Kafka one.
+    async fn files_added_with(target_file_size: u64, kafka: bool) -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let table = create(path, false).await;
+        let batches: Vec<RecordBatch> = (0..3)
+            .map(|i| rows(&table, &(i * 2000..(i + 1) * 2000).collect::<Vec<i64>>()))
+            .collect();
+        let sink = Sink::new("app", target_file_size);
+        let table = match kafka {
+            false => sink.commit(table, batches, 7).await.unwrap(),
+            true => sink
+                .commit_kafka(table, batches, &read(&[(0, (0, 5999))]))
+                .await
+                .unwrap(),
+        };
+        assert_eq!(table.version(), Some(1));
+        actions_at(&table, 1)
+            .await
+            .iter()
+            .filter(|a| matches!(a, Action::Add(_)))
+            .count()
+    }
+
+    /// A pipeline's `target_file_size` reaches the writer, on both kinds of commit. Every
+    /// pipeline the suite runs sets 128 MiB, which a test's few rows never come near, so
+    /// nothing else would notice the setting going missing: delta-rs would then split files
+    /// at its own default instead, and every commit would look the same.
+    #[tokio::test]
+    async fn target_file_size_splits_a_commits_files() {
+        for kafka in [false, true] {
+            let small = files_added_with(1, kafka).await;
+            assert!(
+                small > 1,
+                "a 1-byte target splits the write: {small} file(s)"
+            );
+            // 0 sets nothing, which is what a dropped setting looks like.
+            assert_eq!(files_added_with(0, kafka).await, 1, "kafka: {kafka}");
+        }
+    }
+
     #[tokio::test]
     async fn kafka_baseline_commit_is_marked() {
         let dir = tempfile::tempdir().unwrap();
