@@ -55,8 +55,9 @@
 //! A Kafka batch's rejects are a plain append ([`DataQuality::write_kafka`]), each row with
 //! its message's offset in `source_version` where the row says which message it came from, and
 //! nothing that would let a replay skip them. A replay after the rejects landed and the target
-//! commit did not writes them again: a visible duplicate, which a reader removes by the
-//! message's partition and offset (docs/kafka-design.md §5.7, I9).
+//! commit did not writes them again: a visible duplicate, which a reader removes by the whole
+//! row but `_timestamp` — never by partition and offset alone, which one message that fans out
+//! into several rows shares among genuine rejects (docs/kafka-design.md §5.7, I9).
 //!
 //! Every skip tried for Kafka lost a reject some way: a reject is judged against things a
 //! replay can find changed (the target's schema after an ALTER TABLE, the union of writer
@@ -407,17 +408,26 @@ impl DataQuality {
     ///    table whose protocol or column mapping delta-rs cannot write is refused, as a
     ///    target is, before anything is written ([`crate::fence::refuse_unwritable_protocol`]).
     /// 3. A commit that ends in a conflict (another engine changed the table's metadata or
-    ///    protocol, or delta-rs ran out of attempts) reopens the table. When the commit that
-    ///    landed is this write's own — it did land, and the acknowledgement of its PUT was
-    ///    lost — the write is done ([`Self::landed`]); otherwise it goes back to step 2, up to
+    ///    protocol, a DELETE, UPDATE or MERGE removed files from it, or delta-rs ran out of
+    ///    attempts) reopens the table. When the commit that landed is this write's own — it
+    ///    did land, and the acknowledgement of its PUT was lost — the write is done
+    ///    ([`Self::landed`]); otherwise it goes back to step 2, up to
     ///    [`KAFKA_CONFLICT_RETRIES`] times. After that it is [`Error::DataQualityConflict`],
     ///    for the pipeline to retry, never an error that replans the target. Another member's
     ///    append is no conflict: delta-rs rebases a plain append over another.
+    /// 4. A write that fails otherwise may still have landed: the checkpoint or the log
+    ///    cleanup after its commit failed, or the response to its PUT was lost and the retries
+    ///    ended in a store error. It too reopens the table and looks for its own commit, and is
+    ///    done when it finds it. Only when that reopen or that read fails is it left to the
+    ///    pipeline's retry, which may then record the rejects twice.
     ///
     /// A replay of the batch, after these rejects landed and the target commit did not, writes
-    /// them again: a visible duplicate, which a reader removes by partition and offset. Nothing
-    /// is skipped, because every rule tried for knowing that a reject is already recorded lost
-    /// one some way, and a lost reject is worse than a duplicate (I9).
+    /// them again: a visible duplicate. A reader removes it by the whole row but `_timestamp`
+    /// — partition, offset, `column_name`, `reason` and `payload` — and never by partition and
+    /// offset alone, under which a message that fans out into several rows (a `CROSS JOIN
+    /// UNNEST`) has several genuine rejects. Nothing is skipped, because every rule tried for
+    /// knowing that a reject is already recorded lost one some way, and a lost reject is worse
+    /// than a duplicate (I9).
     ///
     /// Every other failure is [`Error::DataQualityWrite`], with what failed beneath it as it
     /// was raised — delta-rs's error, `Capacity`, the `Config` of a failed reopen, or the
@@ -455,6 +465,28 @@ impl DataQuality {
                     // a handle that has fallen behind log cleanup does not fail it again.
                     if let Ok(table) = self.storage.open(&self.uri).await {
                         self.table = table;
+                    }
+                    return Err(self.unwritable(rows, cause));
+                }
+                Err(Attempt::Ambiguous(cause)) => {
+                    // The commit may have landed: delta-rs reports an error after it did when
+                    // the checkpoint or the log cleanup after it fails, or when the response to
+                    // its PUT was lost and the retries ended in a store error. Retried with the
+                    // batch, it would record every reject again, in a process that never
+                    // crashed. Only when the table cannot be reopened or its log read is it left
+                    // to that retry, which may then write them twice (I9).
+                    let Ok(table) = self.storage.open(&self.uri).await else {
+                        return Err(self.unwritable(rows, cause));
+                    };
+                    self.table = table;
+                    if let Ok(true) = self.landed(read_version, &write_id).await {
+                        debug!(
+                            app_id = %self.app_id,
+                            dq_uri = %self.uri,
+                            "the data-quality commit landed before this failure ({cause}); not \
+                             writing it twice"
+                        );
+                        return Ok(rows);
                     }
                     return Err(self.unwritable(rows, cause));
                 }
@@ -535,21 +567,36 @@ impl DataQuality {
             .iter()
             .map(|(p, (first, last))| (p.to_string(), serde_json::json!([first, last])))
             .collect();
+        // The log is cleaned up, where the table allows it, only by a commit that also
+        // checkpoints, as the target's is (docs/kafka-design.md §7.2): otherwise every commit
+        // would list the whole log after it lands, and fail there wherever it may not delete.
+        // A commit rebased past the version expected cleans up once more or once less.
+        use deltalake::table::config::TablePropertiesExt;
+        let properties = self
+            .table
+            .snapshot()
+            .map_err(|e| Attempt::Failed(Error::Delta(e)))?
+            .table_config();
+        let next = self.table.version().map_or(0, |v| v + 1);
+        let cleanup = properties.enable_expired_log_cleanup()
+            && (next + 1) % properties.checkpoint_interval().get() == 0;
         // No `txn`: a plain append, which delta-rs rebases over any other.
-        let props = CommitProperties::default().with_metadata([
-            (
-                "ddi.appId".to_string(),
-                serde_json::Value::from(self.app_id.clone()),
-            ),
-            (
-                "ddi.kafka.offsets".to_string(),
-                serde_json::Value::Object(ranges),
-            ),
-            (
-                KAFKA_WRITE_ID.to_string(),
-                serde_json::Value::from(write_id),
-            ),
-        ]);
+        let props = CommitProperties::default()
+            .with_cleanup_expired_logs(Some(cleanup))
+            .with_metadata([
+                (
+                    "ddi.appId".to_string(),
+                    serde_json::Value::from(self.app_id.clone()),
+                ),
+                (
+                    "ddi.kafka.offsets".to_string(),
+                    serde_json::Value::Object(ranges),
+                ),
+                (
+                    KAFKA_WRITE_ID.to_string(),
+                    serde_json::Value::from(write_id),
+                ),
+            ]);
 
         // As in `write`, and for the same reason: no runtime nobody configured.
         let session = crate::budget::delta_session(&self.table).map_err(Attempt::Failed)?;
@@ -572,8 +619,9 @@ impl DataQuality {
             }
             Err(e) if is_conflict(&e) => Err(Attempt::Conflict(e)),
             // Typed, as the target's own write is: a full spill directory is out of capacity,
-            // and anything else is delta-rs's error as it came.
-            Err(e) => Err(Attempt::Failed(crate::spill::classify_delta(
+            // and anything else is delta-rs's error as it came. Raised by the write itself, it
+            // may have been raised after the commit landed.
+            Err(e) => Err(Attempt::Ambiguous(crate::spill::classify_delta(
                 e,
                 "data-quality: writing rejects",
             ))),
@@ -671,7 +719,10 @@ enum Attempt {
     /// delta-rs gave up on a conflict: another writer's commit, worth trying again in place,
     /// unless this attempt's own landed before it.
     Conflict(DeltaTableError),
-    /// Anything else.
+    /// The write failed otherwise, possibly after its commit landed: a failed checkpoint or
+    /// log cleanup after it, or a PUT whose response was lost and whose retries failed.
+    Ambiguous(Error),
+    /// Refused before anything was written.
     Failed(Error),
 }
 
@@ -1063,8 +1114,8 @@ mod tests {
 
     /// The target commit failed after the rejects were recorded, and the batch is read again:
     /// by this process, or by the next owner of the partition. Its rejects are written again,
-    /// a visible duplicate a reader removes by (partition, offset); a skip that judged them
-    /// recorded could lose one, which is worse.
+    /// a visible duplicate a reader removes by the whole row but `_timestamp`; a skip that
+    /// judged them recorded could lose one, which is worse.
     #[tokio::test]
     async fn dq_a_replay_writes_its_rejects_again() {
         let dir = tempfile::tempdir().unwrap();
@@ -1287,6 +1338,16 @@ mod tests {
         /// then say it already exists, the first time only: delta-rs then meets that change
         /// in its conflict check, after its own commit, and reports a conflict.
         LandsThenAlteredThenSaysItExists,
+        /// Write it, then fail as a store does whose retries ran out, the first time only: the
+        /// response to the PUT was lost, and so were the retries'.
+        LandsThenFails,
+        /// Fail every PUT of a checkpoint, after the commit it follows has landed.
+        CheckpointFails,
+        /// Refuse every delete, as an immutable container does; count each.
+        DeleteDenied,
+        /// The first time only, write another engine's DELETE there first: a commit that
+        /// removes, with `dataChange`, every file the previous commit added.
+        RivalDeletesFirst,
     }
 
     /// An object store that gets one thing wrong about commits, and passes everything else
@@ -1358,6 +1419,32 @@ mod tests {
                     }
                     self.inner.put_opts(location, payload, opts).await
                 }
+                Fault::LandsThenFails => {
+                    let put = self.inner.put_opts(location, payload, opts).await?;
+                    if commit && self.struck.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(object_store::Error::Generic {
+                            store: "Azure",
+                            source: "the response was lost, and the retries ended in 503".into(),
+                        });
+                    }
+                    Ok(put)
+                }
+                Fault::CheckpointFails if is_checkpoint(location) => {
+                    self.struck.fetch_add(1, Ordering::SeqCst);
+                    Err(checkpoint_refused())
+                }
+                Fault::RivalDeletesFirst => {
+                    if commit && self.struck.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let rival = delete_of_previous(self.inner.as_ref(), location).await;
+                        self.inner
+                            .put_opts(location, rival.into(), PutOptions::default())
+                            .await?;
+                    }
+                    self.inner.put_opts(location, payload, opts).await
+                }
+                Fault::CheckpointFails | Fault::DeleteDenied => {
+                    self.inner.put_opts(location, payload, opts).await
+                }
             }
         }
 
@@ -1366,6 +1453,10 @@ mod tests {
             location: &Path,
             opts: PutMultipartOptions,
         ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            if matches!(self.fault, Fault::CheckpointFails) && is_checkpoint(location) {
+                self.struck.fetch_add(1, Ordering::SeqCst);
+                return Err(checkpoint_refused());
+            }
             self.inner.put_multipart_opts(location, opts).await
         }
 
@@ -1381,6 +1472,21 @@ mod tests {
             &self,
             locations: BoxStream<'static, object_store::Result<Path>>,
         ) -> BoxStream<'static, object_store::Result<Path>> {
+            if matches!(self.fault, Fault::DeleteDenied) {
+                use futures::StreamExt;
+                let struck = self.struck.clone();
+                return locations
+                    .map(move |location| {
+                        struck.fetch_add(1, Ordering::SeqCst);
+                        Err(object_store::Error::PermissionDenied {
+                            path: location?.to_string(),
+                            source: "403 This operation is not permitted on an immutable \
+                                     container"
+                                .into(),
+                        })
+                    })
+                    .boxed();
+            }
             self.inner.delete_stream(locations)
         }
 
@@ -1416,6 +1522,49 @@ mod tests {
         ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
         }
+    }
+
+    fn is_checkpoint(location: &Path) -> bool {
+        location.as_ref().contains(".checkpoint.")
+    }
+
+    fn checkpoint_refused() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "Azure",
+            source: "503 Server Busy, writing the checkpoint".into(),
+        }
+    }
+
+    /// Another engine's DELETE, as the commit at `location`: it removes, with `dataChange`,
+    /// every file the commit before it added.
+    async fn delete_of_previous(store: &dyn ObjectStore, location: &Path) -> String {
+        use deltalake::logstore::object_store::ObjectStoreExt;
+        let (dir, name) = location.as_ref().rsplit_once('/').unwrap();
+        let version: u64 = name.strip_suffix(".json").unwrap().parse().unwrap();
+        let previous = store
+            .get(&Path::from(format!("{dir}/{:020}.json", version - 1)))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let mut commit = serde_json::json!({"commitInfo": {
+            "timestamp": 1_700_000_000_000i64, "operation": "DELETE"
+        }})
+        .to_string();
+        for line in std::str::from_utf8(&previous).unwrap().lines() {
+            let line: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(add) = line.get("add") {
+                let remove = serde_json::json!({"remove": {
+                    "path": add["path"], "dataChange": true,
+                    "deletionTimestamp": 1_700_000_000_000i64
+                }});
+                commit.push('\n');
+                commit.push_str(&remove.to_string());
+            }
+        }
+        commit.push('\n');
+        commit
     }
 
     /// The commit file after the one at `location`.
@@ -1470,13 +1619,16 @@ mod tests {
             .unwrap();
         let store = plain.log_store();
         let struck = Arc::new(AtomicU32::new(0));
-        let flaky = deltalake::logstore::default_logstore(
+        let flaky = |inner| -> Arc<dyn ObjectStore> {
             Arc::new(FlakyCommits {
-                inner: store.object_store(None),
+                inner,
                 fault,
                 struck: struck.clone(),
-            }),
-            store.root_object_store(None),
+            })
+        };
+        let flaky = deltalake::logstore::default_logstore(
+            flaky(store.object_store(None)),
+            flaky(store.root_object_store(None)),
             store.config().location(),
             store.config().options(),
         );
@@ -1998,5 +2150,164 @@ mod tests {
         assert_eq!(dq.kafka_counters().conflict_retries(), 3);
         assert_eq!(e.kafka_class(), KafkaClass::Transient);
         assert_eq!(struck.load(Ordering::SeqCst), 4, "one rival per attempt");
+    }
+
+    async fn create_dq_with(path: &str, properties: &[(&str, &str)]) {
+        DeltaTable::try_from_url(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap()
+            .create()
+            .with_columns(columns())
+            .with_configuration(properties.iter().map(|(k, v)| (*k, Some(*v))))
+            .with_save_mode(SaveMode::ErrorIfExists)
+            .await
+            .unwrap();
+    }
+
+    /// The data-quality commit landed, then the checkpoint delta-rs writes after it failed, so
+    /// the write reported an error for a commit that is in the table. The write finds its own
+    /// commit by `ddi.kafka.dqWriteId` and is done: left to the pipeline's retry of the batch,
+    /// it would record every reject a second time, in a process that never crashed.
+    #[tokio::test]
+    async fn dq_commit_that_landed_before_its_checkpoint_failed_is_not_written_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq_with(path, &[("delta.checkpointInterval", "2")]).await;
+        let mut dq = open_dq(path).await;
+        let struck = with_fault(&mut dq, Fault::CheckpointFails).await;
+
+        let batch = [undecodable(0, &[3, 7], MALFORMED), uncoordinated(&[1])];
+        assert_eq!(
+            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
+                .await
+                .unwrap(),
+            3
+        );
+        assert!(
+            struck.load(Ordering::SeqCst) >= 1,
+            "the checkpoint after commit 1 failed"
+        );
+        assert!(!dir
+            .path()
+            .join("_delta_log")
+            .join(format!("{:020}.checkpoint.parquet", 1))
+            .exists());
+        assert_eq!(recorded(path).await.len(), 3, "each reject once");
+
+        // The next batch is written on the table as it is now.
+        let next = [undecodable(0, &[12], MALFORMED)];
+        assert_eq!(
+            dq.write_kafka(&next, &read(&[(0, (10, 12))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(recorded(path).await.len(), 4);
+    }
+
+    /// The commit's PUT landed, its response was lost, and the store's retries ended in an
+    /// error rather than in finding the commit there: the write reports a store fault for a
+    /// commit that is in the table, and finds it.
+    #[tokio::test]
+    async fn dq_commit_that_landed_before_a_store_error_is_not_written_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+        let struck = with_fault(&mut dq, Fault::LandsThenFails).await;
+
+        let batch = [undecodable(0, &[3, 7], MALFORMED), uncoordinated(&[1])];
+        assert_eq!(
+            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(struck.load(Ordering::SeqCst), 1);
+        assert_eq!(recorded(path).await.len(), 3, "each reject once");
+        assert_eq!(dq.kafka_counters().conflict_retries(), 0);
+    }
+
+    /// A Kafka data-quality commit cleans up the log only when it also checkpoints, as the
+    /// target's commits do (docs/kafka-design.md §7.2). Every other commit would list the
+    /// whole log after it lands, and where it may not delete (an immutable container) fail
+    /// after landing, every time. The one that checkpoints still does, and is found to have
+    /// landed.
+    #[tokio::test]
+    async fn dq_log_is_cleaned_up_only_by_a_commit_that_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq_with(
+            path,
+            &[
+                ("delta.checkpointInterval", "3"),
+                ("delta.logRetentionDuration", "interval 0 seconds"),
+            ],
+        )
+        .await;
+        let mut dq = open_dq(path).await;
+        let mut deletes = Vec::new();
+        for offset in [10, 20, 30, 40] {
+            // Every file before this commit is past the retention of 0 seconds.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let struck = with_fault(&mut dq, Fault::DeleteDenied).await;
+            let batch = [undecodable(0, &[offset], MALFORMED)];
+            assert_eq!(
+                dq.write_kafka(&batch, &read(&[(0, (offset, offset))]), NOW)
+                    .await
+                    .unwrap(),
+                1,
+                "offset {offset}"
+            );
+            deletes.push(struck.load(Ordering::SeqCst));
+        }
+        // Commit 2 checkpoints, and alone tries to delete what precedes it.
+        assert_eq!(deletes[0], 0, "{deletes:?}");
+        assert!(deletes[1] > 0, "{deletes:?}");
+        assert_eq!(&deletes[2..], &[0, 0], "{deletes:?}");
+        assert_eq!(
+            recorded(path).await.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![10, 20, 30, 40],
+            "each reject once"
+        );
+    }
+
+    /// A DELETE on the data-quality table conflicts with a concurrent Kafka append: delta-rs
+    /// counts a plain append as having read every file of its snapshot, so a winning remove
+    /// with `dataChange` of any of them is a conflict (docs/kafka-design.md §5.7 step 4). The
+    /// write tries again in place, on the table as it is, and records each reject once.
+    #[tokio::test]
+    async fn dq_a_delete_on_the_table_conflicts_with_an_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+        dq.write_kafka(
+            &[undecodable(0, &[3], MALFORMED)],
+            &read(&[(0, (3, 3))]),
+            NOW,
+        )
+        .await
+        .unwrap(); // 1
+        let struck = with_fault(&mut dq, Fault::RivalDeletesFirst).await;
+
+        let batch = [undecodable(0, &[7, 8], MALFORMED)];
+        assert_eq!(
+            dq.write_kafka(&batch, &read(&[(0, (7, 8))]), NOW)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(struck.load(Ordering::SeqCst), 1, "one DELETE won the race");
+        assert_eq!(
+            dq.kafka_counters().conflict_retries(),
+            1,
+            "it conflicted, once"
+        );
+        assert_eq!(
+            recorded(path).await.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![7, 8],
+            "the deleted row gone, the new ones once"
+        );
     }
 }

@@ -295,9 +295,11 @@ pub enum Error {
 
     /// A Kafka batch's rejects kept conflicting with other commits to its data-quality table,
     /// past the retries in place: another engine changing the table's metadata or protocol
-    /// each time, or more concurrent commits than delta-rs retries. Another member's rejects
-    /// are no conflict: both are plain appends. Nothing was written, and the batch is tried
-    /// again (docs/kafka-design.md §5.7).
+    /// each time; a DELETE, UPDATE or MERGE on it, whose removes (`dataChange: true`) conflict
+    /// with an append, which delta-rs counts as having read every file of its snapshot; or more
+    /// concurrent commits than delta-rs retries. Another member's rejects are no conflict:
+    /// both are plain appends. Nothing was written, and the batch is tried again
+    /// (docs/kafka-design.md §5.7).
     #[error(
         "cannot write {rows} rejected row(s) to the data-quality table {dq_uri:?}: the commit \
          conflicted with another, {attempts} times in a row ({detail}). The batch was not \
