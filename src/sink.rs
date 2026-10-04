@@ -542,7 +542,9 @@ pub struct KafkaOffsets {
     pub marks: BTreeMap<i32, MessageMark>,
     /// Whether this commit cleans up expired log files afterwards (§7.2).
     pub cleanup_logs: bool,
-    /// Whether this is the txn-only commit that records where a fresh app_id starts (§4.4).
+    /// Whether this is a txn-only baseline: the commit that records where a fresh app_id
+    /// starts, or the takeover baseline an open in kafka-delta-ingest's era commits
+    /// ([`crate::fence::takeover_baseline`], §4.4 step 8).
     pub baseline: bool,
     /// Why an operator moved these offsets by hand, when one did (§4.8).
     pub override_reason: Option<String>,
