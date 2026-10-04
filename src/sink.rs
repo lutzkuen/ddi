@@ -173,7 +173,26 @@ impl Sink {
         source_version: i64,
     ) -> Result<DeltaTable> {
         let props = self.properties(source_version);
+        let table = self.write(table, batches, props).await?;
+        debug!(
+            app_id = %self.app_id,
+            source_version,
+            target_version = ?table.version(),
+            "committed data + txn atomically"
+        );
+        Ok(table)
+    }
 
+    /// Append `batches` in one commit that carries `props`.
+    ///
+    /// Every append of ours goes through here, whatever its commit records, so that how the
+    /// rows are written cannot differ between one kind of commit and another.
+    async fn write(
+        &self,
+        table: DeltaTable,
+        batches: Vec<RecordBatch>,
+        props: CommitProperties,
+    ) -> Result<DeltaTable> {
         // The same runtime every other session in this process gets. A plain append has little
         // to spill today — an in-memory input, and no partition columns anywhere in this
         // tool's config — but delta-rs builds its own SessionState when it is not given one,
@@ -199,16 +218,9 @@ impl Sink {
             write = write.with_target_file_size(Some(size));
         }
 
-        let table = write
+        write
             .await
-            .map_err(|e| crate::spill::classify_delta(e, "append: writing the batch"))?;
-        debug!(
-            app_id = %self.app_id,
-            source_version,
-            target_version = ?table.version(),
-            "committed data + txn atomically"
-        );
-        Ok(table)
+            .map_err(|e| crate::spill::classify_delta(e, "append: writing the batch"))
     }
 
     /// Merge `batch` onto the keys it already has, and record `source_version`, atomically.
