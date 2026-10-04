@@ -1004,9 +1004,43 @@ fn valid_topic(t: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// A URI compared as the same table however it was written at its end.
-fn same_table(uri: &str) -> &str {
-    uri.trim().trim_end_matches('/')
+/// A table's URI as one string however it is spelt, for comparing targets: a local absolute
+/// path as its `file://` URL, the scheme and the host in lower case, runs of `/` in the path
+/// collapsed and a trailing one dropped. ddi's storage opens `/x`, `file:///x` and `/x//` as
+/// one table (deltalake's `ensure_table_uri`), so two entries writing them are two writers of
+/// one table. Pure string work, so `validate` reads nothing; the path keeps its case, as
+/// object stores and most file systems do.
+fn table_key(uri: &str) -> String {
+    let uri = uri.trim();
+    let (scheme, rest) = match uri.split_once("://") {
+        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
+        None => match uri.split_once(':') {
+            Some((scheme, path))
+                if scheme.eq_ignore_ascii_case("file") && path.starts_with('/') =>
+            {
+                ("file".to_string(), path)
+            }
+            _ if uri.starts_with('/') => ("file".to_string(), uri),
+            _ => return collapse_slashes(uri),
+        },
+    };
+    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    format!(
+        "{scheme}://{}{}",
+        host.to_ascii_lowercase(),
+        collapse_slashes(path)
+    )
+}
+
+/// `path` with every run of `/` made one, and none at the end.
+fn collapse_slashes(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c != '/' || !out.ends_with('/') {
+            out.push(c);
+        }
+    }
+    out.trim_end_matches('/').to_string()
 }
 
 /// The name a Kafka entry is reported under: its own, or its place in the file when it has
@@ -1067,6 +1101,24 @@ pub(super) fn conflicts(kafka: &[KafkaPipelineConfig], delta: &[PipelineConfig])
             .collect::<Vec<_>>()
             .join(", ")
     };
+    // One table as the entries `ix` wrote it: the first spelling, and any other one.
+    let spelt = |ix: &[usize], uri: &dyn Fn(&KafkaPipelineConfig) -> String| {
+        let mut seen: Vec<String> = Vec::new();
+        for &i in ix {
+            let u = uri(&kafka[i]);
+            if !seen.contains(&u) {
+                seen.push(u);
+            }
+        }
+        let others: Vec<String> = seen[1..].iter().map(|u| format!("{u:?}")).collect();
+        if others.is_empty() {
+            format!("{:?}", seen[0])
+        } else {
+            format!("{:?} (also written {})", seen[0], others.join(", "))
+        }
+    };
+    let target_of = |p: &KafkaPipelineConfig| p.target_uri.trim().to_string();
+    let dq_table_of = |p: &KafkaPipelineConfig| dq_of(&p.target_uri, &p.dq_uri).trim().to_string();
 
     // Rule 3: one namespace for both kinds.
     let mut by_name: BTreeMap<&str, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
@@ -1100,19 +1152,19 @@ pub(super) fn conflicts(kafka: &[KafkaPipelineConfig], delta: &[PipelineConfig])
     // Rule 4: an app_id is an offset key per table, so it may repeat across tables (kdi's
     // default `kafka_delta_ingest` usually does) but never within one, nor within one DQ table,
     // whose rows are told apart by it.
-    let mut by_target_app: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
+    let mut by_target_app: BTreeMap<(String, &str), Vec<usize>> = BTreeMap::new();
     let mut by_dq_app: BTreeMap<(String, &str), Vec<usize>> = BTreeMap::new();
-    let mut by_target_topic: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
+    let mut by_target_topic: BTreeMap<(String, &str), Vec<usize>> = BTreeMap::new();
     let mut by_group: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, p) in kafka.iter().enumerate().filter(|(_, p)| comparable(p)) {
-        let target = same_table(&p.target_uri);
+        let target = table_key(&p.target_uri);
         let app = p.app_id.trim();
-        by_target_app.entry((target, app)).or_default().push(i);
+        by_target_app
+            .entry((target.clone(), app))
+            .or_default()
+            .push(i);
         by_dq_app
-            .entry((
-                same_table(&dq_of(&p.target_uri, &p.dq_uri)).to_string(),
-                app,
-            ))
+            .entry((table_key(&dq_of(&p.target_uri, &p.dq_uri)), app))
             .or_default()
             .push(i);
         by_target_topic
@@ -1121,32 +1173,34 @@ pub(super) fn conflicts(kafka: &[KafkaPipelineConfig], delta: &[PipelineConfig])
             .push(i);
         by_group.entry(group_of(p)).or_default().push(i);
     }
-    for ((target, app), ix) in &by_target_app {
+    for ((_, app), ix) in &by_target_app {
         if ix.len() > 1 {
             for &i in ix {
                 condemn(
                     i,
                     format!(
-                        "Kafka pipelines {} all write {target:?} under app_id {app:?}. Their \
+                        "Kafka pipelines {} all write {} under app_id {app:?}. Their \
                          offsets are txns `{app}-<partition>` in that table's log, so they \
                          would overwrite each other's; all of them are held back. Give each \
                          its own app_id.",
-                        names(ix)
+                        names(ix),
+                        spelt(ix, &target_of)
                     ),
                 );
             }
         }
     }
-    for ((dq, app), ix) in &by_dq_app {
+    for ((_, app), ix) in &by_dq_app {
         if ix.len() > 1 {
             for &i in ix {
                 condemn(
                     i,
                     format!(
-                        "Kafka pipelines {} all record rejects in {dq:?} under app_id {app:?}, \
+                        "Kafka pipelines {} all record rejects in {} under app_id {app:?}, \
                          where nothing would tell their rows apart; all of them are held back. \
                          Give each its own app_id or dq_uri.",
-                        names(ix)
+                        names(ix),
+                        spelt(ix, &dq_table_of)
                     ),
                 );
             }
@@ -1154,16 +1208,17 @@ pub(super) fn conflicts(kafka: &[KafkaPipelineConfig], delta: &[PipelineConfig])
     }
 
     // Rule 5: one topic read twice into one table is every row twice.
-    for ((target, topic), ix) in &by_target_topic {
+    for ((_, topic), ix) in &by_target_topic {
         if ix.len() > 1 {
             for &i in ix {
                 condemn(
                     i,
                     format!(
-                        "Kafka pipelines {} all read topic {topic:?} into {target:?}, which \
+                        "Kafka pipelines {} all read topic {topic:?} into {}, which \
                          would write every message once per pipeline; all of them are held \
                          back.",
-                        names(ix)
+                        names(ix),
+                        spelt(ix, &target_of)
                     ),
                 );
             }
@@ -1174,10 +1229,10 @@ pub(super) fn conflicts(kafka: &[KafkaPipelineConfig], delta: &[PipelineConfig])
     // `x-0` would be Kafka app_id `x`'s partition 0 in a shared target, and in a shared DQ
     // table Delta's equality rule would take a Kafka reject for one of its own.
     for (i, p) in kafka.iter().enumerate().filter(|(_, p)| comparable(p)) {
-        let target = same_table(&p.target_uri);
+        let target = p.target_uri.trim();
         let dq = dq_of(&p.target_uri, &p.dq_uri);
         for (j, d) in delta.iter().enumerate() {
-            if same_table(&d.target_uri) == target {
+            if table_key(&d.target_uri) == table_key(target) {
                 let reason = format!(
                     "Kafka pipeline {:?} and pipeline {:?} both write {target:?}. A Delta \
                      pipeline's offset txn `<app_id>` and a Kafka pipeline's \
@@ -1189,7 +1244,7 @@ pub(super) fn conflicts(kafka: &[KafkaPipelineConfig], delta: &[PipelineConfig])
                 condemn(i, reason.clone());
                 out.delta.push((j, reason));
             } else if d.app_id.trim() == p.app_id.trim()
-                && same_table(&dq_of(&d.target_uri, &d.dq_uri)) == same_table(&dq)
+                && table_key(&dq_of(&d.target_uri, &d.dq_uri)) == table_key(&dq)
             {
                 let reason = format!(
                     "Kafka pipeline {:?} and pipeline {:?} both record rejects in {:?} under \
@@ -1198,7 +1253,7 @@ pub(super) fn conflicts(kafka: &[KafkaPipelineConfig], delta: &[PipelineConfig])
                      held back. Give each its own app_id or dq_uri.",
                     display_name(i, p),
                     d.name,
-                    same_table(&dq),
+                    dq.trim(),
                     p.app_id.trim()
                 );
                 condemn(i, reason.clone());
@@ -3018,6 +3073,59 @@ url = "http://my-sr:8081"
                 assert!(reason.contains(key), "{written}: {reason}");
             }
         }
+    }
+
+    #[test]
+    fn one_table_under_two_spellings_is_one_target() {
+        let two = |a: &str, b: &str, app_b: &str, topic_b: &str| {
+            resolve(&format!(
+                "{SECTION}{}{}",
+                entry("a", "").replace("/tmp/bronze/a", a),
+                entry("b", "")
+                    .replace("/tmp/bronze/b", b)
+                    .replace("kafka_delta_ingest", app_b)
+                    .replace("topic-b", topic_b)
+            ))
+        };
+        // ddi's storage opens each pair as one table (deltalake's ensure_table_uri).
+        for (a, b) in [
+            ("/tmp/bronze/x", "file:///tmp/bronze/x"),
+            ("/tmp/bronze/x", "/tmp//bronze/x/"),
+            ("/tmp/bronze/x", "file:/tmp/bronze/x"),
+            ("file:///tmp/bronze/x", "FILE:///tmp/bronze/x"),
+            (
+                "abfss://lake@acct.dfs.core.windows.net/bronze/x",
+                "ABFSS://lake@ACCT.dfs.core.windows.net//bronze/x",
+            ),
+        ] {
+            // Rule 5: one topic into one table, under two app_ids.
+            let r = two(a, b, "other_app", "topic-a");
+            let reason = held(&r, "b");
+            assert!(
+                reason.contains("every message once per pipeline"),
+                "{a} / {b}: {r:?}"
+            );
+            assert!(
+                reason.contains(&format!("{a:?} (also written {b:?})")),
+                "both spellings: {reason}"
+            );
+            // Rule 4: one app_id in one table, from two topics.
+            let r = two(a, b, "kafka_delta_ingest", "topic-b");
+            assert!(
+                held(&r, "b").contains("would overwrite each other's"),
+                "{a} / {b}: {r:?}"
+            );
+        }
+        // And against a Delta pipeline.
+        let r = resolve(&format!(
+            "{DELTA}{SECTION}{}",
+            entry("events", "").replace("/tmp/bronze/events", "file:///tmp/silver/orders/")
+        ));
+        assert!(held(&r, "orders").contains("both write"), "{r:?}");
+        assert!(held(&r, "events").contains("both write"), "{r:?}");
+        // A path's case is the table's: these are two.
+        let r = two("/tmp/bronze/x", "/tmp/bronze/X", "other_app", "topic-a");
+        assert_eq!(running(&r), ["a", "b"], "{r:?}");
     }
 
     /// [`librdkafka_property`] against librdkafka itself: a value set under one name is what
