@@ -411,6 +411,26 @@ pub enum Error {
     Other(String),
 }
 
+impl Error {
+    /// Whether this ran out of capacity: a [`Self::Capacity`], or one beneath a
+    /// [`Self::DataQualityWrite`].
+    ///
+    /// The wrapper says which table failed, and that the target needs no replan; whether to
+    /// wait the full backoff and raise the capacity gauge is its cause's to say
+    /// (docs/kafka-design.md §3.6). Matching `Error::Capacity(_)` at the top, as `drive` in
+    /// main.rs and the metrics do for a Delta pipeline, misses a Kafka pipeline's
+    /// data-quality write that ran out. Only capacity is read through the wrapper here: the
+    /// other causes beneath it are classified apart from the same errors raised by the
+    /// target, an `OffsetLogTruncated` above all.
+    pub fn is_capacity(&self) -> bool {
+        match self {
+            Error::Capacity(_) => true,
+            Error::DataQualityWrite { source, .. } => source.is_capacity(),
+            _ => false,
+        }
+    }
+}
+
 impl From<deltalake::datafusion::error::DataFusionError> for Error {
     /// Not every DataFusion error is a fact about the data.
     ///
@@ -474,6 +494,41 @@ mod tests {
             m.contains("offset 9 where this writer expected none"),
             "{m}"
         );
+    }
+
+    /// A Kafka data-quality write that ran out of capacity is a `Capacity` beneath a
+    /// `DataQualityWrite`, which matching the variant at the top misses (main.rs's `RETRY_MAX`
+    /// and the capacity gauge do just that). Nothing else beneath one is capacity, nor is a
+    /// conflict past the retries in place.
+    #[test]
+    fn a_capacity_failure_beneath_a_data_quality_write_is_capacity() {
+        let beneath = |cause: Error| Error::DataQualityWrite {
+            dq_uri: "/lake/orders__ddi_dq".into(),
+            rows: 3,
+            source: Box::new(cause),
+        };
+        let wrapped = beneath(Error::Capacity("the spill directory is full".into()));
+        assert!(!matches!(wrapped, Error::Capacity(_)));
+        assert!(wrapped.is_capacity());
+        assert!(beneath(beneath(Error::Capacity("full".into()))).is_capacity());
+        assert!(Error::Capacity("full".into()).is_capacity());
+
+        for not in [
+            beneath(Error::OffsetLogTruncated {
+                table_uri: "file:///lake/orders__ddi_dq/".into(),
+                version: 4,
+            }),
+            beneath(Error::Other("internal".into())),
+            Error::DataQualityConflict {
+                dq_uri: "/lake/orders__ddi_dq".into(),
+                rows: 3,
+                attempts: 4,
+                detail: "conflict".into(),
+            },
+            Error::Transform("no such column".into()),
+        ] {
+            assert!(!not.is_capacity(), "{not:?}");
+        }
     }
 
     #[test]

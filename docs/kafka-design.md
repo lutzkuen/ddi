@@ -680,11 +680,25 @@ The flush runs outside the callback while librdkafka holds our rejoin. The time 
 | Class | Errors | Handling |
 |---|---|---|
 | **Replan** | `CommitConflict(_)`, `VersionAlreadyExists`, `MaxCommitAttempts`, foreign checkpoint (pipeline.rs:1382-1403, 1521), a commit file missing during the conflict check (cleaned log, EO-m8) or during `read_txns`' walk (`OffsetLogTruncated`), `Fenced` | `reset_in_place`; the batch is retained when still valid |
-| **Transient** | Object store errors (5xx, 429, timeouts, IO); SR 5xx/429/network after its own 3 tries; a DQ commit conflict after 3 in-place tries (`DataQualityConflict`); `DataQualityWrite` whose cause is any of these, or an `OffsetLogTruncated` of the DQ handle (which `write_kafka` has already reopened: never a Replan of the target); librdkafka transport errors | Hold the batch, pause all, back off 1 s → 60 s, stay in the group. `ddi_kafka_retrying = 1`. Never escalates by itself: an outage that hits one member usually hits all, and leaving the group would only add rebalances. |
+| **Transient** | Object store errors (5xx, 429, timeouts, IO); SR 5xx/429/network after its own 3 tries; a DQ commit conflict after 3 in-place tries (`DataQualityConflict`); `DataQualityWrite` whose cause is Transient below; librdkafka transport errors | Hold the batch, pause all, back off 1 s → 60 s, stay in the group. `ddi_kafka_retrying = 1`. Never escalates by itself: an outage that hits one member usually hits all, and leaving the group would only add rebalances. |
 | **Blocking, one partition** | `KafkaOffsetsUnavailable{p, wanted, low}`, `KafkaOffsetsRegressed{p, stored, high}`, `KafkaTopicReplaced{p}` | Pause **that** partition; it keeps being re-asserted at its unchanged base, and the others continue. Gauge `ddi_kafka_blocked_partitions`, plus the per-cause gauges. Re-checked every `blocked_recheck_secs`: refresh, `read_txns` for it, watermarks; it resumes as soon as an operator's `set-offsets` makes it resolvable. |
-| **Blocking, pipeline** | `KafkaOffsetMissing{p}` (§4.4: a commit would replace the evidence it rests on), `KafkaUndecodable` (no DQ table), undecodables above the cap, `KafkaSchemaConflict` (§5.5), `KafkaMetadataCollision` (§6.1), a DQ table that is missing or has the wrong schema (a `DataQualityWrite` whose cause is delta-rs's schema or protocol error), `TargetProtocolUnsupported`, `TargetReplaced`, `KafkaTxnRetention` | Pause all owned partitions, gauge, keep polling (stay in the group), re-check every `blocked_recheck_secs` (re-open the DQ table, re-check the protocol). `TargetReplaced` clears only on restart, where the new table is treated as fresh. |
+| **Blocking, pipeline** | `KafkaOffsetMissing{p}` (§4.4: a commit would replace the evidence it rests on), `KafkaUndecodable` (no DQ table), undecodables above the cap, `KafkaSchemaConflict` (§5.5), `KafkaMetadataCollision` (§6.1), a DQ table that is missing at open, or has the wrong schema or protocol (a `DataQualityWrite` whose cause is Blocking below), `TargetProtocolUnsupported`, `TargetReplaced`, `KafkaTxnRetention` | Pause all owned partitions, gauge, keep polling (stay in the group), re-check every `blocked_recheck_secs` (re-open the DQ table, re-check the protocol). `TargetReplaced` clears only on restart, where the new table is treated as fresh. |
 | **Open-time refusal** | `KafkaAppIdUnknown` (typo guard), `KafkaCompatUnset`, `KafkaPartitionColumnUnmapped`, `KafkaStartingOffsetsIncomplete`, `KafkaTxnRetention` at open | Raised before subscribing or assigning, so no group is joined. `RETRY_MAX` backoff with the gauge. |
 | **Consumer-fatal** | librdkafka fatal error (incl. `FENCED_INSTANCE_ID`), `Event::Fatal`, SASL authentication failure, topic/group authorisation failure, unknown topic, internal invariant violations | `Err` → supervisor: close the consumer on a detached thread, back off (`RETRY_MAX` for config-class), reopen |
+
+**`DataQualityWrite` is classified by its cause**, which `write_kafka` types beneath it as it was raised (§5.7 step 5), and never as a failure of the target: the same error raised by the target can be in another class. M3's classifier therefore looks beneath the wrapper, by variant, never by text:
+
+| Cause beneath `DataQualityWrite` | Class |
+|---|---|
+| `Delta(ObjectStore{..})`, `Delta(Io{..})`, `Delta(Transaction{source: TransactionError::ObjectStore{..} \| LogStoreError{..}})`: the store failed | Transient |
+| `OffsetLogTruncated`: log cleanup ran under the DQ handle, which `write_kafka` has already reopened | Transient, never a Replan of the target |
+| `Config`: the reopen after a conflict failed. `Storage::open` folds a store outage and a table removed while running into the same variant, and each retry reopens | Transient |
+| `Delta(Transaction{source: TransactionError::UnsupportedTableFeatures(_) \| TableFeaturesRequired(_)})`: the DQ table's protocol, or a table that is no DQ table and lacks the features its columns need; `Delta(Arrow{..})` or `Delta(SchemaMismatch{..})`: the rejects do not fit its schema (a field count, a cast) | Blocking, pipeline: retrying the same write cannot help until someone changes the table |
+| `Capacity` | Capacity: the full `RETRY_MAX` backoff and the `ddi_capacity_exhausted` gauge, as for a Delta pipeline. `drive` (main.rs:831-838) and `observe_error` (metrics.rs:273) match `Error::Capacity` at the top, which misses this one: M3 switches both to `Error::is_capacity()`, which looks beneath the wrapper |
+| `Other`: an internal invariant (an unreadable commit of the DQ log, a batch that cannot be assembled) | Consumer-fatal, as every internal error |
+| any other `Delta(_)` | Transient: retried, and visible as `ddi_kafka_retrying` while it lasts |
+
+The variants are pinned by `dq_write_failures_are_typed` and `dq_store_fault_is_typed`, so a delta-rs bump that changes them fails CI.
 
 **`AutoOffsetReset` (-140)** carries no partition (§0.3.20). The handling (EO-m4):
 1. Fetch watermarks for the owned Ready partitions. An offender is one with `next_expected < low`.
@@ -1169,7 +1183,7 @@ They travel as `Batch.rejects` and are written **before** the target commit (pip
 4. **On `ConcurrentTransaction`, `VersionAlreadyExists` or `MaxCommitAttempts`:** refresh the DQ handle, then look for this write's own commit among those that landed since its read version. Every Kafka DQ commit records `ddi.kafka.dqWriteId`, unique to its `write_kafka` call.
    - Found: the commit landed and the acknowledgement of its PUT was lost; the retried PUT met it (§4.7 row 3). The write is done. Writing again would duplicate every reject that is never skipped, without any crash.
    - Not found (a zombie or a handover): go back to step 1, up to 3 times; then `DataQualityConflict`, Transient. A DQ conflict is never a supervisor error.
-5. **Any other failure** is `DataQualityWrite { dq_uri, rows, source }`, with the cause typed beneath it as it was raised (delta-rs's error, `Capacity`, `OffsetLogTruncated`), so §3.6 classifies it without reading text, and never as a failure of the target.
+5. **Any other failure** is `DataQualityWrite { dq_uri, rows, source }`, with the cause typed beneath it as it was raised (delta-rs's error, `Capacity`, `OffsetLogTruncated`, the `Config` of a failed reopen, or `Other` for an internal fault), so §3.6 classifies it by the cause's variant without reading text (its table of causes), and never as a failure of the target.
 
 Why this is safe: Kafka offsets identify one message per topic incarnation, and incarnations are checked by §4.4. `set-offsets` moves the DQ marks with the target txns, and records no decoder, so its marks skip nothing. Whether a message decodes depends only on its bytes, its writer schema and the decoder build; a replay cannot change the first two, and step 2 skips only under a mark the same decoder set, which by step 3 stands for offsets that decoder judged in a commit that landed. A replay starts at the target's offset + 1, never below the first offset of a batch whose DQ commit landed before it, so every offset it skips was judged by that commit. So a skipped reject is always already in the table (I9). Delta pipelines keep `write`'s equality rule unchanged.
 
@@ -1428,6 +1442,7 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
   - `dq_only_an_undecodable_is_skipped_by_the_mark`, `dq_coordinates_outside_the_batch_are_none`, `dq_mark_never_moves_back`, `dq_txn_retention_on_the_data_quality_table_is_not_refused`;
   - `dq_commit_that_landed_unacknowledged_is_not_written_twice`, `dq_write_failures_are_typed`, `dq_store_fault_is_typed`, `dq_conflict_past_the_retries_in_place_is_typed`;
   - `dq_same_decoder_skips_by_its_mark`, `dq_a_mark_another_decoder_set_does_not_skip`, `dq_a_mark_answered_by_a_checkpoint_does_not_skip`.
+- Errors: `a_capacity_failure_beneath_a_data_quality_write_is_capacity` (`Error::is_capacity`, §3.6).
 
 **M1, config:**
 - every §2.5 rule;

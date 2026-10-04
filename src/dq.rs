@@ -2115,36 +2115,108 @@ mod tests {
     /// its text (docs/kafka-design.md §3.6): a failed write with what failed typed beneath
     /// it, or a conflict that outlasted the retries. Never a bare cause, which would read as
     /// the target's: a log cleaned up under a stale data-quality handle is
-    /// `OffsetLogTruncated` beneath, which on its own would replan the target.
+    /// `OffsetLogTruncated` beneath, which on its own would replan the target. A table the
+    /// rejects cannot be written to is delta-rs's protocol or Arrow error beneath, the variants
+    /// §3.6 classifies as Blocking.
     #[tokio::test]
     async fn dq_write_failures_are_typed() {
         let dir = tempfile::tempdir().unwrap();
+        let create_with = |path: &str, columns: Vec<StructField>| {
+            let url = deltalake::ensure_table_uri(path).unwrap();
+            async move {
+                DeltaTable::try_from_url(url)
+                    .await
+                    .unwrap()
+                    .create()
+                    .with_columns(columns)
+                    .with_save_mode(SaveMode::ErrorIfExists)
+                    .await
+                    .unwrap();
+            }
+        };
+        let fail = |path: &str| {
+            let path = path.to_string();
+            async move {
+                open_dq(&path)
+                    .await
+                    .write_kafka(
+                        &[undecodable(0, &[3], MALFORMED)],
+                        &read(&[(0, (0, 9))]),
+                        NOW,
+                    )
+                    .await
+                    .unwrap_err()
+            }
+        };
+        let transaction = |e: &Error| match cause(e) {
+            Error::Delta(DeltaTableError::Transaction { source }) => Some(source.to_string()),
+            _ => None,
+        };
 
-        // A table that is not a data-quality table.
+        // A table that is not a data-quality table: it lacks even the feature the rejects'
+        // timestamp column needs.
         let wrong = dir.path().join("wrong");
         let wrong = wrong.to_str().unwrap();
-        DeltaTable::try_from_url(deltalake::ensure_table_uri(wrong).unwrap())
-            .await
-            .unwrap()
-            .create()
-            .with_columns(vec![StructField::new(
+        create_with(
+            wrong,
+            vec![StructField::new(
                 "x",
                 DeltaType::Primitive(PrimitiveType::Long),
                 true,
-            )])
-            .with_save_mode(SaveMode::ErrorIfExists)
-            .await
-            .unwrap();
-        let e = open_dq(wrong)
-            .await
-            .write_kafka(
-                &[undecodable(0, &[3], MALFORMED)],
-                &read(&[(0, (0, 9))]),
-                NOW,
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(cause(&e), Error::Delta(_)), "{e:?}");
+            )],
+        )
+        .await;
+        let e = fail(wrong).await;
+        assert!(
+            matches!(
+                cause(&e),
+                Error::Delta(DeltaTableError::Transaction {
+                    source: TransactionError::TableFeaturesRequired(_)
+                })
+            ),
+            "{e:?} {:?}",
+            transaction(&e)
+        );
+
+        // A data-quality table with a column the rejects do not have.
+        let extra = dir.path().join("extra");
+        let extra = extra.to_str().unwrap();
+        let mut with_extra = columns();
+        with_extra.push(StructField::new(
+            "extra",
+            DeltaType::Primitive(PrimitiveType::Long),
+            false,
+        ));
+        create_with(extra, with_extra).await;
+        let e = fail(extra).await;
+        assert!(
+            matches!(cause(&e), Error::Delta(DeltaTableError::Arrow { .. })),
+            "{e:?}"
+        );
+
+        // A data-quality table another engine upgraded to a writer feature delta-rs does not
+        // write.
+        let upgraded = dir.path().join("upgraded");
+        let upgraded = upgraded.to_str().unwrap();
+        create_dq(upgraded).await;
+        std::fs::write(
+            format!("{upgraded}/_delta_log/00000000000000000001.json"),
+            "{\"commitInfo\":{\"timestamp\":1700000000000,\"operation\":\"UPGRADE PROTOCOL\"}}\n\
+             {\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\
+             \"readerFeatures\":[\"timestampNtz\"],\
+             \"writerFeatures\":[\"timestampNtz\",\"identityColumns\"]}}\n",
+        )
+        .unwrap();
+        let e = fail(upgraded).await;
+        assert!(
+            matches!(
+                cause(&e),
+                Error::Delta(DeltaTableError::Transaction {
+                    source: TransactionError::UnsupportedTableFeatures(_)
+                })
+            ),
+            "{e:?}"
+        );
 
         // A data-quality handle that log cleanup left behind.
         let path = dir.path().join("dq");
@@ -2225,7 +2297,11 @@ mod tests {
             matches!(e, Error::DataQualityWrite { rows: 1, .. }),
             "{e:?}"
         );
-        assert!(matches!(cause(&e), Error::Delta(_)), "{e:?}");
+        // The variant §3.6 classifies as Transient.
+        assert!(
+            matches!(cause(&e), Error::Delta(DeltaTableError::ObjectStore { .. })),
+            "{e:?}"
+        );
     }
 
     /// A rival that commits the same partition's mark first, every time: the retries in place
