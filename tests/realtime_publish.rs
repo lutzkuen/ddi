@@ -259,6 +259,78 @@ async fn a_fully_filtered_batch_still_publishes_so_the_chain_has_no_hole() {
     );
 }
 
+/// A batch that reads two source commits, published as the range they span: from where the
+/// stream stood before the batch, through its last commit. A batch of one commit cannot pin
+/// that, because its first commit is its last, and the tests above only compare one message
+/// with the one before it.
+#[tokio::test]
+async fn a_batch_of_several_source_commits_publishes_where_it_started() {
+    let f = Fixture::new().await;
+    append(&f.source, &[1]).await;
+    append(&f.source, &[2]).await;
+
+    let hub = FakeHub::start(HubBehaviour::Accept).await;
+    let mut p = Pipeline::open(publishing_cfg(&f, "copy", &hub, 5))
+        .await
+        .unwrap();
+    let started_at = p.cursor();
+    let outcome = p.step().await.unwrap();
+    let StepOutcome::Progressed {
+        through_version, ..
+    } = outcome
+    else {
+        panic!("expected a commit, got {outcome:?}");
+    };
+    let ended_at = p.cursor();
+    assert_eq!(p.step().await.unwrap(), StepOutcome::CaughtUp, "one batch");
+    assert_publishes_its_range(&hub, started_at.version, through_version, ended_at.version);
+}
+
+/// The same for a batch the transform filters out entirely, which publishes from the
+/// zero-row commit's own call: the two calls are separate expressions, so each is pinned.
+#[tokio::test]
+async fn a_fully_filtered_batch_of_several_source_commits_publishes_where_it_started() {
+    let f = Fixture::new().await;
+    append(&f.source, &[1]).await;
+    append(&f.source, &[2]).await;
+
+    let hub = FakeHub::start(HubBehaviour::Accept).await;
+    let mut cfg = publishing_cfg(&f, "copy", &hub, 5);
+    cfg.transform_sql = Some("SELECT id, name FROM source WHERE id < 0".into());
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    let started_at = p.cursor();
+    let outcome = p.step().await.unwrap();
+    let StepOutcome::Skipped {
+        through_version, ..
+    } = outcome
+    else {
+        panic!("expected a batch that commits no rows, got {outcome:?}");
+    };
+    let ended_at = p.cursor();
+    assert_eq!(p.step().await.unwrap(), StepOutcome::CaughtUp, "one batch");
+    assert_publishes_its_range(&hub, started_at.version, through_version, ended_at.version);
+}
+
+/// The one message `hub` received runs from `from`, the version the stream stood at before
+/// the batch, through `through`, its last commit — and neither end is the version the
+/// stream stands at after it.
+fn assert_publishes_its_range(hub: &FakeHub, from: u64, through: u64, after: u64) {
+    assert!(
+        from != through && from != after && through != after,
+        "the batch must span commits for the three to differ: {from}, {through}, {after}"
+    );
+    let envelopes = hub.envelopes();
+    assert_eq!(envelopes.len(), 1, "{envelopes:?}");
+    assert_eq!(
+        (
+            envelopes[0].from_source_version,
+            envelopes[0].source_version
+        ),
+        (from, through),
+        "the range the batch read"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC6 — a publisher failure cannot invalidate or roll back a commit.
 
