@@ -1220,6 +1220,44 @@ mod tests {
         assert_eq!(dq.kafka_counters().rows_skipped(), 1);
     }
 
+    /// A batch that read below a partition's mark leaves the mark where it is. A zombie that
+    /// recorded up to 8, then the new owner's batch up to 5: moved back to 5, the mark would
+    /// let a later replay up to 8 record the rejects above 5 again. The lower batch has to
+    /// commit for the mark to move at all, which only a reject that is never skipped makes it
+    /// do.
+    #[tokio::test]
+    async fn dq_mark_never_moves_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+
+        let upper = [undecodable(0, &[7], MALFORMED)];
+        assert_eq!(
+            dq.write_kafka(&upper, &read(&[(0, (0, 8))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(txn(path, "app.dq-0").await, Some(8));
+
+        let lower = [uncoordinated(&[1])];
+        assert_eq!(
+            dq.write_kafka(&lower, &read(&[(0, (0, 5))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(txn(path, "app.dq-0").await, Some(8), "max(8, 5)");
+        assert_eq!(
+            dq.write_kafka(&upper, &read(&[(0, (6, 8))]), NOW)
+                .await
+                .unwrap(),
+            0,
+            "the replay of offset 7 is still covered"
+        );
+    }
+
     #[test]
     fn only_an_undecodable_is_rejected_again_on_every_replay() {
         assert!(rejected_again_on_a_replay(MALFORMED));
