@@ -8,14 +8,20 @@
 //! give a zero-row commit a file, and stay green. This file records every `_delta_log/*.json`
 //! of the target and its data-quality table, and compares them with tests/golden/delta_commit/.
 //!
-//! Six shapes, one test each:
+//! Seven shapes, one test each:
 //! - a plain append;
 //! - a batch whose every row is rejected, with a data-quality table: a zero-row commit that
 //!   carries the offset, after the data-quality table's own commit;
 //! - an upsert: a merge that inserts, then one that updates and inserts;
 //! - an upsert whose merge changes nothing, which falls back to the zero-row commit;
 //! - an append to a target partitioned by a string column;
-//! - the same partitioned target with a batch whose every row is rejected.
+//! - the same partitioned target with a batch whose every row is rejected;
+//! - a coverage window: zero-row commits that record the window (`ddi.cutoff.*`), then the
+//!   commit that closes it and records none.
+//!
+//! The first six are the ones docs/kafka-design.md §1.3 names. The coverage window was added
+//! after the refactor, from a golden file the code before it wrote, and passes unchanged
+//! after it.
 //!
 //! # What is compared
 //!
@@ -221,6 +227,38 @@ impl Lake {
             .unwrap();
     }
 
+    /// What a batch job that loaded the target before the pipeline first ran leaves there:
+    /// the same orders, written straight to silver.
+    async fn fill_target(&self, rows: &[Row]) {
+        let batch = RecordBatch::try_new(
+            stg_schema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter()
+                        .map(|r| r.2.parse::<i64>().unwrap())
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(
+                    rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        open_table(ensure_table_uri(&self.stg).unwrap())
+            .await
+            .unwrap()
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+    }
+
     /// No transform: the coercer is what casts `amount`, and what rejects a row that will
     /// not cast.
     fn cfg(&self) -> ResolvedPipeline {
@@ -368,6 +406,58 @@ async fn all_rejected_on_a_partitioned_target() {
         .await;
     assert_eq!(lake.stream(lake.cfg()).await, 1);
     lake.check("partitioned_all_rejected");
+}
+
+#[tokio::test]
+async fn bootstrap_window() {
+    // A target a batch job loaded before the pipeline first ran. The pipeline opens a
+    // coverage window and drops what the target already holds, one source commit per batch,
+    // until it has read to the source head it opened against. Each commit inside the window
+    // records it, so that a reopen part-way carries on filtering; the commit that closes it
+    // records nothing.
+    let lake = Lake::new(PLAIN).await;
+    let loaded = [
+        (1, "eu", "100", 10),
+        (2, "us", "200", 11),
+        (3, "eu", "300", 12),
+    ];
+    lake.fill_target(&loaded).await;
+    lake.arrive(&loaded[..2]).await;
+    lake.arrive(&loaded[2..]).await;
+    lake.arrive(&[(4, "us", "400", 13)]).await;
+
+    let mut cfg = lake.cfg();
+    cfg.dedup_timestamp = Some(DEFAULT_TIMESTAMP_COLUMN.to_string());
+    cfg.dedup_key = Some("order_id".to_string());
+    cfg.max_files_per_batch = 1;
+    let mut p = Pipeline::open(cfg).await.unwrap();
+    assert!(p.coverage().is_some(), "a first start on a loaded target");
+    for covered in [2, 1] {
+        let step = p.step().await.unwrap();
+        assert!(
+            matches!(step, StepOutcome::Skipped { covered: c, .. } if c == covered),
+            "a batch the target holds already: {step:?}"
+        );
+    }
+    let closing = p.step().await.unwrap();
+    assert!(
+        matches!(
+            closing,
+            StepOutcome::Progressed {
+                rows: 1,
+                covered: 0,
+                ..
+            }
+        ),
+        "{closing:?}"
+    );
+    assert_eq!(
+        p.coverage(),
+        None,
+        "closed by the batch that read to its head"
+    );
+    assert_eq!(p.step().await.unwrap(), StepOutcome::CaughtUp);
+    lake.check("bootstrap_window");
 }
 
 // ---------------------------------------------------------------- reading the log
