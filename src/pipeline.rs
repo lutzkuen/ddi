@@ -316,6 +316,15 @@ impl Position {
 impl Pipeline {
     /// Open both tables, resolve the resume point, and prepare the loop.
     pub async fn open(cfg: ResolvedPipeline) -> Result<Self> {
+        // `kafka://<topic>` is not a table. The Kafka source arrives in M3 of
+        // docs/kafka-design.md; until then nothing opens one, and `ddi` holds them back first.
+        if cfg.kafka.is_some() {
+            return Err(Error::Config(format!(
+                "pipeline {:?} reads a Kafka topic, and this version of ddi cannot run a Kafka \
+                 source yet",
+                cfg.name
+            )));
+        }
         let source = cfg
             .storage
             .open(&cfg.source_uri)

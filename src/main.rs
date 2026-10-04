@@ -194,8 +194,13 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
     // other two hundred and ninety-nine off the air. What cannot run is named, counted and
     // exported; what can, runs.
     let resolved = cfg.resolve_all()?;
-    let rejected = resolved.rejected;
-    let pipelines = select(resolved.pipelines, &cli.select, &rejected)?;
+    let mut rejected = resolved.rejected;
+    let mut pipelines = resolved.pipelines;
+    // `validate` judges a Kafka pipeline's config; nothing else may open one yet.
+    if !matches!(cli.command, Some(Command::Validate)) {
+        hold_back_kafka(&mut pipelines, &mut rejected);
+    }
+    let pipelines = select(pipelines, &cli.select, &rejected)?;
 
     // With a dbt target named, the catalog is the authority on where tables live.
     let locator = Arc::new(build_locator(&cli)?);
@@ -316,6 +321,24 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
                 println!("INVALID  {:<24} {}", r.name, r.reason);
             }
             for p in &pipelines {
+                // A Kafka pipeline's `kafka://<topic>` is a label, not a table: its storage is
+                // the target and the data-quality table it writes. The topic and the broker
+                // are reached at open, never here — validation reads nothing.
+                if let Some(k) = &p.kafka {
+                    p.storage.check(&p.target_uri)?;
+                    p.storage.check(&p.dq_uri())?;
+                    println!(
+                        "{:<24} {} (group {}) -> {}  (app_id={}, value_format={})",
+                        p.name,
+                        p.source_uri,
+                        k.group_id,
+                        p.target_uri,
+                        p.app_id,
+                        k.value_format.as_str()
+                    );
+                    println!("{:<24}   not run by this build yet: {KAFKA_NOT_YET}", "");
+                    continue;
+                }
                 // Resolving each backend touches no storage, but it does catch a URI
                 // whose scheme was not compiled in and credentials that cannot assemble
                 // — both of which would otherwise surface on the first batch.
@@ -362,6 +385,34 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
         Command::Run => run_all(pipelines, rejected, locator, cli.metrics_addr, false).await,
         Command::Dbt(_) => unreachable!("handled above, before the config is resolved"),
     }
+}
+
+/// Why a Kafka pipeline that resolved does not run.
+const KAFKA_NOT_YET: &str = "the Kafka source is not implemented yet. This build parses and \
+     validates [[kafka.pipeline]] entries and reads no topic; the consumer is milestone M3 of \
+     docs/kafka-design.md.";
+
+/// Hold every Kafka pipeline back, by name, until the source that runs one exists.
+///
+/// Config, validation and the build come first (M1 of docs/kafka-design.md); the consumer
+/// comes in M3, which removes this. Until then a build with the `kafka` feature resolves a
+/// Kafka pipeline and `ddi validate` shows it, but nothing may open it, and it reads
+/// `ddi_pipeline_config_valid 0` like any pipeline that will not run. A build without the
+/// feature never gets here with one: the resolver has held it back already.
+fn hold_back_kafka(
+    pipelines: &mut Vec<ResolvedPipeline>,
+    rejected: &mut Vec<delta_delta_ingest::config::Rejection>,
+) {
+    pipelines.retain(|p| {
+        if p.kafka.is_none() {
+            return true;
+        }
+        rejected.push(delta_delta_ingest::config::Rejection {
+            name: p.name.clone(),
+            reason: KAFKA_NOT_YET.into(),
+        });
+        false
+    });
 }
 
 /// Narrow the pipeline list to `--select`.
