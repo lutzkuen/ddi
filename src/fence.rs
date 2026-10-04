@@ -227,7 +227,7 @@ pub struct TxnState {
 /// What reading offsets has cost, for `ddi_kafka_offset_lookups_total`,
 /// `ddi_kafka_offset_lookup_seconds_total`, `ddi_kafka_offset_lookup_fallbacks_total`,
 /// `ddi_kafka_offset_lookup_below_checkpoint_reads_total` and
-/// `ddi_kafka_offset_lookup_marks_unfound_total`.
+/// `ddi_kafka_offset_lookup_unverifiable_total`.
 ///
 /// Shared rather than returned, so that whoever renders the metrics can hold the same
 /// counters the readers add to.
@@ -237,7 +237,7 @@ pub struct LookupCounters {
     micros: AtomicU64,
     fallbacks: AtomicU64,
     below_checkpoint_reads: AtomicU64,
-    marks_unfound: AtomicU64,
+    unverifiable: AtomicU64,
 }
 
 impl LookupCounters {
@@ -259,18 +259,35 @@ impl LookupCounters {
     }
 
     /// Commits [`read_txns`] read below a checkpoint, for the marks it answered without: at
-    /// most [`BELOW_CHECKPOINT_READS`] per call.
+    /// most [`BELOW_CHECKPOINT_READS`] per call, and none for a checkpoint a [`Fence`] has
+    /// read below already.
     pub fn below_checkpoint_reads(&self) -> u64 {
         self.below_checkpoint_reads.load(Ordering::Relaxed)
     }
 
-    /// appIds a checkpoint or the kernel answered whose commit those reads did not reach,
-    /// because they met a commit log cleanup had removed, or read as many as they may. Each
-    /// is a partition whose resume cannot be checked against its mark (docs/kafka-design.md
-    /// §4.4, Unverifiable).
-    pub fn marks_unfound(&self) -> u64 {
-        self.marks_unfound.load(Ordering::Relaxed)
+    /// Partitions' offsets a read for marks returned without one: the commit that wrote the
+    /// offset recorded none (kafka-delta-ingest's, or ddi's for a partition that has not
+    /// carried data since), or a checkpoint answered it and the walk below did not reach that
+    /// commit (log cleanup removed one on the way, it could not be read, or the walk read as
+    /// many as it may). Each is a partition whose resume cannot be checked against its mark
+    /// (docs/kafka-design.md §4.4, Unverifiable), counted once per read that returns it.
+    pub fn unverifiable(&self) -> u64 {
+        self.unverifiable.load(Ordering::Relaxed)
     }
+}
+
+/// What the walk below one checkpoint found for each partition's offset it went after: the
+/// version the checkpoint answered, and the mark beside it in the commit that wrote it, or
+/// none when that commit recorded none or was not reached.
+///
+/// The same for every read down to that checkpoint: a checkpoint's answer never changes, and
+/// commits below it are only ever removed, never rewritten. So a [`Fence`] keeps it, and its
+/// resets for a blocked partition's recheck or an aging handle do not repeat up to
+/// [`BELOW_CHECKPOINT_READS`] GETs. Only the newest checkpoint's is kept.
+#[derive(Debug, Default)]
+struct BelowCheckpoint {
+    checkpoint: Option<u64>,
+    found: BTreeMap<String, (i64, Option<MessageMark>)>,
 }
 
 /// Every appId in `app_ids`, with its newest `txn` as of `table`'s version, read in one pass.
@@ -293,15 +310,19 @@ impl LookupCounters {
 ///    answered. Without them the re-read check of a resume
 ///    (docs/kafka-design.md §4.4, I19) is off for the partition until it carries data again.
 ///    Bounded twice: by [`BELOW_CHECKPOINT_READS`] commits, counted in
-///    [`LookupCounters::below_checkpoint_reads`], and by the first commit log cleanup has
-///    removed, below which a `txn` is not known to be the newest. An appId neither reached
-///    keeps no mark, counted in [`LookupCounters::marks_unfound`].
+///    [`LookupCounters::below_checkpoint_reads`], and by the first commit it cannot use,
+///    which ends it like the first commit log cleanup has removed: below a gap a `txn` is not
+///    known to be the newest. A commit it cannot use is one that does not parse, or one the
+///    store will not serve (refused, not found); a store fault that may pass, an outage,
+///    fails the read instead, so that it is retried rather than settling for less. Every
+///    partition's offset returned without a mark is counted in
+///    [`LookupCounters::unverifiable`].
 ///
 /// The walk is contiguous, so what it finds is the newest; what it does not find is as the
 /// checkpoint at its bottom says, or absent when it reached version 0. A commit missing from
 /// the middle is an error, never a reason to look further down: an answer older than the
 /// truth would move an offset backwards. Step 6 only ever adds a mark to an answer, so it
-/// stops at a missing commit instead.
+/// stops at a commit it cannot use instead, and never fails a read but for an outage.
 ///
 /// Refuses a table that sets `delta.setTransactionRetentionDuration`, as
 /// [`refuse_txn_retention`] does, so that nothing read here has to be filtered for expiry.
@@ -314,14 +335,15 @@ pub async fn read_txns(
     counters: &LookupCounters,
 ) -> Result<BTreeMap<String, TxnState>> {
     refuse_txn_retention(table)?;
-    read(table, app_ids, counters, Below::Marks).await
+    let mut below = BelowCheckpoint::default();
+    read(table, app_ids, counters, Below::Marks(&mut below)).await
 }
 
 /// Whether [`read_txns`]' step 6 reads below the checkpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Below {
-    /// It does: the caller keeps the marks.
-    Marks,
+#[derive(Debug)]
+enum Below<'a> {
+    /// It does, for the caller keeps the marks, and remembers what it found in there.
+    Marks(&'a mut BelowCheckpoint),
     /// It does not: the caller wants the versions alone.
     Nothing,
 }
@@ -331,19 +353,28 @@ async fn read(
     table: &DeltaTable,
     app_ids: &[String],
     counters: &LookupCounters,
-    below: Below,
+    mut below: Below<'_>,
 ) -> Result<BTreeMap<String, TxnState>> {
     let wanted: BTreeSet<&str> = app_ids.iter().map(String::as_str).collect();
     let mut found = BTreeMap::new();
     if !wanted.is_empty() {
         let head = table.version().ok_or_else(|| not_loaded(table))?;
         let started = Instant::now();
-        let walked = walk(table, head, &wanted, &mut found, counters, below).await;
+        let walked = walk(table, head, &wanted, &mut found, counters, &mut below).await;
         counters.lookups.fetch_add(1, Ordering::Relaxed);
         counters
             .micros
             .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         walked?;
+    }
+    if matches!(below, Below::Marks(_)) {
+        let unverifiable = found
+            .iter()
+            .filter(|(id, txn)| may_carry_a_mark(id) && txn.version.is_some() && txn.mark.is_none())
+            .count();
+        counters
+            .unverifiable
+            .fetch_add(unverifiable as u64, Ordering::Relaxed);
     }
     Ok(wanted
         .into_iter()
@@ -361,7 +392,7 @@ async fn walk(
     wanted: &BTreeSet<&str>,
     found: &mut BTreeMap<String, TxnState>,
     counters: &LookupCounters,
-    below: Below,
+    below: &mut Below<'_>,
 ) -> Result<()> {
     let log_store = table.log_store();
     let all_found = |found: &BTreeMap<String, TxnState>| found.len() == wanted.len();
@@ -446,21 +477,47 @@ async fn walk(
         .into_iter()
         .filter(|id| found.contains_key(*id) && may_carry_a_mark(id))
         .collect();
-    if below == Below::Marks && !answered.is_empty() {
-        below_checkpoint(table, checkpoint.version, answered, found, counters).await?;
+    if let Below::Marks(memo) = below {
+        if !answered.is_empty() {
+            below_checkpoint(table, checkpoint.version, answered, found, counters, memo).await?;
+        }
     }
     Ok(())
 }
 
 /// Step 6 of [`read_txns`]: for the appIds in `answered`, which the checkpoint at `bottom` or
-/// the kernel answered, what the commit below `bottom` that wrote each one's `txn` says.
+/// the kernel answered, what the commit below `bottom` that wrote each one's `txn` says. What
+/// `memo` already knows for `bottom` is taken from it, and what is found goes into it.
 async fn below_checkpoint(
     table: &DeltaTable,
     bottom: u64,
     mut answered: BTreeSet<&str>,
     found: &mut BTreeMap<String, TxnState>,
     counters: &LookupCounters,
+    memo: &mut BelowCheckpoint,
 ) -> Result<()> {
+    if memo.checkpoint != Some(bottom) {
+        *memo = BelowCheckpoint {
+            checkpoint: Some(bottom),
+            found: BTreeMap::new(),
+        };
+    }
+    answered.retain(|id| {
+        let Some(answer) = found.get_mut(*id) else {
+            return false;
+        };
+        match memo.found.get(*id) {
+            Some((version, mark)) if answer.version == Some(*version) => {
+                answer.mark = *mark;
+                false
+            }
+            _ => true,
+        }
+    });
+    if answered.is_empty() {
+        return Ok(());
+    }
+
     let log_store = table.log_store();
     let floor = bottom.saturating_sub(BELOW_CHECKPOINT_READS);
     let mut commits = futures::stream::iter((floor..bottom).rev())
@@ -476,13 +533,37 @@ async fn below_checkpoint(
         })
         .buffered(IN_FLIGHT);
     while let Some((v, read)) = commits.next().await {
-        // Removed by log cleanup: below a gap, a txn is not known to be the newest.
-        let Some(bytes) = read? else { break };
+        let bytes = match read {
+            Ok(Some(bytes)) => bytes,
+            // Removed by log cleanup: below a gap, a txn is not known to be the newest.
+            Ok(None) => break,
+            Err(e) if is_outage(&e) => return Err(e.into()),
+            Err(e) => {
+                warn!(
+                    table = %table.table_url(),
+                    version = v,
+                    "cannot read this commit below the checkpoint ({e}); the offsets whose marks \
+                     were looked for below it resume unverified"
+                );
+                break;
+            }
+        };
         let mut met = BTreeMap::new();
-        record_commit(table, v, &bytes, &answered, &mut met)?;
+        if let Err(e) = record_commit(table, v, &bytes, &answered, &mut met) {
+            warn!(
+                table = %table.table_url(),
+                version = v,
+                "cannot parse this commit below the checkpoint ({e}); the offsets whose marks \
+                 were looked for below it resume unverified"
+            );
+            break;
+        }
         for (id, written) in met {
             answered.remove(id.as_str());
             let Some(answer) = found.get_mut(&id) else {
+                continue;
+            };
+            let Some(version) = answer.version else {
                 continue;
             };
             // Another version is an older txn than the one answered, which the commit at
@@ -490,22 +571,39 @@ async fn below_checkpoint(
             if written.version == answer.version {
                 answer.mark = written.mark;
             }
+            memo.found.insert(id, (version, answer.mark));
         }
         if answered.is_empty() {
             return Ok(());
         }
     }
-    counters
-        .marks_unfound
-        .fetch_add(answered.len() as u64, Ordering::Relaxed);
+    for id in &answered {
+        if let Some(version) = found.get(*id).and_then(|a| a.version) {
+            memo.found.insert(id.to_string(), (version, None));
+        }
+    }
     debug!(
         table = %table.table_url(),
         checkpoint_version = bottom,
         app_ids = answered.len(),
-        "the commits below this checkpoint that wrote these offsets are gone or too far down; \
-         their resume cannot be checked against a mark"
+        "the commits below this checkpoint that wrote these offsets are gone, unreadable or too \
+         far down; their resume cannot be checked against a mark"
     );
     Ok(())
+}
+
+/// Whether a failed read of a commit is the object store's fault that may pass: a 5xx or a
+/// timeout after the store's own retries, a dropped connection, a failed task. Not one about
+/// the commit or the credentials (refused, not found, an invalid path), which reading it again
+/// gives again.
+fn is_outage(e: &deltalake::DeltaTableError) -> bool {
+    use deltalake::ObjectStoreError;
+    matches!(
+        e,
+        deltalake::DeltaTableError::ObjectStore {
+            source: ObjectStoreError::Generic { .. } | ObjectStoreError::JoinError { .. }
+        }
+    )
 }
 
 /// The appIds the kernel has to answer one at a time, because the checkpoint at the bottom of
@@ -989,6 +1087,8 @@ pub struct Fence {
     /// at every later version, whichever handle reads it. That keeps a reset at our own newest
     /// commit, which does not carry it, to the one GET.
     marker: Option<bool>,
+    /// What [`read_txns`]' walk below the newest checkpoint found for the owned partitions.
+    below: BelowCheckpoint,
     lookups: Arc<LookupCounters>,
 }
 
@@ -1000,6 +1100,7 @@ impl Fence {
             base: BTreeMap::new(),
             carried: BTreeSet::new(),
             marker: None,
+            below: BelowCheckpoint::default(),
             lookups: Arc::new(LookupCounters::default()),
         }
     }
@@ -1062,7 +1163,11 @@ impl Fence {
     /// succeeds, and the marker is not known unless it was before.
     pub async fn reset(&mut self, table: &DeltaTable, owned: &[i32]) -> Result<()> {
         let ids = self.ids_to_read(owned);
-        let txns = match read_txns(table, &ids, &self.lookups).await {
+        let read = match refuse_txn_retention(table) {
+            Ok(()) => read(table, &ids, &self.lookups, Below::Marks(&mut self.below)).await,
+            Err(e) => Err(e),
+        };
+        let txns = match read {
             Ok(txns) => txns,
             Err(e) => {
                 self.carried.clear();
@@ -1475,6 +1580,17 @@ mod tests {
         lists: AtomicUsize,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
+        /// GETs of these paths fail, as the store says.
+        failing: Mutex<BTreeMap<String, Failure>>,
+    }
+
+    /// How a GET [`Counting`] is told to fail does.
+    #[derive(Clone, Copy, Debug)]
+    enum Failure {
+        /// 403: the store refuses this object, and will again.
+        Denied,
+        /// An outage, after the store's own retries: it may pass.
+        Outage,
     }
 
     impl Counting {
@@ -1486,7 +1602,16 @@ mod tests {
                 lists: AtomicUsize::new(0),
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
+                failing: Mutex::new(BTreeMap::new()),
             }
+        }
+
+        /// GETs of commit `version` fail with `failure` from now on.
+        fn fail(&self, version: u64, failure: Failure) {
+            self.failing
+                .lock()
+                .unwrap()
+                .insert(format!("_delta_log/{}", commit_name(version)), failure);
         }
 
         fn reset(&self) {
@@ -1545,6 +1670,22 @@ mod tests {
                 return self.inner.get_opts(location, options).await;
             }
             self.gets.lock().unwrap().push(location.to_string());
+            let failure = self.failing.lock().unwrap().get(location.as_ref()).copied();
+            match failure {
+                Some(Failure::Denied) => {
+                    return Err(object_store::Error::PermissionDenied {
+                        path: location.to_string(),
+                        source: "403 This request is not authorized".into(),
+                    })
+                }
+                Some(Failure::Outage) => {
+                    return Err(object_store::Error::Generic {
+                        store: "Counting",
+                        source: "503 Server Busy, after 10 retries".into(),
+                    })
+                }
+                None => {}
+            }
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
             let got = self.inner.get_opts(location, options).await;
@@ -2068,7 +2209,11 @@ mod tests {
         assert_eq!(read, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         let below = counters.below_checkpoint_reads();
         assert!((2..=3).contains(&below), "{below}");
-        assert_eq!(counters.marks_unfound(), 0);
+        assert_eq!(
+            counters.unverifiable(),
+            4,
+            "partitions 0 to 3: assert_txns records no marks"
+        );
         assert!(store
             .gets()
             .iter()
@@ -2887,7 +3032,7 @@ mod tests {
         read.sort_unstable();
         read.retain(|v| *v != 0);
         assert_eq!(read, (1..=12).collect::<Vec<_>>());
-        assert_eq!(fence.lookups().marks_unfound(), 0);
+        assert_eq!(fence.lookups().unverifiable(), 0);
     }
 
     /// An owner's commit of a batch that read one partition carries the marks of all it owns:
@@ -2981,7 +3126,7 @@ mod tests {
             Some((Some(55), None)),
             "not the txn it answered"
         );
-        assert_eq!(fence.lookups().marks_unfound(), 1, "partition 1");
+        assert_eq!(fence.lookups().unverifiable(), 2, "partitions 1 and 3");
     }
 
     /// The walk below a checkpoint reads at most [`BELOW_CHECKPOINT_READS`] commits: a mark
@@ -3018,7 +3163,7 @@ mod tests {
         assert_eq!(below.len(), 256, "{below:?}");
         assert_eq!(below.iter().min(), Some(&44));
         assert_eq!(fence.lookups().below_checkpoint_reads(), 256);
-        assert_eq!(fence.lookups().marks_unfound(), 1, "partition 1");
+        assert_eq!(fence.lookups().unverifiable(), 1, "partition 1");
     }
 
     // ------------------------------------------------------------ the takeover marker
@@ -3337,6 +3482,154 @@ mod tests {
                 high: 12
             }
         );
+    }
+
+    /// The walk below a checkpoint only ever adds a mark to an answer, so a commit it cannot
+    /// use ends it as a missing one does, and never fails the read: one that is not a commit
+    /// this can parse, or one the store refuses to serve. Only a store fault that may pass, an
+    /// outage, fails the read, so that the reset is retried rather than settling for less.
+    #[tokio::test]
+    async fn reset_below_the_checkpoint_stops_at_an_unreadable_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        ddi_commit(dir.path(), 1, &[("app-1", 40)], &[(1, 40)]);
+        ddi_commit(dir.path(), 2, &[("app-9", 2)], &[]);
+        ddi_commit(dir.path(), 3, &[("app-0", 90)], &[(0, 90)]);
+        for v in 4..=8 {
+            ddi_commit(dir.path(), v, &[("app-9", v as i64)], &[]);
+        }
+        deltalake::checkpoints::create_checkpoint(&open(path).await, None)
+            .await
+            .unwrap();
+        ddi_commit(dir.path(), 9, &[("app-9", 9)], &[]);
+        let expect = |fence: &Fence| {
+            assert_eq!(fence.base(0), Some((Some(90), Some(mark_at(90)))));
+            assert_eq!(
+                fence.base(1),
+                Some((Some(40), None)),
+                "below what cannot be read"
+            );
+        };
+
+        // Commit 2 is not JSON.
+        let two = log_file(dir.path(), &commit_name(2));
+        let readable = std::fs::read(&two).unwrap();
+        std::fs::write(&two, b"{\"add\": not json at all").unwrap();
+        let mut fence = Fence::new(APP);
+        fence.reset(&open(path).await, &[0, 1]).await.unwrap();
+        expect(&fence);
+        assert_eq!(fence.lookups().unverifiable(), 1, "partition 1");
+        std::fs::write(&two, readable).unwrap();
+
+        // The store refuses commit 2.
+        let (table, store) = counted(path).await;
+        store.fail(2, Failure::Denied);
+        let mut fence = Fence::new(APP);
+        fence.reset(&table, &[0, 1]).await.unwrap();
+        expect(&fence);
+
+        // An outage while reading it fails the reset, which is retried.
+        let (table, store) = counted(path).await;
+        store.fail(2, Failure::Outage);
+        let mut fence = Fence::new(APP);
+        let e = fence.reset(&table, &[0, 1]).await.unwrap_err();
+        assert!(
+            matches!(
+                e,
+                Error::Delta(deltalake::DeltaTableError::ObjectStore {
+                    source: object_store::Error::Generic { .. }
+                })
+            ),
+            "{e:?}"
+        );
+    }
+
+    /// The walk below a checkpoint finds the same thing every time for one checkpoint, so a
+    /// fence does it once per checkpoint: a blocked partition's recheck and an aging reset do
+    /// not repeat up to 256 GETs. A newer checkpoint is walked below again.
+    #[tokio::test]
+    async fn reset_below_the_checkpoint_is_read_once_per_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        ddi_commit(dir.path(), 1, &[("app-1", 40)], &[(1, 40)]);
+        for v in 2..300 {
+            if v == 290 {
+                ddi_commit(dir.path(), v, &[("app-0", 90)], &[(0, 90)]);
+            } else {
+                ddi_commit(dir.path(), v, &[("app-9", v as i64)], &[]);
+            }
+        }
+        ddi_commit(dir.path(), 300, &[("app-9", 300)], &[]);
+        deltalake::checkpoints::create_checkpoint(&open(path).await, None)
+            .await
+            .unwrap();
+        ddi_commit(dir.path(), 301, &[("app-9", 301)], &[]);
+
+        let (table, store) = counted(path).await;
+        let mut fence = Fence::new(APP);
+        fence.reset(&table, &[0, 1]).await.unwrap();
+        assert_eq!(fence.lookups().below_checkpoint_reads(), 256);
+        assert_eq!(fence.base(0), Some((Some(90), Some(mark_at(90)))));
+
+        // A blocked partition's recheck: the same answer, and not one GET below the checkpoint.
+        store.reset();
+        fence.reset(&table, &[0, 1]).await.unwrap();
+        assert_eq!(fence.lookups().below_checkpoint_reads(), 256, "none more");
+        assert!(
+            store.commits_read().iter().all(|v| *v >= 300),
+            "{:?}",
+            store.commits_read()
+        );
+        assert_eq!(fence.base(0), Some((Some(90), Some(mark_at(90)))));
+        assert_eq!(fence.base(1), Some((Some(40), None)));
+        assert_eq!(
+            fence.lookups().unverifiable(),
+            2,
+            "partition 1, once per reset"
+        );
+
+        // A newer checkpoint, after the table moved on: walked below again.
+        ddi_commit(dir.path(), 302, &[("app-9", 302)], &[]);
+        let newer = open(path).await;
+        deltalake::checkpoints::create_checkpoint(&newer, None)
+            .await
+            .unwrap();
+        ddi_commit(dir.path(), 303, &[("app-9", 303)], &[]);
+        let (table, _) = counted(path).await;
+        fence.reset(&table, &[0, 1]).await.unwrap();
+        assert!(fence.lookups().below_checkpoint_reads() > 256);
+        assert_eq!(fence.base(0), Some((Some(90), Some(mark_at(90)))));
+    }
+
+    /// Every offset a reset reads without the mark that would verify its resume counts as
+    /// unverifiable: one whose commit below the checkpoint recorded none, as
+    /// kafka-delta-ingest's do; one whose commit there is gone or out of reach; and one read
+    /// above the checkpoint from a commit that recorded none. A partition without an offset is
+    /// not one, nor is the takeover marker.
+    #[tokio::test]
+    async fn every_offset_read_without_a_mark_is_unverifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        kdi_commit(dir.path(), 1, "app-1", 40, 1_700_000_000_000);
+        ddi_commit(dir.path(), 2, &[("app-0", 90)], &[(0, 90)]);
+        for v in 3..=8 {
+            ddi_commit(dir.path(), v, &[("app-9", v as i64)], &[]);
+        }
+        deltalake::checkpoints::create_checkpoint(&open(path).await, None)
+            .await
+            .unwrap();
+        kdi_commit(dir.path(), 9, "app-2", 7, 1_700_000_000_000);
+
+        let mut fence = Fence::new(APP);
+        fence.reset(&open(path).await, &[0, 1, 2, 3]).await.unwrap();
+        assert_eq!(fence.base(0), Some((Some(90), Some(mark_at(90)))));
+        assert_eq!(fence.base(1), Some((Some(40), None)));
+        assert_eq!(fence.base(2), Some((Some(7), None)));
+        assert_eq!(fence.base(3), Some((None, None)));
+        assert_eq!(fence.lookups().unverifiable(), 2, "partitions 1 and 2");
     }
 
     #[tokio::test]
