@@ -349,7 +349,7 @@ revoke_flush_timeout_secs = 120          # commit the buffer on revoke within th
 blocked_recheck_secs      = 60           # how often a paused pipeline/partition re-checks its cause (§3.6)
 # kdi_compat    = <unset>                # unset: false on a new table, refused where kdi may have written it (§4.4 step 6, §5.6)
 # kdi_null_text = <kdi_compat>
-# kdi credential env vars; these are the defaults, "" disables one
+# kdi credential env vars; these are the defaults, optional as in kdi whether written out or not; "" disables one
 scram_json_env = "KAFKA_DELTA_INGEST_SCRAM_JSON"
 ssl_cert_env   = "KAFKA_DELTA_INGEST_CERT"
 ssl_key_env    = "KAFKA_DELTA_INGEST_KEY"
@@ -494,7 +494,7 @@ Each failure is a `Rejection`: the pipeline is held back and `ddi_pipeline_confi
 7. **Forced keys** (§2.4) present in any settings map: reject, pointing at the ddi key that owns them.
 8. **Rebalancing.** Reject a `partition.assignment.strategy` other than `range` and/or `roundrobin` (kdi used librdkafka's default `range,roundrobin`, CONFIGURATION.md:129), in particular `cooperative-sticky`. Reject a `group.protocol` other than `classic`.
 9. **`sasl.mechanism = GSSAPI`:** reject. The build has no libsasl2.
-10. **Environment variables.** A `settings_env` entry or an explicitly set `*_env` name pointing at an unset variable: reject at open. The kdi defaults are optional and no-ops when unset.
+10. **Environment variables.** A `settings_env` entry, or a `*_env` name other than kdi's default, pointing at an unset variable: reject at open. kdi's default names are optional and no-ops when unset, whether left out or written out as in §2.1 (written out, a name equal to kdi's is still the default).
 11. **Inline secrets** (`sasl.password`, `ssl.key.password`, `ssl.key.pem` in `settings`): a **warning**, not a rejection.
 12. **Numbers and shapes.**
     - `starting_offsets` map keys must be i32 ≥ 0 or `"*"`. Values must be i64 ≥ 0, or `earliest`/`latest` for `"*"`. Completeness is checked at open against metadata.

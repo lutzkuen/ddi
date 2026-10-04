@@ -431,15 +431,20 @@ pub enum EnvRef {
     Disabled,
     /// kdi's name, taken because nothing was configured. Optional: unset is a no-op.
     Default(String),
-    /// A name the config set. Required: unset is an error at open (§2.5 rule 10).
+    /// A name the config set, other than kdi's. Required: unset is an error at open (§2.5
+    /// rule 10).
     Explicit(String),
 }
 
 impl EnvRef {
-    /// `pipeline`, else `section`, else `default`; an empty name turns it off.
+    /// `pipeline`, else `section`, else `default`; an empty name turns it off. kdi's own name
+    /// written out is still kdi's default, optional as it was in kdi: §2.1 writes them all out
+    /// under "these are the defaults", and a SCRAM-only deployment that copies it sets no
+    /// certificate, key or CA.
     fn resolve(pipeline: &Option<String>, section: &Option<String>, default: Option<&str>) -> Self {
         match pipeline.as_ref().or(section.as_ref()) {
             Some(n) if n.trim().is_empty() => Self::Disabled,
+            Some(n) if default == Some(n.trim()) => Self::Default(n.trim().to_string()),
             Some(n) => Self::Explicit(n.trim().to_string()),
             None => default.map_or(Self::Disabled, |d| Self::Default(d.to_string())),
         }
@@ -2916,6 +2921,57 @@ url = "http://my-sr:8081"
         .unwrap_err()
         .to_string();
         assert!(e.contains("a string, number or boolean"), "{e}");
+    }
+
+    // ------------------------------------------------------------- environment variables
+
+    /// The design's own example config (docs/kafka-design.md §2.1), exactly as written.
+    fn design_example() -> String {
+        let doc =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/kafka-design.md"))
+                .unwrap();
+        let section = &doc[doc.find("### 2.1 TOML").unwrap()..];
+        let start = section.find("```toml\n").unwrap() + "```toml\n".len();
+        let end = section[start..].find("```").unwrap();
+        section[start..start + end].to_string()
+    }
+
+    #[test]
+    fn kdi_default_env_names_written_out_stay_optional() {
+        // §2.1 writes kdi's names out ("these are the defaults"): a deployment that copies it
+        // and authenticates with SCRAM alone sets no certificate, key, CA or proxy.
+        let r = resolve(&design_example());
+        assert!(r.rejected.is_empty(), "{r:?}");
+        let name = "catalog_description_changed_raw";
+        let k = kafka(&r, name);
+        for (env_ref, default) in [
+            (&k.scram_json_env, DEFAULT_SCRAM_JSON_ENV),
+            (&k.ssl_cert_env, DEFAULT_SSL_CERT_ENV),
+            (&k.ssl_key_env, DEFAULT_SSL_KEY_ENV),
+            (&k.ssl_ca_env, DEFAULT_SSL_CA_ENV),
+        ] {
+            assert_eq!(*env_ref, EnvRef::Default(default.into()));
+        }
+        let sr = k.schema_registry.as_ref().unwrap();
+        for env_ref in [&sr.username_env, &sr.password_env, &sr.proxy_env] {
+            assert!(!env_ref.required(), "{env_ref:?}");
+        }
+        let s = settings_of(
+            &r,
+            name,
+            &[(DEFAULT_SCRAM_JSON_ENV, r#"{"username":"u","password":"p"}"#)],
+        )
+        .unwrap();
+        assert_eq!(s.get("sasl.username"), Some("u"));
+        assert!(s.get("ssl.certificate.pem").is_none(), "{s:?}");
+
+        // Any other name is still required.
+        let r = resolve(&format!(
+            "{SECTION}{}",
+            entry("events", "ssl_cert_env = \"MY_CERT\"")
+        ));
+        let e = settings_of(&r, "events", &[]).unwrap_err().to_string();
+        assert!(e.contains("\"MY_CERT\", which is not set"), "{e}");
     }
 
     /// [`librdkafka_property`] against librdkafka itself: a value set under one name is what
