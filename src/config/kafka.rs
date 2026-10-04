@@ -154,13 +154,15 @@ impl std::fmt::Debug for SchemaRegistryConfig {
     }
 }
 
-/// `url` with whatever stands before an `@` in its authority replaced by `<redacted>`: string
-/// work, so that a URL that does not parse is redacted as well.
+/// `url` with whatever stands before its last `@` replaced by `<redacted>`: string work, so that
+/// a URL that does not parse is redacted as well. The last `@` anywhere, not just in the
+/// authority: a password may hold `/`, `?` or `#` (base64-style API secrets do), and cutting the
+/// authority at the first of those would then find no `@` and print the secret whole. An `@` in
+/// a path only over-redacts an error message.
 fn redact_userinfo(url: &str) -> String {
     let start = url.find("://").map_or(0, |i| i + 3);
     let rest = &url[start..];
-    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-    match authority.rfind('@') {
+    match rest.rfind('@') {
         Some(at) => format!("{}<redacted>{}", &url[..start], &rest[at..]),
         None => url.to_string(),
     }
@@ -3179,17 +3181,23 @@ url = "http://my-sr:8081"
             "https://svc:hunter2@sr.internal:8081",
             "htps://svc:hunter2@sr.internal:8081",
             "svc:hunter2@sr.internal:8081",
+            // A secret holding '/', '?' or '#' does not parse as a URL at all.
+            "https://svc:hun/ter2@sr.internal:8081",
+            "https://svc:hun?ter2@sr.internal:8081",
+            "https://svc:hun#ter2@sr.internal:8081",
         ] {
             let cfg = config(&format!(
                 "[kafka]\nbrokers = \"b:9092\"\n[kafka.schema_registry]\nurl = {url:?}\n{}",
                 entry("events", "")
             ));
-            assert!(!format!("{cfg:?}").contains("hunter2"), "{url}: {cfg:?}");
+            // Every secret above ends in "ter2", and nothing else in the config does.
+            let secret = "ter2";
+            assert!(!format!("{cfg:?}").contains(secret), "{url}: {cfg:?}");
             let r = cfg.resolve_all_with(true).unwrap();
             let reason = held(&r, "events");
-            assert!(!reason.contains("hunter2"), "{url}: {reason}");
+            assert!(!reason.contains(secret), "{url}: {reason}");
             assert!(reason.contains("schema_registry.url"), "{url}: {reason}");
-            assert!(!format!("{r:?}").contains("hunter2"), "{url}: {r:?}");
+            assert!(!format!("{r:?}").contains(secret), "{url}: {r:?}");
         }
         let reason = refused(
             "",
