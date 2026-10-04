@@ -19,23 +19,48 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 REGISTRY = pathlib.Path.home() / ".cargo" / "registry" / "src"
 SELF = "delta-delta-ingest"
 
-# C code a `-sys` crate compiles and links statically. cargo-deny and the crate table see the
-# crate's own licence, not this, so each one's licence file is appended verbatim, for every
-# version of the crate in the lockfile (optional ones included: the lockfile lists them, and an
-# image built with the feature ships them).
+# Third-party C code a crate compiles and links statically. cargo-deny and the crate table see
+# the crate's own licence, not this, so each one's licence files are appended verbatim, for
+# every version of the crate in the lockfile (optional ones included: the lockfile lists them,
+# and an image built with the feature ships them).
+#
+# Every crate whose build script links a static C library (`cargo:rustc-link-lib=static=` in
+# target/*/build/*/output) is here, except blake3 and psm, whose assembly is their own and
+# under their crate licence. Check that list again when the lockfile gains a `-sys` crate.
 C_LIBRARIES = [
     (
         "rdkafka-sys",
         "librdkafka",
-        "librdkafka/LICENSES.txt",
+        ["librdkafka/LICENSES.txt"],
         "librdkafka (BSD-2-Clause), and the third-party code it bundles, each under its own "
         "licence below. Linked by the `kafka` feature.",
     ),
     (
         "zstd-sys",
         "zstd",
-        "zstd/LICENSE",
+        ["zstd/LICENSE"],
         "zstd, offered under BSD-3-Clause or GPLv2; the BSD licence is the one taken.",
+    ),
+    (
+        "aws-lc-sys",
+        "AWS-LC",
+        ["aws-lc/LICENSE"],
+        "AWS-LC, the cryptography rustls uses through aws-lc-rs: Apache-2.0 or ISC for its own "
+        "code, with the BoringSSL and OpenSSL/SSLeay notices it carries. Linked by every build.",
+    ),
+    (
+        "ring",
+        "ring",
+        ["LICENSE", "LICENSE-other-bits", "LICENSE-BoringSSL"],
+        "ring's C and assembly, partly from BoringSSL (Apache-2.0 or ISC, as each file says), "
+        "used by the object-store client. Linked by every build.",
+    ),
+    (
+        "liblzma-sys",
+        "liblzma",
+        ["xz/COPYING", "xz/COPYING.0BSD"],
+        "liblzma from XZ Utils, bundled and linked statically by every build: 0BSD, as XZ "
+        "Utils' COPYING says for liblzma (the tools and scripts it names are not linked).",
     ),
 ]
 
@@ -56,37 +81,41 @@ def crate_dir(name: str, version: str) -> pathlib.Path | None:
 def c_library_sections(crates: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
     """The appendix of statically linked C code, and what could not be read for it."""
     out, missing = [], []
-    for name, label, rel, what in C_LIBRARIES:
+    for name, label, rels, what in C_LIBRARIES:
         for crate, version in sorted(crates):
             if crate != name:
                 continue
             d = crate_dir(crate, version)
-            text = (d / rel) if d else None
-            if text is None or not text.exists():
-                missing.append(f"{crate} {version} ({rel})")
+            texts = [(rel, (d / rel) if d else None) for rel in rels]
+            absent = [rel for rel, text in texts if text is None or not text.exists()]
+            if absent:
+                missing += [f"{crate} {version} ({rel})" for rel in absent]
                 continue
             # The upstream version is the build metadata: `4.10.0+2.12.1`, `2.0.16+zstd.1.5.7`.
-            upstream = version.split("+", 1)[1] if "+" in version else version
-            upstream = upstream.removeprefix(f"{label}.")
-            out += [
-                "",
-                f"### {label} {upstream} (in {crate} {version})",
-                "",
-                what,
-                "",
-                "```text",
-                text.read_text().rstrip(),
-                "```",
-            ]
+            # A crate without it does not say which upstream release it bundles.
+            if "+" in version:
+                upstream = version.split("+", 1)[1].removeprefix(f"{label}.")
+                header = f"### {label} {upstream} (in {crate} {version})"
+            else:
+                header = f"### {label} (in {crate} {version})"
+            out += ["", header, "", what]
+            for rel, text in texts:
+                body = text.read_text().rstrip()
+                # A fence longer than any run of backticks in the text, which may hold its own.
+                fence = "`" * max(3, 1 + max((len(r) for r in re.findall(r"`+", body)), default=0))
+                if len(texts) > 1:
+                    out += ["", f"`{rel}`:"]
+                out += ["", f"{fence}text", body, fence]
     if out:
         out = [
             "",
             "## Statically linked C libraries",
             "",
-            "The table above lists crates. These are the C libraries some of them compile and",
-            "link statically, whose licences travel with the binary too. OpenSSL 3 (Apache-2.0),",
-            "and zlib where the build finds it, are linked dynamically from the image's Debian",
-            "packages, whose copyright files cover them.",
+            "The table above lists crates. These are the third-party C libraries some of them",
+            "compile and link statically, whose licences travel with the binary too: every one",
+            "a build links (blake3's and psm's assembly is their own, under their crate licence).",
+            "OpenSSL 3 (Apache-2.0), and zlib where the build finds it, are linked dynamically",
+            "from the image's Debian packages, whose copyright files cover them.",
         ] + out
     return out, missing
 

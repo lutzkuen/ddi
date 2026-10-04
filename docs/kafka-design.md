@@ -1488,7 +1488,8 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
 - cargo-deny cannot see statically linked C. `scripts/third-party-notices.py` appends `rdkafka-sys-*/librdkafka/LICENSES.txt` when rdkafka-sys is in the lockfile:
   - librdkafka is BSD-2-Clause;
   - its bundled third parties are cJSON, crc32c, fnv1a, hdrhistogram, lz4, murmur2, nanopb, opentelemetry protos, pycrc, queue, regexp, snappy, tinycthread and wingetopt;
-  - zstd (BSD/GPLv2 dual; BSD taken) is appended as well.
+  - zstd (BSD/GPLv2 dual; BSD taken) is appended as well;
+  - and so are the C libraries every build links statically, kafka or not: AWS-LC (aws-lc-sys, for rustls), ring's BoringSSL-derived C, and liblzma (liblzma-sys's bundled XZ Utils, 0BSD). The appendix is the whole list: every crate whose build script links a static library (`cargo:rustc-link-lib=static=`), except blake3's and psm's own assembly, which their crate licences cover.
 - OpenSSL 3 (Apache-2.0) is linked dynamically from the base image and covered by Debian's copyright files.
 
 ---
