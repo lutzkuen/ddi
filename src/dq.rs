@@ -62,10 +62,16 @@
 //! equality does not carry over: a source version can mean different data after a rewind,
 //! but an offset names one message for the life of a topic, a resume checks it is still the
 //! same topic, and moving offsets by hand moves these marks with them
-//! (docs/kafka-design.md §5.7). A reject is skipped when it is recorded at or below its
-//! partition's mark, and its classification cannot change on a replay. One that names no
-//! offset, or whose writer schema the registry did not have, is always written: a duplicate
-//! row is visible, a lost one is not.
+//! (docs/kafka-design.md §5.7).
+//!
+//! Only a message that could not be decoded is skipped, when its offset is at or below its
+//! partition's mark: whether it decodes depends on its bytes and its writer schema alone,
+//! and both are fixed for good. Every other reject was judged against things a replay can
+//! find changed — the target's schema after an ALTER TABLE, the union of writer schemas,
+//! the SQL, a value the SQL computes from `now()` — so a retry can reject a row at an offset
+//! below the mark that the first attempt took, and skipping it would leave it in neither
+//! table. Those, a message whose writer schema the registry did not have, and a reject that
+//! names no offset are always written: a duplicate row is visible, a lost one is not.
 
 use deltalake::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Int64Array, RecordBatch, StringArray,
@@ -111,11 +117,19 @@ pub fn kafka_app_id_for(app_id: &str, partition: i32) -> String {
     format!("{app_id}.dq-{partition}")
 }
 
+/// How the reason a Kafka message is rejected with begins when the message could not be
+/// decoded at all (docs/kafka-design.md §5.7). No other reject's reason begins so.
+///
+/// The only rejects [`DataQuality::write_kafka`] skips on a replay, when they are at or
+/// below their partition's mark: whether a message decodes depends on nothing but its bytes
+/// and its writer schema, which no retry changes.
+pub const KAFKA_UNDECODABLE: &str = "avro:";
+
 /// How the reason a Kafka message is rejected with begins when its writer schema was not in
 /// the registry.
 ///
-/// Such a reject is never skipped on a replay ([`DataQuality::write_kafka`]): the schema can
-/// be registered between two attempts, and the same message then decodes.
+/// The one undecodable never skipped on a replay ([`DataQuality::write_kafka`]): the schema
+/// can be registered between two attempts, and the same message then decodes.
 pub const KAFKA_SCHEMA_NOT_FOUND: &str = "avro: schema not found";
 
 /// The prefix of the columns a Kafka reject carries its coordinates in, until the pipeline
@@ -437,7 +451,9 @@ impl DataQuality {
     ///    `delta.setTransactionRetentionDuration` is not refused here, as it is on a target).
     /// 2. Skip a reject recorded at or below its partition's mark: one with coordinates — its
     ///    `<prefix>partition` and `<prefix>offset` columns, naming an offset the batch read —
-    ///    whose reason is deterministic, which every reason is but [`KAFKA_SCHEMA_NOT_FOUND`].
+    ///    that could not be decoded ([`KAFKA_UNDECODABLE`]), unless its writer schema was not
+    ///    found ([`KAFKA_SCHEMA_NOT_FOUND`]). Only those are rejected again on a replay,
+    ///    whatever has changed in between; any other reject is written each time.
     /// 3. Commit the rest, each row's `source_version` its offset (−1 without one), with
     ///    `<app_id>.dq-<p>` = max(mark, last offset read) for every partition of the batch.
     /// 4. A commit that conflicts on a mark — a zombie, or a handover — reopens the table and
@@ -535,7 +551,7 @@ impl DataQuality {
                 .zip(&r.reasons)
                 .map(|(at, reason)| {
                     let recorded = at.is_some_and(|(p, offset)| {
-                        !reason.starts_with(KAFKA_SCHEMA_NOT_FOUND)
+                        rejected_again_on_a_replay(reason)
                             && marks.get(&p).is_some_and(|mark| offset <= *mark)
                     });
                     !recorded
@@ -681,6 +697,13 @@ impl DataQuality {
             })
             .collect()
     }
+}
+
+/// Whether a Kafka reject with this reason is one every replay of its message rejects
+/// again: a message that could not be decoded, for a reason other than a writer schema the
+/// registry did not have yet.
+fn rejected_again_on_a_replay(reason: &str) -> bool {
+    reason.starts_with(KAFKA_UNDECODABLE) && !reason.starts_with(KAFKA_SCHEMA_NOT_FOUND)
 }
 
 /// How one attempt of [`DataQuality::write_kafka`] ended, when it did not write.
@@ -1160,6 +1183,56 @@ mod tests {
             1,
             "below the mark, but not known to be"
         );
+    }
+
+    /// Only an undecodable is skipped by its partition's mark. A row the transform, the
+    /// conform or the coercer set aside was judged against the target's schema, the SQL and
+    /// the union of writer schemas, any of which can change between two attempts at one
+    /// batch — an ALTER TABLE on the target in between (§4.7 row 20) is enough. A retry can
+    /// then reject a row the first attempt did not, at an offset already under the mark, and
+    /// it has to be written: a duplicate is visible, a row in neither table is not.
+    #[tokio::test]
+    async fn dq_only_an_undecodable_is_skipped_by_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+
+        // The first attempt: offset 3 does not decode, and every other row fits the target.
+        let first = [undecodable(0, &[3], MALFORMED)];
+        let batch = read(&[(0, (1, 10))]);
+        assert_eq!(dq.write_kafka(&first, &batch, NOW).await.unwrap(), 1);
+        assert_eq!(txn(path, "app.dq-0").await, Some(10));
+
+        // The target commit failed on a new column, and the retry's coercer rejects offset 7.
+        let coerced = rejected_with(
+            &[("kafka_", 0, 7)],
+            "value does not fit \"note\" (Utf8 -> Int32)",
+        );
+        let retry = [undecodable(0, &[3], MALFORMED), coerced];
+        assert_eq!(
+            dq.write_kafka(&retry, &batch, NOW).await.unwrap(),
+            1,
+            "offset 3 is recorded already; offset 7 is new"
+        );
+        let versions: Vec<i64> = recorded(path).await.iter().map(|r| r.0).collect();
+        assert_eq!(versions, vec![3, 7]);
+        assert_eq!(dq.kafka_counters().rows_skipped(), 1);
+    }
+
+    #[test]
+    fn only_an_undecodable_is_rejected_again_on_every_replay() {
+        assert!(rejected_again_on_a_replay(MALFORMED));
+        assert!(rejected_again_on_a_replay("avro: no magic byte"));
+        assert!(KAFKA_SCHEMA_NOT_FOUND.starts_with(KAFKA_UNDECODABLE));
+        for reason in [
+            format!("{KAFKA_SCHEMA_NOT_FOUND}: id 42 (404, error code 40403)"),
+            "value does not fit \"note\" (Utf8 -> Int32)".to_string(),
+            "cannot cast 'n/a' to DECIMAL(10,2)".to_string(),
+            "writer schema 7 field \"amount\" cannot be read as DECIMAL(10,2)".to_string(),
+        ] {
+            assert!(!rejected_again_on_a_replay(&reason), "{reason}");
+        }
     }
 
     /// A message's coordinates always lie inside what its batch read. A reject whose
