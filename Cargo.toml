@@ -19,6 +19,13 @@ path = "src/main.rs"
 name = "delta_delta_ingest"
 path = "src/lib.rs"
 
+[features]
+default = []
+# The Kafka source (docs/kafka-design.md). Off by default: it builds librdkafka from C and
+# links the system's OpenSSL 3, which a Delta-only build has no use for. Its config is parsed
+# and validated either way; a build without it holds every [[kafka.pipeline]] back by name.
+kafka = ["dep:rdkafka", "dep:arrow-avro"]
+
 [dependencies]
 # Pinned exactly: delta-rs is 0.x and churns. All calls are isolated behind
 # src/source/ and src/sink.rs so a bump touches a bounded surface (plan §5).
@@ -74,6 +81,20 @@ serde_norway = "0.9"
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+
+# The `kafka` feature. librdkafka 2.12.1, built from source and linked statically:
+# - `ssl` against the system's OpenSSL 3, which also brings SASL PLAIN and SCRAM; not `sasl`,
+#   which means GSSAPI (Kerberos) through libsasl2 and nothing else;
+# - `zstd` reuses the zstd-sys this tree already locks, built bundled; snappy and lz4 are
+#   built into librdkafka, and gzip goes through libz-sys;
+# - no `dynamic-linking`: rdkafka-sys requires librdkafka >= 2.12.1, which no distribution
+#   ships.
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "libz", "ssl", "zstd", "tracing"], optional = true }
+# The one direct arrow crate, and the exception to the rule above: pinned exactly to the arrow
+# deltalake re-exports (58.4.0), so it resolves to that copy and not a second one. Default
+# features off: they are codecs for Avro container files, which Kafka messages are not, and
+# `xz` would bring back the `links = "lzma"` collision.
+arrow-avro = { version = "=58.4.0", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

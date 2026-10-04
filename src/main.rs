@@ -38,8 +38,29 @@ mod tokio_util_shim {
     }
 }
 
+/// What `ddi --version` prints after the name: this crate's version, and with the `kafka`
+/// feature the librdkafka linked into it. The image runs `--version` as it is built
+/// (docker/Dockerfile), so a librdkafka or an OpenSSL the loader cannot resolve fails there.
+fn version() -> &'static str {
+    #[cfg(feature = "kafka")]
+    {
+        static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        VERSION.get_or_init(|| {
+            format!(
+                "{} (librdkafka {})",
+                env!("CARGO_PKG_VERSION"),
+                delta_delta_ingest::kafka::librdkafka_version()
+            )
+        })
+    }
+    #[cfg(not(feature = "kafka"))]
+    {
+        env!("CARGO_PKG_VERSION")
+    }
+}
+
 #[derive(Parser)]
-#[command(name = "ddi", version, about, long_about = None)]
+#[command(name = "ddi", version = version(), about, long_about = None)]
 struct Cli {
     /// Path to the pipeline config (TOML).
     #[arg(

@@ -12,6 +12,8 @@ pub mod error;
 pub mod fence;
 pub mod gate;
 pub mod grain;
+#[cfg(feature = "kafka")]
+pub mod kafka;
 pub mod locate;
 pub mod lookup;
 pub mod metrics;
