@@ -29,8 +29,8 @@
 //!
 //! ddi resumes offsets kafka-delta-ingest wrote, under the same appIds. The first commit ddi
 //! makes under an app_id also writes the takeover marker ([`takeover_marker_app_id`]), a
-//! `txn` nothing ever removes, so from then on the table says for good which of the two
-//! wrote last ([`era`]). Before that, [`takeover_check`] is the one check a takeover needs.
+//! `txn` nothing ever removes, so from then on the table says for good that ddi has taken
+//! them over ([`era`]). Before that, [`takeover_check`] is the one check a takeover needs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};

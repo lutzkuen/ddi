@@ -403,7 +403,9 @@ impl DataQuality {
     ///    and `<prefix>offset` columns name an offset the batch read ([`Self::coordinates`]),
     ///    and −1 otherwise. Its partition is in its payload, beside the offset.
     /// 2. One commit appends them, with no `txn`, and records `ddi.appId`,
-    ///    `ddi.kafka.offsets` and `ddi.kafka.dqWriteId`, an id unique to this call.
+    ///    `ddi.kafka.offsets` and `ddi.kafka.dqWriteId`, an id unique to this call. First, a
+    ///    table whose protocol or column mapping delta-rs cannot write is refused, as a
+    ///    target is, before anything is written ([`crate::fence::refuse_unwritable_protocol`]).
     /// 3. A commit that ends in a conflict (another engine changed the table's metadata or
     ///    protocol, or delta-rs ran out of attempts) reopens the table. When the commit that
     ///    landed is this write's own — it did land, and the acknowledgement of its PUT was

@@ -477,7 +477,7 @@ impl Error {
     ///
     /// A [`Self::DataQualityWrite`] is classified by its cause, and apart from the same error
     /// raised by the target: whatever failed, it failed on the data-quality table, so it is
-    /// never a Replan of the target ([`Self::data_quality_class`]).
+    /// never a Replan of the target (its table of causes is `data_quality_class`).
     pub fn kafka_class(&self) -> KafkaClass {
         use deltalake::kernel::transaction::TransactionError;
         match self {
