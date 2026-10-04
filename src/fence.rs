@@ -96,8 +96,9 @@ pub const TAKEOVER_MARKER_VERSION: i64 = 1;
 ///   first re-asserts, once the duration has passed.
 ///
 /// A present time past any cutoff is kept as it is by Trino and Spark, and expired by none.
-/// Only a checkpoint writer that drops the field (delta-rs up to 0.17.3, which
-/// kafka-delta-ingest's `-c` builds before 2024-07 ran) makes it null again, which Spark
+/// Only a checkpoint writer that drops the field (delta-rs up to 0.17.3 nulls it, as
+/// kafka-delta-ingest's `-c` builds before 2024-07 did; 0.26.2, which its `-c` runs today,
+/// writes no `lastUpdated` column at all) makes it null again, which Spark
 /// alone then expires, and only while the property is set. The target is refused while it is
 /// ([`refuse_txn_retention`]); the stamp is what keeps ddi's offsets and its marker when the
 /// property was set, a checkpoint written and the property removed again between two
@@ -1109,7 +1110,8 @@ async fn parquet_txns(
         let versions = cast(versions, &DataType::Int64)?;
         let versions = versions.as_primitive::<Int64Type>();
         // `lastUpdated` is not read: checkpoint writers do not agree on it (delta-rs up to
-        // 0.17.3 nulls it, Trino writes 0 for a txn without one), and nothing here needs it.
+        // 0.17.3 nulls it, 0.26.2 has no such column, Trino writes 0 for a txn without one),
+        // and nothing here needs it.
         for row in 0..txn.len() {
             if txn.is_null(row) || app_ids.is_null(row) {
                 continue; // a row for another kind of action
@@ -3439,6 +3441,9 @@ mod tests {
         Null,
         /// 0 for a txn without one, as Trino writes it; every other kept.
         Trino,
+        /// No `lastUpdated` field at all, as delta-rs 0.26.2 writes it: kafka-delta-ingest's
+        /// `-c` today (its kernel/arrow/mod.rs:206-209 checkpoint schema).
+        Absent,
     }
 
     /// Rewrite the single-part checkpoint at `version` as another writer would have written
@@ -3446,6 +3451,7 @@ mod tests {
     fn restamp_checkpoint(dir: &std::path::Path, version: u64, restamp: Restamp) {
         use deltalake::arrow::array::{ArrayRef, Int64Array, StructArray};
         use deltalake::arrow::compute::concat_batches;
+        use deltalake::arrow::datatypes::{Fields, Schema};
         use deltalake::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use deltalake::parquet::arrow::ArrowWriter;
 
@@ -3459,9 +3465,16 @@ mod tests {
         let index = all.schema().index_of("txn").unwrap();
         let txn = all.column(index).as_struct().clone();
         let (fields, children, nulls) = txn.into_parts();
+        let kept = |f: &&Arc<deltalake::arrow::datatypes::Field>| {
+            !matches!(
+                (f.name().as_str(), restamp),
+                ("lastUpdated", Restamp::Absent)
+            )
+        };
         let children: Vec<ArrayRef> = fields
             .iter()
             .zip(children)
+            .filter(|(f, _)| kept(f))
             .map(|(f, child)| match (f.name().as_str(), restamp) {
                 ("lastUpdated", Restamp::Null) => {
                     Arc::new(Int64Array::from(vec![None::<i64>; child.len()])) as ArrayRef
@@ -3482,13 +3495,21 @@ mod tests {
                 _ => child,
             })
             .collect();
+        let fields: Fields = fields.iter().filter(kept).cloned().collect();
         let restamped = StructArray::new(fields, children, nulls);
+        let mut schema_fields = all.schema().fields().to_vec();
+        schema_fields[index] = Arc::new(
+            schema_fields[index]
+                .as_ref()
+                .clone()
+                .with_data_type(restamped.data_type().clone()),
+        );
+        let schema = Arc::new(Schema::new(schema_fields));
         let mut columns = all.columns().to_vec();
         columns[index] = Arc::new(restamped);
-        let rewritten = RecordBatch::try_new(all.schema(), columns).unwrap();
+        let rewritten = RecordBatch::try_new(schema.clone(), columns).unwrap();
         let mut writer =
-            ArrowWriter::try_new(std::fs::File::create(&file).unwrap(), all.schema(), None)
-                .unwrap();
+            ArrowWriter::try_new(std::fs::File::create(&file).unwrap(), schema, None).unwrap();
         writer.write(&rewritten).unwrap();
         writer.close().unwrap();
     }
@@ -3557,6 +3578,85 @@ mod tests {
             }
             assert_eq!(era_of(open(path).await).await, Era::Kdi, "{stamp:?}");
         }
+    }
+
+    /// kafka-delta-ingest's `-c` checkpoints today (delta-rs 0.26.2) carry no `lastUpdated` at
+    /// all. ddi reads the offsets and the era from one the same: kdi's own at a takeover, and
+    /// ddi's and the marker after a rollback to kdi (docs/kafka-design.md §0.3.9, §10.5).
+    #[tokio::test]
+    async fn offsets_and_era_read_from_a_checkpoint_without_last_updated() {
+        let ids_and_marker = || {
+            let mut ids = ids(0..3);
+            ids.push(takeover_marker_app_id(APP));
+            ids
+        };
+        let read = |table: DeltaTable| async move {
+            let counters = LookupCounters::default();
+            let txns = read_txns(&table, &ids_and_marker(), &counters)
+                .await
+                .unwrap();
+            assert_eq!(counters.fallbacks(), 0, "read from the checkpoint itself");
+            let offsets: Vec<Option<i64>> =
+                (0..3).map(|p| txns[&txn_app_id(APP, p)].version).collect();
+            (era(APP, &txns), offsets)
+        };
+
+        let txn_fields = |dir: &std::path::Path, version: u64| {
+            use deltalake::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+            let file = log_file(dir, &format!("{version:020}.checkpoint.parquet"));
+            let reader =
+                ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(file).unwrap())
+                    .unwrap();
+            match reader.schema().field_with_name("txn").unwrap().data_type() {
+                DataType::Struct(fields) => {
+                    fields.iter().map(|f| f.name().clone()).collect::<Vec<_>>()
+                }
+                other => panic!("txn is {other:?}"),
+            }
+        };
+
+        // kafka-delta-ingest's offsets, checkpointed by kafka-delta-ingest.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        kdi_commit(dir.path(), 1, "app-0", 7, 1_700_000_000_000);
+        kdi_commit(dir.path(), 2, "app-1", 9, 1_700_000_000_000);
+        deltalake::checkpoints::create_checkpoint(&open(path).await, None)
+            .await
+            .unwrap();
+        restamp_checkpoint(dir.path(), 2, Restamp::Absent);
+        assert_eq!(txn_fields(dir.path(), 2), ["appId", "version"]);
+        for v in 0..=2 {
+            std::fs::remove_file(log_file(dir.path(), &commit_name(v))).unwrap();
+        }
+        assert_eq!(
+            read(open(path).await).await,
+            (Era::Kdi, vec![Some(7), Some(9), None])
+        );
+
+        // ddi's takeover, then kafka-delta-ingest's checkpoint after a rollback.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        kdi_commit(dir.path(), 1, "app-0", 7, 1_700_000_000_000);
+        kdi_commit(dir.path(), 2, "app-1", 9, 1_700_000_000_000);
+        let mut fence = Fence::new(APP);
+        let table = open(path).await;
+        fence.reset(&table, &[0, 1]).await.unwrap();
+        let table = fenced_commit(&mut fence, table, &[(0, (8, 10))])
+            .await
+            .unwrap(); // 3
+        let before = read(table.clone()).await;
+        assert_eq!(before.0, Era::Ddi);
+        deltalake::checkpoints::create_checkpoint(&table, None)
+            .await
+            .unwrap();
+        restamp_checkpoint(dir.path(), 3, Restamp::Absent);
+        assert_eq!(txn_fields(dir.path(), 3), ["appId", "version"]);
+        for v in 0..=3 {
+            std::fs::remove_file(log_file(dir.path(), &commit_name(v))).unwrap();
+        }
+        assert_eq!(read(open(path).await).await, before);
     }
 
     #[test]
