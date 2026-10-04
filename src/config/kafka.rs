@@ -1286,6 +1286,25 @@ impl Config {
             }
             refuse_two_names(&keys, place)?;
         }
+        // A static member id written in the file is every member's, since every member reads
+        // one file, and members of one group with one id fence each other out in turn (§3.4).
+        for (place, written) in [
+            ("[kafka.settings]", &s.settings),
+            ("[kafka.pipeline.settings]", &p.settings),
+        ] {
+            if let Some(key) = written
+                .keys()
+                .find(|k| librdkafka_property(k) == "group.instance.id")
+            {
+                return fail(format!(
+                    "{place}: {key:?} written in the file is the same on every member that \
+                     reads it, and members of one group with one static id fence each other \
+                     out in turn (FENCED_INSTANCE_ID, fatal to the consumer). Set it in \
+                     settings_env, from a variable each member sets to its own value (a \
+                     StatefulSet's pod name), or leave it unset."
+                ));
+            }
+        }
         // The pipeline's key wins, under any of librdkafka's names for the setting.
         let mut settings = KafkaSettings::default();
         for (k, v) in s.settings.iter().chain(p.settings.iter()) {
@@ -2787,6 +2806,39 @@ url = "http://my-sr:8081"
         assert!(
             reason.contains("\"sasl.mechanism\"") && reason.contains("\"sasl.mechanisms\""),
             "{reason}"
+        );
+    }
+
+    #[test]
+    fn an_inline_group_instance_id_is_refused() {
+        // Every member reads one file, so a static id written in it is every member's, and
+        // members of one group with one id fence each other out in turn.
+        for (section, pipeline) in [
+            ("[kafka.settings]\n\"group.instance.id\" = \"ddi-1\"\n", ""),
+            (
+                "",
+                "[kafka.pipeline.settings]\n\"group.instance.id\" = \"ddi-1\"",
+            ),
+        ] {
+            let reason = refused(section, pipeline);
+            assert!(
+                reason.contains("group.instance.id") && reason.contains("settings_env"),
+                "{reason}"
+            );
+        }
+        // From the environment, each member sets its own.
+        let r = resolve(&format!(
+            "{SECTION}{}",
+            entry(
+                "events",
+                "[kafka.pipeline.settings_env]\n\"group.instance.id\" = \"POD_NAME\""
+            )
+        ));
+        let a = settings_of(&r, "events", &[("POD_NAME", "ddi-0")]).unwrap();
+        let b = settings_of(&r, "events", &[("POD_NAME", "ddi-1")]).unwrap();
+        assert_eq!(
+            (a.get("group.instance.id"), b.get("group.instance.id")),
+            (Some("ddi-0"), Some("ddi-1"))
         );
     }
 
