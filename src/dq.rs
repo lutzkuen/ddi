@@ -76,7 +76,7 @@ use deltalake::kernel::transaction::{CommitProperties, TransactionError};
 use deltalake::kernel::{DataType as DeltaType, PrimitiveType, StructField, Transaction};
 use deltalake::protocol::SaveMode;
 use deltalake::{DeltaTable, DeltaTableError};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -432,13 +432,12 @@ impl DataQuality {
     /// recorded, and move each of its partitions' marks to the last offset it read.
     ///
     /// Returns how many rows were written. In steps (docs/kafka-design.md §5.7):
-    /// 1. Read the marks `<app_id>.dq-<p>` of the batch's partitions, and of any partition a
-    ///    reject names, from this table's handle (`fence::read_own_txns`: a mark never
-    ///    expires, so `delta.setTransactionRetentionDuration` is not refused here, as it is
-    ///    on a target).
+    /// 1. Read the marks `<app_id>.dq-<p>` of the batch's partitions from this table's handle
+    ///    (`fence::read_own_txns`: a mark never expires, so
+    ///    `delta.setTransactionRetentionDuration` is not refused here, as it is on a target).
     /// 2. Skip a reject recorded at or below its partition's mark: one with coordinates — its
-    ///    `<prefix>partition` and `<prefix>offset` columns — whose reason is deterministic,
-    ///    which every reason is but [`KAFKA_SCHEMA_NOT_FOUND`].
+    ///    `<prefix>partition` and `<prefix>offset` columns, naming an offset the batch read —
+    ///    whose reason is deterministic, which every reason is but [`KAFKA_SCHEMA_NOT_FOUND`].
     /// 3. Commit the rest, each row's `source_version` its offset (−1 without one), with
     ///    `<app_id>.dq-<p>` = max(mark, last offset read) for every partition of the batch.
     /// 4. A commit that conflicts on a mark — a zombie, or a handover — reopens the table and
@@ -456,8 +455,10 @@ impl DataQuality {
         if rows == 0 {
             return Ok(0);
         }
-        let coordinates: Vec<Vec<Option<(i32, i64)>>> =
-            rejected.iter().map(|r| self.coordinates(r)).collect();
+        let coordinates: Vec<Vec<Option<(i32, i64)>>> = rejected
+            .iter()
+            .map(|r| self.coordinates(r, &offsets.ranges))
+            .collect();
 
         let mut retries = 0;
         loop {
@@ -508,12 +509,8 @@ impl DataQuality {
         offsets: &KafkaOffsets,
         now_micros: i64,
     ) -> std::result::Result<usize, Attempt> {
-        let partitions: BTreeSet<i32> = offsets
-            .ranges
-            .keys()
-            .copied()
-            .chain(coordinates.iter().flatten().flatten().map(|(p, _)| *p))
-            .collect();
+        // Every reject's coordinates are in these partitions, or it has none.
+        let partitions: Vec<i32> = offsets.ranges.keys().copied().collect();
         let ids: Vec<String> = partitions
             .iter()
             .map(|p| kafka_app_id_for(&self.app_id, *p))
@@ -638,11 +635,21 @@ impl DataQuality {
     }
 
     /// Each row's partition and offset, where its `<prefix>partition` and `<prefix>offset`
-    /// columns are integers and both are set.
+    /// columns are integers, both are set, and they name an offset of `ranges`: one the batch
+    /// read.
     ///
-    /// A row without them — a transform's output that dropped the columns, or computed
-    /// something else under their names — has no coordinates, and is always written.
-    fn coordinates(&self, rejected: &Rejected) -> Vec<Option<(i32, i64)>> {
+    /// A row without them — a transform's output that dropped the columns — has no
+    /// coordinates, and is always written. So has one whose columns name a message the batch
+    /// did not read: a message's own coordinates always lie inside the batch, so those are
+    /// something else under the same names — values the SQL computed, or a payload's own
+    /// fields read under the default prefix where the pipeline set another. Taken at their
+    /// word, they would be checked against another partition's mark, or below the batch's
+    /// range, and the reject skipped.
+    fn coordinates(
+        &self,
+        rejected: &Rejected,
+        ranges: &BTreeMap<i32, (i64, i64)>,
+    ) -> Vec<Option<(i32, i64)>> {
         let column = |name: String| {
             let c = rejected.rows.column_by_name(&name)?;
             if !c.data_type().is_integer() {
@@ -665,7 +672,12 @@ impl DataQuality {
                 if partitions.is_null(i) || offsets.is_null(i) {
                     return None;
                 }
-                Some((i32::try_from(partitions.value(i)).ok()?, offsets.value(i)))
+                let (partition, offset) =
+                    (i32::try_from(partitions.value(i)).ok()?, offsets.value(i));
+                let (first, last) = ranges.get(&partition)?;
+                (*first..=*last)
+                    .contains(&offset)
+                    .then_some((partition, offset))
             })
             .collect()
     }
@@ -873,6 +885,32 @@ mod tests {
             rows,
             reasons: vec!["cannot cast 'n/a' to DECIMAL(10,2)".to_string(); n],
             columns: vec![Some("amount".to_string()); n],
+        }
+    }
+
+    /// One rejected row with integer `<prefix>partition` and `<prefix>offset` columns for each
+    /// `(prefix, partition, offset)`, as SQL that computed them would leave it.
+    fn rejected_with(coordinates: &[(&str, i32, i64)], reason: &str) -> Rejected {
+        let mut fields = vec![Field::new("order_id", DataType::Int64, false)];
+        let mut values: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![42]))];
+        for (prefix, partition, offset) in coordinates {
+            fields.push(Field::new(
+                format!("{prefix}partition"),
+                DataType::Int32,
+                false,
+            ));
+            fields.push(Field::new(
+                format!("{prefix}offset"),
+                DataType::Int64,
+                false,
+            ));
+            values.push(Arc::new(Int32Array::from(vec![*partition])));
+            values.push(Arc::new(Int64Array::from(vec![*offset])));
+        }
+        Rejected {
+            rows: RecordBatch::try_new(Arc::new(Schema::new(fields)), values).unwrap(),
+            reasons: vec![reason.to_string()],
+            columns: vec![None],
         }
     }
 
@@ -1122,6 +1160,64 @@ mod tests {
             1,
             "below the mark, but not known to be"
         );
+    }
+
+    /// A message's coordinates always lie inside what its batch read. A reject whose
+    /// `<prefix>partition` and `<prefix>offset` lie outside — computed by the SQL under those
+    /// names, or a payload's own fields read under the default prefix where the pipeline set
+    /// another — names no message of the batch, and is written rather than checked against
+    /// another partition's mark, or an offset the batch never read.
+    #[tokio::test]
+    async fn dq_coordinates_outside_the_batch_are_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+        let first = [undecodable(0, &[50], MALFORMED)];
+        assert_eq!(
+            dq.write_kafka(&first, &read(&[(0, (0, 100))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(txn(path, "app.dq-0").await, Some(100));
+
+        // A batch that read partition 1 only, with a reject that says partition 0.
+        let other_partition = [rejected_with(&[("kafka_", 0, 5)], MALFORMED)];
+        assert_eq!(
+            dq.write_kafka(&other_partition, &read(&[(1, (0, 10))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+        // A batch that read partition 0 from 101, with a reject that says offset 7.
+        let below = [rejected_with(&[("kafka_", 0, 7)], MALFORMED)];
+        assert_eq!(
+            dq.write_kafka(&below, &read(&[(0, (101, 200))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+        // A pipeline whose metadata prefix is meta_, read as if it were kafka_: the payload's
+        // own kafka_partition and kafka_offset are not this message's.
+        let payload_fields = [rejected_with(
+            &[("meta_", 3, 4), ("kafka_", 0, 9)],
+            MALFORMED,
+        )];
+        assert_eq!(
+            dq.write_kafka(&payload_fields, &read(&[(3, (0, 10))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let versions: Vec<i64> = recorded(path).await.iter().map(|r| r.0).collect();
+        assert_eq!(
+            versions,
+            vec![-1, -1, -1, 50],
+            "no offset to record for those"
+        );
+        assert_eq!(dq.kafka_counters().rows_skipped(), 0);
     }
 
     #[tokio::test]
