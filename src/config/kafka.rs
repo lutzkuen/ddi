@@ -123,10 +123,14 @@ impl KafkaConfig {
 }
 
 /// `[kafka.schema_registry]`, or the same table on one pipeline, which overrides it key by key.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+///
+/// `Debug` is written by hand, so that a URL somebody wrote with credentials in it is printed
+/// without them (resolution refuses it).
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchemaRegistryConfig {
-    /// `http(s)://host:port`. Required for `value_format = "avro_confluent"`.
+    /// `http(s)://host:port`. Required for `value_format = "avro_confluent"`. Credentials go in
+    /// the variables `username_env` and `password_env` name, never in the URL.
     pub url: Option<String>,
     /// Basic auth. Unset takes kdi's names; `""` turns one off.
     pub username_env: Option<String>,
@@ -136,6 +140,30 @@ pub struct SchemaRegistryConfig {
     /// A PEM added to the roots the registry's certificate is checked against. kdi used the
     /// OS store; unset means the bundled roots only.
     pub ca_pem_env: Option<String>,
+}
+
+impl std::fmt::Debug for SchemaRegistryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SchemaRegistryConfig")
+            .field("url", &self.url.as_deref().map(redact_userinfo))
+            .field("username_env", &self.username_env)
+            .field("password_env", &self.password_env)
+            .field("proxy_env", &self.proxy_env)
+            .field("ca_pem_env", &self.ca_pem_env)
+            .finish()
+    }
+}
+
+/// `url` with whatever stands before an `@` in its authority replaced by `<redacted>`: string
+/// work, so that a URL that does not parse is redacted as well.
+fn redact_userinfo(url: &str) -> String {
+    let start = url.find("://").map_or(0, |i| i + 3);
+    let rest = &url[start..];
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    match authority.rfind('@') {
+        Some(at) => format!("{}<redacted>{}", &url[..start], &rest[at..]),
+        None => url.to_string(),
+    }
 }
 
 /// One `[[kafka.pipeline]]`: one topic into one Delta table.
@@ -1362,12 +1390,27 @@ impl Config {
         let sr = merged_registry(s.schema_registry.as_ref(), p.schema_registry.as_ref());
         let schema_registry = match &sr.url {
             Some(url) => {
+                // Printed only as this: the URL is in error messages and logs.
+                let shown = redact_userinfo(url.trim());
                 let parsed = url::Url::parse(url.trim()).ok();
                 let http = parsed.as_ref().is_some_and(|u| {
                     matches!(u.scheme(), "http" | "https") && u.host_str().is_some()
                 });
                 if !http {
-                    return fail(format!("schema_registry.url {url:?} is not an http(s) URL"));
+                    return fail(format!(
+                        "schema_registry.url {shown:?} is not an http(s) URL"
+                    ));
+                }
+                if parsed
+                    .as_ref()
+                    .is_some_and(|u| !u.username().is_empty() || u.password().is_some())
+                {
+                    return fail(format!(
+                        "schema_registry.url {shown:?} carries credentials, which the config \
+                         must not hold: put them in the variables username_env and password_env \
+                         name (kdi's {DEFAULT_SR_USERNAME_ENV} and {DEFAULT_SR_PASSWORD_ENV} by \
+                         default)"
+                    ));
                 }
                 Some(ResolvedSchemaRegistry {
                     url: url.trim().to_string(),
@@ -3126,6 +3169,36 @@ url = "http://my-sr:8081"
         // A path's case is the table's: these are two.
         let r = two("/tmp/bronze/x", "/tmp/bronze/X", "other_app", "topic-a");
         assert_eq!(running(&r), ["a", "b"], "{r:?}");
+    }
+
+    // ----------------------------------------------------------------------- secrets
+
+    #[test]
+    fn schema_registry_credentials_are_refused_and_never_printed() {
+        for url in [
+            "https://svc:hunter2@sr.internal:8081",
+            "htps://svc:hunter2@sr.internal:8081",
+            "svc:hunter2@sr.internal:8081",
+        ] {
+            let cfg = config(&format!(
+                "[kafka]\nbrokers = \"b:9092\"\n[kafka.schema_registry]\nurl = {url:?}\n{}",
+                entry("events", "")
+            ));
+            assert!(!format!("{cfg:?}").contains("hunter2"), "{url}: {cfg:?}");
+            let r = cfg.resolve_all_with(true).unwrap();
+            let reason = held(&r, "events");
+            assert!(!reason.contains("hunter2"), "{url}: {reason}");
+            assert!(reason.contains("schema_registry.url"), "{url}: {reason}");
+            assert!(!format!("{r:?}").contains("hunter2"), "{url}: {r:?}");
+        }
+        let reason = refused(
+            "",
+            "[kafka.pipeline.schema_registry]\nurl = \"https://svc:hunter2@sr.internal:8081\"",
+        );
+        assert!(
+            reason.contains("username_env") && reason.contains("<redacted>@sr.internal"),
+            "points at the variables: {reason}"
+        );
     }
 
     /// [`librdkafka_property`] against librdkafka itself: a value set under one name is what
