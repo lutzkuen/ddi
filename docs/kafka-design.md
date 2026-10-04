@@ -32,12 +32,12 @@ Everything else cites the earlier verification pass (§11). Claims a milestone m
 | Client | rdkafka 0.39.0 with librdkafka 2.12.1, static, features `tokio, libz, ssl, zstd, tracing` (this already builds here). Eager protocol only. **Deferred rebalancing:** the callback copies the partition list and returns. The main loop reads offsets from Delta, then calls `assign()` with them. On revoke it commits the buffer (time-boxed), then calls `unassign()`. `ddi once` uses manual assignment and never joins the group. |
 | Errors | A member leaves its group only on consumer-fatal errors. Transient failures hold the batch, pause, and retry in place. Operator-action failures pause only the affected partitions (or all of them, when the cause is pipeline-wide) and re-check every 60 s. |
 | Offsets | Kept only in the target. txn appId `"<app_id>-<p>"`; `version` = last offset accounted for (kdi's convention). Every commit re-asserts every owned partition whose base is known, so delta-rs's txn conflict check fences everything. Lookups use a backward commit walker bounded by the newest checkpoint: one GET in steady state. |
-| Missing offsets | **Fresh app_id:** `starting_offsets` (`earliest`, `latest`, or a complete map with an optional `"*"`). A txn-only baseline is committed when any start is > 0. **Not fresh:** a partition without a txn starts at **exactly offset 0**; `low > 0` is a retention gap that needs an acknowledged `set-offsets`. The typo guard (with a shared-table exemption) and the txn-retention refusal stay. |
+| Missing offsets | **Fresh app_id:** `starting_offsets` (`earliest`, `latest`, or a complete map with an optional `"*"`). A txn-only baseline is committed when any start is > 0. **Not fresh:** a partition without a txn starts at **exactly offset 0**; `low > 0` is a retention gap that needs an acknowledged `set-offsets`. **Takeover:** ddi's first commit under an app_id writes one marker txn, `<app_id>.ddi`, and no commit after it. Until it is there (kdi's era), a partition without a txn whose topic holds messages needs an explicit `starting_offsets` entry, checked once at open. The typo guard (with a shared-table exemption) and the txn-retention refusal stay. |
 | Incarnation | A partition resumes by re-reading its last written offset and comparing it with the timestamp and length ddi recorded. A recreated topic blocks the partition. |
 | Decode | arrow-avro =58.4.0, plus a small SR client on reqwest 0.12 (`?deleted=true`). One decoder per writer schema id, a strict per-message check, isolation by re-decoding a chunk. |
 | Evolution | **Identity path:** by-name nested conform to the target. **SQL path:** inputs are aligned to `U` = the latest registered version ∪ every id seen. The newest id's type wins; older values are cast, and rows that cannot be cast go to DQ. Never refuses to start because of history. |
 | kdi parity | `kdi_compat`: a non-string value going into a STRING column is rendered by its **Arrow type, at every depth**, the way kdi's serde_json rendered it. `kdi_null_text`: a null becomes the text `"null"` where kdi's JSON would have had the key. Unset on a kdi-written table refuses to start; false on new tables. The parity reference is the apache-avro version inside the **production** kdi binary. |
-| Bad messages | DQ table with per-partition marks `<app_id>.dq-<p>`. On replay, deterministic rejects at offsets ≤ the mark are skipped. A DQ conflict is retried in place. With no DQ table, that pipeline pauses but stays in its group. |
+| Bad messages | DQ table, written as plain appends with no txn, each reject with its offset. A replay after a crash between the DQ and the target commit writes its rejects again: a visible duplicate, never a loss. A DQ conflict is retried in place. With no DQ table, that pipeline pauses but stays in its group. |
 | Batching | Close on latency (the timer starts at the first message after a commit), message count, raw key+value bytes, or **measured** decoded bytes against the memory budget. Kafka never feeds `Amplification`. |
 | Transforms | ddi's SQL, fixed `kafka_*` metadata columns (prefix configurable), and a translation table for kdi's `-t`. |
 | Metrics | Prometheus `ddi_kafka_*`. `Waiting` counts as progress only when the member is caught up or committed recently. Alert rules ship with it. statsd only if dashboards need it. |
@@ -58,9 +58,9 @@ Design A was reuse-first, design B correctness-first. "rev." marks a decision ch
 | 6 | SQL over several writer schemas | **A, rev.:** align to `U`, but `U` = latest ∪ seen. The newest type wins and rows that cannot be cast go to DQ (PO-M7). |
 | 7 | STRING-column parity | **rev.:** rendered by Arrow type plus key presence (PO-B1, PO-M2). Default false for new tables; must be set explicitly on kdi tables. |
 | 8 | Parity reference | **rev.:** the apache-avro version inside the production kdi image (PO-M1), not the fork's 0.21/0.22. |
-| 9 | DQ idempotence | **rev.:** per-partition DQ txns `<app_id>.dq-<p>`, each holding the last offset covered; undecodables at offsets ≤ it are skipped when the decoder that set it is the current one (§5.7). dq.rs's argument for equality (a version can mean different data after a rewind, dq.rs:262-280) does not carry over: a Kafka offset names one message for the life of a topic incarnation, which §4.4 checks, and `set-offsets` moves the marks with the txns. Members never share a DQ appId (EO-M1). |
+| 9 | DQ idempotence | **rev. (twice):** none across replays for Kafka. A Kafka DQ commit is a plain append with no txn, so members never contend on one (EO-M1), and a replay after a crash between the DQ and the target commit records its rejects again, deduplicable by (partition, offset) (§5.7). Per-partition marks `<app_id>.dq-<p>` with a skip below them were tried and lost a reject three ways in review: a reject's classification can change between attempts, the decoder can change between builds, and nothing bounds a mark from below after a re-read. A lost reject is worse than a duplicate. One write's own retry stays idempotent (`ddi.kafka.dqWriteId`). Delta pipelines keep dq.rs's equality rule. |
 | 10 | Retention gap | **B:** recovered only by `ddi kafka set-offsets --acknowledge-skip "<reason>"`, recorded in the commit. |
-| 11 | Missing offset while siblings have one | **rev.:** exactly offset 0; `low > 0` needs an acknowledged skip. Never the low watermark (EO-M4a). |
+| 11 | Missing offset while siblings have one | **rev.:** exactly offset 0; `low > 0` needs an acknowledged skip. Never the low watermark (EO-M4a). **rev. again:** in kdi's era (no takeover marker), one whose topic holds messages needs an explicit `starting_offsets` entry, checked once at open over every partition; its kdi txn may have expired (EO-M4b). |
 | 12 | Baseline commit | **rev.:** on a fresh app_id whenever any partition starts above 0. |
 | 13 | Typo guard | **Adopted, rev.:** exempts targets whose txns all belong to other configured Kafka pipelines (EO-m15). |
 | 14 | `max_bytes_per_batch` | **B:** raw key+value bytes, plus a decoded-bytes cap from the budget (EO-M5). |
@@ -244,13 +244,15 @@ pub struct KafkaOffsets {
     pub cleanup_logs: bool,                      // §7.2
     pub baseline: bool,                          // txn-only start commit (§4.4)
     pub override_reason: Option<String>,         // set-offsets (§4.8)
+    pub takeover_marker: bool,                   // writes `<app_id>.ddi`: first commit whose snapshot lacks it (§4.3)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MessageMark { pub offset: i64, pub timestamp_ms: i64, pub value_len: u32 }
 
 impl Sink {
     pub async fn commit_kafka(&self, t: DeltaTable, b: Vec<RecordBatch>, k: &KafkaOffsets) -> Result<DeltaTable> {
-        let txns = k.assert.iter().map(|(p, v)| Transaction::new(fence::txn_app_id(&self.app_id, *p), *v)).collect();
+        let mut txns: Vec<_> = k.assert.iter().map(|(p, v)| Transaction::new(fence::txn_app_id(&self.app_id, *p), *v)).collect();
+        if k.takeover_marker { txns.push(Transaction::new(fence::takeover_marker_app_id(&self.app_id), 1)) }
         let mut meta = vec![
             ("ddi.appId".into(), self.app_id.clone().into()),
             ("ddi.kafka.topic".into(), k.topic.clone().into()),
@@ -271,9 +273,9 @@ impl Sink {
 
 There is no `ddi.sourceVersion` on Kafka commits: it is written but never read (only dq.rs:219 and sink.rs:107 mention it).
 
-**`src/fence.rs`** (always compiled, Kafka-agnostic: "partitioned offsets in a Delta table") holds the txn naming, the backward `read_txns` walker and the `Fence` (§4.3). Its unit tests run in M0 against local tables.
+**`src/fence.rs`** (always compiled, Kafka-agnostic: "partitioned offsets in a Delta table") holds the txn naming, the backward `read_txns` walker, the `Fence`, and the takeover marker with the era and the open-time takeover check (§4.3, §4.4). Its unit tests run in M0 against local tables.
 
-**dq.rs: additive.** `write` and `already_recorded` (dq.rs:191-290) stay byte-for-byte, so Delta DQ commits do not change. New: `kafka_app_id_for(app_id, p) = "<app_id>.dq-<p>"`, and `write_kafka(rejected, &KafkaOffsets, now)` (§5.7), which uses `fence::read_txns` on the DQ table.
+**dq.rs: additive.** `write` and `already_recorded` (dq.rs:191-290) stay byte-for-byte, so Delta DQ commits do not change. New: `write_kafka(rejected, &KafkaOffsets, now)` (§5.7), a plain append with no txn.
 
 ### 1.3 Delta pipelines stay identical, and how that is proven
 
@@ -302,10 +304,10 @@ There is no `ddi.sourceVersion` on Kafka commits: it is written but never read (
 |---|---|---|---|
 | src/pipeline.rs | always | `Source`, `Batch`, `Position`, `process()` split, `conform` hook, `commit(&Offsets)` | +140/-50 |
 | src/sink.rs | always | `Offsets`, `KafkaOffsets`, `MessageMark`, `commit_kafka`, private `write` | +110 |
-| src/fence.rs | always | Txn naming; `read_txns` (backward walk, checkpoint `txn` column, kernel fallback); `Fence`; retention, protocol and table-id refusals | 450 |
-| src/dq.rs | always | `kafka_app_id_for`, `write_kafka` (marks, filtering, in-place conflict retry) | +160 |
+| src/fence.rs | always | Txn naming; `read_txns` (backward walk, checkpoint `txn` column, kernel fallback); `Fence`; takeover marker, era, takeover check; retention, protocol and table-id refusals | 450 |
+| src/dq.rs | always | `write_kafka` (plain append, protocol refusal, in-place conflict retry) | +160 |
 | src/config.rs | always | `KafkaConfig`, `KafkaPipelineConfig`, `ResolvedKafka`, merge into `resolve_all`, validation, kdi env-name defaults | +500 |
-| src/error.rs | always | Kafka error variants (§3.6), with no rdkafka types | +110 |
+| src/error.rs | always | Kafka error variants (§3.6), with no rdkafka types; `Error::kafka_class`, the §3.6 classes read by variant | +230 |
 | src/metrics.rs | always | `kafka: Option<Arc<KafkaMetrics>>` on `PipelineMetrics`, rendered after the existing block only when `Some` | +220 |
 | src/budget.rs | always | Per-Kafka-pipeline reservation | +20 |
 | src/kafka/mod.rs | kafka | `KafkaSource`, `Work`, `KafkaProgress`, `Drop` (close on a detached thread) | 180 |
@@ -483,7 +485,7 @@ Each failure is a `Rejection`: the pipeline is held back and `ddi_pipeline_confi
 5. **Target sharing:**
    - A Kafka target that is also a Delta pipeline's target: reject both. A Delta app_id `x-0` would otherwise collide with Kafka app_id `x`, partition 0.
    - Two Kafka pipelines on one target with the same topic: reject (that would duplicate data).
-   - Distinct topics with distinct app_ids may share a table. kdi allowed it, and partition-watermark documents `["kafka_topic","kafka_partition"]` for exactly this (config.rs:341-342). Appids `"<a>-<digits>"` never collide across different `a`.
+   - Distinct topics with distinct app_ids may share a table. kdi allowed it, and partition-watermark documents `["kafka_topic","kafka_partition"]` for exactly this (config.rs:341-342). Appids `"<a>-<digits>"` never collide across different `a`, nor with any takeover marker `"<b>.ddi"` (§4.3), which ends in `.ddi`, not in digits.
 6. **Groups.** Two Kafka pipelines in one config with the same `group_id`: reject both. They would rebalance each other.
 7. **Forced keys** (§2.4) present in any settings map: reject, pointing at the ddi key that owns them.
 8. **Rebalancing.** Reject a `partition.assignment.strategy` other than `range` and/or `roundrobin` (kdi used librdkafka's default `range,roundrobin`, CONFIGURATION.md:129), in particular `cooperative-sticky`. Reject a `group.protocol` other than `classic`.
@@ -609,7 +611,7 @@ loop until TICK (1 s) elapsed or a batch closes:
 - **On close,** `decode.finish()` flushes every group and builds a `KafkaBatch { input, rejects, offsets }`:
   - `input`: per-group batches; on the SQL path each is aligned to `U` (§5.5).
   - `rejects`: one `Rejected` holding all undecodables (§5.7).
-  - `offsets`: `KafkaOffsets` with `ranges`, `assert` and `marks` from the fence (§4.3).
+  - `offsets`: `KafkaOffsets` with `ranges`, `assert` and `marks` from the fence (§4.3), and `takeover_marker` from `fence.takeover_marker_due()` after `verify` (step 2 below).
 
 **`step_kafka` (src/kafka/step.rs):**
 
@@ -624,11 +626,12 @@ self.commit_batch(batch).await
 
 `commit_batch`:
 1. **Aging (EO-m8).** If the handle has not advanced through our own commit or a reset for `handle_max_age` (10 min): refresh incrementally, then `fence.reset`. If any batch partition's base changed, drop the batch and `reset_in_place`.
-2. **`fence.verify(&self.target, &ranges)`.** A mismatch → `reset_in_place`; counts `fenced_total{kind="base_mismatch"}`.
-3. **`self.process(batch.clone())`** (cheap clone, so the batch can be kept). Then:
+2. **`fence.verify(&self.target, &ranges)`.** A mismatch → `reset_in_place`; counts `fenced_total{kind="base_mismatch"}`. It also reads the takeover marker at the handle's version when the fence does not know it yet, so that `takeover_marker_due()` is exact for this commit.
+3. **`self.process(batch.clone())`** (cheap clone, so the batch can be kept). The class of an error is `Error::kafka_class()` (§3.6). Then:
    - `Ok(o)` → `src.committed(&offsets)`; resume paused partitions; if `commit_offsets_to_kafka`, `commit_async`; return `o`.
    - `Err(e)` in class **Replan** → `reset_in_place`. The batch survives iff every partition it covers still has `base_p = first_p − 1`; it is then retried at once, with nothing re-sought. Otherwise it is dropped and the changed partitions are re-sought (EO-m10).
    - `Err(e)` in class **Transient** → hold the batch, pause all owned partitions, back off (1 s doubling to 60 s), return `Waiting`. Counts `errors_total`; `ddi_kafka_retrying = 1`.
+   - `Err(e)` in class **Capacity** → as Transient, but back off the full `RETRY_MAX` and raise `ddi_capacity_exhausted` instead of `ddi_kafka_retrying`.
    - `Err(e)` in class **Blocking** → hold the batch while it stays valid, pause (one partition or all, §3.6), set the gauge, re-check every `blocked_recheck_secs`, return `Waiting`.
    - `Err(e)` in class **Consumer-fatal** → `Err(e)`: the supervisor drops the consumer and reopens.
 
@@ -646,7 +649,7 @@ self.commit_batch(batch).await
 
 **`Assign(tpl)` → `assign_with_delta_offsets`.** The group waits meanwhile, heartbeating; this takes seconds.
 1. Refresh the target incrementally, as in `reset_in_place` steps 1-5 (EO-m11). The full `Storage::open` remains for the supervisor and for a failed refresh.
-2. `fence.reset(target, partitions)`: bases and marks in one backward walk (§4.3).
+2. `fence.reset(target, partitions)`: bases and marks in one backward walk (§4.3), and the takeover marker until the fence has seen it.
 3. `fetch_watermarks` per partition (`spawn_blocking`, 8 at a time, 10 s timeout). Under `read_committed` "high" is the LSO (§0.3.15).
 4. Resolve each start (§4.4): `Start { offset, reread }` or `Blocked(reason)`.
 5. Write the offsets into the copied list; blocked partitions get `Offset::End`. Call `assign(&tpl)`, then `pause` the blocked ones (any message that slips through for them is dropped).
@@ -677,28 +680,31 @@ The flush runs outside the callback while librdkafka holds our rejoin. The time 
 
 ### 3.6 Error classes
 
+`Error::kafka_class()` (src/error.rs) is the classifier: it reads the variant, never the text, except for delta-rs's foreign-checkpoint error, which has no variant of its own. It covers every error of this build; M3 adds the Kafka-only variants (`KafkaOffsetsUnavailable` and the rest) and the one-partition class. `every_error_has_its_kafka_class` pins every row below that an error of M0 can fall in.
+
 | Class | Errors | Handling |
 |---|---|---|
 | **Replan** | `CommitConflict(_)`, `VersionAlreadyExists`, `MaxCommitAttempts`, foreign checkpoint (pipeline.rs:1382-1403, 1521), a commit file missing during the conflict check (cleaned log, EO-m8) or during `read_txns`' walk (`OffsetLogTruncated`), `Fenced` | `reset_in_place`; the batch is retained when still valid |
-| **Transient** | Object store errors (5xx, 429, timeouts, IO); SR 5xx/429/network after its own 3 tries; a DQ commit conflict after 3 in-place tries (`DataQualityConflict`); `DataQualityWrite` whose cause is Transient below; librdkafka transport errors | Hold the batch, pause all, back off 1 s → 60 s, stay in the group. `ddi_kafka_retrying = 1`. Never escalates by itself: an outage that hits one member usually hits all, and leaving the group would only add rebalances. |
-| **Blocking, one partition** | `KafkaOffsetsUnavailable{p, wanted, low}`, `KafkaOffsetsRegressed{p, stored, high}`, `KafkaTopicReplaced{p}` | Pause **that** partition; it keeps being re-asserted at its unchanged base, and the others continue. Gauge `ddi_kafka_blocked_partitions`, plus the per-cause gauges. Re-checked every `blocked_recheck_secs`: refresh, `read_txns` for it, watermarks; it resumes as soon as an operator's `set-offsets` makes it resolvable. |
-| **Blocking, pipeline** | `KafkaOffsetMissing{p}` (§4.4: a commit would replace the evidence it rests on), `KafkaUndecodable` (no DQ table), undecodables above the cap, `KafkaSchemaConflict` (§5.5), `KafkaMetadataCollision` (§6.1), a DQ table that is missing at open, or has the wrong schema or protocol (a `DataQualityWrite` whose cause is Blocking below), `TargetProtocolUnsupported`, `TargetReplaced`, `KafkaTxnRetention` | Pause all owned partitions, gauge, keep polling (stay in the group), re-check every `blocked_recheck_secs` (re-open the DQ table, re-check the protocol). `TargetReplaced` clears only on restart, where the new table is treated as fresh. |
-| **Open-time refusal** | `KafkaAppIdUnknown` (typo guard), `KafkaCompatUnset`, `KafkaPartitionColumnUnmapped`, `KafkaStartingOffsetsIncomplete`, `KafkaTxnRetention` at open | Raised before subscribing or assigning, so no group is joined. `RETRY_MAX` backoff with the gauge. |
-| **Consumer-fatal** | librdkafka fatal error (incl. `FENCED_INSTANCE_ID`), `Event::Fatal`, SASL authentication failure, topic/group authorisation failure, unknown topic, internal invariant violations | `Err` → supervisor: close the consumer on a detached thread, back off (`RETRY_MAX` for config-class), reopen |
+| **Transient** | Object store errors (5xx, 429, timeouts, IO), and any other delta-rs error; SR 5xx/429/network after its own 3 tries; a DQ commit conflict after 3 in-place tries (`DataQualityConflict`); `DataQualityWrite` whose cause is Transient below; `Config` from a refresh that fell back to a full open; librdkafka transport errors | Hold the batch, pause all, back off 1 s → 60 s, stay in the group. `ddi_kafka_retrying = 1`. Never escalates by itself: an outage that hits one member usually hits all, and leaving the group would only add rebalances. |
+| **Capacity** | `Capacity` from the bronze write (a full spill directory), or one beneath `DataQualityWrite` | Hold the batch, pause all, back off the full `RETRY_MAX`, stay in the group, raise `ddi_capacity_exhausted`. Retried a second later, it would re-run the same work into the same full directory every backoff period (error.rs, `Capacity`). `drive` (main.rs:831-838) and `observe_error` (metrics.rs:273) match `Error::Capacity` at the top, which misses the one beneath the wrapper: M3 switches both to `Error::is_capacity()`, and the Kafka loop raises the gauge from the class. |
+| **Blocking, one partition** | `KafkaOffsetsUnavailable{p, wanted, low}`, `KafkaOffsetsRegressed{p, stored, high}`, `KafkaTopicReplaced{p}` (M3) | Pause **that** partition; it keeps being re-asserted at its unchanged base, and the others continue. Gauge `ddi_kafka_blocked_partitions`, plus the per-cause gauges. Re-checked every `blocked_recheck_secs`: refresh, `read_txns` for it, watermarks; it resumes as soon as an operator's `set-offsets` makes it resolvable. |
+| **Blocking, pipeline** | `KafkaUndecodable` (no DQ table), undecodables above the cap, `KafkaSchemaConflict` (§5.5), `KafkaMetadataCollision` (§6.1), a DQ table that is missing at open, or has the wrong schema or protocol, uses column mapping, or has a commit that cannot be read (a `DataQualityWrite` whose cause is Blocking below), `TargetProtocolUnsupported` and a delta-rs `UnsupportedTableFeatures`/`TableFeaturesRequired`, `TargetReplaced`, `KafkaTxnRetention`, and a `Transform`, `Evaluation` or `Schema` error (the same batch fails the same way until someone changes the SQL or the target) | Pause all owned partitions, gauge, keep polling (stay in the group), re-check every `blocked_recheck_secs` (re-open the DQ table, re-check the protocol). `TargetReplaced` clears only on restart, where the new table is treated as fresh. |
+| **Open-time refusal** | `KafkaOffsetMissing{partitions}` (§4.4 step 3: the takeover check, naming every such partition), `KafkaAppIdUnknown` (typo guard), `KafkaCompatUnset`, `KafkaPartitionColumnUnmapped`, `KafkaStartingOffsetsIncomplete`, `KafkaTxnRetention` at open | Raised before subscribing or assigning, so no group is joined. `RETRY_MAX` backoff with the gauge. |
+| **Consumer-fatal** | librdkafka fatal error (incl. `FENCED_INSTANCE_ID`), `Event::Fatal`, SASL authentication failure, topic/group authorisation failure, unknown topic, internal invariant violations (`Other`), and the errors of a Delta source, which a Kafka pipeline cannot raise | `Err` → supervisor: close the consumer on a detached thread, back off (`RETRY_MAX` for config-class), reopen |
 
-**`DataQualityWrite` is classified by its cause**, which `write_kafka` types beneath it as it was raised (§5.7 step 5), and never as a failure of the target: the same error raised by the target can be in another class. M3's classifier therefore looks beneath the wrapper, by variant, never by text:
+**`DataQualityWrite` is classified by its cause**, which `write_kafka` types beneath it as it was raised (§5.7), and never as a failure of the target: the same error raised by the target can be in another class, and nothing beneath the wrapper is ever a Replan. `kafka_class` looks beneath the wrapper, by variant, never by text:
 
 | Cause beneath `DataQualityWrite` | Class |
 |---|---|
 | `Delta(ObjectStore{..})`, `Delta(Io{..})`, `Delta(Transaction{source: TransactionError::ObjectStore{..} \| LogStoreError{..}})`: the store failed | Transient |
-| `OffsetLogTruncated`: log cleanup ran under the DQ handle, which `write_kafka` has already reopened | Transient, never a Replan of the target |
-| `Config`: the reopen after a conflict failed. `Storage::open` folds a store outage and a table removed while running into the same variant, and each retry reopens | Transient |
-| `Delta(Transaction{source: TransactionError::UnsupportedTableFeatures(_) \| TableFeaturesRequired(_)})`: the DQ table's protocol, or a table that is no DQ table and lacks the features its columns need; `Delta(Arrow{..})` or `Delta(SchemaMismatch{..})`: the rejects do not fit its schema (a field count, a cast) | Blocking, pipeline: retrying the same write cannot help until someone changes the table |
-| `Capacity` | Capacity: the full `RETRY_MAX` backoff and the `ddi_capacity_exhausted` gauge, as for a Delta pipeline. `drive` (main.rs:831-838) and `observe_error` (metrics.rs:273) match `Error::Capacity` at the top, which misses this one: M3 switches both to `Error::is_capacity()`, which looks beneath the wrapper |
-| `Other`: an internal invariant (an unreadable commit of the DQ log, a batch that cannot be assembled) | Consumer-fatal, as every internal error |
-| any other `Delta(_)` | Transient: retried, and visible as `ddi_kafka_retrying` while it lasts |
+| `Delta(InvalidVersion(_))`: a commit log cleanup removed under a stale DQ handle, which `write_kafka` has already reopened | Transient |
+| `Config`: the reopen after a failure or a conflict failed. `Storage::open` folds a store outage and a table removed while running into the same variant, and each retry reopens | Transient |
+| `TargetProtocolUnsupported`: the DQ table's protocol asks for a writer feature delta-rs cannot write, or it uses column mapping. `write_kafka` asks first, as a target is asked at open and refresh, because delta-rs refuses a column-mapped write only once writing, with an untyped `Generic` error that would read as Transient. Nothing is written first. `Delta(Transaction{source: TransactionError::UnsupportedTableFeatures(_) \| TableFeaturesRequired(_)})`: a table that is no DQ table and lacks the features its columns need; `Delta(Arrow{..})` or `Delta(SchemaMismatch{..})`: the rejects do not fit its schema (a field count, a cast); `Delta(InvalidJsonLog{..})`: a commit of its log cannot be read | Blocking, pipeline: retrying the same write cannot help until someone changes the table |
+| `Capacity` | Capacity |
+| `Other`: an internal invariant (a batch that cannot be assembled) | Consumer-fatal, as every internal error |
+| any other `Delta(_)`, and anything else | Transient: retried, and visible as `ddi_kafka_retrying` while it lasts |
 
-The variants are pinned by `dq_write_failures_are_typed` and `dq_store_fault_is_typed`, so a delta-rs bump that changes them fails CI.
+The variants are pinned by `dq_write_failures_are_typed`, `dq_store_fault_is_typed`, `dq_column_mapped_table_is_refused_before_writing` and `dq_unreadable_commit_is_blocking`, and the classes by `every_error_has_its_kafka_class`, so a delta-rs bump that changes them fails CI.
 
 **`AutoOffsetReset` (-140)** carries no partition (§0.3.20). The handling (EO-m4):
 1. Fetch watermarks for the owned Ready partitions. An offender is one with `next_expected < low`.
@@ -758,11 +764,11 @@ This replaces kdi's `--ends_at_latest_offsets` (bug #228) and `position()`, whic
 | I2 | A commit with data for p from base b succeeds only if txn_p = b at its read snapshot and no later commit touched txn_p | Unit `fence_concurrent_txn_rejected_by_delta_rs` (pins delta-rs 0.32.4), `fence_base_mismatch_detected`; integration `two_groups_same_app_id_never_duplicate`, `rebalance_two_consumers` |
 | I3 | A partition stored at b resumes at b+1; b is re-read only to verify it. Inside (b, e], only broker-side gaps (compaction, transaction markers) | `restart_resumes_at_stored_plus_one`, `kdi_takeover_fixture`, `offset_gap_metric_counts_compaction` |
 | I4 | A start position never comes from `auto.offset.reset`, nor from the low watermark of a partition ddi has no record for. Out of range gives a typed error and a gauge, and pauses the partition; nothing is skipped without an acknowledged `set-offsets` | `seek_past_retention_blocks_partition`, `missing_txn_low_above_zero_blocks`, `mid_fetch_retention_commits_buffer_then_blocks`, `topic_recreated_fails` |
-| I5 | Missing offsets resolve explicitly (§4.4): fresh → `starting_offsets` plus a baseline; otherwise exactly offset 0. The typo guard and the retention refusal hold | `app_id_typo_refused`, `shared_table_second_pipeline_allowed`, `new_partition_starts_at_zero`, `set_transaction_retention_refused`, `latest_baseline_survives_crash` |
+| I5 | Missing offsets resolve explicitly (§4.4): fresh → `starting_offsets` plus a baseline; otherwise exactly offset 0, after, in kdi's era, the one-time takeover check at open has refused every partition without a txn whose topic holds messages and that no explicit `starting_offsets` entry acknowledges. The typo guard and the retention refusal hold | `app_id_typo_refused`, `shared_table_second_pipeline_allowed`, `new_partition_starts_at_zero`, `set_transaction_retention_refused`, `latest_baseline_survives_crash`; unit `takeover_check_needs_an_acknowledgment_only_in_kdis_era`, `expired_kdi_offsets_are_caught_by_the_takeover_check` |
 | I6 | After a revoke, the partition's buffered rows have been committed or dropped before `unassign()`, and its txn is never asserted again. Messages for partitions that are not Ready never reach the buffer | `revoke_flushes_before_unassign`, `revoke_flush_timeout_drops`, `revoked_partition_not_reasserted`, `lost_revoke_drops` |
 | I7 | Only eager assignment exists | `cooperative_rejected_at_load`, unit `cooperative_protocol_in_callback_is_fatal` |
 | I8 | Every consumed offset becomes a target row, a DQ row, a counted tombstone, or a row the SQL filtered. Never an uncounted drop | `accounting_identity` |
-| I9 | A reject is never lost. Only an undecodable with coordinates is skipped on a replay, and only under a mark the same decoder set; any other reject (no coordinates, schema not found, or a transform, conform or coerce reject, whose classification can change), and any under a mark another or an unknown decoder set, is written again on a replay after a crash or a failed target commit between the DQ and target commits | `dq_crash_between_dq_and_target`, `dq_marks_skip_recorded_offsets`, `dq_a_mark_another_decoder_set_does_not_skip` |
+| I9 | A reject is never lost; it is duplicated only after a crash or a failed target commit between the DQ and the target commits, when the replay writes it again. A write's own retry, after a PUT that landed unacknowledged, records it once | `dq_crash_between_dq_and_target`; unit `dq_a_replay_writes_its_rejects_again`, `dq_commit_that_landed_unacknowledged_is_not_written_twice`, `dq_landed_commit_is_found_when_a_conflict_follows` |
 | I10 | One malformed message cannot change or lose another message's row | `truncated_message_isolated`, `trailing_bytes_isolated`, `unknown_schema_id_isolated`, `no_magic_byte_isolated` |
 | I11 | Each row is decoded with its own writer schema and mapped to target columns by name, recursively | `writer_schema_switch_mid_batch`, `nested_struct_by_name`, `field_added_and_removed` |
 | I12 | With `kdi_compat` and `kdi_null_text`, every (Avro type, nullability, target type) value equals what the production kdi wrote | `kdi_parity_matrix`, `kdi_null_text_matrix`, `kdi_takeover_fixture` |
@@ -774,15 +780,16 @@ This replaces kdi's `--ends_at_latest_offsets` (bug #228) and `position()`, whic
 | I18 | The target's table id at every refresh equals its id at open | `replaced_target_blocks` |
 | I19 | A partition resumed on a recreated topic is blocked, even when the new topic has more data than the stored offset, whenever ddi recorded a mark for that offset and the mark can still be read (otherwise it is Unverifiable, §4.4) | `topic_recreated_with_more_data_detected` |
 | I20 | No member's transient or operator-action error causes a rebalance, and a member that keeps failing never stops the others committing | `transient_storage_outage_stays_in_group`, `blocked_partition_others_progress`, `liveness_under_churn` |
-| I21 | Two members never contend on a DQ appId | `two_members_dq_rejects_concurrently` |
+| I21 | Two members never contend on the DQ table: a Kafka DQ commit carries no txn, and delta-rs rebases one plain append over another | `two_members_dq_rejects_concurrently`; unit `dq_two_members_append_without_conflict` |
 | I22 | `Waiting` is not progress while fenced, blocked or retrying | `waiting_not_progress_when_fenced` |
+| I23 | The takeover marker `<app_id>.ddi` is written by the first Kafka commit whose read snapshot lacks it and by no commit after; once written it is in the table at every later version, whatever checkpoint writer ran | unit `takeover_marker_written_once_and_only_when_absent`, `two_members_racing_to_take_over_conflict_once`, `takeover_marker_survives_checkpoints`, `txns_without_last_updated_never_expire` |
 
 ### 4.2 Commit construction
 
 There is one `table.write()` per batch, through `Sink::commit_kafka` and the same private `write` as Delta pipelines:
 - `SaveMode::Append`, `cast_safety(false)`, `target_file_size`.
 - Partition columns come from the snapshot (operations/write/mod.rs:364-389). The `ingest_date` partitioning works once the batch carries the column; §5.6 step 0 guarantees it does.
-- Txns: `assert` (§4.3), each a `Transaction::new` with `lastUpdated: None`.
+- Txns: `assert` (§4.3), each a `Transaction::new` with `lastUpdated: None`; and, in the first Kafka commit of the app_id whose read snapshot lacks it (a data, zero-row or baseline commit alike), the takeover marker `<app_id>.ddi` at version 1 (§4.3).
 - Metadata: `ddi.appId`, `ddi.kafka.topic`, `ddi.kafka.groupId`, `ddi.kafka.offsets = {"<p>":[first,last]}`, `ddi.kafka.marks = {"<p>":[offset,ts_ms,len]}`, and optionally `ddi.kafka.baseline` or `ddi.kafka.offsetOverride`. The txn is the authority; the rest is evidence.
 - An empty batch (only tombstones, or every row rejected or filtered) takes the zero-row path (pipeline.rs:852-879) and carries txns only. On a partitioned target this is pinned by the golden test.
 - The operation is `WRITE` (append) where kdi wrote `STREAMING UPDATE`. Downstream classification is action-based (source/log_stream.rs:782-806), so data commits count as `Data` and txn-only commits as `NoData`, as with kdi.
@@ -791,57 +798,71 @@ There is one `table.write()` per batch, through `Sink::commit_kafka` and the sam
 
 ```rust
 pub fn txn_app_id(app_id: &str, p: i32) -> String { format!("{app_id}-{p}") }       // kdi delta_helpers.rs:70-72
+pub fn takeover_marker_app_id(app_id: &str) -> String { format!("{app_id}.ddi") }    // version 1, written once
+pub fn partition_of(app_id: &str, txn_app_id: &str) -> Option<i32>;                 // "<app_id>-<digits>" → p
 
-pub struct TxnState { pub version: Option<i64>, pub mark: Option<MessageMark>, pub last_updated: LastUpdated,
-                      pub decoder: Option<String> }   // decoder: `ddi.kafka.decoder` of the commit (a DQ mark's, §5.7)
-pub enum LastUpdated { Absent, At(i64), Unknown }   // the txn's own field; Unknown: answered by the kernel (step 3)
-impl TxnState {
-    pub fn writer(&self) -> Writer;         // Absent → Ddi, At(_) → Other, Unknown or no txn → Unknown
-    pub fn may_expire(&self) -> bool;       // a txn whose lastUpdated is not Absent
-}
-pub enum Writer { Ddi, Other, Unknown }
-pub fn kdi_era(txns: &BTreeMap<String, TxnState>) -> bool;                                  // §4.4 step 2
-pub fn offset_may_have_expired(txns: &BTreeMap<String, TxnState>, retention_ever_set: bool) -> bool;   // §4.4 None row
+pub struct TxnState { pub version: Option<i64>, pub mark: Option<MessageMark> }
+pub enum Era { Fresh, Kdi, Ddi }
+/// Fresh: no "<app_id>-<digits>" txn and no marker; Kdi: some partition txn, no marker; Ddi: the marker.
+pub fn era(app_id: &str, txns: &BTreeMap<String, TxnState>) -> Era;                  // §4.4 step 2
+/// Kdi era only: every partition (from metadata) with no txn and high > 0 needs an explicit
+/// starting_offsets entry, else KafkaOffsetMissing naming all of them.
+pub fn takeover_check(app_id: &str, era: Era, partitions: &BTreeMap<i32, (Option<i64>, i64 /*high*/)>,
+                      acknowledged: &BTreeSet<i32>) -> Result<()>;                   // §4.4 step 3
+pub enum NoTxnStart { Explicit(i64), Zero, Unavailable { wanted: i64, low: i64 }, Regressed { wanted: i64, high: i64 } }
+pub fn start_without_offset(low: i64, high: i64, explicit: Option<i64>) -> NoTxnStart;   // §4.4 None rows, either era
 
 /// Every wanted appId's newest txn as of `table`'s version, in ONE pass (EO-M6):
 ///  1. Walk `_delta_log/<v>.json` backwards from the handle's version (log_store.read_commit_entry + get_actions,
 ///     the pattern dbt/watermark.rs:207-245 already uses), 4 GETs in flight, until every wanted appId is
 ///     found or the newest checkpoint version (from `_last_checkpoint`) is reached. The mark comes from
-///     `ddi.kafka.marks` in the same commit when it is ddi's (`ddi.appId`); `lastUpdated` from the txn.
+///     `ddi.kafka.marks` in the same commit when it is ddi's (`ddi.appId`). `lastUpdated` is never read.
 ///  2. For the rest, read the checkpoint's `txn` column once (parquet projection; single- or multi-part).
-///     Those come with their `lastUpdated`, which the column keeps, and no mark.
+///     Those come with no mark.
 ///  3. Only if that checkpoint cannot be read (a foreign format): per-id kernel lookups, counted in
-///     ddi_kafka_offset_lookup_fallbacks_total. The kernel gives the version alone: `LastUpdated::Unknown`.
-///  4. For what steps 2 and 3 answered, the commits below the checkpoint, newest first, 4 in flight, until each
-///     appId is met: the newest commit with its txn gives back its mark (and, for a kernel answer, its
-///     `lastUpdated`) when that txn holds the version answered. At most 256 GETs
-///     (ddi_kafka_offset_lookup_below_checkpoint_reads_total), and never past a commit log cleanup removed;
-///     an appId not met keeps no mark (ddi_kafka_offset_lookup_marks_unfound_total): Unverifiable, §4.4.
-///     Fence::verify and the DQ marks (§5.7) skip this step: they need the versions alone.
+///     ddi_kafka_offset_lookup_fallbacks_total.
+///  4. For the partitions' offsets steps 2 and 3 answered (appIds `<a>-<p>`; never the marker), the commits
+///     below the checkpoint, newest first, 4 in flight, until each appId is met: the newest commit with its txn
+///     gives back its mark when that txn holds the version answered. At most 256 GETs
+///     (ddi_kafka_offset_lookup_below_checkpoint_reads_total). It ends, as at a commit log cleanup removed, at
+///     the first commit it cannot use: one that does not parse, or one the store refuses to serve (403);
+///     only an outage (a Generic or JoinError from the store, after its own retries) fails the read. A Fence
+///     keeps what the walk found per (checkpoint version, appId), so a recheck or an aging reset down to the
+///     same checkpoint makes none of these GETs again. Every partition's offset returned without a mark is
+///     counted in ddi_kafka_offset_lookup_unverifiable_total: Unverifiable, §4.4.
+///     Fence::verify skips this step: it needs the versions alone.
 /// Refuses when delta.setTransactionRetentionDuration is set, so no expiry filter is needed.
-pub async fn read_txns(table: &DeltaTable, app_ids: &[String]) -> Result<BTreeMap<String, TxnState>>;
+pub async fn read_txns(table: &DeltaTable, app_ids: &[String], counters: &LookupCounters) -> Result<BTreeMap<String, TxnState>>;
 
 pub struct Fence {
     app_id: String,
     base: BTreeMap<i32, (Option<i64>, Option<MessageMark>)>,   // owned partitions: last offset durably in the target
     carried: BTreeSet<i32>,                                    // verified at the handle's version and re-asserted since
+    marker: Option<bool>,             // the takeover marker at the handle's version; once true, never read again
+    below: BelowCheckpoint,           // step 4's findings for the newest checkpoint
 }
 impl Fence {
-    pub async fn reset(&mut self, table: &DeltaTable, owned: &[i32]) -> Result<()>;        // one read_txns, marks too; carried = owned
+    pub async fn reset(&mut self, table: &DeltaTable, owned: &[i32]) -> Result<()>;        // one read_txns, marks and marker too; carried = owned
     /// Before a commit: batch partitions not in `carried` are looked up on `table` (this commit's read snapshot,
-    /// since write() plans from the handle) and must equal base[p] (None == None).
-    pub async fn verify(&mut self, table: &DeltaTable, ranges: &BTreeMap<i32, (i64, i64)>) -> Result<Result<(), Fenced>>;
+    /// since write() plans from the handle) and must equal base[p] (None == None); the marker too, when not known.
+    pub async fn verify(&mut self, table: &DeltaTable, ranges: &BTreeMap<i32, (i64, i64)>) -> Result<()>;
+    /// Whether the next commit writes the takeover marker: it was absent at the handle's version.
+    pub fn takeover_marker_due(&self) -> bool;
     /// last_p for batch partitions; base_p for every other owned partition with Some(base). Marks likewise:
     /// each re-asserted base carries its mark, so an owner's newest commit holds the marks of all it owns.
     pub fn assert_map(&self, ranges: &BTreeMap<i32, (i64, i64)>, marks: &BTreeMap<i32, MessageMark>) -> (BTreeMap<i32, i64>, BTreeMap<i32, MessageMark>);
-    pub fn committed(&mut self, offsets: &KafkaOffsets);      // base[p] = assert[p]; carried = keys of assert
+    pub fn committed(&mut self, offsets: &KafkaOffsets);      // base[p] = assert[p]; carried = keys of assert; marker if written
     pub fn forget(&mut self, p: i32);                         // revoke (I6)
 }
 pub fn refuse_txn_retention(table: &DeltaTable) -> Result<()>;
 pub fn refuse_unwritable_protocol(table: &DeltaTable) -> Result<()>;   // writer features delta-rs 0.32.4 cannot write, column mapping
 ```
 
-**Attribution.** Who wrote a txn is read from the txn, not from the commit that carries it. kdi stamps every txn with `lastUpdated = now` (delta_helpers.rs:29-40); ddi never stamps one (`Transaction::new`); and those two are the only writers of these appIds. A checkpoint keeps the stamp, so a txn answered by a checkpoint is attributed exactly as one read from its commit: a table only ddi has written offsets to stays ddi's when another pipeline sharing the target, or Trino's OPTIMIZE at a checkpoint-interval version, pushes a checkpoint above ddi's last commit, and a kdi table whose commits log cleanup has removed stays kdi's. The same field is what expiry reads (§4.6), so it also says which txns can expire. Only a kernel answer (step 3) leaves it `Unknown`, which counts as one that can expire.
+**The takeover marker.** ddi records that it has taken over an app_id's offsets in a target with one durable txn, appId `<app_id>.ddi` at version 1 (`fence::takeover_marker_app_id`), and the era is read from it alone (`fence::era`): **fresh** = no `<app_id>-<digits>` txn and no marker; **kdi's** = some partition txn and no marker; **ddi's** = the marker.
+- **Why a txn, and why exact.** Nothing removes a txn from a Delta table: the protocol has no action for it, it has every checkpoint keep every txn that has not expired (whatever a writer does to `lastUpdated`, as `takeover_marker_survives_checkpoints` pins for the delta-rs and Trino spellings), and only `delta.setTransactionRetentionDuration` expires one, by its `lastUpdated`. A target with that property is refused (§4.6), and the marker carries no `lastUpdated`, so it would not expire even then. So once written it is at every later version, and its absence means ddi has never committed under this app_id here.
+- **Why not `lastUpdated` or the commit.** An earlier revision told kdi's txns from ddi's by `lastUpdated` (kdi stamps it, ddi does not), and guarded an expired kdi txn by the retention property's history. Refuted: delta-rs up to 0.17.3 checkpoints write it null (kdi's own `-c` checkpoints before 2024-07), Trino checkpoints write 0 for an unstamped txn, every other group member's commit replaces stamped evidence, and log cleanup normally removes the history. Commit metadata does not survive a checkpoint at all. Nothing here reads `lastUpdated` any more.
+- **Written once.** The first Kafka commit (data, zero-row or baseline) whose read snapshot lacks the marker carries it, and no commit after: re-asserted by every commit, a shared appId would make every two members' concurrent commits conflict. The fence decides (`Fence::takeover_marker_due`): it reads the marker with the owned partitions in `reset`, and in `verify` when it does not know it at the handle's version, and once it has seen it never reads it again. Two members racing to write it: one wins, the other gets `ConcurrentTransaction` (it carries the same appId), replans, re-reads, finds it and leaves it out.
+- **Never from `set-offsets`** (§4.8): in kdi's era an operator's txn acknowledges the partitions it names, not the takeover check for the others.
 
 **Handle discipline.** In a Kafka pipeline, `self.target` changes only through:
 1. the table returned by our own successful commit, which includes the winners we were rebased over (kernel/transaction/mod.rs:902-903, 996); or
@@ -860,8 +881,8 @@ Blind appends on disjoint appIds rebase cleanly (conflict_checker.rs:461-463), s
 
 **Cost.**
 - **Steady state:** zero lookups. Every owned partition with a known base is carried; only a partition with no txn needs one walk before its first data.
-- **Assign, reset, aging:** one walk. That is one GET when our newest commit is the head, since it carries every owned partition; otherwise at most `head − checkpoint` GETs plus one checkpoint read, bounded by `checkpointInterval` (10 after cutover). When the checkpoint answers some partition, the walk goes on below it for the marks, down to the previous owner's last commit, which carries every partition it owned (`assert_map`): usually a few versions, never more than 256 GETs. Never one lookup per partition. The checkpoint is found and read through the table's unfiltered store, also on a handle `Storage::open` built by replaying the log past a Trino checkpoint, whose own store hides every checkpoint from the kernel; otherwise that handle's walk would read every commit down to version 0.
-- **Metrics:** `ddi_kafka_offset_lookups_total`, `ddi_kafka_offset_lookup_seconds_total`, `ddi_kafka_offset_lookup_fallbacks_total`, `ddi_kafka_offset_lookup_below_checkpoint_reads_total` and `ddi_kafka_offset_lookup_marks_unfound_total`.
+- **Assign, reset, aging:** one walk. That is one GET when our newest commit is the head, since it carries every owned partition; otherwise at most `head − checkpoint` GETs plus one checkpoint read, bounded by `checkpointInterval` (10 after cutover). A fence's first reset also looks for the takeover marker, which only the takeover commit carries, so that one walk goes back to the checkpoint once in the fence's life; once seen, the marker is never read again. When the checkpoint answers some partition, the walk goes on below it for the marks, down to the previous owner's last commit, which carries every partition it owned (`assert_map`): usually a few versions, never more than 256 GETs, and none again for the same checkpoint. Never one lookup per partition. The checkpoint is found and read through the table's unfiltered store, also on a handle `Storage::open` built by replaying the log past a Trino checkpoint, whose own store hides every checkpoint from the kernel; otherwise that handle's walk would read every commit down to version 0.
+- **Metrics:** `ddi_kafka_offset_lookups_total`, `ddi_kafka_offset_lookup_seconds_total`, `ddi_kafka_offset_lookup_fallbacks_total`, `ddi_kafka_offset_lookup_below_checkpoint_reads_total` and `ddi_kafka_offset_lookup_unverifiable_total`.
 
 **Aging (EO-m8).** A quiet member's handle can trail the head by thousands of versions. The conflict loop would then read them one by one, and fail with a missing file if log cleanup has removed any. `commit_batch` therefore refreshes and resets when the handle is older than `handle_max_age` (10 min). A missing commit file during the conflict check is classified Replan, not supervisor-fatal.
 
@@ -869,54 +890,62 @@ Blind appends on disjoint appIds rebase cleanly (conflict_checker.rs:461-463), s
 
 **At open,** before subscribing (run mode) or assigning (once-mode):
 1. Read the topic's partitions from metadata (`fetch_metadata`, `spawn_blocking`).
-2. `read_txns` over every partition → `known`, `fresh` (fresh = no partition has a txn), `kdi_era` (`fence::kdi_era`: some txn is kdi's, `Writer::Other`, and none is ddi's).
-   - The writer is the txn's `lastUpdated` (§4.3, Attribution), so a txn answered by a checkpoint counts exactly as one read from its commit. `Writer::Unknown` is left only for a txn the kernel answered (a checkpoint this build cannot read), and counts for neither side.
-3. `refuse_txn_retention`, `refuse_unwritable_protocol`; record the table id.
-4. **Partition columns** (§5.6 step 0): refuse with `KafkaPartitionColumnUnmapped` when the target's partition columns cannot be produced.
-5. **`kdi_compat` unset on a kdi-written table** (`kdi_era`; after a rollback to kdi it holds again, since kdi re-asserts every partition it is assigned with a stamp, §0.3.13) → `KafkaCompatUnset`: "this table was written by kafka-delta-ingest; set `kdi_compat = true` to keep its STRING rendering ("null" text, raw-number timestamps, sorted-key JSON), or `false` to accept the documented break". Unset elsewhere means false.
-   - When every txn's writer is `Unknown` (every one was answered by the kernel, §4.3 step 3, and the commits below that checkpoint did not give its `lastUpdated` back, step 4), step 2 cannot tell: it refuses with `KafkaCompatUnset` worded as "cannot tell who wrote this table's offsets", never as "written by kafka-delta-ingest".
-6. **Typo guard.** Refuse with `KafkaAppIdUnknown` when all of these hold:
+2. `read_txns` over every partition and the takeover marker `<app_id>.ddi` → `known`, and the era (`fence::era`, §4.3): **fresh** (no partition txn, no marker), **kdi's** (some partition txn, no marker) or **ddi's** (the marker). Exact: nothing is inferred from who wrote a txn, nor from its `lastUpdated`, nor from commit metadata, so a txn answered by a checkpoint counts exactly as one read from its commit.
+3. **The takeover check** (`fence::takeover_check`, once, in kdi's era only), over every partition from step 1 with its txn and its high watermark (`fetch_watermarks`): every partition with no txn and `high > 0` needs an explicit `starting_offsets` entry. Otherwise refuse with `KafkaOffsetMissing{partitions}` naming all of them (open-time refusal, §3.6). Such a partition is one kdi never wrote a row for (only tombstones, undecodables or transform failures, §0.3.13), or one whose kdi txn expired under `delta.setTransactionRetentionDuration` while kdi ran (EO-M4b); the table cannot tell them apart, and re-reading the second from 0 would duplicate it. `plan` prints the evidence per partition (file statistics of `kafka_partition`, the property's visible history) and a ready-to-paste entry. A `"*"` entry acknowledges nothing: the decision is per partition. A partition with `high == 0` had no message, so no txn of it can have expired. In ddi's era there is nothing to check (below), and a fresh app_id starts where `starting_offsets` says (step 8).
+4. `refuse_txn_retention`, `refuse_unwritable_protocol`; record the table id.
+5. **Partition columns** (§5.6 step 0): refuse with `KafkaPartitionColumnUnmapped` when the target's partition columns cannot be produced.
+6. **`kdi_compat` unset in kdi's era** (partition txns, no marker) → `KafkaCompatUnset`: "this table was written by kafka-delta-ingest; set `kdi_compat = true` to keep its STRING rendering ("null" text, raw-number timestamps, sorted-key JSON), or `false` to accept the documented break". Exact now: the era is read from the marker. Unset elsewhere means false, ddi's era included: there the setting was explicit when ddi took the table over, and stays in the config that took it over.
+7. **Typo guard.** Refuse with `KafkaAppIdUnknown` when all of these hold:
    - `fresh`;
    - the target has data files (snapshot file count; accessor **verify (M3)**);
    - `starting_offsets` is not explicit;
-   - the target's txn appIds (in the last 100 commits, and in the checkpoint's `txn` column) are **not** all of the form `<a>-<digits>` for another configured Kafka pipeline's app_id on this target (EO-m15).
+   - the target's txn appIds (in the last 100 commits, and in the checkpoint's `txn` column) are **not** all of the form `<a>-<digits>` or `<a>.ddi` for another configured Kafka pipeline's app_id `a` on this target (EO-m15).
 
    The message lists the appIds seen ("did you mean `kafka_delta_ingest`?"). A target with data but no txns at all is refused too.
-7. **Fresh start.** Resolve every partition's start:
+8. **Fresh start.** Resolve every partition's start:
    - an explicit map, which must cover all partitions unless it has `"*"` (otherwise `KafkaStartingOffsetsIncomplete`);
    - `earliest` → low_p;
    - `latest` → high_p, which is the LSO under read_committed.
 
-   If any start_p > 0, commit a **baseline**: txn-only, `assert[p] = start_p − 1` for every start_p > 0, with `ddi.kafka.baseline = true`.
+   If any start_p > 0, commit a **baseline**: txn-only, `assert[p] = start_p − 1` for every start_p > 0, with `ddi.kafka.baseline = true`, and the takeover marker (it is the first commit).
 
-   A partition starting at 0 gets no txn: its txn would have to be −1, and kdi would read `Offset(-1)` as `End` on a rollback. The "None, not fresh, low == 0" row below then gives the same start.
-8. Subscribe (run) or assign (once).
+   A partition starting at 0 gets no txn: its txn would have to be −1, and kdi would read `Offset(-1)` as `End` on a rollback. The "None, low == 0" row below then gives the same start.
+9. Subscribe (run) or assign (once).
 
 **Per partition,** at assign, reset or blocked recheck, with `(low, high)` from `fetch_watermarks`:
 
 | Stored txn | Condition | Start |
 |---|---|---|
-| `Some(b)` | `low ≤ b < high` | Assign at **b** and re-read it. If our commits recorded a mark for b, timestamp and length must match, otherwise **Blocked `KafkaTopicReplaced{p}`** (I19). b itself is dropped; consumption continues at b+1. kdi did the same seek-and-drop (lib.rs:1065-1115). With no mark for b the partition is **Unverifiable**: b is re-read and dropped unchecked, as kdi did, until the partition carries data again; the `b ≥ high` row still applies. That is a kdi-written offset, or one a checkpoint answered whose commit the walk below it did not reach within 256 GETs or before a commit log cleanup removed (§4.3 step 4). |
+| `Some(b)` | `low ≤ b < high` | Assign at **b** and re-read it. If our commits recorded a mark for b, timestamp and length must match, otherwise **Blocked `KafkaTopicReplaced{p}`** (I19). b itself is dropped; consumption continues at b+1. kdi did the same seek-and-drop (lib.rs:1065-1115). With no mark for b the partition is **Unverifiable**: b is re-read and dropped unchecked, as kdi did, until the partition carries data again; the `b ≥ high` row still applies. That is a kdi-written offset, or one a checkpoint answered whose commit the walk below it did not reach (within 256 GETs, before a commit log cleanup removed or one it could not read; §4.3 step 4). |
 | `Some(b)` | `b + 1 == low` (b itself already trimmed) | Assign at b+1, no verification |
 | `Some(b)` | `b + 1 < low` | **Blocked `KafkaOffsetsUnavailable{p, wanted: b+1, low}`**: a retention gap (I4). Recover with `set-offsets --next <low> --acknowledge-skip "<reason>"`. |
 | `Some(b)` | `b ≥ high` | **Blocked `KafkaOffsetsRegressed{p, stored: b, high}`**: topic recreated, or the wrong cluster |
 | `None` | explicit `starting_offsets` entry s for p (an acknowledgment, also on a non-fresh table) | s, provided `low ≤ s ≤ high` (else Unavailable or Regressed). Asserted as s−1 from the next commit when s > 0. Entries for partitions that have a txn are ignored, with a warning. |
-| `None` | not fresh, `high > 0`, `fence::offset_may_have_expired` (some txn of this app_id can expire: it carries `lastUpdated`, whether read from a commit or a checkpoint, or the kernel answered it and does not say), and the table's visible history ever set `delta.setTransactionRetentionDuration` (scanned in the walk and in the checkpoint's `metaData`) | **Blocked `KafkaOffsetMissing{p}`**, which holds the whole pipeline (below): a kdi txn may have expired, and re-reading from 0 would duplicate the partition (EO-M4b). Acknowledge with an explicit entry after checking the data (`plan` prints the evidence). |
-| `None` | not fresh, `low == 0` | **Offset 0 exactly.** In a ddi-written table this is a new partition, or one ddi never saw a message from. In a kdi table it is one kdi never wrote a row for (§0.3.13). Either way nothing from it is in the table. |
+| `None` | not fresh, `low == 0` | **Offset 0 exactly.** In ddi's era this is a new partition, or one nothing of is in the table. In kdi's era, after the takeover check, it is one whose topic held no message at open, or one added since. Either way nothing from it is in the table. |
 | `None` | not fresh, `low > 0` | **Blocked `KafkaOffsetsUnavailable{p, wanted: 0, low}`**: messages ddi never read were trimmed (EO-M4a). Recover with `set-offsets --next <low> --acknowledge-skip`. |
 
-**The `KafkaOffsetMissing` guard** keys on the txns' `lastUpdated`, not on who wrote their commits. Only a stamped txn can expire, and the writer that stamps one stamps all it writes, so a stamped txn among this app_id's is exactly the evidence that a sibling may have expired. Keyed on commitInfo authorship instead, the guard went off whenever every txn was answered by a checkpoint — the usual state of a kdi table whose old commits log cleanup has removed — and the partition whose kdi txn had expired was read again from offset 0. That evidence is also what ddi's own commits replace, one partition at a time, as they re-assert each offset without a stamp. A block on the one partition would therefore turn into a re-read from 0 at the first recheck or restart after ddi had re-asserted every other partition. So while the row holds for any partition, the pipeline commits nothing (§3.6, Blocking, pipeline), and the block clears only by acknowledgment: an explicit `starting_offsets` entry for the partition, or a txn `set-offsets` wrote for it. On a table only ddi has written to, no txn can expire, and the row never holds.
+The `None` rows are the same in both eras (`fence::start_without_offset`): the era matters only to the takeover check, which has already refused, at open, every partition they would start at 0 that may have had an offset.
 
-Why no `ddi.kafka.partitionCount` bookkeeping (EO-M4's suggestion): with "exactly 0, block if low > 0", a new partition and an empty one are treated identically and safely. The one ambiguous case (a lost kdi-era txn) is handled by the history rule above. ddi's own txns cannot be lost (§0.3.9).
+**Why the takeover check is race-free across members.** Every member reads one config, so every one holds the same acknowledgments, and every one opens through step 3:
+1. A member that opens while the marker is absent runs the check over **every** partition of the topic, not just those it will own, and joins the group only if it passes. A member that opens once the marker is there skips it.
+2. A commit writes the marker only when the marker is absent at its read snapshot (§4.3). A member that opened after the marker landed never sees it absent (it is never removed, and a fence that has seen it never reads it again), so it never writes it. So the commit that writes the marker is by a member that passed the check while the marker was absent.
+3. What that check established holds from then on: every partition that had messages and no txn is acknowledged in the shared config, and every partition that had no message had nothing to lose. Between the check and the marker landing no txn can disappear: every writer only adds or advances txns (kdi too, in §10.4's zero-pause variant), and only expiry removes one, which the refusal of `delta.setTransactionRetentionDuration` at open and on every refresh rules out.
+4. So a member that opens in ddi's era, and so skips the check, meets a partition without a txn only where the check found one with no message (nothing of it is in the table), where the shared config acknowledges it (the explicit-entry row), or where the partition is new: offset 0 is right for each.
+5. Two members can reach different verdicts only if a partition's high watermark moved from 0 between their checks. The later one then refuses and backs off `RETRY_MAX`; by its retry the earlier one has usually committed the marker, and it opens in ddi's era. The divergence is only ever toward a refusal.
+
+The precondition is the one §4.5 states: kdi stopped, and the retention property never set while ddi runs. After a rollback to kdi (§10.5) kdi re-stamps every txn it re-asserts; the marker stays, so a second takeover skips the check, and the property must stay unset while kdi runs.
+
+Why no `ddi.kafka.partitionCount` bookkeeping (EO-M4's suggestion): with "exactly 0, block if low > 0", a new partition and an empty one are treated identically and safely. The one ambiguous case (a lost kdi-era txn) is the takeover check's. ddi's own txns cannot be lost (§0.3.9).
 
 Why no topic id (EO-M4): rdkafka 0.39 exposes no topic id, and DescribeTopics would mean the first `unsafe` FFI in ddi. The re-read mark check catches a recreated topic at the same cost as kdi's existing seek-and-drop.
 
 ### 4.5 Taking over kdi tables (no gap, no duplicate)
 
 - **Same convention.** kdi writes `txn{appId: "<app_id>-<p>", version: last offset written, lastUpdated: now}` (delta_helpers.rs:29-40, 70-72) and resumes by seeking `Offset(o)` and dropping o (`Beginning` for o = 0; lib.rs:1065-1115). ddi assigns at o, verifies it, drops it and continues at o+1. There is no off-by-one.
-- **Partitions kdi never wrote.** kdi re-asserts every assigned partition with a known offset (§0.3.13), so a kdi partition with no txn never had a row under that app_id. ddi reads it from 0 and re-reads only what kdi dropped: tombstones, undecodables and transform failures, the last two going to DQ. **Create the DQ tables before cutover.**
+- **Partitions without a txn.** kdi re-asserts every assigned partition with a known offset (§0.3.13), so a kdi partition with no txn never had a row under that app_id — unless its txn expired under `delta.setTransactionRetentionDuration` while kdi ran, which the table cannot tell apart. So the takeover check (§4.4 step 3) refuses to start until every such partition whose topic holds messages has an explicit `starting_offsets` entry: 0 (re-read what kdi dropped: tombstones, undecodables and transform failures, the last two going to DQ) when `plan`'s evidence shows no rows of it in the table, or the next offset after them when it does. **Create the DQ tables before cutover.**
 - **Holes kdi left.** kdi silently dropped deserialization failures, including those caused by transient Schema Registry outages (lib.rs:866-879). Its bronze tables can therefore have holes below the stored offsets. ddi never re-reads below a stored offset, so it does not fill them. The shadow comparison (§10.3) lists them when offset columns exist; filling them is out of scope (open question 12).
-- **Requirements:** the same `app_id`, kdi stopped first, the same topic and cluster, and `kdi_compat` set explicitly. `plan` checks that every partition's stored+1 lies in [low, high].
+- **Requirements:** the same `app_id`, kdi stopped first, the same topic and cluster, `kdi_compat` set explicitly, an explicit `starting_offsets` entry for every partition the takeover check names, and `delta.setTransactionRetentionDuration` unset (refused anyway). `plan` checks that every partition's stored+1 lies in [low, high], and prints the takeover check's verdict.
+- **The takeover is recorded.** ddi's first commit writes the marker `<app_id>.ddi` (§4.3), and from then on the table is in ddi's era for good: later opens skip the check, and `kdi_compat` unset no longer refuses (§4.4 step 6).
 - **Protocol.** ddi already opens these bronze tables as a source, including the Trino-checkpoint fallback (storage.rs:95-153). `plan` still prints the protocol and writer features, and refuses any writer feature delta-rs 0.32.4 cannot write, column mapping included (write/mod.rs:409-411).
 - **Value parity** is §5.6; **overlap safety** is §4.7 row 8.
 
@@ -924,7 +953,8 @@ Why no topic id (EO-M4): rdkafka 0.39 exposes no topic id, and DescribeTopics wo
 
 1. `open_kafka` and every refresh **refuse** a target whose configuration contains `delta.setTransactionRetentionDuration` (table/config.rs:112, 148). kdi's txns carry `lastUpdated`, so the kernel's filter (buoyant_kernel snapshot/mod.rs:896-938; set_transaction.rs:10-21) could expire a quiet partition before ddi's first re-assert.
 2. ddi writes `lastUpdated: None`, which never expires. A property set later cannot strand ddi's own txns; the next refresh refuses loudly.
-3. A txn already lost to a past setting (a checkpoint written while the property was set drops expired txns) is the `KafkaOffsetMissing` row in §4.4, which holds the pipeline. It is not a silent re-read.
+3. A kdi txn already lost to a past setting (a checkpoint written while the property was set drops expired txns) is what the takeover check catches (§4.4 step 3): in kdi's era, a partition without a txn whose topic holds messages refuses the open until it is acknowledged. It is not a silent re-read, and the check needs none of the property's history, which log cleanup normally removes.
+4. In ddi's era no txn can be lost: ddi's carry no `lastUpdated`, the marker included. A rollback to kdi (§10.5) re-stamps every txn kdi re-asserts, and the marker keeps the table in ddi's era, so a later takeover runs no check: while kdi runs again the property must stay unset, as it must while ddi runs.
 
 ### 4.7 Failure matrix
 
@@ -938,12 +968,12 @@ Why no topic id (EO-M4): rdkafka 0.39 exposes no topic id, and DescribeTopics wo
 | 6 | Two deployments with the same app_id, different groups | Every interleaved commit conflicts; alternating progress, no duplicates | Alert on `fenced_total` rate; fix the deployment |
 | 7 | A rebalance while a batch is buffered | Revoke flush commits it (time-boxed), else drops it | Automatic; the next owner reads the txn |
 | 8 | kdi still running with the same app_id | ddi side is fenced. kdi side: `are_partition_offsets_match` (lib.rs:1164-1186) plus delta-rs 0.26's checker **(verify in the nightly `kdi_and_ddi_race`)**. kdi re-asserts all its assigned partitions, so during a handover both sides conflict on every commit for the moving partitions | The runbook stops kdi first |
-| 9 | DQ write OK, target commit fails | DQ rows and marks present | Replay skips coordinate-carrying undecodables at offsets ≤ the mark when the same decoder set it (I9); the rest are written again (a visible duplicate, never a loss) |
-| 10 | DQ write fails | Nothing advanced | DQ conflict: our own landed commit is recognised by `ddi.kafka.dqWriteId` (row 3 on the DQ table); otherwise up to 3 in-place retries, then Transient. A failure that is not a conflict but may have landed is retried with the batch, and can duplicate the rejects that are never skipped (I9) |
+| 9 | DQ write OK, target commit fails | DQ rows present | The replay writes every reject again: a visible duplicate, never a loss (I9), deduplicable by (partition, offset) |
+| 10 | DQ write fails | Nothing advanced | A plain append conflicts with no other member's. A PUT that landed unacknowledged: delta-rs re-commits the very same actions at the next version (the same files, counted once), or, when a later commit makes it give up with a conflict, our landed commit is recognised by `ddi.kafka.dqWriteId`. Any other conflict (another engine's metadata or protocol change): up to 3 in-place retries, then Transient. A failure that is not a conflict but may have landed is retried with the batch, and can duplicate its rejects (I9) |
 | 11 | Retention passed stored+1 (at assign, or mid-fetch as -140) | Mid-fetch: buffer committed first. Partition blocked (`KafkaOffsetsUnavailable`), others continue | Operator: `set-offsets --next <low> --acknowledge-skip "<reason>"` |
 | 12 | stored ≥ high: topic recreated or wrong cluster | Partition blocked (`KafkaOffsetsRegressed`) | Operator: new app_id, or `set-offsets --allow-replay` |
 | 13 | Topic recreated and refilled past stored | Re-read mark mismatch → `KafkaTopicReplaced` (I19) | Operator: new app_id, or `set-offsets` |
-| 14 | No txn for a partition; partitions added | Offset 0 exactly; `low > 0` blocks | Acknowledged skip if needed |
+| 14 | No txn for a partition; partitions added | ddi's era: offset 0 exactly; `low > 0` blocks. kdi's era, at open: refused (`KafkaOffsetMissing`, every such partition with messages named) until acknowledged | Acknowledged skip if needed; an explicit `starting_offsets` entry per named partition |
 | 15 | Target has `setTransactionRetentionDuration` | Refused at open and on refresh (pipeline blocked) | Operator unsets it |
 | 16 | `app_id` typo | `KafkaAppIdUnknown`, with a suggestion, at open | Fix the config |
 | 17 | SR down when a new schema id arrives | Transient: batch held, partitions paused, member stays in group; known ids are cached | Automatic |
@@ -966,8 +996,9 @@ Why no topic id (EO-M4): rdkafka 0.39 exposes no topic id, and DescribeTopics wo
 All of these use a group-less client and never disturb the group. User-facing offsets are always the **next offset to read** (PO-minor 8); only the txn stores "last written".
 
 **`ddi kafka plan -p <name>`** (M4) is the read-only preflight. It prints:
-- **Table:** protocol and writer features, partition columns, and the properties `checkpointInterval`, `logRetentionDuration`, `deletedFileRetentionDuration`, `setTransactionRetentionDuration` (current, and **ever set** in visible history), `enableExpiredLogCleanup`, `appendOnly`, and column mapping. Also the last commit's engine and operation (for example `delta-rs.0.26 STREAMING UPDATE`), the table id, and the active-file count.
-- **Per partition:** txn, writer (kdi or ddi), low/high watermark, resume position, lag, and status: OK, RETENTION_GAP, REGRESSED, NO_TXN→offset 0, or NO_TXN→ack needed. For NO_TXN partitions on kdi tables with a `kafka_partition` column, it also says whether file statistics show any rows for p.
+- **Table:** protocol and writer features, partition columns, and the properties `checkpointInterval`, `logRetentionDuration`, `deletedFileRetentionDuration`, `setTransactionRetentionDuration` (current, and **ever set** in visible history, as evidence for the operator: no check depends on it), `enableExpiredLogCleanup`, `appendOnly`, and column mapping. Also the last commit's engine and operation (for example `delta-rs.0.26 STREAMING UPDATE`), the table id, and the active-file count.
+- **The era** (fresh, kdi's, ddi's: the takeover marker, §4.3), and in kdi's era the takeover check's verdict (§4.4 step 3).
+- **Per partition:** txn, low/high watermark, resume position, lag, and status: OK, RETENTION_GAP, REGRESSED, NO_TXN→offset 0, or NO_TXN→ack needed (the takeover check). For NO_TXN partitions on kdi tables with a `kafka_partition` column, it also says whether file statistics show any rows for p.
 - **Other appIds** seen in recent commits.
 - **A ready-to-paste `starting_offsets = { "0" = …, … }`** (stored+1), used by the shadow run.
 - **Schema mapping** for the latest writer schema per partition, found by scanning backwards from high−1 to the newest non-tombstone message (compacted topics, PO-minor 9). For each target column it shows the source (Avro field, `kafka_*`, transform, or nothing → null), the conversion, and kdi-specific notes such as "timestamp-millis into TIMESTAMP: kdi wrote it 1000× too small".
@@ -983,7 +1014,8 @@ It exits non-zero on blocking findings.
   - moving forward past offsets that are still retained requires `--acknowledge-skip "<reason>"`, recorded as `ddi.kafka.offsetOverride`;
   - moving backwards requires `--allow-replay`;
   - `--all-partitions` applies one rule to each.
-- **DQ marks** for the same partitions are set to `O − 1` in the DQ table, in a commit that records no `ddi.kafka.decoder`, so a replay records its rejects again (duplicates, never a loss): such a mark skips nothing (§5.7).
+- **Nothing in the DQ table** moves: a Kafka DQ table holds no txn (§5.7), and a replay after a move backwards records its rejects again (duplicates, never a loss).
+- **No takeover marker.** In kdi's era a txn `set-offsets` writes acknowledges the partition it names, and only that one: the takeover check still runs at the next open for the rest (§4.4 step 3). The marker is written by the pipeline's first commit.
 - **A running owner** conflicts on its next commit, or notices at its blocked recheck, then resets and reads the new value.
 
 **`ddi status`** prints the per-partition stored offset, writer, watermarks and block reason for Kafka pipelines.
@@ -1167,31 +1199,30 @@ Conform rejects are added to `rejects` in the same DQ write, so there is one DQ 
 
 **With a DQ table** (`<target>__ddi_dq`, dq.rs:69), each undecodable becomes a `Rejected` (schema.rs:290-300):
 - `rows` = a RecordBatch of `<prefix>topic, <prefix>partition, <prefix>offset, <prefix>timestamp, <prefix>key_b64, <prefix>value_b64, <prefix>value_schema_id` (base64 through the existing `base64` dependency);
-- `columns` = `None`, and `reasons` = `avro: <error>`. No other reject's reason may start with `avro:` (`dq::KAFKA_UNDECODABLE`): the filter in step 2 below tells undecodables by it, so a union-alignment or conform reject must be worded otherwise.
+- `columns` = `None`, and `reasons` = `avro: <error>`, so that an operator can tell undecodables by their reason.
 
-They travel as `Batch.rejects` and are written **before** the target commit (pipeline.rs:793-825) by `DataQuality::write_kafka` (EO-M1, EO-m9, PO-M6):
-1. **Read the marks.** `fence::read_own_txns` on the DQ handle gives `m_p` = txn `<app_id>.dq-<p>` for each batch partition, with `d_p`, the decoder the commit that set it recorded under `ddi.kafka.decoder` (`TxnState::decoder`). DQ tables are small, so this is one or two GETs. It is `read_txns` without the refusal of `delta.setTransactionRetentionDuration` (§4.6), which is for the target: a mark has no `lastUpdated` and never expires, so the property changes nothing here. Nor does it read below a checkpoint (§4.3 step 4): a mark a checkpoint answered has no `d_p`, and skips nothing.
-2. **Filter.** A reject is skipped when it is an undecodable (its reason starts with `avro:`), carries coordinates `(p, o)`, `o ≤ m_p`, and `d_p` is this build's decoder (`dq::decoder_identity()`, `"<ddi version>/<DECODER_GENERATION>"`; M2 bumps the generation with every change to what decodes, and adds arrow-avro's version).
-   - A mark another decoder set, or one whose decoder is unknown (answered by a checkpoint, or set by a commit that records none), skips nothing: a stricter build can reject a message the other decoded, at an offset under its mark, and that reject would be in neither table. It is written again, a visible duplicate.
-   - Coordinates come from the `<prefix>partition`/`<prefix>offset` columns of the rejected row. Undecodables and transform-evaluation rejects (source rows) always have them; coerce and conform rejects have them when the SQL kept the columns (`SELECT *`). They count only when they name an offset the batch read, inside its range for that partition: a message's own coordinates always do, so anything else under those names (values the SQL computed, or a payload's own fields read under the default prefix where the pipeline set another) is treated as no coordinates.
-   - "Schema not found" rejects are **never** skipped: the registry can change between attempts.
-   - Nor is any reject that is not an undecodable: transform-evaluation, conform, coerce and union-alignment rejects are judged against the target's schema, the union `U` (§5.5), the SQL (which may call `now()`), all of which can change between two attempts at one batch. After an `ALTER TABLE` on the target (§4.7 row 20) the retried batch's fresh coercer can reject a row at an offset below the mark that the first attempt wrote to the target's failed commit; skipping it would leave it in neither table. They are written on every attempt.
-3. **Commit** the remaining rows, with txns `<app_id>.dq-<p> = max(m_p, last_p)` for every batch partition whose `d_p` is this decoder and `last_p` for every other, and metadata `ddi.appId`, `ddi.kafka.offsets`, `ddi.kafka.decoder`.
-   - Moving another decoder's mark down to `last_p` is what keeps step 2 exact. Kept at `max`, the commit would name this decoder for offsets in `(last_p, m_p]` it never judged, and its next batch over them would skip a reject the other decoder never made. A lower mark only means fewer skips, so more duplicates and never a loss; a mark this decoder set never moves back.
-   - The DQ row's `source_version` column holds the rejected message's offset, or −1 when unknown. Its partition is in `payload`.
-   - Members own disjoint partitions, so their DQ appIds never collide (I21).
-4. **On `ConcurrentTransaction`, `VersionAlreadyExists` or `MaxCommitAttempts`:** refresh the DQ handle, then look for this write's own commit among those that landed since its read version. Every Kafka DQ commit records `ddi.kafka.dqWriteId`, unique to its `write_kafka` call.
-   - Found: the commit landed and the acknowledgement of its PUT was lost; the retried PUT met it (§4.7 row 3). The write is done. Writing again would duplicate every reject that is never skipped, without any crash.
-   - Not found (a zombie or a handover): go back to step 1, up to 3 times; then `DataQualityConflict`, Transient. A DQ conflict is never a supervisor error.
-5. **Any other failure** is `DataQualityWrite { dq_uri, rows, source }`, with the cause typed beneath it as it was raised (delta-rs's error, `Capacity`, `OffsetLogTruncated`, the `Config` of a failed reopen, or `Other` for an internal fault), so §3.6 classifies it by the cause's variant without reading text (its table of causes), and never as a failure of the target.
+They travel as `Batch.rejects` and are written **before** the target commit (pipeline.rs:793-825) by `DataQuality::write_kafka`, as a **plain append** (EO-M1, EO-m9, PO-M6):
+1. **Rows.** Every reject of the batch, each with `source_version` = its message's offset, or −1 when unknown. Its partition is in `payload`, beside the offset.
+   - Coordinates come from the `<prefix>partition`/`<prefix>offset` columns of the rejected row. Undecodables and transform-evaluation rejects (source rows) always have them; coerce and conform rejects have them when the SQL kept the columns (`SELECT *`). They count only when they name an offset the batch read, inside its range for that partition: a message's own coordinates always do, so anything else under those names (values the SQL computed, or a payload's own fields read under the default prefix where the pipeline set another) is treated as no coordinates, rather than recorded as another message's offset.
+2. **Refuse an unwritable table first.** `fence::refuse_unwritable_protocol` on the DQ handle, as a target is asked at open and refresh: a protocol asking for a writer feature delta-rs cannot write, or column mapping, is `TargetProtocolUnsupported` beneath `DataQualityWrite`, Blocking (§3.6), before anything is written. delta-rs itself refuses a column-mapped write only once writing, with an untyped error.
+3. **Commit** the rows in one append with **no txn**, and metadata `ddi.appId`, `ddi.kafka.offsets` and `ddi.kafka.dqWriteId` (unique to the `write_kafka` call). With no txn, no two writers of the DQ table contend: delta-rs rebases one plain append over another (conflict_checker.rs:461-463), so the members of a group, and a zombie beside the new owner, all write side by side (I21).
+4. **On a conflict delta-rs gives up with** (`CommitConflict`, `VersionAlreadyExists` or `MaxCommitAttempts`: another engine changed the table's metadata or protocol, or more commits raced than delta-rs retries): reopen the DQ handle, then look for this write's own commit among those that landed since its read version, by `ddi.kafka.dqWriteId`.
+   - Found: the commit landed and the acknowledgement of its PUT was lost, and the conflict came after it. The write is done; writing again would duplicate every reject, without any crash. (A PUT that landed unacknowledged with no conflict after it never gets here: delta-rs meets its own commit in its conflict check, finds nothing to conflict with in a plain append, and lands the very same actions at the next version — the same files under the same `ddi.kafka.dqWriteId`, which every reader reconciles to one file each.)
+   - Not found: go back to step 2, up to 3 times; then `DataQualityConflict`, Transient. A DQ conflict is never a supervisor error.
+5. **Any other failure** is `DataQualityWrite { dq_uri, rows, source }`, with the cause typed beneath it as it was raised (delta-rs's error, `Capacity`, the `Config` of a failed reopen, the `TargetProtocolUnsupported` of step 2, or `Other` for an internal fault), so §3.6 classifies it by the cause's variant without reading text (its table of causes), and never as a failure of the target.
 
-Why this is safe: Kafka offsets identify one message per topic incarnation, and incarnations are checked by §4.4. `set-offsets` moves the DQ marks with the target txns, and records no decoder, so its marks skip nothing. Whether a message decodes depends only on its bytes, its writer schema and the decoder build; a replay cannot change the first two, and step 2 skips only under a mark the same decoder set, which by step 3 stands for offsets that decoder judged in a commit that landed. A replay starts at the target's offset + 1, never below the first offset of a batch whose DQ commit landed before it, so every offset it skips was judged by that commit. So a skipped reject is always already in the table (I9). Delta pipelines keep `write`'s equality rule unchanged.
+**No skip, and why.** A replay of a batch after its DQ commit landed and its target commit did not (a crash, or a failed target commit) writes its rejects again: a **visible duplicate**, deduplicable downstream by (partition, offset) — `json_extract_scalar(payload, '$.<prefix>partition')` and `source_version` — and never a loss (I9). An earlier revision skipped rejects at offsets at or below a per-partition DQ mark `<app_id>.dq-<p>`, to save that duplicate. Review found three ways it lost a reject, each closed by a narrower rule the next round broke again:
+- a reject's classification can change between two attempts at one batch (an `ALTER TABLE` on the target, the union `U`, SQL that calls `now()`), so a retry can reject a row at an offset under the mark that the first attempt took;
+- whether a message decodes depends on the decoder build, which can change between attempts;
+- nothing bounds a mark from below after a re-read, so a replay can start under it.
+
+A lost reject is worse than a duplicate one, so the skip is gone, and with it the marks, the decoder identity and the per-partition DQ txns. Delta pipelines keep `write`'s equality rule unchanged.
 
 **Cap.** More than `max_evaluation_rejects_per_batch` undecodables in one batch (default 100, config.rs:37-42) is Blocking: "this looks like a format or registry misconfiguration, not bad data".
 
 **Without a DQ table:** the first undecodable makes the pipeline Blocking with `KafkaUndecodable{partition, offset, reason}` and `ddi_kafka_undecodable_blocking = 1`. The member stays in its group, and the recheck re-opens the DQ table. This is ddi's rule (dq.rs:28-32) and **differs from kdi**, which silently dropped such messages through the default `NoopDeadLetterQueue` (open question 5).
 
-**Transform and coercion rejects** follow the existing semantics, and are written again on every replay (step 2). Keep `<prefix>partition`/`<prefix>offset` in the SQL output (`SELECT *, …`) anyway, so their DQ rows say which message they came from and a duplicate can be told apart.
+**Transform and coercion rejects** follow the existing semantics, and are written again on every replay, as every reject is. Keep `<prefix>partition`/`<prefix>offset` in the SQL output (`SELECT *, …`), so their DQ rows say which message they came from and a duplicate can be told apart.
 
 **Tombstones** are skipped and counted in `ddi_kafka_tombstones_total`; their offsets advance (kdi lib.rs:866-871).
 
@@ -1331,8 +1362,8 @@ FROM source
 | `ddi_kafka_brokers_up`, `ddi_kafka_retrying` | gauge | — |
 | `ddi_kafka_offsets_unavailable`, `ddi_kafka_offsets_regressed`, `ddi_kafka_offset_missing`, `ddi_kafka_topic_replaced`, `ddi_kafka_undecodable_blocking`, `ddi_kafka_schema_conflict`, `ddi_kafka_target_columns_unmatched`, `ddi_kafka_null_text_approximate` | gauge, held until the cause clears (like `ddi_source_file_vacuumed`, metrics.rs:245) | — |
 | `ddi_kafka_null_partition_values_total` | counter | — |
-| `ddi_kafka_offset_lookups_total`, `ddi_kafka_offset_lookup_seconds_total`, `ddi_kafka_offset_lookup_fallbacks_total`, `ddi_kafka_offset_lookup_below_checkpoint_reads_total`, `ddi_kafka_offset_lookup_marks_unfound_total` (Unverifiable partitions, §4.4) | counter | — |
-| `ddi_kafka_dq_rows_skipped_total`, `ddi_kafka_dq_conflict_retries_total` | counter | — |
+| `ddi_kafka_offset_lookups_total`, `ddi_kafka_offset_lookup_seconds_total`, `ddi_kafka_offset_lookup_fallbacks_total`, `ddi_kafka_offset_lookup_below_checkpoint_reads_total`, `ddi_kafka_offset_lookup_unverifiable_total` (partitions' offsets a read returned without the mark that would verify their resume, §4.4 Unverifiable; once per read) | counter | — |
+| `ddi_kafka_dq_conflict_retries_total` | counter | — |
 | `ddi_kafka_schema_registry_requests_total{outcome}`, `ddi_kafka_client_errors_total{code}` | counter | — |
 
 **Alert rules** (shipped in docs/alerts.yml, M5):
@@ -1423,26 +1454,26 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
 - `delta_commit_golden`, written first, with six shapes including the partitioned target; then `bootstrap_window`, `two_batches_in_one_process` and `a_commit_still_checkpoints_and_cleans_up_the_log` (§1.3).
 - Pinned through the pipeline, in the existing integration files: the range a published multi-commit batch spans (`a_batch_of_several_source_commits_publishes_where_it_started`, and its fully filtered twin), and the DQ-before-target order (`a_data_quality_write_that_fails_leaves_the_target_where_it_was`).
 - Sink: `target_file_size_splits_a_commits_files`, on both kinds of commit.
-- Commits: `kafka_commit_writes_n_txns` (`transaction_version("app-0") == 9`, `"app"` → None, `ddi.kafka.offsets` and `ddi.kafka.marks` present, no `ddi.sourceVersion`); `kafka_empty_commit_carries_txns_only`, also on a partitioned target.
+- Commits: `kafka_commit_writes_n_txns` (`transaction_version("app-0") == 9`, `"app"` → None, `ddi.kafka.offsets` and `ddi.kafka.marks` present, no `ddi.sourceVersion`); `kafka_empty_commit_carries_txns_only`, also on a partitioned target; `kafka_commit_writes_the_takeover_marker_when_asked`.
 - delta-rs pin: `fence_concurrent_txn_rejected_by_delta_rs`. Two handles on one snapshot both commit `a-0`, and the second fails with `CommitConflict(ConcurrentTransaction)`, so a delta-rs bump that changes this fails CI.
 - Fence: `fence_disjoint_partitions_do_not_conflict`, `fence_base_mismatch_detected`, `none_partition_verified_before_first_commit`, `revoked_partition_not_reasserted`.
+- Takeover marker and era (I23, I5): `takeover_marker_written_once_and_only_when_absent` (the JSON of the first commit carries it, of the next not), `two_members_racing_to_take_over_conflict_once`, `takeover_marker_survives_checkpoints` (a delta-rs checkpoint, one restamped with null `lastUpdated` as delta-rs ≤ 0.17.3 wrote it, and one with 0 as Trino writes it; kdi's era survives the same), `era_is_read_from_the_marker_and_the_partition_txns_alone`, `takeover_check_needs_an_acknowledgment_only_in_kdis_era` (and `start_without_offset`), `expired_kdi_offsets_are_caught_by_the_takeover_check`, `a_checkpoint_above_our_last_commit_keeps_the_era_and_the_marks`, `a_foreign_checkpoint_at_the_head_keeps_the_era`.
 - Retention: `set_transaction_retention_refused`, `txns_without_last_updated_never_expire` (property set after the fact).
 - Retried PUT: `retried_put_of_own_commit_is_concurrent_transaction`, using a log store that fails the first conditional PUT with 412 after writing.
 - Txn reader:
   - `read_txns_one_get_in_steady_state`, with a counting object store;
   - `read_txns_walks_back_to_checkpoint`, `read_txns_reads_checkpoint_txn_column`, `read_txns_multipart_checkpoint`;
   - `read_txns_foreign_checkpoint_falls_back_to_kernel`, `read_txns_on_a_replayed_handle_still_reads_the_checkpoint`;
-  - `read_txns_returns_marks_and_writer`, `read_txns_checkpoint_above_our_last_commit_still_reads_as_ddis`, `read_txns_foreign_checkpoint_at_the_head_still_reads_as_ddis`, `kdi_txns_answered_by_a_checkpoint_guard_a_missing_offset`;
+  - `read_txns_returns_marks`;
   - `read_txns_missing_commit_zero_is_an_error_at_version_zero`, `read_txns_commit_removed_by_cleanup_is_a_typed_error`;
-  - `reset_recovers_marks_from_below_the_checkpoint`, `reset_below_the_checkpoint_stops_at_a_missing_commit`, `reset_below_the_checkpoint_reads_at_most_the_cap`, `every_commit_carries_every_owned_mark`, `a_txn_whose_last_updated_is_not_known_may_expire`.
+  - `reset_recovers_marks_from_below_the_checkpoint`, `reset_below_the_checkpoint_stops_at_a_missing_commit`, `reset_below_the_checkpoint_reads_at_most_the_cap`, `reset_below_the_checkpoint_stops_at_an_unreadable_commit` (not JSON, refused by the store; an outage fails the read), `reset_below_the_checkpoint_is_read_once_per_checkpoint`, `every_offset_read_without_a_mark_is_unverifiable`, `every_commit_carries_every_owned_mark`.
 - DQ:
-  - `dq_marks_skip_recorded_offsets`, `dq_schema_not_found_never_skipped`, `dq_without_coordinates_written`;
-  - `dq_two_writers_disjoint_partitions_no_conflict`, `dq_same_partition_conflict_retried_in_place`;
+  - `dq_kafka_commit_is_a_plain_append` (no txn in the commit's JSON), `dq_a_replay_writes_its_rejects_again` (2 rows), `dq_two_members_append_without_conflict` (one partition, no retry);
+  - `dq_without_coordinates_written`, `dq_coordinates_outside_the_batch_are_none`;
   - `dq_delta_write_unchanged` (equality rule pinned);
-  - `dq_only_an_undecodable_is_skipped_by_the_mark`, `dq_coordinates_outside_the_batch_are_none`, `dq_mark_never_moves_back`, `dq_txn_retention_on_the_data_quality_table_is_not_refused`;
-  - `dq_commit_that_landed_unacknowledged_is_not_written_twice`, `dq_write_failures_are_typed`, `dq_store_fault_is_typed`, `dq_conflict_past_the_retries_in_place_is_typed`;
-  - `dq_same_decoder_skips_by_its_mark`, `dq_a_mark_another_decoder_set_does_not_skip`, `dq_a_mark_answered_by_a_checkpoint_does_not_skip`.
-- Errors: `a_capacity_failure_beneath_a_data_quality_write_is_capacity` (`Error::is_capacity`, §3.6).
+  - `dq_commit_that_landed_unacknowledged_is_not_written_twice` (delta-rs re-commits the same files), `dq_landed_commit_is_found_when_a_conflict_follows` (the `dqWriteId` search);
+  - `dq_write_failures_are_typed`, `dq_store_fault_is_typed`, `dq_conflict_past_the_retries_in_place_is_typed`, `dq_column_mapped_table_is_refused_before_writing`, `dq_unreadable_commit_is_blocking`.
+- Errors: `every_error_has_its_kafka_class` (§3.6), `a_capacity_failure_beneath_a_data_quality_write_is_capacity` (`Error::is_capacity`).
 
 **M1, config:**
 - every §2.5 rule;
@@ -1485,8 +1516,8 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
 - `not_owned_dropped`, `blocked_dropped`, `duplicate_below_next_expected_dropped`;
 - `reread_verified_and_dropped`, `reread_mismatch_blocks`, `reread_compacted_skips_verification`;
 - `gap_counted`, `batch_close_by_latency_messages_bytes_decoded`, `latency_timer_starts_after_commit` (kdi #233);
-- every row of §4.4, `app_id_typo_refused`, `shared_table_second_pipeline_allowed`, `baseline_when_any_start_positive`, `kdi_compat_unset_on_kdi_table_refused`;
-- `error_classification_table` (every §3.6 row).
+- every row of §4.4, `app_id_typo_refused`, `shared_table_second_pipeline_allowed`, `baseline_when_any_start_positive`, `kdi_compat_unset_on_kdi_table_refused` (kdi's era only), `takeover_check_runs_over_every_partition_at_open`, `baseline_writes_the_takeover_marker`;
+- `error_classification_table`: `every_error_has_its_kafka_class` extended with every Kafka-only variant M3 adds and the one-partition class.
 
 ### 9.2 Integration (tests/kafka_*.rs, `#[ignore]`; Redpanda with its built-in SR; local filesystem tables, one Azurite variant)
 
@@ -1516,8 +1547,8 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
 
 15. `schema_evolution`: register v1, then v2 with an added field, then v3 changing a field type; interleave producers. The identity path fills the target; SQL referencing the v2 field gives NULL for v1 rows; v1 rows that cannot be cast go to DQ. No stall.
 16. `undecodable_goes_to_dq_or_blocks`: a bad magic byte with no DQ table → blocked (gauge), still in the group. After creating `<t>__ddi_dq` the recheck resumes it, with a DQ row holding partition, offset and base64. Above the cap → blocked.
-17. `dq_crash_between_dq_and_target` (fault hook `abort_after_dq`): the replay, with different batch boundaries, writes no duplicate for coordinate-carrying rejects.
-18. `two_members_dq_rejects_concurrently`: both write DQ rows for minutes → no step errors, no rebalances, every reject exactly once.
+17. `dq_crash_between_dq_and_target` (fault hook `abort_after_dq`): the replay, with different batch boundaries, writes the rejects again: every reject's (partition, offset) is in the DQ table, those of the crashed batch twice, and none is missing.
+18. `two_members_dq_rejects_concurrently`: both write DQ rows for minutes → no step errors, no DQ conflict retries, no rebalances, every reject exactly once (no crash, so no replay).
 19. `latest_baseline_survives_crash` and `earliest_on_trimmed_topic_baseline`.
 20. `cooperative_rejected_at_load`.
 21. `alter_table_mid_stream`: add a nullable column on bronze while running → reset, coercer rebuilt, held batch retried, continues.
@@ -1555,7 +1586,7 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
 ### 9.4 Nightly
 
 - `kdi_and_ddi_race`: kdi and ddi on one table under one app_id for 2 minutes → each offset exactly once. Conflicts on every commit for partitions both hold are expected (kdi re-asserts all its assigned partitions).
-- `kdi_ddi_alternate`: hand the table back and forth 3 times. This proves rollback, including delta-rs 0.26 reading 0.32 checkpoints and txns without `lastUpdated`.
+- `kdi_ddi_alternate`: hand the table back and forth 3 times. This proves rollback, including delta-rs 0.26 reading 0.32 checkpoints, txns without `lastUpdated` and the takeover marker it never reads; every switch back to ddi finds the marker and runs no takeover check.
 
 ---
 
@@ -1589,16 +1620,17 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
 **4. Switch:**
 1. Scale kdi to 0 and wait until its pod is gone and its txns have been stable for one `allowed_latency`.
 2. Record kdi's final txns with `plan`.
-3. Start ddi with kdi's `app_id`, `group_id = ddi-<name>` (or kdi's), the bronze target, explicit `kdi_compat`, and the translated settings.
+3. Start ddi with kdi's `app_id`, `group_id = ddi-<name>` (or kdi's), the bronze target, explicit `kdi_compat`, an explicit `starting_offsets` entry for every partition `plan` lists as NO_TXN→ack needed (the takeover check refuses the open otherwise, §4.4 step 3), and the translated settings.
 4. Verify:
-   - the first commit's txns are ≥ the recorded ones;
+   - the first commit's txns are ≥ the recorded ones, and it carries the takeover marker `<app_id>.ddi`;
    - the continuity SQL around the boundary on `(kafka_partition, kafka_offset)`;
    - lag reaches 0, `fenced_total = 0`, no blocked partitions, DQ quiet, and downstream silver pipelines unaffected (same table, appends only).
 
 Optional zero-pause variant: start ddi in kdi's group first (both eager, `range,roundrobin`), then stop kdi. Expect conflicts on the moving partitions during the handover. Use it only after the nightly `kdi_and_ddi_race` is green.
 
-**5. Rollback.** Stop ddi and start kdi with the same flags. kdi reads the same txn convention (a null `lastUpdated` is fine) and resumes at stored.
+**5. Rollback.** Stop ddi and start kdi with the same flags. kdi reads the same txn convention (a null `lastUpdated` is fine) and resumes at stored. It never reads the takeover marker, which is not one of its `<app_id>-<p>` appIds.
 - Precondition, rehearsed by `kdi_ddi_alternate`: delta-rs 0.26 reads 0.32 checkpoints.
+- **Keep `delta.setTransactionRetentionDuration` unset while kdi runs again.** kdi stamps every txn it re-asserts, and the marker keeps the table in ddi's era, so switching back to ddi runs no takeover check (§4.4): a txn that expired meanwhile would be a partition read again from 0.
 - If it cannot, rollback needs ddi's newest checkpoint and `_last_checkpoint` removed, which is risky. Prefer to fix forward, or delay the first ddi checkpoint and the property change until confidence is high.
 - Rows quarantined in DQ stay there; kdi would have dropped them. ddi never writes a txn of −1, so kdi cannot misread one as `End`.
 
@@ -1665,10 +1697,10 @@ Optional zero-pause variant: start ddi in kdi's group first (both eager, `range,
 
 | Id | Point | Disposition | Where |
 |---|---|---|---|
-| EO-M1 | Replicas conflict on the shared DQ appId, and each conflict leaves the group | **Accept, different fix.** Per-partition DQ txns holding the last offset covered, a per-offset skip for deterministic coordinate-carrying rejects, and in-place retry on DQ conflicts. Equality on a fingerprint was not used, because it rarely matches on replay (EO-m9). | §5.7, §1.2 |
+| EO-M1 | Replicas conflict on the shared DQ appId, and each conflict leaves the group | **Accept, different fix (rev.).** Kafka DQ commits carry no txn at all: plain appends never contend, and a DQ conflict (another engine's metadata change) is retried in place. A replay after a crash between the DQ and the target commit writes its rejects again, a visible duplicate. Per-partition DQ marks with a per-offset skip were tried first and lost rejects (§5.7); equality on a fingerprint was not used, because it rarely matches on replay (EO-m9). | §5.7, §1.2 |
 | EO-M2 | Dropping buffers on revoke plus leaving the group on any error can starve the group | **Accept (a) and (b); reject (c).** Error classes keep members in the group; deferred revoke with a time-boxed flush. (c), keeping buffers across revoke/reassign, is moot once revokes flush. | §3.3, §3.4, §3.6 |
 | EO-M3 | `ddi once` never finishes, because `position()` is INVALID | **Accept.** Done when `max(next_expected, start) ≥ end` (LSO) or after 10 s idle; manual assignment. | §3.8 |
-| EO-M4 | Missing-txn policy can skip silently (a) or duplicate in bulk (b) | **Accept the problem, partly different fix.** Exactly offset 0, blocked if `low > 0`; kdi-era tables with a retention-property history need an acknowledgment. `partitionCount` bookkeeping is unnecessary under that rule; topic id replaced by the re-read mark check (rdkafka 0.39 has no topic id without `unsafe` FFI). | §4.4, §4.6 |
+| EO-M4 | Missing-txn policy can skip silently (a) or duplicate in bulk (b) | **Accept the problem, partly different fix.** Exactly offset 0, blocked if `low > 0`. (b): until ddi has taken a table over (no takeover marker), every partition without a txn whose topic holds messages needs an explicit `starting_offsets` entry, checked once at open over every partition; no history scan, no attribution by `lastUpdated`. `partitionCount` bookkeeping is unnecessary under that rule; topic id replaced by the re-read mark check (rdkafka 0.39 has no topic id without `unsafe` FFI). | §4.4, §4.6 |
 | EO-M5 | Amplification ratchets upward and shrinks batches | **Accept.** Kafka never observes `Amplification`; it closes on measured decoded bytes (slice size). | §3.3, §3.7 |
 | EO-M6 | Txn lookups fetch every commit since the checkpoint | **Accept (verified).** Backward walker plus the checkpoint's `txn` column, in M0, not optional. | §4.3, §0.3.17 |
 | EO-m1 | kdi re-asserts every assigned partition | **Accept (verified).** Text and race expectations fixed. | §0.3.13, §4.5, §9.4 |
@@ -1679,7 +1711,7 @@ Optional zero-pause variant: start ddi in kdi's group first (both eager, `range,
 | EO-m6 | Fatal client errors loop forever | **Accept.** Consumer-fatal class. | §3.6 |
 | EO-m7 | `block_in_place`, `spawn_blocking` in Drop, exit hang | **Accept.** `spawn_blocking` on an `Arc`'d consumer; close on a detached thread. | §3.9 |
 | EO-m8 | Idle handle ages past log retention | **Accept.** `handle_max_age` refresh; a missing file in the conflict check is Replan. | §4.3 |
-| EO-m9 | DQ fingerprint rarely matches on replay | **Accept.** Solved by per-offset marks rather than first-batch alignment. | §5.7 |
+| EO-m9 | DQ fingerprint rarely matches on replay | **Accept.** No match is attempted: a replay writes its rejects again (rev.; per-offset marks lost rejects). | §5.7 |
 | EO-m10 | Replan conflicts drop uncommitted work | **Accept.** The batch is retained when bases are unchanged. | §3.3 |
 | EO-m11 | Full reopen on every assign | **Accept.** Incremental refresh; full open for the supervisor and failed refreshes; `require_files` stays on. | §3.4, §7.2 |
 | EO-m12 | Unmapped partition column writes nulls silently | **Accept.** Refused at open (or blocking at first batch); golden and M3 tests. | §5.6 step 0, §1.3 |
@@ -1713,7 +1745,7 @@ Optional zero-pause variant: start ddi in kdi's group first (both eager, `range,
 | PO-2 | Decimal byte length; double→DECIMAL | **Accept.** Minimal or fixed, verified against the corpus; shortest-text conversion. | §5.6 |
 | PO-3 | `-t` overwrite semantics, dotted access, quoting | **Accept.** `* REPLACE (coalesce(..))`, dotted access, quoted aliases; validator check in M4. | §6.3 |
 | PO-4 | Metric names, durations, statsd prefix | **Accept.** | §7.1 |
-| PO-5 | `kdi_compat` default true | **Accept, with a guard.** False by default; unset on a kdi table refuses to start. | §4.4 step 5 |
+| PO-5 | `kdi_compat` default true | **Accept, with a guard.** False by default; unset in kdi's era (no takeover marker) refuses to start. | §4.4 step 6 |
 | PO-6 | `kafka_*` collision makes everything undecodable | **Accept partly.** Configurable prefix, a single blocking error, reported by `plan`. "Payload wins" rejected: it would corrupt the watermark's columns. | §6.1 |
 | PO-7 | Shadow created with Trino CTAS | **Accept.** `ddi kafka clone-table`. | §4.8, §10.2 |
 | PO-8 | Two offset conventions | **Accept.** "Next offset to read" everywhere user-facing. | §4.8 |
@@ -1729,16 +1761,16 @@ Each milestone can be reviewed and merged on its own. Days are dev-days at ddi's
 
 | # | Increment | Acceptance | Days |
 |---|---|---|---|
-| **M-1** | **Inventory and evidence.** Per kdi deployment: topic, table, `-a`, `-g`, every `-t`, `-K`, `-l/-m/-b`, `-c`, `-o`, statsd endpoint, replicas, **image digest**, and the crate versions read from the binary (`strings` for apache-avro / schema_registry_converter / rdkafka). Per bronze table: DDL, properties (including txn-retention history), partitioning, a `= 'null'` count per STRING column, and `plan`-equivalent txn/watermark readings (by script, read-only). Per subject: versions, compatibility, references, decimal encodings. Group ACL prefixes, topic retention and compaction. Then the **production-kdi fixture** (§9.3, steps 1-4). | Inventory sheet complete for every topic; fixture tables and corpus checked in; apache-avro dev-dep version fixed; open questions answered or defaulted | 1.5 (+1-2 if the production image must be rebuilt) |
-| **M0** | **No-Kafka refactor and offset core.** Golden test first (six shapes, partitioned included); `Source`/`DeltaSource`, `Batch`/`Position`, `process()` with the conform hook; `Offsets`/`KafkaOffsets`/`MessageMark`, `Sink::commit_kafka`, private `write`; `fence.rs` with `read_txns` (walk, checkpoint `txn` column, fallback) and `Fence`; `DataQuality::write_kafka`; error variants; `Pipeline` fields `pub(crate)` | Existing suite **unmodified** and green; `delta_commit_golden` identical before and after; moved-code diff reviewed; §9.1 M0 tests, including the delta-rs pin, one-GET steady state and the DQ marks; `cargo tree` unchanged | 4.5 |
+| **M-1** | **Inventory and evidence.** Per kdi deployment: topic, table, `-a`, `-g`, every `-t`, `-K`, `-l/-m/-b`, `-c`, `-o`, statsd endpoint, replicas, **image digest**, and the crate versions read from the binary (`strings` for apache-avro / schema_registry_converter / rdkafka). Per bronze table: DDL, properties (including txn-retention history, as evidence for the takeover acknowledgments), partitioning, a `= 'null'` count per STRING column, and `plan`-equivalent txn/watermark readings (by script, read-only). Per subject: versions, compatibility, references, decimal encodings. Group ACL prefixes, topic retention and compaction. Then the **production-kdi fixture** (§9.3, steps 1-4). | Inventory sheet complete for every topic; fixture tables and corpus checked in; apache-avro dev-dep version fixed; open questions answered or defaulted | 1.5 (+1-2 if the production image must be rebuilt) |
+| **M0** | **No-Kafka refactor and offset core.** Golden test first (six shapes, partitioned included); `Source`/`DeltaSource`, `Batch`/`Position`, `process()` with the conform hook; `Offsets`/`KafkaOffsets`/`MessageMark`, `Sink::commit_kafka`, private `write`; `fence.rs` with `read_txns` (walk, checkpoint `txn` column, fallback) and `Fence`; `DataQuality::write_kafka`; the takeover marker, era and takeover check; error variants and `Error::kafka_class`; `Pipeline` fields `pub(crate)` | Existing suite **unmodified** and green; `delta_commit_golden` identical before and after; moved-code diff reviewed; §9.1 M0 tests, including the delta-rs pin, one-GET steady state, the marker and the DQ appends; `cargo tree` unchanged | 4.5 |
 | **M1** | **Config and build.** `[kafka]` config, resolution and validation (always compiled); `ResolvedPipeline.kafka` (+5 mechanical literals); the `kafka` feature with rdkafka and arrow-avro, no `cargo update`; `ddi validate`/`--version`; Docker `DDI_FEATURES` (default empty); CI `check-kafka`; deny `[graph]`; notices appendix; budget reservation | Config unit tests; feature-off rejection (I16); `cargo build --features kafka` on the laptop and in Docker; `builtin.features ⊇ ssl,sasl_scram,zstd`; zstd-sys still 2.0.16; image `--version` shows librdkafka 2.12.1; cargo-deny green | 2.5 |
 | **M2** | **Pure decode.** SR client; framing; per-id decoders; strict check; isolation; normalisation; metadata columns with prefix; measured sizes; `U` (latest ∪ seen, newest wins, casts, widening); conform (by name, containers, unions, float→decimal); `kdi_compat` by type; `kdi_null_text` by presence; parity matrices against the production apache-avro | §9.1 registry, decode and conform tests green, including both parity matrices on the M-1 corpus; arrow-avro go/no-go recorded (fallback: `trait Decode` with apache-avro) | 8 |
-| **M3** | **`KafkaSource`.** Client config; `DdiContext` with deferred events; `assign_with_delta_offsets`, `flush_then_unassign`; partition state with re-read verification; poll and `step_kafka`/`commit_batch` with error classes, held batch, pauses and blocked rechecks; `reset_in_place` (incremental); start resolution, baseline, typo guard with exemption, kdi-era checks, `kdi_compat` refusal; once-mode manual assignment and done rule; handle aging; `Drop` on a detached thread; main.rs wiring (`Waiting` progress rule, shutdown flush); metrics; `status`/`validate`; `raw` format; dead-code allowance removed; image default `kafka` | Integration tests 1-25 and 27-33 green in `kafka-integration`; §9.1 M3 unit tests; a 2-hour soak on the laptop with 3 members and a churn script shows no duplicates and continuous commits | 12 |
-| **M4** | **kdi compatibility and tooling.** SCRAM/SSL env compat and the SASL job (test 26); `ddi kafka plan` (history scan, NO_TXN evidence, mapping via backward peek, `kdi_compat` advice, collisions); `ddi kafka clone-table`; `kdi_takeover_fixture`; translation checks (`* REPLACE`, quoted multi-level access, `to_char`, string→timestamp); cleanup gating | Test 26 and the takeover test green; `plan` golden output on the fixture; the clone keeps column case and has no column mapping | 5 |
-| **M5** | **Operations.** `ddi kafka set-offsets` (`--next`, acknowledgments, DQ marks, `--all-partitions`); docs (README Kafka section, USING_DDI, `pipelines.example.toml`, metrics reference, runbook, docs/alerts.yml); optional statsd shim (+1 d) only if open question 4 says so | `set-offsets` guard tests (forward needs an ack, backward needs `--allow-replay`, DQ marks move, a running owner picks it up); doc review | 3 |
+| **M3** | **`KafkaSource`.** Client config; `DdiContext` with deferred events; `assign_with_delta_offsets`, `flush_then_unassign`; partition state with re-read verification; poll and `step_kafka`/`commit_batch` with error classes, held batch, pauses and blocked rechecks; `reset_in_place` (incremental); start resolution, baseline, the takeover check over every partition at open, typo guard with exemption, `kdi_compat` refusal; once-mode manual assignment and done rule; handle aging; `Drop` on a detached thread; main.rs wiring (`Waiting` progress rule, shutdown flush); metrics; `status`/`validate`; `raw` format; dead-code allowance removed; image default `kafka` | Integration tests 1-25 and 27-33 green in `kafka-integration`; §9.1 M3 unit tests; a 2-hour soak on the laptop with 3 members and a churn script shows no duplicates and continuous commits | 12 |
+| **M4** | **kdi compatibility and tooling.** SCRAM/SSL env compat and the SASL job (test 26); `ddi kafka plan` (era and takeover verdict, NO_TXN evidence, mapping via backward peek, `kdi_compat` advice, collisions); `ddi kafka clone-table`; `kdi_takeover_fixture`; translation checks (`* REPLACE`, quoted multi-level access, `to_char`, string→timestamp); cleanup gating | Test 26 and the takeover test green; `plan` golden output on the fixture; the clone keeps column case and has no column mapping | 5 |
+| **M5** | **Operations.** `ddi kafka set-offsets` (`--next`, acknowledgments, `--all-partitions`; no DQ marks, no takeover marker); docs (README Kafka section, USING_DDI, `pipelines.example.toml`, metrics reference, runbook, docs/alerts.yml); optional statsd shim (+1 d) only if open question 4 says so | `set-offsets` guard tests (forward needs an ack, backward needs `--allow-replay`, writes no takeover marker, a running owner picks it up); doc review | 3 |
 | **M6** | **Pilot cutover.** Comparison SQL recipes; runbook executed on one low-traffic topic (shadow → compare → switch); rollback rehearsal | The §10.3 gates pass on the pilot and stay green for 3 days after the switch; `kdi_ddi_alternate` green | 1.5 + soak |
 
-**Total: about 38 dev-days** (range 33-43), plus soak and roughly 0.25 day per further table. This is above the critique's 30-35 because their findings added scope: deferred revoke flush, stay-in-group error handling, the txn walker in M0, null-text presence and per-partition DQ marks.
+**Total: about 38 dev-days** (range 33-43), plus soak and roughly 0.25 day per further table. This is above the critique's 30-35 because their findings added scope: deferred revoke flush, stay-in-group error handling, the txn walker in M0, and null-text presence.
 
 ---
 
