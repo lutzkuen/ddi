@@ -242,9 +242,53 @@ pub enum OffsetValue {
 /// `Debug` is written by hand for the same reason as [`super::PublisherConfig`]'s: a
 /// `{:?}` on a `Config`, a `ResolvedPipeline` or anything holding one must not print a
 /// password somebody wrote inline.
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct KafkaSettings(BTreeMap<String, String>);
+
+/// A value of `[kafka.settings]`, as librdkafka takes every value: text. TOML's numbers and
+/// booleans (`"fetch.min.bytes" = 1`, `"enable.ssl.certificate.verification" = false`) are
+/// taken as the text they are written as, since refusing one would fail the whole file, Delta
+/// pipelines included, over a value librdkafka accepts. Anything else is no librdkafka value.
+impl<'de> Deserialize<'de> for KafkaSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Text(String);
+        impl<'de> Deserialize<'de> for Text {
+            fn deserialize<D: serde::Deserializer<'de>>(
+                d: D,
+            ) -> std::result::Result<Self, D::Error> {
+                struct Visitor;
+                impl serde::de::Visitor<'_> for Visitor {
+                    type Value = Text;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("a string, number or boolean")
+                    }
+                    fn visit_str<E>(self, v: &str) -> std::result::Result<Text, E> {
+                        Ok(Text(v.to_string()))
+                    }
+                    fn visit_string<E>(self, v: String) -> std::result::Result<Text, E> {
+                        Ok(Text(v))
+                    }
+                    fn visit_bool<E>(self, v: bool) -> std::result::Result<Text, E> {
+                        Ok(Text(v.to_string()))
+                    }
+                    fn visit_i64<E>(self, v: i64) -> std::result::Result<Text, E> {
+                        Ok(Text(v.to_string()))
+                    }
+                    fn visit_u64<E>(self, v: u64) -> std::result::Result<Text, E> {
+                        Ok(Text(v.to_string()))
+                    }
+                    fn visit_f64<E>(self, v: f64) -> std::result::Result<Text, E> {
+                        Ok(Text(v.to_string()))
+                    }
+                }
+                d.deserialize_any(Visitor)
+            }
+        }
+        let written = BTreeMap::<String, Text>::deserialize(d)?;
+        Ok(Self(written.into_iter().map(|(k, v)| (k, v.0)).collect()))
+    }
+}
 
 impl KafkaSettings {
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -2840,6 +2884,38 @@ url = "http://my-sr:8081"
             (a.get("group.instance.id"), b.get("group.instance.id")),
             (Some("ddi-0"), Some("ddi-1"))
         );
+    }
+
+    #[test]
+    fn settings_take_numbers_and_booleans() {
+        // librdkafka takes every value as text; TOML's numbers and booleans are written as it.
+        let r = resolve(&format!(
+            "{SECTION}[kafka.settings]\n\"fetch.min.bytes\" = 1\n\
+             \"enable.ssl.certificate.verification\" = false\n{}",
+            entry(
+                "events",
+                "[kafka.pipeline.settings]\n\"statistics.interval.ms\" = 0"
+            )
+        ));
+        let s = settings_of(&r, "events", &[]).unwrap();
+        assert_eq!(s.get("fetch.min.bytes"), Some("1"));
+        assert_eq!(s.get("enable.ssl.certificate.verification"), Some("false"));
+        assert_eq!(s.get("statistics.interval.ms"), Some("0"));
+        // A forced key is ddi's, however its value is written.
+        for line in [
+            "\"enable.partition.eof\" = false",
+            "\"enable.auto.commit\" = false",
+        ] {
+            let reason = refused("", &format!("[kafka.pipeline.settings]\n{line}"));
+            assert!(reason.contains("is ddi's to set"), "{line}: {reason}");
+        }
+        // Anything else is no librdkafka value, and fails the file with its line.
+        let e = Config::from_toml_str(&format!(
+            "{SECTION}[kafka.settings]\n\"fetch.min.bytes\" = [1]\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("a string, number or boolean"), "{e}");
     }
 
     /// [`librdkafka_property`] against librdkafka itself: a value set under one name is what
