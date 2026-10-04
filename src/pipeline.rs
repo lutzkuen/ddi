@@ -18,7 +18,7 @@ use crate::dq::DataQuality;
 use crate::error::{Error, Result};
 use crate::offset::OffsetStore;
 use crate::schema::{Rejected, SchemaCoercer};
-use crate::sink::{Sink, UpsertStats};
+use crate::sink::{KafkaOffsets, Offsets, Sink, UpsertStats};
 use crate::source::{classify, CommitClass, LogBatch, LogStreamBuilder, StreamCursor, Version};
 use crate::transform::{Identity, SqlTransform, Transform};
 use crate::upsert::{self, MergePlan};
@@ -290,20 +290,25 @@ pub(crate) enum Position {
         start: StreamCursor,
         end: StreamCursor,
     },
+    /// The offsets a Kafka batch read, and the ones its commit re-asserts.
+    #[allow(dead_code)] // used from M3: built by the Kafka step
+    Kafka(KafkaOffsets),
 }
 
 impl Position {
-    /// Where a Delta batch ends.
+    /// Where a Delta batch ends. `None` for any other source.
     fn delta_end(&self) -> Option<StreamCursor> {
         match self {
             Self::Delta { end, .. } => Some(*end),
+            Self::Kafka(_) => None,
         }
     }
 
-    /// The source version a Delta batch starts at.
+    /// The source version a Delta batch starts at. `None` for any other source.
     fn delta_start_version(&self) -> Option<Version> {
         match self {
             Self::Delta { start, .. } => Some(start.version),
+            Self::Kafka(_) => None,
         }
     }
 }
@@ -925,7 +930,7 @@ impl Pipeline {
 
         // The offset must advance even when a batch produces no rows — otherwise a
         // fully-filtered commit would be re-read forever.
-        let txn_version = self.txn_version_for(&position)?;
+        let offsets = self.offsets_for(&position)?;
 
         // 4b. Rejects go to their own table *before* the target commits, and they are the
         // only thing here that is not covered by the batch's own atomicity — two tables
@@ -934,7 +939,7 @@ impl Pipeline {
         // reject is written again unless the data-quality table's own txn action says it
         // is already there. See `crate::dq`.
         if rejected_rows > 0 {
-            let written = self.write_rejects(&rejects, txn_version).await?;
+            let written = self.write_rejects(&rejects, &offsets).await?;
             if in_rows > 0 && out_rows == 0 && covered == 0 {
                 // Every row failed. That is far more likely to be an upstream type change
                 // than a batch of uniformly bad data, and it is invisible in the target —
@@ -996,7 +1001,7 @@ impl Pipeline {
             // declines to commit a merge that produced no actions, which would take the
             // txn action down with it and strand the offset here forever.
             let empty = RecordBatch::new_empty(self.coercer.target());
-            self.commit(vec![empty], txn_version).await?;
+            self.commit(vec![empty], &offsets).await?;
             self.acknowledge_lookup_table_id_transitions(&lookup_batch.transitions);
             self.settle_cutoff(closes, covered, beyond);
             // This commit moved the offset too, so it gets a message like any other. Staying
@@ -1022,10 +1027,16 @@ impl Pipeline {
 
         // 5+6. Write parquet and commit the data actions AND the txn action atomically.
         let (out_rows, upsert) = if self.cfg.write_mode.is_upsert() {
+            // Only a Delta source can be configured to upsert.
+            let Offsets::Version(txn_version) = offsets else {
+                return Err(Error::Other(
+                    "internal: an upsert needs a source version to commit".into(),
+                ));
+            };
             let stats = self.upsert(coerced, produced, txn_version).await?;
             (stats.rows_written(), Some(stats))
         } else {
-            self.commit(coerced, txn_version).await?;
+            self.commit(coerced, &offsets).await?;
             (out_rows, None)
         };
         self.acknowledge_lookup_table_id_transitions(&lookup_batch.transitions);
@@ -1088,10 +1099,13 @@ impl Pipeline {
     }
 
     /// The offset a batch at `position` commits.
-    fn txn_version_for(&self, position: &Position) -> Result<i64> {
-        match position {
-            Position::Delta { end, .. } => self.source.delta().offsets.txn_version_for(*end),
-        }
+    fn offsets_for(&self, position: &Position) -> Result<Offsets> {
+        Ok(match position {
+            Position::Delta { end, .. } => {
+                Offsets::Version(self.source.delta().offsets.txn_version_for(*end)?)
+            }
+            Position::Kafka(offsets) => Offsets::Kafka(offsets.clone()),
+        })
     }
 
     /// Account for a batch filtered inside a coverage window, once its commit is durable, and
@@ -1149,7 +1163,7 @@ impl Pipeline {
     /// Errors rather than swallowing: if the rejects cannot be recorded, the target must not
     /// commit either, or the offset would advance past rows that went nowhere. Failing here
     /// leaves the whole batch to be retried, which is why the write is idempotent.
-    async fn write_rejects(&mut self, rejects: &[Rejected], txn_version: i64) -> Result<usize> {
+    async fn write_rejects(&mut self, rejects: &[Rejected], offsets: &Offsets) -> Result<usize> {
         let Some(dq) = self.dq.as_mut() else {
             // Unreachable: rejects are only produced when a table was opened.
             return Err(Error::Other(
@@ -1157,7 +1171,14 @@ impl Pipeline {
             ));
         };
         let now = chrono::Utc::now().naive_utc().and_utc().timestamp_micros();
-        dq.write(rejects, txn_version, now).await
+        match offsets {
+            Offsets::Version(txn_version) => dq.write(rejects, *txn_version, now).await,
+            // Unreachable: nothing builds a Kafka position before
+            // `DataQuality::write_kafka` (docs/kafka-design.md §5.7) is here to take this arm.
+            Offsets::Kafka(_) => Err(Error::Other(
+                "internal: recording a Kafka batch's rejects is not implemented".into(),
+            )),
+        }
     }
 
     async fn lookup_snapshots(&mut self, batch: &LogBatch) -> Result<LookupBatch> {
@@ -1460,7 +1481,11 @@ impl Pipeline {
         Some(stats)
     }
 
-    async fn commit(&mut self, batches: Vec<RecordBatch>, txn_version: i64) -> Result<()> {
+    async fn commit(&mut self, batches: Vec<RecordBatch>, offsets: &Offsets) -> Result<()> {
+        let txn_version = match offsets {
+            Offsets::Version(v) => *v,
+            Offsets::Kafka(offsets) => return self.commit_kafka(batches, offsets).await,
+        };
         // The sink consumes the table and returns it at its new version.
         let table = std::mem::replace(&mut self.target, DeltaTable::new_in_memory());
         match self.sink.commit(table, batches, txn_version).await {
@@ -1474,6 +1499,23 @@ impl Pipeline {
                 Err(e)
             }
         }
+    }
+
+    /// Commit a Kafka batch's rows and offsets.
+    ///
+    /// The sink is handed a clone of the handle rather than the handle itself, so a failed
+    /// commit leaves `self.target` at the snapshot the batch was planned and fenced against,
+    /// instead of reopening the table. A Kafka pipeline's handle changes only through its own
+    /// commits and its deliberate refreshes, and what follows a failure depends on the
+    /// error's class (docs/kafka-design.md §3.6, §4.3).
+    async fn commit_kafka(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        offsets: &KafkaOffsets,
+    ) -> Result<()> {
+        let table = self.target.clone();
+        self.target = self.sink.commit_kafka(table, batches, offsets).await?;
+        Ok(())
     }
 
     /// Read exactly the files in `batch` — not the whole table.

@@ -9,7 +9,11 @@
 //! `CommitProperties::with_application_transaction` puts the `txn` action in the merge's own
 //! commit — with one wrinkle delta-rs introduces and [`Sink::upsert`] has to close: a merge
 //! that changes nothing writes **no commit at all**, and would take the offset down with it.
+//!
+//! It holds for a Kafka batch too, whose offset is one number per partition rather than one
+//! in all: [`Sink::commit_kafka`] writes a `txn` action for each, in the batch's own commit.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use deltalake::arrow::array::RecordBatch;
@@ -158,6 +162,78 @@ impl Sink {
             .with_metadata(metadata)
     }
 
+    /// The commit properties of a Kafka batch: a `txn` per asserted partition, and the
+    /// evidence an operator reads beside them.
+    ///
+    /// No `ddi.sourceVersion`, which nothing reads back and a Kafka batch has no single value
+    /// for, and none of the Delta source's provenance: a Kafka pipeline has no source table, no
+    /// lookups and no coverage window.
+    fn kafka_properties(&self, offsets: &KafkaOffsets) -> CommitProperties {
+        let txns = offsets
+            .assert
+            .iter()
+            .map(|(p, last)| Transaction::new(crate::fence::txn_app_id(&self.app_id, *p), *last))
+            .collect();
+        let ranges: serde_json::Map<String, serde_json::Value> = offsets
+            .ranges
+            .iter()
+            .map(|(p, (first, last))| (p.to_string(), serde_json::json!([first, last])))
+            .collect();
+        let marks: serde_json::Map<String, serde_json::Value> = offsets
+            .marks
+            .iter()
+            .map(|(p, m)| {
+                let mark = serde_json::json!([m.offset, m.timestamp_ms, m.value_len]);
+                (p.to_string(), mark)
+            })
+            .collect();
+
+        let mut metadata = vec![
+            (
+                "ddi.appId".to_string(),
+                serde_json::Value::from(self.app_id.clone()),
+            ),
+            (
+                "ddi.kafka.topic".to_string(),
+                serde_json::Value::from(offsets.topic.clone()),
+            ),
+            (
+                "ddi.kafka.groupId".to_string(),
+                serde_json::Value::from(offsets.group_id.clone()),
+            ),
+            (
+                "ddi.kafka.offsets".to_string(),
+                serde_json::Value::Object(ranges),
+            ),
+            (
+                "ddi.kafka.marks".to_string(),
+                serde_json::Value::Object(marks),
+            ),
+        ];
+        if offsets.baseline {
+            metadata.push((
+                "ddi.kafka.baseline".to_string(),
+                serde_json::Value::from(true),
+            ));
+        }
+        if let Some(reason) = &offsets.override_reason {
+            metadata.push((
+                "ddi.kafka.offsetOverride".to_string(),
+                serde_json::Value::from(reason.clone()),
+            ));
+        }
+
+        CommitProperties::default()
+            // The plural replaces the list where the singular adds to it. The txns are the
+            // authority; the metadata is evidence.
+            .with_application_transactions(txns)
+            .with_metadata(metadata)
+            // Some(false) as well as Some(true): left as None, delta-rs follows
+            // delta.enableExpiredLogCleanup, true by default, and lists the whole log after
+            // every commit (docs/kafka-design.md §7.2).
+            .with_cleanup_expired_logs(Some(offsets.cleanup_logs))
+    }
+
     /// Append `batches` and record `source_version` in a `txn` action, atomically.
     ///
     /// Returns the table at its new version.
@@ -179,6 +255,36 @@ impl Sink {
             source_version,
             target_version = ?table.version(),
             "committed data + txn atomically"
+        );
+        Ok(table)
+    }
+
+    /// Append `batches` and record a Kafka batch's offsets, one `txn` per partition,
+    /// atomically.
+    ///
+    /// Returns the table at its new version. The rows are written exactly as
+    /// [`Self::commit`] writes them; only what the commit records differs.
+    ///
+    /// Every partition in `offsets.assert` gets a `txn` action, not only those this batch
+    /// read. delta-rs refuses a commit when a commit that landed after its snapshot wrote a
+    /// `txn` with one of the same appIds (`ConcurrentTransaction`), so re-asserting every
+    /// partition this member owns fences all of them against a second writer, and a commit
+    /// whose PUT is retried after it already landed fences itself rather than landing twice.
+    pub async fn commit_kafka(
+        &self,
+        table: DeltaTable,
+        batches: Vec<RecordBatch>,
+        offsets: &KafkaOffsets,
+    ) -> Result<DeltaTable> {
+        let props = self.kafka_properties(offsets);
+        let table = self.write(table, batches, props).await?;
+        debug!(
+            app_id = %self.app_id,
+            topic = %offsets.topic,
+            partitions = offsets.ranges.len(),
+            asserted = offsets.assert.len(),
+            target_version = ?table.version(),
+            "committed data + txns atomically"
         );
         Ok(table)
     }
@@ -390,6 +496,49 @@ impl UpsertStats {
     }
 }
 
+/// The offset a commit records: how far it has read its source.
+#[derive(Clone, Debug)]
+pub enum Offsets {
+    /// The last source version a Delta batch read, as one `txn` under the pipeline's app_id.
+    Version(i64),
+    /// A Kafka batch's offsets, as one `txn` per partition.
+    Kafka(KafkaOffsets),
+}
+
+/// The offsets one Kafka batch commits, and the evidence recorded beside them.
+///
+/// Holds no rdkafka type, so it is compiled into every build and its commits can be tested
+/// without a broker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KafkaOffsets {
+    pub topic: String,
+    pub group_id: String,
+    /// The partitions this batch read: the first and the last offset it accounted for in
+    /// each.
+    pub ranges: BTreeMap<i32, (i64, i64)>,
+    /// Every `txn` this commit writes, by partition: the last offset for each partition in
+    /// `ranges`, and the unchanged base of every other owned partition whose base is known
+    /// (docs/kafka-design.md §4.3). Always holds every key of `ranges`.
+    pub assert: BTreeMap<i32, i64>,
+    /// For each asserted partition where it is known, the message at the asserted offset, so
+    /// that a resume can tell the topic it read from one recreated under the same name (§4.4).
+    pub marks: BTreeMap<i32, MessageMark>,
+    /// Whether this commit cleans up expired log files afterwards (§7.2).
+    pub cleanup_logs: bool,
+    /// Whether this is the txn-only commit that records where a fresh app_id starts (§4.4).
+    pub baseline: bool,
+    /// Why an operator moved these offsets by hand, when one did (§4.8).
+    pub override_reason: Option<String>,
+}
+
+/// A message, recorded well enough to tell whether reading its offset again returns it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageMark {
+    pub offset: i64,
+    pub timestamp_ms: i64,
+    pub value_len: u32,
+}
+
 /// `s."col"`, quoted so a column called `order` survives the planner.
 fn source_col(name: &str) -> deltalake::datafusion::prelude::Expr {
     deltalake::datafusion::prelude::col(format!("{}.{}", crate::upsert::SOURCE_ALIAS, quoted(name)))
@@ -397,4 +546,463 @@ fn source_col(name: &str) -> deltalake::datafusion::prelude::Expr {
 
 fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use deltalake::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use deltalake::arrow::datatypes::SchemaRef;
+    use deltalake::delta_datafusion::DataFusionMixins;
+    use deltalake::kernel::transaction::{CommitConflictError, TransactionError};
+    use deltalake::kernel::{Action, DataType, PrimitiveType, StructField};
+    use deltalake::logstore::object_store::{
+        self, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+    use deltalake::protocol::SaveMode;
+    use deltalake::{ensure_table_uri, DeltaTable, DeltaTableError, Path};
+    use futures::stream::BoxStream;
+    use futures::TryStreamExt;
+
+    use super::{KafkaOffsets, MessageMark, Sink};
+    use crate::error::Error;
+
+    async fn create(path: &str, partitioned: bool) -> DeltaTable {
+        let mut columns = vec![
+            StructField::new("id", DataType::Primitive(PrimitiveType::Long), false),
+            StructField::new("name", DataType::Primitive(PrimitiveType::String), true),
+        ];
+        let mut partition_columns = Vec::new();
+        if partitioned {
+            columns.push(StructField::new(
+                "region",
+                DataType::Primitive(PrimitiveType::String),
+                true,
+            ));
+            partition_columns.push("region");
+        }
+        DeltaTable::try_from_url(ensure_table_uri(path).unwrap())
+            .await
+            .unwrap()
+            .create()
+            .with_columns(columns)
+            .with_partition_columns(partition_columns)
+            .with_save_mode(SaveMode::ErrorIfExists)
+            .await
+            .unwrap()
+    }
+
+    async fn open(path: &str) -> DeltaTable {
+        deltalake::open_table(ensure_table_uri(path).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// The table's schema as the pipeline reads it, which is what its batches are built in.
+    fn schema_of(table: &DeltaTable) -> SchemaRef {
+        table.snapshot().unwrap().snapshot().read_schema()
+    }
+
+    /// One row per id, in every column the table has.
+    fn rows(table: &DeltaTable, ids: &[i64]) -> RecordBatch {
+        let schema = schema_of(table);
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|f| -> ArrayRef {
+                match f.name().as_str() {
+                    "id" => Arc::new(Int64Array::from(ids.to_vec())),
+                    "name" => Arc::new(StringArray::from_iter_values(
+                        ids.iter().map(|i| format!("row-{i}")),
+                    )),
+                    "region" => Arc::new(StringArray::from(vec!["eu"; ids.len()])),
+                    other => panic!("no test values for column {other:?}"),
+                }
+            })
+            .collect();
+        RecordBatch::try_new(schema, columns).unwrap()
+    }
+
+    /// A batch that read `ranges` and asserts each at its last offset, with no other owned
+    /// partitions and no evidence beyond the ranges.
+    fn read(ranges: &[(i32, (i64, i64))]) -> KafkaOffsets {
+        KafkaOffsets {
+            topic: "orders".into(),
+            group_id: "ddi-orders".into(),
+            ranges: ranges.iter().copied().collect(),
+            assert: ranges.iter().map(|(p, (_, last))| (*p, *last)).collect(),
+            marks: BTreeMap::new(),
+            cleanup_logs: false,
+            baseline: false,
+            override_reason: None,
+        }
+    }
+
+    async fn txn(table: &DeltaTable, app_id: &str) -> Option<i64> {
+        table
+            .snapshot()
+            .unwrap()
+            .transaction_version(table.log_store().as_ref(), app_id)
+            .await
+            .unwrap()
+    }
+
+    async fn actions_at(table: &DeltaTable, version: u64) -> Vec<Action> {
+        let raw = table
+            .log_store()
+            .read_commit_entry(version)
+            .await
+            .unwrap()
+            .expect("the commit exists");
+        deltalake::logstore::get_actions(version, &raw).unwrap()
+    }
+
+    fn commit_info(actions: &[Action]) -> &std::collections::HashMap<String, serde_json::Value> {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                Action::CommitInfo(ci) => Some(&ci.info),
+                _ => None,
+            })
+            .expect("every commit of ours has a commitInfo")
+    }
+
+    async fn ids_in(table: &DeltaTable) -> Vec<i64> {
+        let (_, stream) = table.scan_table().await.unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let mut ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                let id = b.column_by_name("id").unwrap().as_any();
+                id.downcast_ref::<Int64Array>().unwrap().values().to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn is_concurrent_transaction(e: &Error) -> bool {
+        matches!(
+            e,
+            Error::Delta(DeltaTableError::Transaction {
+                source: TransactionError::CommitConflict(
+                    CommitConflictError::ConcurrentTransaction
+                ),
+            })
+        )
+    }
+
+    #[tokio::test]
+    async fn kafka_commit_writes_n_txns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let table = create(path, false).await;
+
+        let mut offsets = read(&[(0, (5, 9)), (1, (3, 4))]);
+        // Partition 2 is owned but was not in this batch: it is re-asserted at its base.
+        offsets.assert.insert(2, 17);
+        offsets.marks.insert(
+            0,
+            MessageMark {
+                offset: 9,
+                timestamp_ms: 1_700_000_000_000,
+                value_len: 42,
+            },
+        );
+        let batch = rows(&table, &[1, 2, 3]);
+        let table = Sink::new("app", 0)
+            .commit_kafka(table, vec![batch], &offsets)
+            .await
+            .unwrap();
+        assert_eq!(table.version(), Some(1));
+
+        let table = open(path).await;
+        assert_eq!(txn(&table, "app-0").await, Some(9));
+        assert_eq!(txn(&table, "app-1").await, Some(4));
+        assert_eq!(txn(&table, "app-2").await, Some(17));
+        assert_eq!(
+            txn(&table, "app").await,
+            None,
+            "nothing under the bare app_id, which is a Delta pipeline's offset"
+        );
+        assert_eq!(ids_in(&table).await, vec![1, 2, 3]);
+
+        let actions = actions_at(&table, 1).await;
+        let txns: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Txn(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(txns.len(), 3, "one txn per asserted partition: {txns:?}");
+        assert!(
+            txns.iter().all(|t| t.last_updated.is_none()),
+            "a txn without lastUpdated never expires: {txns:?}"
+        );
+
+        let info = commit_info(&actions);
+        assert_eq!(info["ddi.appId"], serde_json::json!("app"));
+        assert_eq!(info["ddi.kafka.topic"], serde_json::json!("orders"));
+        assert_eq!(info["ddi.kafka.groupId"], serde_json::json!("ddi-orders"));
+        assert_eq!(
+            info["ddi.kafka.offsets"],
+            serde_json::json!({"0": [5, 9], "1": [3, 4]})
+        );
+        assert_eq!(
+            info["ddi.kafka.marks"],
+            serde_json::json!({"0": [9, 1_700_000_000_000_i64, 42]})
+        );
+        for absent in [
+            "ddi.sourceVersion",
+            "ddi.kafka.baseline",
+            "ddi.kafka.offsetOverride",
+        ] {
+            assert!(!info.contains_key(absent), "{absent} in {info:?}");
+        }
+    }
+
+    /// A batch with nothing to write still moves its partitions' offsets: a zero-row batch in
+    /// the target's schema commits the txns and no file.
+    async fn empty_commit_carries_txns_only(partitioned: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let table = create(path, partitioned).await;
+
+        let mut offsets = read(&[(0, (10, 12)), (3, (7, 7))]);
+        offsets.override_reason = Some("acknowledged skip".into());
+        let empty = RecordBatch::new_empty(schema_of(&table));
+        Sink::new("app", 0)
+            .commit_kafka(table, vec![empty], &offsets)
+            .await
+            .unwrap();
+
+        let table = open(path).await;
+        assert_eq!(table.version(), Some(1));
+        assert_eq!(txn(&table, "app-0").await, Some(12));
+        assert_eq!(txn(&table, "app-3").await, Some(7));
+        let actions = actions_at(&table, 1).await;
+        assert!(
+            actions
+                .iter()
+                .all(|a| matches!(a, Action::Txn(_) | Action::CommitInfo(_))),
+            "only txns and commitInfo: {actions:?}"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::Txn(_)))
+                .count(),
+            2
+        );
+        let info = commit_info(&actions);
+        assert_eq!(
+            info["ddi.kafka.offsetOverride"],
+            serde_json::json!("acknowledged skip")
+        );
+        assert!(ids_in(&table).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn kafka_empty_commit_carries_txns_only() {
+        empty_commit_carries_txns_only(false).await;
+    }
+
+    #[tokio::test]
+    async fn kafka_empty_commit_carries_txns_only_on_a_partitioned_target() {
+        empty_commit_carries_txns_only(true).await;
+    }
+
+    #[tokio::test]
+    async fn kafka_baseline_commit_is_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let table = create(path, true).await;
+
+        // A fresh app_id starting at offset 100 of partition 0 and 0 of partition 1: only
+        // the first has an offset before its start to record.
+        let mut offsets = read(&[]);
+        offsets.assert.insert(0, 99);
+        offsets.baseline = true;
+        let empty = RecordBatch::new_empty(schema_of(&table));
+        Sink::new("app", 0)
+            .commit_kafka(table, vec![empty], &offsets)
+            .await
+            .unwrap();
+
+        let table = open(path).await;
+        assert_eq!(txn(&table, "app-0").await, Some(99));
+        assert_eq!(txn(&table, "app-1").await, None);
+        let actions = actions_at(&table, 1).await;
+        let info = commit_info(&actions);
+        assert_eq!(info["ddi.kafka.baseline"], serde_json::json!(true));
+        assert_eq!(info["ddi.kafka.offsets"], serde_json::json!({}));
+    }
+
+    /// Pins the behaviour of delta-rs the Kafka fence rests on (docs/kafka-design.md §4.3): a
+    /// commit carrying a txn that another commit wrote after its snapshot is refused. A
+    /// delta-rs upgrade that stopped refusing it would let a stale member write offsets the
+    /// owner has already written past, and this is the test that would say so.
+    #[tokio::test]
+    async fn fence_concurrent_txn_rejected_by_delta_rs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path, false).await;
+        // Three handles on version 0.
+        let (first, second, third) = (open(path).await, open(path).await, open(path).await);
+        let sink = Sink::new("a", 0);
+
+        let batch = rows(&first, &[1]);
+        sink.commit_kafka(first, vec![batch], &read(&[(0, (0, 4))]))
+            .await
+            .unwrap();
+
+        let batch = rows(&second, &[2]);
+        let e = sink
+            .commit_kafka(second, vec![batch], &read(&[(0, (0, 6))]))
+            .await
+            .unwrap_err();
+        assert!(is_concurrent_transaction(&e), "got: {e}");
+
+        // The control: on the same old snapshot, a commit that asserts only another partition
+        // is rebased over the first and lands. What refused the second was the txn, not the
+        // append.
+        let batch = rows(&third, &[3]);
+        sink.commit_kafka(third, vec![batch], &read(&[(1, (0, 2))]))
+            .await
+            .unwrap();
+
+        let table = open(path).await;
+        assert_eq!(table.version(), Some(2));
+        assert_eq!(txn(&table, "a-0").await, Some(4));
+        assert_eq!(txn(&table, "a-1").await, Some(2));
+        assert_eq!(ids_in(&table).await, vec![1, 3]);
+    }
+
+    /// An object store whose first conditional PUT under `_delta_log/` lands and then reports
+    /// that the object already exists, which is what a PUT retried after its response was lost
+    /// gets back. Everything else passes straight through.
+    #[derive(Debug)]
+    struct LandsThenSaysItExists {
+        inner: Arc<dyn ObjectStore>,
+        tripped: AtomicBool,
+    }
+
+    impl std::fmt::Display for LandsThenSaysItExists {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "LandsThenSaysItExists({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for LandsThenSaysItExists {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            let conditional = matches!(opts.mode, PutMode::Create);
+            let put = self.inner.put_opts(location, payload, opts).await?;
+            if conditional
+                && location.as_ref().starts_with("_delta_log/")
+                && !self.tripped.swap(true, Ordering::SeqCst)
+            {
+                return Err(object_store::Error::AlreadyExists {
+                    path: location.to_string(),
+                    source: "the response to the first attempt was lost".into(),
+                });
+            }
+            Ok(put)
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A commit that landed, but whose writer was told the version already exists, goes round
+    /// delta-rs's conflict loop again and meets itself there: its own txns are in the winning
+    /// commit, so it is refused rather than written a second time (docs/kafka-design.md §4.7
+    /// row 3).
+    #[tokio::test]
+    async fn retried_put_of_own_commit_is_concurrent_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path, false).await;
+
+        let plain = open(path).await;
+        let store = plain.log_store();
+        let flaky = deltalake::logstore::default_logstore(
+            Arc::new(LandsThenSaysItExists {
+                inner: store.object_store(None),
+                tripped: AtomicBool::new(false),
+            }),
+            store.root_object_store(None),
+            store.config().location(),
+            store.config().options(),
+        );
+        let mut table = DeltaTable::new(flaky, plain.config.clone());
+        table.load().await.unwrap();
+
+        let batch = rows(&table, &[1, 2]);
+        let e = Sink::new("app", 0)
+            .commit_kafka(table, vec![batch], &read(&[(0, (0, 4)), (1, (0, 2))]))
+            .await
+            .unwrap_err();
+        assert!(is_concurrent_transaction(&e), "got: {e}");
+
+        // It landed, and only once.
+        let table = open(path).await;
+        assert_eq!(table.version(), Some(1));
+        assert_eq!(txn(&table, "app-0").await, Some(4));
+        assert_eq!(txn(&table, "app-1").await, Some(2));
+        assert_eq!(ids_in(&table).await, vec![1, 2]);
+    }
 }

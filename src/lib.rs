@@ -9,6 +9,7 @@ pub mod dbt;
 pub mod dedup;
 pub mod dq;
 pub mod error;
+pub mod fence;
 pub mod gate;
 pub mod grain;
 pub mod locate;
