@@ -169,15 +169,24 @@ impl Sink {
     /// for, and none of the Delta source's provenance: a Kafka pipeline has no source table, no
     /// lookups and no coverage window.
     fn kafka_properties(&self, offsets: &KafkaOffsets) -> CommitProperties {
+        // Every one stamped with a time no engine expires, unlike a Delta pipeline's `txn`,
+        // which keeps none (crate::fence::KAFKA_TXN_LAST_UPDATED says why).
+        let txn = |app_id: String, version: i64| {
+            Transaction::new_with_last_update(
+                app_id,
+                version,
+                Some(crate::fence::KAFKA_TXN_LAST_UPDATED),
+            )
+        };
         let mut txns: Vec<Transaction> = offsets
             .assert
             .iter()
-            .map(|(p, last)| Transaction::new(crate::fence::txn_app_id(&self.app_id, *p), *last))
+            .map(|(p, last)| txn(crate::fence::txn_app_id(&self.app_id, *p), *last))
             .collect();
         // Once, in the first Kafka commit whose snapshot lacks it, and never again: in every
         // commit, a shared appId would make every two members' concurrent commits conflict.
         if offsets.takeover_marker {
-            txns.push(Transaction::new(
+            txns.push(txn(
                 crate::fence::takeover_marker_app_id(&self.app_id),
                 crate::fence::TAKEOVER_MARKER_VERSION,
             ));
@@ -754,8 +763,9 @@ mod tests {
             .collect();
         assert_eq!(txns.len(), 3, "one txn per asserted partition: {txns:?}");
         assert!(
-            txns.iter().all(|t| t.last_updated.is_none()),
-            "a txn without lastUpdated never expires: {txns:?}"
+            txns.iter()
+                .all(|t| t.last_updated == Some(crate::fence::KAFKA_TXN_LAST_UPDATED)),
+            "stamped with a time no engine expires: {txns:?}"
         );
 
         let info = commit_info(&actions);

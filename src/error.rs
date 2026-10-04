@@ -315,12 +315,13 @@ pub enum Error {
     /// The target sets `delta.setTransactionRetentionDuration`, under which an offset can
     /// expire.
     ///
-    /// Delta forgets a `txn` whose recorded time is older than that duration.
-    /// kafka-delta-ingest records one on each, so on a table it wrote, the offset of a
-    /// partition no commit has re-asserted for that long (a quiet topic, or a gap between
-    /// stopping it and starting ddi) is forgotten, and the partition would have to be read
-    /// again. ddi's own `txn` actions record no time and never expire, and the property is
-    /// refused when the pipeline opens and on every refresh, before any offset can go. See
+    /// Delta forgets a `txn` whose recorded time is older than that duration (Spark one that
+    /// records none, too). kafka-delta-ingest records one on each, so on a table it wrote, the
+    /// offset of a partition no commit has re-asserted for that long (a quiet topic, or a gap
+    /// between stopping it and starting ddi) is forgotten, and the partition would have to be
+    /// read again. ddi's own `txn` actions record a time no engine expires
+    /// ([`crate::fence::KAFKA_TXN_LAST_UPDATED`]), and the property is refused when the
+    /// pipeline opens and on every refresh, before any offset can go. See
     /// docs/kafka-design.md §4.6.
     #[error(
         "target {target_uri} sets delta.setTransactionRetentionDuration = {retention}. Delta \
@@ -389,6 +390,28 @@ pub enum Error {
     KafkaOffsetMissing {
         app_id: String,
         partitions: Vec<i32>,
+    },
+
+    /// A partition this writer held at an offset no longer has one in the target.
+    ///
+    /// Nothing removes a `txn` but expiry under `delta.setTransactionRetentionDuration`: set,
+    /// a checkpoint written while it was, and removed again between two refreshes, it can take
+    /// one whose recorded time it expires. The partition's rows up to that offset are in the
+    /// table, so it is not started as one without an offset, which would read them again. Held
+    /// until the table has an offset for it again (docs/kafka-design.md §4.6).
+    #[error(
+        "app_id {app_id:?}: the target {target_uri} no longer holds the offsets of these \
+         partitions, given as (partition, last offset this writer held): {partitions:?}. \
+         Nothing removes an offset but expiry under delta.setTransactionRetentionDuration, so \
+         the rows up to each are in the table, and reading the partition from offset 0 would \
+         write them twice. Restore each with `ddi kafka set-offsets --partition P --next \
+         <last + 1> --acknowledge-skip \"offset expired\"`; nothing was read or written, and \
+         the pipeline goes on once the target has them again."
+    )]
+    KafkaOffsetVanished {
+        target_uri: String,
+        app_id: String,
+        partitions: Vec<(i32, i64)>,
     },
 
     #[error("transform error: {0}")]
@@ -513,6 +536,9 @@ impl Error {
             Error::KafkaTxnRetention { .. }
             | Error::TargetProtocolUnsupported { .. }
             | Error::TargetReplaced { .. } => KafkaClass::BlockingPipeline,
+            // Until M3 has a class for one partition, it holds them all; the recheck's reset
+            // refuses until the offsets are back.
+            Error::KafkaOffsetVanished { .. } => KafkaClass::BlockingPipeline,
             // The SQL, or the rows against the target's schema: the same batch fails the same
             // way until someone changes one or the other.
             Error::Transform(_) | Error::Evaluation(_) | Error::Schema(_) => {
@@ -833,6 +859,14 @@ mod tests {
                     partitions: vec![1, 3],
                 },
                 OpenRefusal,
+            ),
+            (
+                Error::KafkaOffsetVanished {
+                    target_uri: "/lake/orders".into(),
+                    app_id: "orders".into(),
+                    partitions: vec![(1, 41)],
+                },
+                BlockingPipeline,
             ),
             (
                 Error::Other("internal: a broken invariant".into()),

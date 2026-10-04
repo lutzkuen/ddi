@@ -29,8 +29,10 @@
 //!
 //! ddi resumes offsets kafka-delta-ingest wrote, under the same appIds. The first commit ddi
 //! makes under an app_id also writes the takeover marker ([`takeover_marker_app_id`]), a
-//! `txn` nothing ever removes, so from then on the table says for good that ddi has taken
-//! them over ([`era`]). Before that, [`takeover_check`] is the one check a takeover needs.
+//! `txn` nothing removes, so from then on the table says for good that ddi has taken them
+//! over ([`era`]). Before that, [`takeover_check`] is the one check a takeover needs. Every
+//! `txn` ddi writes for Kafka carries [`KAFKA_TXN_LAST_UPDATED`], a `lastUpdated` no engine
+//! expires.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,19 +81,48 @@ pub fn txn_app_id(app_id: &str, partition: i32) -> String {
 /// appId has a `txn` at all.
 pub const TAKEOVER_MARKER_VERSION: i64 = 1;
 
+/// The `lastUpdated` of every `txn` a Kafka commit writes, the takeover marker included:
+/// 9999-12-31T23:59:59.999Z, later than any cutoff `delta.setTransactionRetentionDuration`
+/// sets (docs/kafka-design.md §4.6).
+///
+/// Neither obvious choice survives every engine that writes these tables:
+/// - no `lastUpdated` is kept by the kernel (delta-rs) under the property, but dropped by
+///   Spark, whose log replay keeps only the `txn`s whose `lastUpdated` is after the cutoff
+///   while the property is set (`InMemoryLogReplay.getTransactions`); and Trino's checkpoint
+///   writes 0 for a `txn` without one, which every engine expires;
+/// - the time of the commit, as kafka-delta-ingest stamps it, expires a partition no commit
+///   has re-asserted for longer than the duration, and the marker, which no commit after the
+///   first re-asserts, once the duration has passed.
+///
+/// A present time past any cutoff is kept as it is by Trino and Spark, and expired by none.
+/// Only a checkpoint writer that drops the field (delta-rs up to 0.17.3, which
+/// kafka-delta-ingest's `-c` builds before 2024-07 ran) makes it null again, which Spark
+/// alone then expires, and only while the property is set. The target is refused while it is
+/// ([`refuse_txn_retention`]); the stamp is what keeps ddi's offsets and its marker when the
+/// property was set, a checkpoint written and the property removed again between two
+/// refreshes. A Delta pipeline's `txn` is written as it always was, without one.
+pub const KAFKA_TXN_LAST_UPDATED: i64 = 253_402_300_799_999;
+
 /// The `txn` appId that records that ddi has taken over `app_id`'s offsets in a target: the
 /// takeover marker (docs/kafka-design.md §4.3).
 ///
 /// Written once, by the first Kafka commit of `app_id` whose read snapshot lacks it
 /// ([`Fence::takeover_marker_due`]), and by no commit after. Nothing removes it: the protocol
-/// has no action that takes a `txn` out of a table, every checkpoint writer keeps every
-/// `txn`, and this one carries no `lastUpdated`, so not even
-/// `delta.setTransactionRetentionDuration`, which a target is refused with anyway, could
-/// expire it. Its presence is therefore exactly "ddi has committed under this app_id here".
+/// has no action that takes a `txn` out of a table, and every checkpoint writer keeps every
+/// `txn` but one `delta.setTransactionRetentionDuration` has expired. A target is refused
+/// while that is set, and the marker carries [`KAFKA_TXN_LAST_UPDATED`], which no engine
+/// expires even then. Its presence is therefore "ddi has committed under this app_id here".
 /// No property of the partitions' own `txn`s can say that: kafka-delta-ingest stamps each with
-/// a `lastUpdated` and ddi does not, but checkpoint writers rewrite the field (delta-rs up to
-/// 0.17.3 nulls it, Trino writes 0 for a `txn` without one), and a commit's metadata does not
-/// survive a checkpoint at all.
+/// the time it wrote it, but checkpoint writers rewrite the field (delta-rs up to 0.17.3 nulls
+/// it, Trino writes 0 for a `txn` without one), and a commit's metadata does not survive a
+/// checkpoint at all.
+///
+/// One sequence can still lose it: a checkpoint by a writer that nulls the field, then the
+/// property set and a Spark checkpoint written under it, then the property removed. A
+/// [`Fence`] that sees the property refused reads the marker again ([`Fence::reset`]), so a
+/// running member writes it once more; an open after such a loss that reads
+/// kafka-delta-ingest's era goes through the takeover check again ([`takeover_check`]), which
+/// refuses a partition it cannot account for rather than read it twice.
 ///
 /// Never the appId of a partition's offset, `<a>-<p>`, of any app_id `a`: it ends in `.ddi`,
 /// not in digits.
@@ -1083,9 +1114,11 @@ pub struct Fence {
     /// handle's version: read there by [`Self::reset`] or [`Self::verify`], or written by a
     /// commit of ours since. `None` until a read succeeds.
     ///
-    /// Once `Some(true)`, never read again: nothing removes a marker, so it is in the table
-    /// at every later version, whichever handle reads it. That keeps a reset at our own newest
-    /// commit, which does not carry it, to the one GET.
+    /// Once `Some(true)`, not read again: nothing removes a marker, so it is in the table at
+    /// every later version, whichever handle reads it. That keeps a reset at our own newest
+    /// commit, which does not carry it, to the one GET. Read again only after the target was
+    /// refused for `delta.setTransactionRetentionDuration`, the one property under which a
+    /// `txn` can expire ([`takeover_marker_app_id`] says how the marker still could).
     marker: Option<bool>,
     /// What [`read_txns`]' walk below the newest checkpoint found for the owned partitions.
     below: BelowCheckpoint,
@@ -1160,7 +1193,15 @@ impl Fence {
     /// Every owned partition is then carried: all of them were just read at the handle's
     /// version. So is the takeover marker, in the same pass, unless it is known to be there
     /// already. On an error nothing is carried, so that no offset is trusted until a reset
-    /// succeeds, and the marker is not known unless it was before.
+    /// succeeds, and the marker is not known unless it was before; after a refusal of
+    /// `delta.setTransactionRetentionDuration` not even then, so that a marker the property
+    /// expired is found missing and written again.
+    ///
+    /// An owned partition this fence held at an offset that the table no longer has is
+    /// [`Error::KafkaOffsetVanished`], and nothing is carried. Nothing removes a `txn` but
+    /// expiry under that property, so the partition's rows up to that offset are in the table,
+    /// and starting it as a partition without an offset would read them again. The fence keeps
+    /// the offset it held, so every reset after refuses the same until the table has one again.
     pub async fn reset(&mut self, table: &DeltaTable, owned: &[i32]) -> Result<()> {
         let ids = self.ids_to_read(owned);
         let read = match refuse_txn_retention(table) {
@@ -1171,12 +1212,30 @@ impl Fence {
             Ok(txns) => txns,
             Err(e) => {
                 self.carried.clear();
-                if self.marker == Some(false) {
+                if self.marker == Some(false) || matches!(e, Error::KafkaTxnRetention { .. }) {
                     self.marker = None;
                 }
                 return Err(e);
             }
         };
+        self.read_marker(&txns);
+        let vanished: Vec<(i32, i64)> = owned
+            .iter()
+            .zip(&ids)
+            .filter_map(|(p, id)| {
+                let held = self.base.get(p)?.0?;
+                let now = txns.get(id).and_then(|t| t.version);
+                now.is_none().then_some((*p, held))
+            })
+            .collect();
+        if !vanished.is_empty() {
+            self.carried.clear();
+            return Err(Error::KafkaOffsetVanished {
+                target_uri: table.table_url().to_string(),
+                app_id: self.app_id.clone(),
+                partitions: vanished,
+            });
+        }
         self.base = owned
             .iter()
             .zip(&ids)
@@ -1186,7 +1245,6 @@ impl Fence {
             })
             .collect();
         self.carried = owned.iter().copied().collect();
-        self.read_marker(&txns);
         Ok(())
     }
 
@@ -1228,7 +1286,11 @@ impl Fence {
             ids.push(takeover_marker_app_id(&self.app_id));
         }
         // [`read_txns`] without its step 6: only the versions are compared.
-        refuse_txn_retention(table)?;
+        if let Err(e) = refuse_txn_retention(table) {
+            // As in `reset`: under the property the marker may expire, so it is read again.
+            self.marker = None;
+            return Err(e);
+        }
         let txns = read(table, &ids, &self.lookups, Below::Nothing).await?;
         self.read_marker(&txns);
         for (p, id) in unverified.iter().zip(&ids) {
@@ -1324,12 +1386,13 @@ impl Fence {
 
 /// Refuse a target that sets `delta.setTransactionRetentionDuration`.
 ///
-/// Under it the kernel forgets a `txn` whose `lastUpdated` is older than the duration.
-/// kafka-delta-ingest wrote one on every `txn`, so the offset of a partition it had not
+/// Under it the kernel forgets a `txn` whose `lastUpdated` is at or before the cutoff, and
+/// Spark one whose `lastUpdated` is not after it, a missing one included. kafka-delta-ingest
+/// stamped every `txn` with the time it wrote it, so the offset of a partition it had not
 /// written for that long would be forgotten — and a checkpoint written meanwhile drops it for
-/// good. ddi's own `txn`s carry no `lastUpdated` and never expire, but a table under the
-/// property can hold ones that do, so it is refused when it is opened and on every refresh,
-/// rather than read with an expiry filter (docs/kafka-design.md §4.6).
+/// good. ddi's own carry [`KAFKA_TXN_LAST_UPDATED`], which no engine expires, but a table
+/// under the property can hold ones that do, so it is refused when it is opened and on every
+/// refresh, rather than read with an expiry filter (docs/kafka-design.md §4.6).
 pub fn refuse_txn_retention(table: &DeltaTable) -> Result<()> {
     let snapshot = table.snapshot().map_err(Error::Delta)?;
     // Spelled as the protocol spells it everywhere that matters, but not every engine keeps
@@ -1510,6 +1573,37 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    /// The `lastUpdated` of every txn commit `version` of the table at `dir` writes, by appId,
+    /// read from its JSON as it lies in the log.
+    fn stamps_in_commit(dir: &std::path::Path, version: u64) -> BTreeMap<String, Option<i64>> {
+        let commit = std::fs::read_to_string(log_file(dir, &commit_name(version))).unwrap();
+        commit
+            .lines()
+            .filter_map(|l| {
+                let line: serde_json::Value = serde_json::from_str(l).unwrap();
+                let txn = line.get("txn")?;
+                Some((
+                    txn["appId"].as_str().unwrap().to_string(),
+                    txn.get("lastUpdated").and_then(serde_json::Value::as_i64),
+                ))
+            })
+            .collect()
+    }
+
+    /// Set `delta.setTransactionRetentionDuration` to `duration` on the table at `path`, as
+    /// another engine would, ddi refusing the table meanwhile.
+    async fn set_retention(path: &str, duration: &str) -> DeltaTable {
+        open(path)
+            .await
+            .set_tbl_properties()
+            .with_properties(std::collections::HashMap::from([(
+                TXN_RETENTION.to_string(),
+                duration.to_string(),
+            )]))
+            .await
+            .unwrap()
     }
 
     fn ids(partitions: impl IntoIterator<Item = i32>) -> Vec<String> {
@@ -2055,11 +2149,11 @@ mod tests {
     }
 
     /// What the refusal protects against, and why ddi's own offsets and its takeover marker
-    /// need no protecting: a `txn` without `lastUpdated` survives the property being set after
-    /// the fact, and a checkpoint written under it; one with an old `lastUpdated`, as
-    /// kafka-delta-ingest wrote them, does not.
+    /// need no protecting: one stamped [`KAFKA_TXN_LAST_UPDATED`] survives the property being
+    /// set after the fact, and a checkpoint written under it; one with an old `lastUpdated`,
+    /// as kafka-delta-ingest wrote them, does not.
     #[tokio::test]
-    async fn txns_without_last_updated_never_expire() {
+    async fn ddi_txns_never_expire() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         create(path).await;
@@ -3270,11 +3364,18 @@ mod tests {
         assert_eq!(txns[&takeover_marker_app_id(APP)].version, Some(1));
     }
 
+    /// How another checkpoint writer spells a txn's `lastUpdated`.
+    #[derive(Clone, Copy, Debug)]
+    enum Restamp {
+        /// Null on every txn, as delta-rs up to 0.17.3 wrote it, kafka-delta-ingest's included.
+        Null,
+        /// 0 for a txn without one, as Trino writes it; every other kept.
+        Trino,
+    }
+
     /// Rewrite the single-part checkpoint at `version` as another writer would have written
-    /// it: every txn's `lastUpdated` replaced by `stamp`. `None` is null, as delta-rs up to
-    /// 0.17.3 wrote it for every txn, kafka-delta-ingest's included; `Some(0)` is what Trino
-    /// writes for a txn without one.
-    fn restamp_checkpoint(dir: &std::path::Path, version: u64, stamp: Option<i64>) {
+    /// it: every txn's `lastUpdated` spelled as `restamp` says.
+    fn restamp_checkpoint(dir: &std::path::Path, version: u64, restamp: Restamp) {
         use deltalake::arrow::array::{ArrayRef, Int64Array, StructArray};
         use deltalake::arrow::compute::concat_batches;
         use deltalake::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -3293,8 +3394,23 @@ mod tests {
         let children: Vec<ArrayRef> = fields
             .iter()
             .zip(children)
-            .map(|(f, child)| match f.name().as_str() {
-                "lastUpdated" => Arc::new(Int64Array::from(vec![stamp; child.len()])) as ArrayRef,
+            .map(|(f, child)| match (f.name().as_str(), restamp) {
+                ("lastUpdated", Restamp::Null) => {
+                    Arc::new(Int64Array::from(vec![None::<i64>; child.len()])) as ArrayRef
+                }
+                ("lastUpdated", Restamp::Trino) => {
+                    let stamps = child.as_primitive::<Int64Type>();
+                    let rewritten: Int64Array = (0..stamps.len())
+                        .map(|i| {
+                            Some(if stamps.is_null(i) {
+                                0
+                            } else {
+                                stamps.value(i)
+                            })
+                        })
+                        .collect();
+                    Arc::new(rewritten) as ArrayRef
+                }
                 _ => child,
             })
             .collect();
@@ -3311,8 +3427,8 @@ mod tests {
 
     /// The era read from a checkpoint alone, the commits below it cleaned up: the marker is a
     /// txn, which every checkpoint writer keeps, whatever it does to `lastUpdated`. Nothing
-    /// is read from `lastUpdated`, so a checkpoint that nulled kafka-delta-ingest's stamps (old
-    /// delta-rs) or stamped ddi's with 0 (Trino) changes no answer.
+    /// is read from `lastUpdated`, so a checkpoint that nulled every stamp (old delta-rs) or
+    /// stamped an unstamped txn with 0 (Trino) changes no answer.
     #[tokio::test]
     async fn takeover_marker_survives_checkpoints() {
         let ids_and_marker = || {
@@ -3330,7 +3446,7 @@ mod tests {
         };
 
         // kafka-delta-ingest's offsets, then ddi's takeover; checkpointed, every way.
-        for stamp in [None, Some(None), Some(Some(0))] {
+        for stamp in [None, Some(Restamp::Null), Some(Restamp::Trino)] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().to_str().unwrap();
             create(path).await;
@@ -3356,7 +3472,7 @@ mod tests {
         }
 
         // kafka-delta-ingest's alone: still its, however the checkpoint stamped them.
-        for stamp in [None, Some(None), Some(Some(0))] {
+        for stamp in [None, Some(Restamp::Null), Some(Restamp::Trino)] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().to_str().unwrap();
             create(path).await;
@@ -3655,5 +3771,179 @@ mod tests {
             "got: {e}"
         );
         assert!(e.to_string().contains("writer 7"), "{e}");
+    }
+
+    /// Trino's checkpoint writes 0 for a txn without `lastUpdated`, which every engine expires
+    /// once `delta.setTransactionRetentionDuration` is set, and Spark drops one without it
+    /// outright while the property is. ddi stamps every Kafka txn past any cutoff, so neither
+    /// its offsets nor its marker go when the property is set, a checkpoint written under it,
+    /// and the property removed again, all between two of a member's refreshes: an idle
+    /// partition's offset, which no commit re-asserts, and the marker, which none does after
+    /// the first, included.
+    #[tokio::test]
+    async fn ddi_offsets_and_marker_survive_a_trino_checkpoint_then_one_under_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        // Member b owns partition 1 and takes the table over; a owns partition 0.
+        let (mut a, mut b) = (Fence::new(APP), Fence::new(APP));
+        let table = open(path).await;
+        b.reset(&table, &[1]).await.unwrap();
+        let table = fenced_commit(&mut b, table, &[(1, (0, 2))]).await.unwrap(); // 1
+        let stamps = stamps_in_commit(dir.path(), 1);
+        assert_eq!(
+            stamps,
+            BTreeMap::from([
+                ("app-1".to_string(), Some(KAFKA_TXN_LAST_UPDATED)),
+                (takeover_marker_app_id(APP), Some(KAFKA_TXN_LAST_UPDATED)),
+            ]),
+            "the offset and the marker, each stamped"
+        );
+        a.reset(&table, &[0]).await.unwrap();
+        let table = fenced_commit(&mut a, table, &[(0, (0, 4))]).await.unwrap(); // 2
+                                                                                 // Trino checkpoints; partition 1 then goes idle, partition 0 does not.
+        deltalake::checkpoints::create_checkpoint(&table, None)
+            .await
+            .unwrap();
+        restamp_checkpoint(dir.path(), 2, Restamp::Trino);
+        fenced_commit(&mut a, open(path).await, &[(0, (5, 6))])
+            .await
+            .unwrap(); // 3
+                       // Between two refreshes: the property set, a checkpoint written under it, removed.
+        assert_eq!(
+            set_retention(path, "interval 1 seconds").await.version(),
+            Some(4)
+        );
+        deltalake::checkpoints::create_checkpoint(&open(path).await, None)
+            .await
+            .unwrap();
+        unset_property(dir.path(), 4, 5, TXN_RETENTION); // 5
+
+        let table = open(path).await;
+        let mut wanted = ids(0..2);
+        wanted.push(takeover_marker_app_id(APP));
+        let counters = LookupCounters::default();
+        let txns = read_txns(&table, &wanted, &counters).await.unwrap();
+        assert_eq!(
+            [
+                txns["app-0"].version,
+                txns["app-1"].version,
+                txns[&takeover_marker_app_id(APP)].version
+            ],
+            [Some(6), Some(2), Some(TAKEOVER_MARKER_VERSION)],
+            "{txns:?}"
+        );
+        assert_eq!(era(APP, &txns), Era::Ddi);
+        assert_eq!(
+            kernel_versions(&table, [0, 1]).await,
+            BTreeMap::from([(0, Some(6)), (1, Some(2))])
+        );
+        b.reset(&table, &[1]).await.unwrap();
+        assert_eq!(b.base(1), Some((Some(2), None)));
+    }
+
+    /// Nothing removes a txn but expiry, so an offset a fence held that the table no longer
+    /// has is one that expired between two of its refreshes: the property set, a checkpoint
+    /// written under it, the property removed. Its rows are in the table, so the partition is
+    /// refused, not started as one without an offset, until the table has the offset again.
+    #[tokio::test]
+    async fn a_vanished_offset_is_refused_until_it_is_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        // kafka-delta-ingest's offsets, partition 0's stamp long past; then ddi took the
+        // table over, and partition 0 has been idle since.
+        kdi_commit(dir.path(), 1, "app-0", 7, 1_000);
+        kdi_commit(dir.path(), 2, "app-1", 9, now);
+        take_over(open(path).await).await; // 3
+        let mut fence = Fence::new(APP);
+        fence.reset(&open(path).await, &[0, 1]).await.unwrap();
+        assert_eq!(fence.base(0), Some((Some(7), None)));
+
+        set_retention(path, "interval 1 days").await; // 4
+        deltalake::checkpoints::create_checkpoint(&open(path).await, None)
+            .await
+            .unwrap();
+        unset_property(dir.path(), 4, 5, TXN_RETENTION); // 5
+        let table = open(path).await;
+        let counters = LookupCounters::default();
+        assert_eq!(
+            versions(&table, [0, 1], &counters).await,
+            BTreeMap::from([(0, None), (1, Some(9))]),
+            "partition 0's offset expired"
+        );
+
+        let e = fence.reset(&table, &[0, 1]).await.unwrap_err();
+        assert!(
+            matches!(&e, Error::KafkaOffsetVanished { app_id, partitions, .. }
+                if app_id == APP && partitions == &vec![(0, 7)]),
+            "{e:?}"
+        );
+        assert_eq!(e.kafka_class(), crate::error::KafkaClass::BlockingPipeline);
+        assert!(e.to_string().contains("--next <last + 1>"), "{e}");
+        // Nothing is carried, and the recheck refuses the same.
+        let e = fence.reset(&table, &[0, 1]).await.unwrap_err();
+        assert!(matches!(e, Error::KafkaOffsetVanished { .. }), "{e:?}");
+
+        // An operator's `set-offsets --next 8` puts it back.
+        let table = assert_txns(table, &[(0, 7)]).await;
+        fence.reset(&table, &[0, 1]).await.unwrap();
+        assert_eq!(fence.base(0), Some((Some(7), None)));
+        assert_eq!(fence.base(1), Some((Some(9), None)));
+    }
+
+    /// A refusal of the property makes a fence read the marker again, rather than trust that
+    /// it saw it once: a marker that lost its stamp to a checkpoint writer (here as Trino
+    /// writes 0) expires under the property, and a running member then writes it again.
+    #[tokio::test]
+    async fn a_retention_refusal_makes_the_fence_read_the_marker_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        let commit = format!(
+            "{}\n{{\"txn\":{{\"appId\":\"{}\",\"version\":1,\"lastUpdated\":0}}}}\n\
+             {{\"txn\":{{\"appId\":\"app-0\",\"version\":4,\"lastUpdated\":{KAFKA_TXN_LAST_UPDATED}}}}}\n",
+            serde_json::json!({"commitInfo": {
+                "timestamp": 1_700_000_000_000i64, "operation": "WRITE", "ddi.appId": APP
+            }}),
+            takeover_marker_app_id(APP),
+        );
+        std::fs::write(log_file(dir.path(), &commit_name(1)), commit).unwrap();
+        let mut fence = Fence::new(APP);
+        fence.reset(&open(path).await, &[0]).await.unwrap();
+        assert!(!fence.takeover_marker_due());
+
+        set_retention(path, "interval 1 days").await; // 2
+        let e = fence.reset(&open(path).await, &[0]).await.unwrap_err();
+        assert!(matches!(e, Error::KafkaTxnRetention { .. }), "{e:?}");
+        assert!(fence.takeover_marker_due(), "not known any more");
+        deltalake::checkpoints::create_checkpoint(&open(path).await, None)
+            .await
+            .unwrap();
+        unset_property(dir.path(), 2, 3, TXN_RETENTION); // 3
+
+        let table = open(path).await;
+        fence.reset(&table, &[0]).await.unwrap();
+        assert_eq!(fence.base(0), Some((Some(4), None)));
+        assert!(fence.takeover_marker_due(), "the marker expired");
+        fenced_commit(&mut fence, table, &[(0, (5, 6))])
+            .await
+            .unwrap(); // 4
+        assert_eq!(
+            stamps_in_commit(dir.path(), 4),
+            BTreeMap::from([
+                ("app-0".to_string(), Some(KAFKA_TXN_LAST_UPDATED)),
+                (takeover_marker_app_id(APP), Some(KAFKA_TXN_LAST_UPDATED)),
+            ]),
+            "written again"
+        );
+        let mut wanted = ids([0]);
+        wanted.push(takeover_marker_app_id(APP));
+        let counters = LookupCounters::default();
+        let txns = read_txns(&open(path).await, &wanted, &counters)
+            .await
+            .unwrap();
+        assert_eq!(era(APP, &txns), Era::Ddi);
     }
 }
