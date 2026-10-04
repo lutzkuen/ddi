@@ -102,12 +102,25 @@ impl StepOutcome {
 /// only if that batch's target transaction commits. Keeping the transition with the batch is
 /// important: a failure after lookup selection must retry with the same `use_current` decision
 /// and provenance marker, rather than silently returning to timestamp pinning.
-struct LookupBatch {
+#[derive(Clone)]
+pub(crate) struct LookupBatch {
     snapshots: Vec<crate::lookup::LookupSnapshot>,
     transitions: Vec<LookupTableIdTransition>,
 }
 
+impl LookupBatch {
+    /// No lookups, and so nothing to acknowledge once the batch commits.
+    #[allow(dead_code)] // used from M3: a Kafka batch has no source commit to pin lookups by
+    pub(crate) fn none() -> Self {
+        Self {
+            snapshots: Vec::new(),
+            transitions: Vec::new(),
+        }
+    }
+}
+
 /// A lookup identity accepted by `use_current` for the source batch being committed.
+#[derive(Clone)]
 struct LookupTableIdTransition {
     name: String,
     table_id: String,
@@ -130,7 +143,7 @@ pub struct CoverageWindow {
 }
 
 /// A coverage window and the cut-off applied inside it.
-struct Cutoff {
+pub(crate) struct Cutoff {
     dedup: Dedup,
     window: CoverageWindow,
     /// Rows dropped since it opened in this process, for the line that says it closed.
@@ -170,43 +183,40 @@ impl Closed {
 }
 
 pub struct Pipeline {
-    cfg: ResolvedPipeline,
-    source: DeltaTable,
-    target: DeltaTable,
-    stream: LogStreamBuilder,
-    transform: Box<dyn Transform>,
-    sink: Sink,
-    offsets: OffsetStore,
-    coercer: SchemaCoercer,
+    pub(crate) cfg: ResolvedPipeline,
+    /// Where batches come from, and everything that only matters for that kind of source.
+    pub(crate) source: Source,
+    pub(crate) target: DeltaTable,
+    pub(crate) transform: Box<dyn Transform>,
+    pub(crate) sink: Sink,
+    pub(crate) coercer: SchemaCoercer,
     /// What the target already holds, while this pipeline has to infer that from its data.
     ///
     /// `None` on an ordinary resume, which is the usual case: the `txn` offset is exact on
     /// its own, and a timestamp filter on top of it could only drop rows — every late row
     /// older than the target's newest, at every restart. `Some` only inside a coverage window,
     /// and cleared the moment the window closes. See [`crate::dedup`] and [`coverage_cutoff`].
-    cutoff: Option<Cutoff>,
+    pub(crate) cutoff: Option<Cutoff>,
     /// Where rows the target will not take are put. `None` when there is no such table, in
     /// which case a bad row still stops the pipeline — see [`crate::dq`].
-    dq: Option<DataQuality>,
-    /// What decoding this source costs, shared with the stream that sizes batches by it.
-    amplification: Arc<crate::budget::Amplification>,
+    pub(crate) dq: Option<DataQuality>,
     /// Passes the startup uniqueness check took, so the supervisor can export it. Zero on an
     /// appending pipeline, which has no grain to check.
-    grain_check_passes: u32,
+    pub(crate) grain_check_passes: u32,
     /// Identities checked when the pipeline opened. Re-checking every selected snapshot stops a
     /// drop/recreate at the same URI from silently changing a lookup halfway through a run.
-    lookup_table_ids: BTreeMap<String, String>,
+    pub(crate) lookup_table_ids: BTreeMap<String, String>,
     /// Lookups whose target provenance named a prior table id when this pipeline opened.
     /// `use_current` accepts that deliberate migration once, recording the first new target
     /// commit with the current head before returning to ordinary timestamp pinning.
-    lookup_current_on_open: BTreeSet<String>,
+    pub(crate) lookup_current_on_open: BTreeSet<String>,
     /// Table-id transitions already warned about in this process. A historical backfill can
     /// cross the same replacement in many batches; it should be observable without flooding
     /// the log once per source commit.
-    warned_lookup_table_id_changes: BTreeSet<(String, String, String)>,
+    pub(crate) warned_lookup_table_id_changes: BTreeSet<(String, String, String)>,
     /// What to push after each commit. `None` unless a dbt model asked for it, this
     /// deployment configured somewhere to push it, and this pipeline is append-only.
-    publisher: Option<crate::publish::Publisher>,
+    pub(crate) publisher: Option<crate::publish::Publisher>,
     /// The `through_version` of the last batch this process published.
     ///
     /// The client's gap detector, and the reason it is held here rather than read off the
@@ -215,7 +225,87 @@ pub struct Pipeline {
     /// the reader. A fact about the publication sequence is, and this is it. `None` until
     /// the first publication of the process, which is itself a signal — a restart is a gap,
     /// because whatever was in flight when the process died was not sent.
-    prev_published_through: Option<Version>,
+    pub(crate) prev_published_through: Option<Version>,
+}
+
+/// Where a pipeline's batches come from.
+///
+/// Only the pull and the read differ between sources. Everything after them — the transform,
+/// coercion, the data-quality table, the commit — is [`Pipeline::process`], which every source
+/// shares, so a source keeps here only the state nothing else needs.
+pub(crate) enum Source {
+    Delta(DeltaSource),
+}
+
+/// A Delta table, read commit by commit through its log.
+pub(crate) struct DeltaSource {
+    table: DeltaTable,
+    stream: LogStreamBuilder,
+    offsets: OffsetStore,
+    /// What decoding this source costs, shared with the stream that sizes batches by it.
+    amplification: Arc<crate::budget::Amplification>,
+}
+
+impl Source {
+    /// The Delta source, for the paths only it reaches: pulling and reading a batch, and the
+    /// coverage window, which is opened only over a Delta source.
+    fn delta(&self) -> &DeltaSource {
+        match self {
+            Self::Delta(src) => src,
+        }
+    }
+
+    fn delta_mut(&mut self) -> &mut DeltaSource {
+        match self {
+            Self::Delta(src) => src,
+        }
+    }
+}
+
+/// One batch, read and ready for [`Pipeline::process`]: what a source hands on.
+///
+/// Cheap to clone, since the arrays are reference-counted, so a source can keep a batch it
+/// may have to process again.
+#[derive(Clone)]
+pub(crate) struct Batch {
+    /// When the step began, for the line that says it committed.
+    pub started: Instant,
+    /// The last source version the batch holds. Zero for a source without versions.
+    pub through: Version,
+    /// Source files read. Zero for a source without files.
+    pub files: usize,
+    pub input: Vec<RecordBatch>,
+    /// Rows set aside before the transform, because the source could not read them. Always
+    /// empty for a Delta source.
+    pub rejects: Vec<Rejected>,
+    pub lookups: LookupBatch,
+    /// Where the batch sits in its source, which is what its commit records.
+    pub position: Position,
+}
+
+/// Where a batch sits in its source.
+#[derive(Clone)]
+pub(crate) enum Position {
+    Delta {
+        start: StreamCursor,
+        end: StreamCursor,
+    },
+}
+
+impl Position {
+    /// Where a Delta batch ends.
+    fn delta_end(&self) -> Option<StreamCursor> {
+        match self {
+            Self::Delta { end, .. } => Some(*end),
+        }
+    }
+
+    /// The source version a Delta batch starts at.
+    fn delta_start_version(&self) -> Option<Version> {
+        match self {
+            Self::Delta { start, .. } => Some(start.version),
+        }
+    }
 }
 
 impl Pipeline {
@@ -514,16 +604,18 @@ impl Pipeline {
 
         Ok(Self {
             cfg,
-            source,
+            source: Source::Delta(DeltaSource {
+                table: source,
+                stream,
+                offsets,
+                amplification,
+            }),
             target,
-            stream,
             transform,
             sink,
-            offsets,
             coercer: SchemaCoercer::new(target_schema),
             cutoff,
             dq,
-            amplification,
             grain_check_passes,
             lookup_table_ids: lookup_validation.table_ids,
             lookup_current_on_open: lookup_validation.use_current_on_open,
@@ -547,12 +639,16 @@ impl Pipeline {
     }
 
     pub fn cursor(&self) -> StreamCursor {
-        self.stream.cursor()
+        match &self.source {
+            Source::Delta(src) => src.stream.cursor(),
+        }
     }
 
     /// Source head as of the last step. `None` before the first step.
     pub fn source_head_version(&self) -> Option<Version> {
-        self.stream.last_known_head()
+        match &self.source {
+            Source::Delta(src) => src.stream.last_known_head(),
+        }
     }
 
     /// The coverage window this pipeline is in, if it is in one: while it lasts, rows at or
@@ -564,6 +660,13 @@ impl Pipeline {
 
     /// One iteration: pull, read, transform, coerce, commit — all or nothing.
     pub async fn step(&mut self) -> Result<StepOutcome> {
+        match &self.source {
+            Source::Delta(_) => self.step_delta().await,
+        }
+    }
+
+    /// Pull and read one batch from a Delta source, then [`Self::process`] it.
+    async fn step_delta(&mut self) -> Result<StepOutcome> {
         let started = Instant::now();
 
         // 1. Pull one bounded batch of new files from the source log. A window whose head
@@ -571,9 +674,9 @@ impl Pipeline {
         // without a batch — and a stream that came back empty only because it was held at
         // that head is asked again.
         self.retire_cutoff_if_read_through();
-        let mut next = self.stream.next_batch().await?;
+        let mut next = self.source.delta_mut().stream.next_batch().await?;
         if next.is_none() && self.retire_cutoff_if_read_through() {
-            next = self.stream.next_batch().await?;
+            next = self.source.delta_mut().stream.next_batch().await?;
         }
         let Some(batch) = next else {
             return Ok(StepOutcome::CaughtUp);
@@ -582,7 +685,8 @@ impl Pipeline {
         let through = batch.through_version;
         // The id this batch was read under, which is not the one at open once the stream has
         // read across a table replaced in place: a reopen compares it with the log's.
-        self.sink.set_source_identity(self.stream.identity());
+        self.sink
+            .set_source_identity(self.source.delta().stream.identity());
 
         // A lookup is selected from the source commit's timestamp before any input is read or
         // target write is attempted. If anything below fails, retrying this source version asks
@@ -592,14 +696,44 @@ impl Pipeline {
 
         // 2. Read those files as Arrow.
         let input = self.scan(&batch).await?;
-        let in_rows: usize = input.iter().map(|b| b.num_rows()).sum();
 
         // What that cost, so the next batch can be sized by it rather than by a constant.
         // `max_bytes_per_batch` counts the compressed bytes the log recorded; this is what
         // they became once decoded, and the ratio between them is the whole reason a
         // 256 MB setting can hold a gigabyte and a half.
         let decoded: u64 = input.iter().map(|b| b.get_array_memory_size() as u64).sum();
-        self.amplification.observe(batch.total_bytes(), decoded);
+        self.source
+            .delta()
+            .amplification
+            .observe(batch.total_bytes(), decoded);
+
+        self.process(Batch {
+            started,
+            through,
+            files,
+            input,
+            rejects: Vec::new(),
+            lookups: lookup_batch,
+            position: Position::Delta {
+                start: batch.start,
+                end: batch.end,
+            },
+        })
+        .await
+    }
+
+    /// Transform, coerce and commit one batch: the part of a step every source shares.
+    async fn process(&mut self, batch: Batch) -> Result<StepOutcome> {
+        let Batch {
+            started,
+            through,
+            files,
+            input,
+            lookups: lookup_batch,
+            position,
+            ..
+        } = batch;
+        let in_rows: usize = input.iter().map(|b| b.num_rows()).sum();
 
         // 3. Transform. Stateless, row-local, validated at config load. A row it cannot
         // evaluate is set aside like one the target will not take, and for the same reason:
@@ -634,7 +768,8 @@ impl Pipeline {
         let reevaluations = isolated.reevaluations;
         // Unevaluable rows go first, and in the same list as the coercion rejects below, so
         // the data-quality table still gets one write, and one commit, per source version.
-        let mut rejects: Vec<Rejected> = Vec::new();
+        let mut rejects: Vec<Rejected> = batch.rejects;
+        let output = self.conform(output, &mut rejects)?;
         let mut unevaluable = 0;
         if let Some(bad) = isolated.unevaluable {
             unevaluable = bad.len();
@@ -754,10 +889,12 @@ impl Pipeline {
         // recorded with its commit, so a reopen before the next one carries on filtering
         // rather than re-emitting what the target holds; the one that does records nothing,
         // so a reopen after it does not.
-        let closes = self
-            .cutoff
-            .as_ref()
-            .map(|c| window_closes_after(c.window.through, batch.end, beyond));
+        let closes = self.cutoff.as_ref().map(|c| {
+            let end = position
+                .delta_end()
+                .expect("a cut-off implies a Delta source");
+            window_closes_after(c.window.through, end, beyond)
+        });
         self.sink.set_cutoff(match (&self.cutoff, closes) {
             (Some(c), Some(false)) => Some(c.recorded()),
             _ => None,
@@ -788,7 +925,7 @@ impl Pipeline {
 
         // The offset must advance even when a batch produces no rows — otherwise a
         // fully-filtered commit would be re-read forever.
-        let txn_version = self.offsets.txn_version_for(batch.end)?;
+        let txn_version = self.txn_version_for(&position)?;
 
         // 4b. Rejects go to their own table *before* the target commits, and they are the
         // only thing here that is not covered by the batch's own atomicity — two tables
@@ -866,7 +1003,12 @@ impl Pipeline {
             // silent on a fully-filtered batch would leave a hole in the version chain and
             // make the *next* real message look like one the client had lost.
             let published = self
-                .publish(pending, batch.start.version, through, self.target.version())
+                .publish(
+                    pending,
+                    position.delta_start_version().unwrap_or(0),
+                    through,
+                    self.target.version(),
+                )
                 .await;
             return Ok(StepOutcome::Skipped {
                 through_version: through,
@@ -907,7 +1049,12 @@ impl Pipeline {
         // `crate::publish` for why that is a property of the signature rather than a
         // convention here.
         let published = self
-            .publish(pending, batch.start.version, through, target_version)
+            .publish(
+                pending,
+                position.delta_start_version().unwrap_or(0),
+                through,
+                target_version,
+            )
             .await;
 
         Ok(StepOutcome::Progressed {
@@ -922,6 +1069,29 @@ impl Pipeline {
             covered,
             published,
         })
+    }
+
+    /// Fit the transform's output to the target by name, before the coercer casts it.
+    ///
+    /// A Delta source's rows already have the shape the transform was written against, so
+    /// for one this hands `output` back as it is. A source whose rows arrive in more than one
+    /// shape conforms them here instead, and adds the rows it cannot to `rejects`, so that the
+    /// batch still makes one data-quality commit (docs/kafka-design.md §5.6).
+    fn conform(
+        &self,
+        output: Vec<RecordBatch>,
+        _rejects: &mut Vec<Rejected>,
+    ) -> Result<Vec<RecordBatch>> {
+        match &self.source {
+            Source::Delta(_) => Ok(output),
+        }
+    }
+
+    /// The offset a batch at `position` commits.
+    fn txn_version_for(&self, position: &Position) -> Result<i64> {
+        match position {
+            Position::Delta { end, .. } => self.source.delta().offsets.txn_version_for(*end),
+        }
     }
 
     /// Account for a batch filtered inside a coverage window, once its commit is durable, and
@@ -956,7 +1126,7 @@ impl Pipeline {
             "coverage window closed: the target's coverage is behind the stream, so from here \
              an older timestamp is a late row, not a covered one"
         );
-        self.stream.release_stop();
+        self.source.delta_mut().stream.release_stop();
     }
 
     /// Retire a window whose source head the stream has read past, and say whether it did.
@@ -967,7 +1137,7 @@ impl Pipeline {
         let Some(through) = self.cutoff.as_ref().and_then(|c| c.window.through) else {
             return false;
         };
-        if cutoff_applies(through, self.stream.cursor()) {
+        if cutoff_applies(through, self.source.delta().stream.cursor()) {
             return false;
         }
         self.retire(Closed::ReadThrough);
@@ -1325,7 +1495,7 @@ impl Pipeline {
     /// file and one delta-rs-written file would not even be a batch: two schemas, one
     /// transform.
     async fn scan(&self, batch: &LogBatch) -> Result<Vec<RecordBatch>> {
-        scan_source(&self.source, &self.cfg.source_uri, batch).await
+        scan_source(&self.source.delta().table, &self.cfg.source_uri, batch).await
     }
 
     /// Run until caught up, then return how many batches were committed.
