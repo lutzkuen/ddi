@@ -678,13 +678,10 @@ fn not_loaded(table: &DeltaTable) -> Error {
 }
 
 fn missing_commit(table: &DeltaTable, version: u64) -> Error {
-    Error::Other(format!(
-        "cannot read the offsets in {}: commit {version} is no longer in its log, and no \
-         checkpoint at or above it stands in for it. Log cleanup has removed a commit this \
-         handle's version still needs; a handle reopened at the table's current version reads \
-         its offsets from a newer checkpoint.",
-        table.table_url()
-    ))
+    Error::OffsetLogTruncated {
+        table_uri: table.table_url().to_string(),
+        version,
+    }
 }
 
 /// The offsets one writer holds for the partitions it owns, and the `txn`s each of its
@@ -1726,6 +1723,56 @@ mod tests {
             e.to_string().contains("commit 2 is no longer in its log"),
             "{e}"
         );
+    }
+
+    /// A commit log cleanup removed under a handle that still needs it is an error of its own
+    /// type, so a retry loop can tell it from an internal fault without reading its text: the
+    /// cure is to reopen the table and read the offsets again (docs/kafka-design.md §3.6).
+    #[tokio::test]
+    async fn read_txns_commit_removed_by_cleanup_is_a_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        let table = assert_txns(open(path).await, &[(0, 4)]).await; // 1
+        let mut fence = Fence::new(APP);
+        fence.reset(&table, &[0, 1]).await.unwrap();
+        // Partition 1 has no offset, so this commit does not carry it.
+        let table = fenced_commit(&mut fence, table, &[(0, (5, 9))])
+            .await
+            .unwrap(); // 2
+
+        // Another member commits and checkpoints above this handle, and log cleanup removes
+        // the commits below that checkpoint which this handle still needs.
+        let other = assert_txns(open(path).await, &[(2, 7)]).await; // 3
+        deltalake::checkpoints::create_checkpoint(&other, None)
+            .await
+            .unwrap();
+        for v in 0..=1 {
+            std::fs::remove_file(log_file(dir.path(), &commit_name(v))).unwrap();
+        }
+
+        let ranges = BTreeMap::from([(1, (0, 2))]);
+        let e = fence.verify(&table, &ranges).await.unwrap_err();
+        assert!(
+            matches!(
+                &e,
+                Error::OffsetLogTruncated { table_uri, version: 1 }
+                    if *table_uri == table.table_url().to_string()
+            ),
+            "got: {e:?}"
+        );
+        // Not the type an internal fault has.
+        let internal = Fence::new(APP)
+            .verify(&table, &BTreeMap::from([(7, (0, 0))]))
+            .await
+            .unwrap_err();
+        assert!(matches!(internal, Error::Other(_)), "{internal:?}");
+
+        // Reopened at the table's version, the offsets come out of the newer checkpoint.
+        let table = open(path).await;
+        fence.reset(&table, &[0, 1]).await.unwrap();
+        fence.verify(&table, &ranges).await.unwrap();
+        assert_eq!(fence.base(0), Some((Some(9), None)));
     }
 
     /// A V2 checkpoint's top-level file, in either format, read where it is listed. Its

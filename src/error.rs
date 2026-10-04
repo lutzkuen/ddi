@@ -255,6 +255,23 @@ pub enum Error {
         found: Option<i64>,
     },
 
+    /// A commit the offsets of a partitioned source have to be read through is gone from the
+    /// table's log.
+    ///
+    /// Log cleanup removes the commits below a checkpoint once they are older than
+    /// `delta.logRetentionDuration`, and a handle older than that checkpoint can still need
+    /// them. Its own variant because the cure is the one a commit conflict has, not the one
+    /// an internal fault has: reopen the table at its current version and read the offsets
+    /// there, from the newer checkpoint (docs/kafka-design.md §3.6, Replan). Reading past the
+    /// gap instead could answer with an older offset than the truth.
+    #[error(
+        "cannot read the offsets in {table_uri}: commit {version} is no longer in its log, and \
+         no checkpoint at or above it stands in for it. Log cleanup has removed a commit this \
+         handle's version still needs; a handle reopened at the table's current version reads \
+         its offsets from a newer checkpoint."
+    )]
+    OffsetLogTruncated { table_uri: String, version: u64 },
+
     /// The target sets `delta.setTransactionRetentionDuration`, under which an offset can
     /// expire.
     ///
