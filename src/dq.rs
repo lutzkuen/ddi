@@ -460,8 +460,13 @@ impl DataQuality {
     ///    this write's own — it landed, and the acknowledgement of its PUT was lost — the
     ///    write is done ([`Self::landed`]). When it is another writer's — a zombie, or a
     ///    handover — the write goes back to step 1, up to [`KAFKA_CONFLICT_RETRIES`] times.
-    ///    After that it is an ordinary error for the pipeline to retry, never one that
-    ///    replans the target.
+    ///    After that it is [`Error::DataQualityConflict`], for the pipeline to retry, never an
+    ///    error that replans the target.
+    ///
+    /// Every other failure is [`Error::DataQualityWrite`], with what failed beneath it as it
+    /// was raised — delta-rs's error, `Capacity`, or the `OffsetLogTruncated` of a handle left
+    /// behind by log cleanup — so that the pipeline can tell a fault worth retrying from a
+    /// table it cannot write, and neither from a failure of the target (§3.6).
     ///
     /// [`Self::write`] and its equality rule are untouched by any of this.
     pub async fn write_kafka(
@@ -495,8 +500,15 @@ impl DataQuality {
                     written,
                     skipped,
                 }) => {
-                    self.table = self.storage.open(&self.uri).await?;
-                    if self.landed(read_version, &write_id).await? {
+                    self.table = match self.storage.open(&self.uri).await {
+                        Ok(table) => table,
+                        Err(cause) => return Err(self.unwritable(written, cause)),
+                    };
+                    let landed = match self.landed(read_version, &write_id).await {
+                        Ok(landed) => landed,
+                        Err(cause) => return Err(self.unwritable(written, cause)),
+                    };
+                    if landed {
                         debug!(
                             app_id = %self.app_id,
                             dq_uri = %self.uri,
@@ -520,22 +532,20 @@ impl DataQuality {
                         );
                         continue;
                     }
-                    return Err(Error::Other(format!(
-                        "cannot write {rows} rejected row(s) to the data-quality table {:?}: \
-                         another writer kept recording rejects for the same partitions, \
-                         {} times in a row ({e}). The batch was not committed, so nothing was \
-                         lost; it is tried again.",
-                        self.uri,
-                        KAFKA_CONFLICT_RETRIES + 1
-                    )));
+                    return Err(Error::DataQualityConflict {
+                        dq_uri: self.uri.clone(),
+                        rows: written,
+                        attempts: KAFKA_CONFLICT_RETRIES + 1,
+                        detail: e.to_string(),
+                    });
                 }
-                Err(Attempt::Failed(e)) => {
+                Err(Attempt::Failed { rows, cause }) => {
                     // As in `write`: the next attempt starts from the table as it is now, so
                     // a handle that has fallen behind log cleanup does not fail it again.
                     if let Ok(table) = self.storage.open(&self.uri).await {
                         self.table = table;
                     }
-                    return Err(e);
+                    return Err(self.unwritable(rows, cause));
                 }
             }
         }
@@ -550,6 +560,7 @@ impl DataQuality {
         write_id: &str,
         now_micros: i64,
     ) -> std::result::Result<usize, Attempt> {
+        let all: usize = rejected.iter().map(Rejected::len).sum();
         // Every reject's coordinates are in these partitions, or it has none.
         let partitions: Vec<i32> = offsets.ranges.keys().copied().collect();
         let ids: Vec<String> = partitions
@@ -558,7 +569,7 @@ impl DataQuality {
             .collect();
         let txns = fence::read_own_txns(&self.table, &ids, &self.kafka.lookups)
             .await
-            .map_err(Attempt::Failed)?;
+            .map_err(|cause| Attempt::Failed { rows: all, cause })?;
         let marks: BTreeMap<i32, i64> = partitions
             .iter()
             .zip(&ids)
@@ -590,12 +601,13 @@ impl DataQuality {
                 &r.rows,
                 &BooleanArray::from(keep.clone()),
             )
-            .map_err(|e| {
-                Attempt::Failed(Error::Other(format!(
+            .map_err(|e| Attempt::Failed {
+                rows: all,
+                cause: Error::Other(format!(
                     "cannot set aside the rejects already recorded: {e}"
-                )))
+                )),
             })?;
-            payload.extend(payloads(&rows).map_err(Attempt::Failed)?);
+            payload.extend(payloads(&rows).map_err(|cause| Attempt::Failed { rows: all, cause })?);
             for (i, kept) in keep.iter().enumerate() {
                 if *kept {
                     source_versions.push(coordinates[i].map_or(-1, |(_, offset)| offset));
@@ -620,7 +632,10 @@ impl DataQuality {
         let written = reasons.len();
         let batch = self
             .assemble(source_versions, columns, reasons, payload, now_micros)
-            .map_err(Attempt::Failed)?;
+            .map_err(|cause| Attempt::Failed {
+                rows: written,
+                cause,
+            })?;
 
         let txns = offsets.ranges.iter().map(|(p, (_, last))| {
             let mark = marks.get(p).map_or(*last, |m| (*m).max(*last));
@@ -649,7 +664,12 @@ impl DataQuality {
             ]);
 
         // As in `write`, and for the same reason: no runtime nobody configured.
-        let session = Arc::new(crate::budget::delta_session(&self.table).map_err(Attempt::Failed)?);
+        let session =
+            crate::budget::delta_session(&self.table).map_err(|cause| Attempt::Failed {
+                rows: written,
+                cause,
+            })?;
+        let session = Arc::new(session);
         // A clone rather than the handle itself, so that a failed write leaves a usable
         // handle behind even when the table cannot be reopened.
         let written_table = self
@@ -674,12 +694,21 @@ impl DataQuality {
                 written,
                 skipped,
             }),
-            Err(e) => Err(Attempt::Failed(Error::Other(format!(
-                "cannot write {written} rejected row(s) to the data-quality table {:?}: {e}. \
-                 The batch was not committed, so nothing was lost — but this pipeline cannot \
-                 make progress until the table is writable.",
-                self.uri
-            )))),
+            // Typed, as the target's own write is: a full spill directory is out of capacity,
+            // and anything else is delta-rs's error as it came.
+            Err(e) => Err(Attempt::Failed {
+                rows: written,
+                cause: crate::spill::classify_delta(e, "data-quality: writing rejects"),
+            }),
+        }
+    }
+
+    /// `rows` of a batch's rejects were not written to this table, because of `cause`.
+    fn unwritable(&self, rows: usize, cause: Error) -> Error {
+        Error::DataQualityWrite {
+            dq_uri: self.uri.clone(),
+            rows,
+            source: Box::new(cause),
         }
     }
 
@@ -776,7 +805,8 @@ enum Attempt {
         written: usize,
         skipped: u64,
     },
-    Failed(Error),
+    /// Anything else, about `rows` of the batch's rejects.
+    Failed { rows: usize, cause: Error },
 }
 
 /// The commitInfo key a Kafka data-quality commit records its write's id under.
@@ -1588,6 +1618,9 @@ mod tests {
         /// Write it, then say it already exists, the first time only: what the PUT retried
         /// after its response was lost gets back.
         LandsThenSaysItExists,
+        /// Every time, write another writer's commit there first, which asserts mark 0 of
+        /// partition 0: a rival that always wins the race.
+        RivalFirst,
     }
 
     /// An object store that gets one thing wrong about commits, and passes everything else
@@ -1634,6 +1667,18 @@ mod tests {
                     }
                     Ok(put)
                 }
+                Fault::RivalFirst => {
+                    if commit {
+                        self.struck.fetch_add(1, Ordering::SeqCst);
+                        let rival = "{\"commitInfo\":{\"timestamp\":1700000000000,\
+                                     \"operation\":\"WRITE\",\"operationParameters\":{\"mode\":\"Append\"}}}\n\
+                                     {\"txn\":{\"appId\":\"app.dq-0\",\"version\":0}}\n";
+                        self.inner
+                            .put_opts(location, rival.into(), PutOptions::default())
+                            .await?;
+                    }
+                    self.inner.put_opts(location, payload, opts).await
+                }
             }
         }
 
@@ -1660,11 +1705,13 @@ mod tests {
             self.inner.delete_stream(locations)
         }
 
+        // Sorted, as a cloud store lists: the kernel relies on it for every scheme but file://,
+        // and the local file system lists in no order.
         fn list(
             &self,
             prefix: Option<&Path>,
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.inner.list(prefix)
+            sorted(self.inner.list(prefix))
         }
 
         fn list_with_offset(
@@ -1672,7 +1719,7 @@ mod tests {
             prefix: Option<&Path>,
             offset: &Path,
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.inner.list_with_offset(prefix, offset)
+            sorted(self.inner.list_with_offset(prefix, offset))
         }
 
         async fn list_with_delimiter(
@@ -1690,6 +1737,19 @@ mod tests {
         ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
         }
+    }
+
+    fn sorted(
+        listing: BoxStream<'static, object_store::Result<ObjectMeta>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        use futures::{StreamExt, TryStreamExt};
+        futures::stream::once(async move {
+            let mut all: Vec<ObjectMeta> = listing.try_collect().await?;
+            all.sort_by(|a, b| a.location.cmp(&b.location));
+            Ok::<_, object_store::Error>(futures::stream::iter(all.into_iter().map(Ok)))
+        })
+        .try_flatten()
+        .boxed()
     }
 
     /// `dq`'s table, from here on reached through a store with `fault`, until it is reopened.
@@ -1754,5 +1814,233 @@ mod tests {
             0,
             "nobody else was there to conflict with"
         );
+    }
+
+    /// The scheme every table reached through a [`Fault::RivalFirst`] store is opened by, so
+    /// that the data-quality table reopened after a conflict still has its rival. Registered
+    /// once for the process; no other test opens a table under it.
+    const RIVAL_SCHEME: &str = "ddi-dq-rival";
+
+    struct RivalFactory {
+        struck: Arc<AtomicU32>,
+    }
+
+    impl deltalake::logstore::ObjectStoreFactory for RivalFactory {
+        fn parse_url_opts(
+            &self,
+            url: &url::Url,
+            _: &deltalake::logstore::StorageConfig,
+        ) -> deltalake::DeltaResult<(deltalake::logstore::ObjectStoreRef, Path)> {
+            let store = FlakyCommits {
+                inner: Arc::new(object_store::local::LocalFileSystem::new()),
+                fault: Fault::RivalFirst,
+                struck: self.struck.clone(),
+            };
+            let path = Path::from_url_path(url.path())
+                .map_err(|e| DeltaTableError::Generic(e.to_string()))?;
+            Ok((Arc::new(store), path))
+        }
+    }
+
+    impl deltalake::logstore::LogStoreFactory for RivalFactory {
+        fn with_options(
+            &self,
+            prefixed_store: deltalake::logstore::ObjectStoreRef,
+            root_store: deltalake::logstore::ObjectStoreRef,
+            location: &url::Url,
+            options: &deltalake::logstore::StorageConfig,
+        ) -> deltalake::DeltaResult<Arc<dyn deltalake::logstore::LogStore>> {
+            Ok(deltalake::logstore::default_logstore(
+                prefixed_store,
+                root_store,
+                location,
+                options,
+            ))
+        }
+    }
+
+    /// How often the rival under [`RIVAL_SCHEME`] has committed first.
+    fn rival_scheme() -> Arc<AtomicU32> {
+        static STRUCK: std::sync::OnceLock<Arc<AtomicU32>> = std::sync::OnceLock::new();
+        STRUCK
+            .get_or_init(|| {
+                let struck = Arc::new(AtomicU32::new(0));
+                let factory = Arc::new(RivalFactory {
+                    struck: struck.clone(),
+                });
+                let scheme = url::Url::parse(&format!("{RIVAL_SCHEME}://")).unwrap();
+                deltalake::logstore::object_store_factories().insert(
+                    scheme.clone(),
+                    factory.clone() as Arc<dyn deltalake::logstore::ObjectStoreFactory>,
+                );
+                deltalake::logstore::logstore_factories().insert(
+                    scheme,
+                    factory as Arc<dyn deltalake::logstore::LogStoreFactory>,
+                );
+                struck
+            })
+            .clone()
+    }
+
+    /// What a [`Error::DataQualityWrite`] says failed beneath it.
+    fn cause(e: &Error) -> &Error {
+        match e {
+            Error::DataQualityWrite { source, .. } => source,
+            other => panic!("expected a failed data-quality write, got {other:?}"),
+        }
+    }
+
+    /// Every way `write_kafka` fails is an error a retry loop can sort by type rather than by
+    /// its text (docs/kafka-design.md §3.6): a failed write with what failed typed beneath
+    /// it, or a conflict that outlasted the retries. Never a bare cause, which would read as
+    /// the target's: a log cleaned up under a stale data-quality handle is
+    /// `OffsetLogTruncated` beneath, which on its own would replan the target.
+    #[tokio::test]
+    async fn dq_write_failures_are_typed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A table that is not a data-quality table.
+        let wrong = dir.path().join("wrong");
+        let wrong = wrong.to_str().unwrap();
+        DeltaTable::try_from_url(deltalake::ensure_table_uri(wrong).unwrap())
+            .await
+            .unwrap()
+            .create()
+            .with_columns(vec![StructField::new(
+                "x",
+                DeltaType::Primitive(PrimitiveType::Long),
+                true,
+            )])
+            .with_save_mode(SaveMode::ErrorIfExists)
+            .await
+            .unwrap();
+        let e = open_dq(wrong)
+            .await
+            .write_kafka(
+                &[undecodable(0, &[3], MALFORMED)],
+                &read(&[(0, (0, 9))]),
+                NOW,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(cause(&e), Error::Delta(_)), "{e:?}");
+
+        // A data-quality handle that log cleanup left behind.
+        let path = dir.path().join("dq");
+        let path = path.to_str().unwrap();
+        create_dq(path).await;
+        let mut stale = open_dq(path).await;
+        let first = [undecodable(0, &[1], MALFORMED)];
+        assert_eq!(
+            stale
+                .write_kafka(&first, &read(&[(0, (0, 1))]), NOW)
+                .await
+                .unwrap(),
+            1
+        ); // 1
+        let mut other = open_dq(path).await;
+        for offset in 10..13 {
+            let theirs = [undecodable(1, &[offset], MALFORMED)];
+            other
+                .write_kafka(&theirs, &read(&[(1, (offset, offset))]), NOW)
+                .await
+                .unwrap();
+        } // 2..=4
+        let head = deltalake::open_table(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap();
+        deltalake::checkpoints::create_checkpoint(&head, None)
+            .await
+            .unwrap();
+        for v in 0..=3u64 {
+            std::fs::remove_file(format!("{path}/_delta_log/{v:020}.json")).unwrap();
+        }
+        let next = [undecodable(0, &[5], MALFORMED)];
+        let e = stale
+            .write_kafka(&next, &read(&[(0, (2, 5))]), NOW)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(cause(&e), Error::OffsetLogTruncated { version: 1, .. }),
+            "{e:?}"
+        );
+        // The failure reopened the handle, so the batch's next attempt goes through.
+        assert_eq!(
+            stale
+                .write_kafka(&next, &read(&[(0, (2, 5))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// An object store that refuses the commit: the store's own error, typed beneath.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dq_store_fault_is_typed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+        let log = dir.path().join("_delta_log");
+        let writable = std::fs::metadata(&log).unwrap().permissions();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let read_only = std::fs::File::create(log.join("probe")).is_err();
+        let outcome = dq
+            .write_kafka(
+                &[undecodable(0, &[3], MALFORMED)],
+                &read(&[(0, (0, 9))]),
+                NOW,
+            )
+            .await;
+        std::fs::set_permissions(&log, writable).unwrap();
+        if !read_only {
+            return; // running as root, where the mode bits do not bite. Nothing to pin.
+        }
+        let e = outcome.unwrap_err();
+        assert!(
+            matches!(e, Error::DataQualityWrite { rows: 1, .. }),
+            "{e:?}"
+        );
+        assert!(matches!(cause(&e), Error::Delta(_)), "{e:?}");
+    }
+
+    /// A rival that commits the same partition's mark first, every time: the retries in place
+    /// run out, and the error says so by its type.
+    #[tokio::test]
+    async fn dq_conflict_past_the_retries_in_place_is_typed() {
+        let struck = rival_scheme();
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(dir.path()).unwrap();
+        create_dq(path.to_str().unwrap()).await;
+        let uri = format!("{RIVAL_SCHEME}://{}", path.to_str().unwrap());
+        let mut dq = DataQuality::open(&crate::storage::Storage::default(), &uri, "app", "orders")
+            .await
+            .unwrap()
+            .expect("the table was just created");
+
+        let e = dq
+            .write_kafka(
+                &[undecodable(0, &[10, 11], MALFORMED)],
+                &read(&[(0, (10, 12))]),
+                NOW,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                e,
+                Error::DataQualityConflict {
+                    rows: 2,
+                    attempts: 4,
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        assert_eq!(dq.kafka_counters().conflict_retries(), 3);
+        assert_eq!(struck.load(Ordering::SeqCst), 4, "one rival per attempt");
     }
 }

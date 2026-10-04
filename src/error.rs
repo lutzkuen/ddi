@@ -272,6 +272,42 @@ pub enum Error {
     )]
     OffsetLogTruncated { table_uri: String, version: u64 },
 
+    /// A Kafka batch's rejects could not be written to its data-quality table, so the batch
+    /// was not committed either.
+    ///
+    /// Every failure of [`crate::dq::DataQuality::write_kafka`] but a conflict that outlasted
+    /// its retries is this one, with what failed as its cause rather than folded into its text,
+    /// so that a retry loop can sort them by type (docs/kafka-design.md §3.6): an object store
+    /// fault is worth retrying in a moment, a table with the wrong schema is not. Whatever the
+    /// cause, it is about the data-quality table, and the target needs no replan for it — not
+    /// even when the cause is one that would replan the target had the target raised it, such
+    /// as a commit log cleanup removed under a stale data-quality handle.
+    #[error(
+        "cannot write {rows} rejected row(s) to the data-quality table {dq_uri:?}: {source}. \
+         The batch was not committed, so nothing was lost — but this pipeline cannot make \
+         progress until the table is writable."
+    )]
+    DataQualityWrite {
+        dq_uri: String,
+        rows: usize,
+        source: Box<Error>,
+    },
+
+    /// Another writer kept recording rejects for a Kafka batch's partitions in its
+    /// data-quality table, past the retries in place: a zombie, or a handover still under way.
+    /// Nothing was written, and the batch is tried again (docs/kafka-design.md §5.7).
+    #[error(
+        "cannot write {rows} rejected row(s) to the data-quality table {dq_uri:?}: another \
+         writer kept recording rejects for the same partitions, {attempts} times in a row \
+         ({detail}). The batch was not committed, so nothing was lost; it is tried again."
+    )]
+    DataQualityConflict {
+        dq_uri: String,
+        rows: usize,
+        attempts: u32,
+        detail: String,
+    },
+
     /// The target sets `delta.setTransactionRetentionDuration`, under which an offset can
     /// expire.
     ///
