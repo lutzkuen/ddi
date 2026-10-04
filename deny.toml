@@ -5,6 +5,12 @@
 # transitive dependency under any licence at all. This turns that from something nobody
 # notices into a failed build.
 
+[graph]
+# Optional dependencies are part of what ddi ships: the `kafka` feature's crates (rdkafka,
+# arrow-avro and theirs) are in the published binary from the day the image builds with it.
+# Without this, cargo-deny checks the default feature set only and never sees them.
+all-features = true
+
 [licenses]
 # Everything permissive enough to link into a commercial product without conditions
 # beyond attribution.

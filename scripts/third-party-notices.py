@@ -19,10 +19,76 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 REGISTRY = pathlib.Path.home() / ".cargo" / "registry" / "src"
 SELF = "delta-delta-ingest"
 
+# C code a `-sys` crate compiles and links statically. cargo-deny and the crate table see the
+# crate's own licence, not this, so each one's licence file is appended verbatim, for every
+# version of the crate in the lockfile (optional ones included: the lockfile lists them, and an
+# image built with the feature ships them).
+C_LIBRARIES = [
+    (
+        "rdkafka-sys",
+        "librdkafka",
+        "librdkafka/LICENSES.txt",
+        "librdkafka (BSD-2-Clause), and the third-party code it bundles, each under its own "
+        "licence below. Linked by the `kafka` feature.",
+    ),
+    (
+        "zstd-sys",
+        "zstd",
+        "zstd/LICENSE",
+        "zstd, offered under BSD-3-Clause or GPLv2; the BSD licence is the one taken.",
+    ),
+]
+
 
 def crates_from_lock() -> list[tuple[str, str]]:
     lock = (ROOT / "Cargo.lock").read_text()
     return re.findall(r'^name = "([^"]+)"\nversion = "([^"]+)"', lock, re.M)
+
+
+def crate_dir(name: str, version: str) -> pathlib.Path | None:
+    for src in REGISTRY.glob("*"):
+        d = src / f"{name}-{version}"
+        if d.is_dir():
+            return d
+    return None
+
+
+def c_library_sections(crates: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
+    """The appendix of statically linked C code, and what could not be read for it."""
+    out, missing = [], []
+    for name, label, rel, what in C_LIBRARIES:
+        for crate, version in sorted(crates):
+            if crate != name:
+                continue
+            d = crate_dir(crate, version)
+            text = (d / rel) if d else None
+            if text is None or not text.exists():
+                missing.append(f"{crate} {version} ({rel})")
+                continue
+            # The upstream version is the build metadata: `4.10.0+2.12.1`, `2.0.16+zstd.1.5.7`.
+            upstream = version.split("+", 1)[1] if "+" in version else version
+            upstream = upstream.removeprefix(f"{label}.")
+            out += [
+                "",
+                f"### {label} {upstream} (in {crate} {version})",
+                "",
+                what,
+                "",
+                "```text",
+                text.read_text().rstrip(),
+                "```",
+            ]
+    if out:
+        out = [
+            "",
+            "## Statically linked C libraries",
+            "",
+            "The table above lists crates. These are the C libraries some of them compile and",
+            "link statically, whose licences travel with the binary too. OpenSSL 3 (Apache-2.0),",
+            "and zlib where the build finds it, are linked dynamically from the image's Debian",
+            "packages, whose copyright files cover them.",
+        ] + out
+    return out, missing
 
 
 def license_of(name: str, version: str) -> str | None:
@@ -85,11 +151,21 @@ def main() -> int:
         "",
         "- Apache-2.0: http://www.apache.org/licenses/LICENSE-2.0",
         "- MIT: https://opensource.org/licenses/MIT",
-        "",
     ]
+
+    c_sections, c_missing = c_library_sections(crates)
+    out += c_sections
+    if c_missing:
+        out += ["", "C licence files not found locally (run `cargo fetch` and regenerate):", ""]
+        out += [f"- {m}" for m in c_missing]
+    out.append("")
+
     (ROOT / "THIRD_PARTY_NOTICES.md").write_text("\n".join(out))
-    print(f"wrote THIRD_PARTY_NOTICES.md: {len(rows)} crates, {len(missing)} unresolved")
-    return 1 if missing else 0
+    print(
+        f"wrote THIRD_PARTY_NOTICES.md: {len(rows)} crates, {len(missing)} unresolved, "
+        f"{len(c_missing)} C licence files missing"
+    )
+    return 1 if missing or c_missing else 0
 
 
 if __name__ == "__main__":
