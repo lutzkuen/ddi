@@ -41,7 +41,8 @@
 //! which rebuild recorded it: the table only grows, and a rewrite that records nothing, or a
 //! post-hook still to run, leaves an earlier rebuild's row the newest. The rescan's price is
 //! its ordering requirement: a source written from a multi-partition Kafka topic can lose a
-//! lagging partition's late rows to its cut-off, as [`crate::dedup`] says.
+//! lagging partition's late rows to its cut-off, as [`crate::dedup`] says, unless the model
+//! declares the column it is ordered within (`meta: {ddi_partition: kafka_partition}`).
 //!
 //! # Ordering
 //!

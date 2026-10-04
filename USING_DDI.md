@@ -349,18 +349,64 @@ orders timestamps only within each partition, so a lagging partition's rows rout
 after newer ones from another. So after a rebuild, on a first start against a table that
 already has rows, and after the source was replaced, such a source can lose a lagging
 partition's late rows at or below the table's `max(_timestamp)`: counted in
-`ddi_rows_skipped_as_covered_total`, but dropped. That is a known limitation. A watermark table
+`ddi_rows_skipped_as_covered_total`, but dropped. A watermark table
 (`watermark_uri`, in the README's
 [handover section](README.md#the-handover-and-why-it-needs-a-watermark)) does not help here: a
-model always has `_timestamp`, and with it set `ddi` never reads that table. A watermark per
-Kafka partition would be exact; `ddi` does not offer one yet.
+model always has `_timestamp`, and with it set `ddi` never reads that table.
+
+What does help is keeping the cut-off per Kafka partition. Declare the column the timestamp is
+ordered within:
+
+```yaml
+models:
+  - name: events_stg
+    meta:
+      ddi_key: id
+      ddi_partition: kafka_partition    # or [kafka_topic, kafka_partition]
+```
+
+Then each row is measured against its own partition's newest row in the table, a partition the
+table has no row of has nothing skipped, and the requirement above holds per partition — which
+`kafka_offset` always meets, so `ddi_timestamp: kafka_offset` works too, as long as the topic is
+never recreated or moved to another cluster (its offsets would start again below the old
+marks). What to know:
+
+- The model must **select `kafka_partition`** (and `kafka_offset`, if that is the timestamp),
+  passed through unchanged: the source column of that name must hold the same values. A model
+  that lacks it does not start. The key (`ddi_key`) may be derived; only the rescan after a
+  rebuild then counts a row tied with its partition's newest as not yet covered.
+- A table fed from **several topics** needs `[kafka_topic, kafka_partition]`.
+- A row with **no partition** stops the model, as a row with no timestamp does, under every
+  `ddi_write_mode`: an upserting model must select the column too.
+- A model that **filters out whole partitions whose rows share source commits with the ones it
+  keeps** — a `WHERE` on `kafka_partition`, on the message key when that leaves some partitions
+  empty, or on `kafka_topic` when one ingester's commits mix topics — cannot have its rescan
+  bounded: those commits carry rows of partitions the table has none of, and such rows prove
+  nothing. Every rebuild then rescans from the start (`ddi` warns and names the partition), and
+  stops once the source's log no longer reaches back that far. Give such a model a source of its
+  own. Turning `ddi_partition` off bounds the rescan again but brings back the single cut-off's
+  loss of a lagging partition's late rows. A `kafka_topic` filter over commits that each hold
+  one topic stays bounded.
+- Under `ddi_write_mode: upsert` or `staged_upsert`, keep a **timestamp** as `ddi_timestamp`: it
+  is also what decides which delivery of a key is newer, across partitions, and offsets of two
+  partitions do not compare.
+- **Before rolling `ddi` back** to 0.4.0, or turning the setting on or off, wait for
+  `ddi_coverage_cutoff_active` to be 0. If you don't, nothing is lost: the window in progress is
+  not resumed, and the rest of what the rebuild wrote is written again. 0.3.1 and earlier apply
+  one cut-off at every restart, so they drop a lagging partition's late rows whatever you wait
+  for.
+- A `DELETE` of a partition's newest rows in the table brings them back after the next
+  rebuild or restart that has to infer coverage: the partition's newest row is then older.
+- `ddi_partition` must be a column name or a list of them; anything else stops the model rather
+  than quietly running without it. Only that model: the rest of the project runs, `ddi run`
+  logs it as held back, and `ddi dbt check` lists it as not streamable.
 
 ### What else can happen to a shared table
 
 | Event | What `ddi` does |
 |---|---|
 | Restart, redeploy, crash | Resumes from its own offset; nothing is skipped by timestamp |
-| dbt full-refresh | Rescans from the batch's high-water mark, whose `_timestamp` cut-off can drop a lagging partition's late rows (above), and can write again a version the rebuild read past the head `ddi` loaded |
+| dbt full-refresh | Rescans from the batch's high-water mark, whose `_timestamp` cut-off can drop a lagging partition's late rows unless `ddi_partition` is set (above), and can write again a version the rebuild read past the head `ddi` loaded |
 | Rows arrive while dbt runs | Re-emitted afterwards, by timestamp |
 | Another writer appends to the target | Not taken as coverage; nothing is skipped because of it |
 | Another writer updates, deletes or merges in the target | Treated as a rebuild. Timestamps it writes newer than rows `ddi` has not delivered yet make it skip the source versions holding them (logged as `versions_not_reread`) |
@@ -374,7 +420,8 @@ Kafka partition would be exact; `ddi` does not offer one yet.
 
 The rescan after a rebuild is bounded by the source's own file statistics — Delta records
 `maxValues` per file — so a rebuild costs a read of the last commit or two, not the whole
-history.
+history. With `ddi_partition` that holds only while every partition the source carries has rows
+in the table (above).
 
 ---
 

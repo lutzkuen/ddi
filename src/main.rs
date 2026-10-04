@@ -461,6 +461,8 @@ async fn dbt_command(sub: &DbtCommand, cfg: &Config, cli: &Cli) -> delta_delta_i
             let path = manifest_path(manifest, cfg)?;
             let m = Manifest::from_path(&path)?;
             let mut verdicts = analyze_all(&m);
+            // What `ddi run` would hold back for a malformed meta key, said here too.
+            delta_delta_ingest::dbt::convert::reject_unreadable_meta(&m, &mut verdicts);
 
             // A row-wise model on an Iceberg table is not a Delta→Delta pipeline, however
             // streamable its SQL looks.

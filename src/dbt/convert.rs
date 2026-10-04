@@ -21,6 +21,50 @@ pub fn app_id_for(model: &str) -> String {
     format!("{APP_ID_PREFIX}.{model}")
 }
 
+/// A meta value naming one column or a list of them, as a list. Absent is empty.
+///
+/// Anything else is an error rather than absent, for a key whose absence is a valid and
+/// quietly worse setting: `ddi_partition: 0` read as "not set" would leave the pipeline on a
+/// single cut-off, which loses a lagging partition's late rows, and say nothing. An empty list
+/// is refused for the same reason: it says the key is set and means it is not.
+fn meta_columns(
+    value: Option<&serde_json::Value>,
+    key: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let bad = |v: &serde_json::Value| {
+        format!("meta {key} must name a column or a list of columns, not {v}")
+    };
+    match value {
+        None => Ok(Vec::new()),
+        Some(serde_json::Value::String(one)) => Ok(vec![one.clone()]),
+        Some(v @ serde_json::Value::Array(many)) if many.is_empty() => Err(bad(v)),
+        Some(serde_json::Value::Array(many)) => many
+            .iter()
+            .map(|v| v.as_str().map(str::to_string).ok_or_else(|| bad(v)))
+            .collect(),
+        Some(other) => Err(bad(other)),
+    }
+}
+
+/// Why a model's meta cannot be read, if it cannot.
+fn meta_problem(node: &Node) -> Option<String> {
+    meta_columns(node.meta_value("ddi_partition"), "ddi_partition").err()
+}
+
+/// Every streamable verdict whose model's meta cannot be read, turned into a rejection that
+/// says why: what `ddi dbt check` and `ddi dbt convert` show for a model `ddi run` holds back.
+pub fn reject_unreadable_meta(manifest: &Manifest, verdicts: &mut [Verdict]) {
+    for v in verdicts.iter_mut() {
+        let Verdict::Streamable(s) = v else { continue };
+        if let Some(reason) = manifest.node(&s.unique_id).and_then(meta_problem) {
+            *v = Verdict::Rejected {
+                name: s.name.clone(),
+                reason,
+            };
+        }
+    }
+}
+
 /// Where a node's data actually lives.
 ///
 /// dbt usually knows, and when it does it is more authoritative than anything configured
@@ -110,6 +154,17 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
             });
         }
 
+        // `meta: {ddi_partition: kafka_partition}`, or a list for a table fed from several
+        // topics. Read strictly, unlike the keys around it: anything else read as absent
+        // would leave the pipeline on the single cut-off, which is the lossy one, and
+        // nothing would say so. Not an error here, though: that would stop every model in
+        // the project. The resolver holds back this one, by name.
+        let (dedup_partition, meta_problem) =
+            match meta_columns(tgt.meta_value("ddi_partition"), "ddi_partition") {
+                Ok(columns) => (columns, None),
+                Err(m) => (Vec::new(), Some(m)),
+            };
+
         out.push(PipelineConfig {
             name: s.name.clone(),
             app_id: app_id_for(&s.name),
@@ -135,6 +190,7 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
                     .to_string(),
             ),
             dedup_key: tgt.meta_str("ddi_key").map(str::to_string),
+            dedup_partition,
             // Upserting is declared next to the model too, for the same reason the
             // timestamp is: the grain of a table is a property of the model, not of how
             // this daemon happens to be deployed.
@@ -148,6 +204,7 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
             stage_uri: None,
             // Set by the expansion, never by the manifest.
             stage_for: None,
+            meta_problem,
             apply_max_bytes: tgt.meta_str("ddi_apply_max_bytes").map(str::to_string),
             apply_max_latency_secs: tgt
                 .meta_value("ddi_apply_max_latency_secs")
@@ -195,7 +252,12 @@ pub fn pipelines(manifest: &Manifest, storage: &StorageConfig) -> Result<Vec<Pip
 
 /// The same derivation, rendered as TOML for a human to read.
 pub fn to_toml(manifest: &Manifest, cfg: &Config) -> Result<String> {
-    let derived = pipelines(manifest, &cfg.storage)?;
+    // A model whose meta cannot be read is not pinned: written out without it, it would run
+    // as something it does not say. It is listed with the models that are not streamable.
+    let derived: Vec<PipelineConfig> = pipelines(manifest, &cfg.storage)?
+        .into_iter()
+        .filter(|p| p.meta_problem.is_none())
+        .collect();
 
     let mut out = String::new();
     out.push_str(
@@ -234,7 +296,8 @@ pub fn to_toml(manifest: &Manifest, cfg: &Config) -> Result<String> {
         out.push_str("# No streamable models found.\n\n");
     }
 
-    let all = analyze_all(manifest);
+    let mut all = analyze_all(manifest);
+    reject_unreadable_meta(manifest, &mut all);
     let rejected: Vec<&Verdict> = all
         .iter()
         .filter(|v| matches!(v, Verdict::Rejected { .. }))
@@ -437,6 +500,132 @@ mod tests {
         let p = &pipelines(&m, &storage()).unwrap()[0];
         assert_eq!(p.dedup_timestamp.as_deref(), Some("event_ts"));
         assert_eq!(p.dedup_key.as_deref(), Some("order_id"));
+    }
+
+    #[test]
+    fn meta_supplies_the_dedup_partition() {
+        let with = |v: Option<serde_json::Value>| {
+            let mut m = fixture();
+            if let Some(v) = v {
+                m.nodes
+                    .get_mut("model.p.orders_stg")
+                    .unwrap()
+                    .meta
+                    .insert("ddi_partition".into(), v);
+            }
+            pipelines(&m, &storage())
+        };
+        assert!(with(None).unwrap()[0].dedup_partition.is_empty());
+        assert_eq!(
+            with(Some(serde_json::json!("kafka_partition"))).unwrap()[0].dedup_partition,
+            ["kafka_partition"]
+        );
+        assert_eq!(
+            with(Some(serde_json::json!(["kafka_topic", "kafka_partition"]))).unwrap()[0]
+                .dedup_partition,
+            ["kafka_topic", "kafka_partition"]
+        );
+
+        // Read as absent, these would leave the pipeline on the single cut-off — the lossy
+        // one — without a word. Carried to the resolver instead, which holds back this model
+        // alone; an error here would stop every model in the project.
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!(["kafka_partition", 1]),
+            serde_json::json!([]),
+            serde_json::json!({"column": "kafka_partition"}),
+        ] {
+            let p = &with(Some(bad.clone())).unwrap()[0];
+            let m = p.meta_problem.as_deref().expect("a problem");
+            assert!(m.contains("ddi_partition"), "{bad}: {m}");
+            assert!(p.dedup_partition.is_empty(), "{bad}");
+        }
+        assert!(with(Some(serde_json::json!("kafka_partition"))).unwrap()[0]
+            .meta_problem
+            .is_none());
+    }
+
+    #[test]
+    fn a_model_with_unreadable_meta_is_listed_not_pinned() {
+        let mut m = fixture();
+        // A second streamable model, so the test tells "only the bad model is left out"
+        // from "nothing is pinned".
+        let mut payments = m.nodes["model.p.orders_stg"].clone();
+        payments.name = "payments_stg".into();
+        m.nodes.insert("model.p.payments_stg".into(), payments);
+        m.nodes
+            .get_mut("model.p.orders_stg")
+            .unwrap()
+            .meta
+            .insert("ddi_partition".into(), serde_json::json!(0));
+        let cfg = Config {
+            storage: storage(),
+            ..Default::default()
+        };
+        let toml = to_toml(&m, &cfg).unwrap();
+        assert_eq!(
+            toml.matches("[[pipeline]]").count(),
+            1,
+            "one pinned: {toml}"
+        );
+        assert!(
+            toml.contains("name = \"payments_stg\""),
+            "good one pinned: {toml}"
+        );
+        assert!(
+            !toml.contains("name = \"orders_stg\""),
+            "bad one not pinned: {toml}"
+        );
+        assert!(
+            toml.contains("#   orders_stg: meta ddi_partition must name a column"),
+            "listed: {toml}"
+        );
+
+        // And `ddi dbt check` calls it not streamable, as `ddi run` holds it back.
+        let mut verdicts = analyze_all(&m);
+        reject_unreadable_meta(&m, &mut verdicts);
+        assert!(verdicts.iter().any(|v| matches!(
+            v,
+            Verdict::Rejected { name, reason }
+                if name == "orders_stg" && reason.contains("ddi_partition")
+        )));
+    }
+
+    #[test]
+    fn a_pinned_dedup_partition_round_trips_through_toml() {
+        let cfg = Config {
+            storage: storage(),
+            ..Default::default()
+        };
+        for (meta, rendered) in [
+            (
+                serde_json::json!("kafka_partition"),
+                "dedup_partition = \"kafka_partition\"",
+            ),
+            (
+                serde_json::json!(["kafka_topic", "kafka_partition"]),
+                "dedup_partition = [\"kafka_topic\", \"kafka_partition\"]",
+            ),
+        ] {
+            let mut m = fixture();
+            m.nodes
+                .get_mut("model.p.orders_stg")
+                .unwrap()
+                .meta
+                .insert("ddi_partition".into(), meta.clone());
+            let toml = to_toml(&m, &cfg).unwrap();
+            assert!(toml.contains(rendered), "{meta}: {toml}");
+            let r = Config::from_toml_str(&toml).unwrap().resolve().unwrap();
+            assert_eq!(
+                serde_json::to_value(&r[0].dedup_partition).unwrap(),
+                match meta {
+                    serde_json::Value::String(s) => serde_json::json!([s]),
+                    many => many,
+                }
+            );
+        }
     }
 
     #[test]

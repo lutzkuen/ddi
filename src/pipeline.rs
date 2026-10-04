@@ -114,13 +114,15 @@ struct LookupTableIdTransition {
 }
 
 /// A stretch of the source over which the pipeline has to infer from the target's data what
-/// the target already holds. See [`crate::dedup`].
+/// the target already holds, whether by one cut-off or one per `dedup_partition` value. See
+/// [`crate::dedup`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoverageWindow {
     pub reason: CoverageReason,
     /// The source version the window closes after once read, as well as on the first row
-    /// newer than the target's watermark. `None` when only such a row closes it: for a
-    /// replaced source, and for a staged upsert's apply half.
+    /// newer than the target's watermark (its partition's, with `dedup_partition`). `None`
+    /// when only such a row closes it: for a replaced source, and for a staged upsert's apply
+    /// half.
     pub through: Option<Version>,
     /// True when this window was opened by an earlier process and recorded in its commits,
     /// rather than inferred just now.
@@ -140,6 +142,7 @@ impl Cutoff {
         RecordedCutoff {
             reason: self.window.reason,
             source_through: self.window.through,
+            partition_columns: self.dedup.partition_columns().to_vec(),
         }
     }
 }
@@ -147,7 +150,8 @@ impl Cutoff {
 /// What ended a coverage window.
 #[derive(Clone, Copy)]
 enum Closed {
-    /// A batch carried a row newer than the target's watermark.
+    /// A batch carried a row newer than the target's watermark — than its own partition's,
+    /// or in a partition the target lacks, when the cut-off is kept per partition.
     Beyond,
     /// The source head the window was opened against has been read.
     ReadThrough,
@@ -156,7 +160,10 @@ enum Closed {
 impl Closed {
     fn describe(self) -> &'static str {
         match self {
-            Self::Beyond => "a row newer than the target's watermark arrived",
+            Self::Beyond => {
+                "a row newer than the target's watermark (its partition's, when kept per \
+                 partition) arrived"
+            }
             Self::ReadThrough => "the source head it opened against has been read",
         }
     }
@@ -270,7 +277,31 @@ impl Pipeline {
         // the cut-off every open built, and a misnamed column is a mistake whatever state the
         // target is in — better named at this restart than at the next rebuild.
         if let Some(ts) = cfg.dedup_timestamp.as_deref() {
-            dedup::require_columns(&target_schema, ts, cfg.dedup_key.as_deref())?;
+            dedup::require_columns(
+                &target_schema,
+                ts,
+                cfg.dedup_key.as_deref(),
+                &cfg.dedup_partition,
+            )?;
+            // Offsets are a sequence within one partition only, and a merge compares the
+            // sequence across them whenever a key moves partition. Not refused: whether that
+            // column is an offset, and whether keys move, is not something this can know.
+            let integer = target_schema
+                .field_with_name(ts)
+                .is_ok_and(|f| f.data_type().is_integer());
+            if integer && !cfg.dedup_partition.is_empty() && cfg.write_mode.is_upsert() {
+                warn!(
+                    pipeline = %cfg.name,
+                    dedup_timestamp = %ts,
+                    dedup_partition = ?cfg.dedup_partition,
+                    "dedup_timestamp is an integer and the cut-off is kept per partition, so it \
+                     is probably an offset. It is also this merge's sequence, which compares it \
+                     across partitions: a key that moves partition can be merged onto an older \
+                     row, and upsert_lookback and the merge window's pruning read it as one \
+                     order. Prefer a timestamp as the sequence; the cut-off is per partition \
+                     either way."
+                );
+            }
         }
 
         let cutoff = coverage_cutoff(
@@ -327,6 +358,8 @@ impl Pipeline {
                 resumed = cut.window.resumed,
                 dedup_timestamp = %ts,
                 dedup_key = ?cfg.dedup_key,
+                dedup_partition = ?cut.dedup.partition_columns(),
+                partitions = cut.dedup.partition_count(),
                 watermark_known = cut.dedup.watermark_is_known(),
                 boundary_keys = cut.dedup.boundary_key_count(),
                 watermark = %watermark_display(&cut.dedup),
@@ -686,6 +719,7 @@ impl Pipeline {
             };
             let c = match &self.cutoff {
                 Some(cut) => {
+                    // Refuses a null partition as well as a null timestamp, on every mode.
                     let f = cut.dedup.filter(c)?;
                     covered += f.covered;
                     beyond += f.beyond;
@@ -695,11 +729,16 @@ impl Pipeline {
                     // The one check the cut-off made of every batch that is still needed
                     // without it: a row with no timestamp, once written, is one the next
                     // rebuild handover cannot place. Upsert has its own, about the merge.
-                    if let (Some(ts), false) = (
-                        self.cfg.dedup_timestamp.as_deref(),
-                        self.cfg.write_mode.is_upsert(),
-                    ) {
-                        dedup::require_timestamps(&c, ts)?;
+                    if let Some(ts) = self.cfg.dedup_timestamp.as_deref() {
+                        if !self.cfg.write_mode.is_upsert() {
+                            dedup::require_timestamps(&c, ts)?;
+                        }
+                        // And for the same reason a row with no partition, where the cut-off
+                        // is kept per partition: the next handover's read passes it over, and
+                        // the window it opens refuses it. On every mode, as the merge knows
+                        // nothing of partitions; a transform that leaves the column out is
+                        // caught here too, on its first batch, as a column of nulls.
+                        dedup::require_partitions(&c, &self.cfg.dedup_partition)?;
                     }
                     c
                 }
@@ -729,7 +768,8 @@ impl Pipeline {
                 through_version = through,
                 covered,
                 reason = %self.cutoff.as_ref().map_or("none", |c| c.window.reason.as_str()),
-                "skipped rows the target already holds (at or below its watermark)"
+                "skipped rows the target already holds (at or below its watermark, or its \
+                 partition's)"
             );
         }
 
@@ -1808,26 +1848,28 @@ async fn resume_cursor(
     if let Some(ts) = cfg.dedup_timestamp.as_deref() {
         // How far back the rescan has to reach is a question the source's own file
         // statistics can answer, so ask rather than re-reading history every night.
-        let dedup = Dedup::read(target, ts, cfg.dedup_key.as_deref()).await?;
-        let from = match dedup.watermark() {
-            Some(w) => StreamCursor::at_version(
-                dedup::bounded_rescan_start(
-                    source,
-                    ts,
-                    w,
-                    cfg.starting_version,
-                    watermark::DEFAULT_MAX_SCAN,
-                )
-                .await?,
-            ),
-            None => StreamCursor::at_version(cfg.starting_version),
-        };
+        let dedup =
+            Dedup::read_partitioned(target, ts, cfg.dedup_key.as_deref(), &cfg.dedup_partition)
+                .await?;
+        let from = StreamCursor::at_version(
+            dedup::rescan_start(
+                source,
+                &dedup,
+                cfg.starting_version,
+                watermark::DEFAULT_MAX_SCAN,
+            )
+            .await?,
+        );
         warn!(
             pipeline = %cfg.name,
             overwritten_at_target_version = at,
             own_offset = %own,
             dedup_timestamp = ts,
+            dedup_partition = ?cfg.dedup_partition,
             rescan_from = %from,
+            // False when the log could not show where the rebuild read to: a source without
+            // statistics, or — kept per partition — one whose files had to be read and could
+            // not be, or a walk that ran out of `max_scan` first.
             bounded = (from.version > cfg.starting_version),
             // Source versions between our own offset and the rescan's start, which the file
             // statistics say the rebuild covered. Where another writer repaired the target
@@ -1939,11 +1981,27 @@ struct Resume {
 /// half's own pace, and a raw row a rebuild covered can be staged long after this head.
 ///
 /// Recorded windows re-read the target rather than remembering its watermark: a commit made
-/// inside an open window holds only rows exactly at the watermark, so the target's newest
-/// is still the same one, and the keys at it now include ours, which our offset is already
-/// past. A recorded window whose remaining versions up to `H` hold no data is not resumed,
-/// so an idle pipeline whose window ended in compactions does not re-read its target on
-/// every restart.
+/// inside an open window holds only rows exactly at the watermark — with `dedup_partition`,
+/// exactly at their own partition's — so the target's newest is still the same one, and the
+/// keys at it now include ours, which our offset is already past. They are re-read in the form
+/// they were recorded in:
+///
+/// | Recorded per | Configured per | Resumed as |
+/// |---|---|---|
+/// | nothing | nothing | one cut-off |
+/// | `c` | `c` | a cut-off per value of `c` |
+/// | nothing | `c` | not resumed: duplicates, never a gap |
+/// | `c` | nothing, or other columns | not resumed: duplicates, never a gap |
+///
+/// The last because a commit inside a partitioned window can hold rows above other partitions'
+/// marks, which a single cut-off, or one by other columns, would take for covered. The one
+/// before it because a commit does not record its `dedup_timestamp`, and adopting
+/// `dedup_partition` is when that is likely to change — to an offset, whose one global maximum
+/// covers every lower-offset partition.
+///
+/// A recorded window whose remaining versions up to `H` hold no data is not resumed, so an
+/// idle pipeline whose window ended in compactions does not re-read its target on every
+/// restart.
 ///
 /// `H` is fixed only once the window's first commit records it. A reopen before that infers
 /// the window again from whatever the head is then, which matters only where the newer-row
@@ -1961,6 +2019,7 @@ async fn coverage_cutoff(
         return Ok(None);
     };
     let key = cfg.dedup_key.as_deref();
+    let partition = cfg.dedup_partition.as_slice();
     let head = match crate::stage::is_stage_uri(&cfg.source_uri) {
         true => None,
         false => source.version(),
@@ -1969,21 +2028,53 @@ async fn coverage_cutoff(
     let (reason, through, resumed, dedup) = if replaced {
         let dedup = match resume.rebuilt {
             Some(d) => d,
-            None => Dedup::read(target, ts, key).await?,
+            None => Dedup::read_partitioned(target, ts, key, partition).await?,
         };
+        warn_of_restarted_offsets(cfg, target, ts, &dedup)?;
         (CoverageReason::SourceReplaced, None, false, dedup)
     } else if let Some(dedup) = resume.rebuilt {
         (CoverageReason::Rebuilt, head, false, dedup)
     } else if resume.bootstrapping {
-        let dedup = Dedup::read(target, ts, key).await?;
+        let dedup = Dedup::read_partitioned(target, ts, key, partition).await?;
         (CoverageReason::Bootstrap, head, false, dedup)
-    } else if let Some(recorded) = ours.cutoff {
+    } else if let Some(recorded) = &ours.cutoff {
         if let Some(through) = recorded.source_through {
             if !has_data_commit_between(source, cursor.version, through).await? {
                 return Ok(None);
             }
         }
-        let dedup = Dedup::read(target, ts, key).await?;
+        // Resumed only in the form it was recorded in. One recorded per partition can hold
+        // rows above other partitions' marks, so any other reading of it would over-cover.
+        // One recorded with a single cut-off is not resumed under `dedup_partition` either:
+        // the commit does not record which `dedup_timestamp` it was kept on, and adopting
+        // the option is the moment that is likely to change — to an offset, whose one global
+        // maximum would cover every lower-offset partition. Not resumed errs towards
+        // duplicates.
+        let resume_as = match (recorded.partition_columns.as_slice(), partition) {
+            (r, c) if r == c => r,
+            ([], c) => {
+                warn!(
+                    pipeline = %cfg.name,
+                    dedup_partition = ?c,
+                    "a coverage window of ours was recorded with a single cut-off, before \
+                     dedup_partition was set; resuming as though it had closed, so rows the \
+                     target holds may be written again"
+                );
+                return Ok(None);
+            }
+            (r, c) => {
+                warn!(
+                    pipeline = %cfg.name,
+                    recorded = ?r,
+                    dedup_partition = ?c,
+                    "a coverage window of ours was recorded per partition of other columns; \
+                     resuming as though it had closed, so rows the target holds may be \
+                     written again"
+                );
+                return Ok(None);
+            }
+        };
+        let dedup = Dedup::read_partitioned(target, ts, key, resume_as).await?;
         (recorded.reason, recorded.source_through, true, dedup)
     } else {
         return Ok(None);
@@ -2049,14 +2140,69 @@ fn window_closes_after(through: Option<Version>, end: StreamCursor, beyond: usiz
     beyond > 0 || through.is_some_and(|h| !cutoff_applies(h, end))
 }
 
-/// The watermark as a value, for the startup line.
+/// The watermark as a value, for the startup line. Kept per partition, the first few marks
+/// on the line and every one of them at debug.
 fn watermark_display(dedup: &Dedup) -> String {
     use deltalake::arrow::util::display::array_value_to_string;
 
-    dedup
-        .watermark()
-        .and_then(|w| array_value_to_string(w, 0).ok())
-        .unwrap_or_else(|| "none".to_string())
+    const SHOWN: usize = 8;
+    if dedup.partition_columns().is_empty() {
+        return dedup
+            .watermark()
+            .and_then(|w| array_value_to_string(w, 0).ok())
+            .unwrap_or_else(|| "none".to_string());
+    }
+    let marks: Vec<String> = dedup
+        .partition_marks()
+        .into_iter()
+        .map(|(p, m)| format!("{p}={}", array_value_to_string(&m, 0).unwrap_or_default()))
+        .collect();
+    if marks.len() > SHOWN {
+        debug!(marks = %marks.join(", "), "every partition's mark");
+    }
+    match marks.len() {
+        0 => "none".to_string(),
+        n if n > SHOWN => format!("{n} partitions: {}, …", marks[..SHOWN].join(", ")),
+        n => format!("{n} partitions: {}", marks.join(", ")),
+    }
+}
+
+/// Say so when a replaced source is about to be measured against offsets of the old one.
+///
+/// An offset is a position in one topic on one cluster. A topic recreated, or mirrored to
+/// another cluster, starts again near zero, and a replaced source's window has no head to
+/// close at — so until the new offsets pass the old marks, every row it delivers is dropped
+/// as covered.
+fn warn_of_restarted_offsets(
+    cfg: &ResolvedPipeline,
+    target: &DeltaTable,
+    ts: &str,
+    dedup: &Dedup,
+) -> Result<()> {
+    if dedup.partition_columns().is_empty() || dedup.is_inert() {
+        return Ok(());
+    }
+    let schema = target
+        .snapshot()
+        .map_err(Error::Delta)?
+        .snapshot()
+        .read_schema();
+    if schema
+        .field_with_name(ts)
+        .is_ok_and(|f| f.data_type().is_integer())
+    {
+        warn!(
+            pipeline = %cfg.name,
+            dedup_timestamp = %ts,
+            partitions = dedup.partition_count(),
+            "the source was replaced and dedup_timestamp is an integer, kept per partition: \
+             if it is an offset and the topic was recreated or moved to another cluster, its \
+             offsets started again and every row below the old marks is being dropped as \
+             covered. Prefer a timestamp as dedup_timestamp, or reset this pipeline if the \
+             topic changed."
+        );
+    }
+    Ok(())
 }
 
 /// Refuse to start a pipeline whose first version the source's log no longer holds.

@@ -93,8 +93,9 @@ pub struct PipelineMetrics {
     ///
     /// A gauge as well as the counter, because the window that drops them need not end on its
     /// own: after a replaced source, or on a staged upsert's apply half, only a row newer than
-    /// the target's watermark closes it. One that stays at 1 on an idle pipeline is waiting
-    /// for that row, and a watermark somebody pushed into the future would hold it there.
+    /// the target's watermark — than its partition's, with `dedup_partition` — closes it. One
+    /// that stays at 1 on an idle pipeline is waiting for that row, and a watermark somebody
+    /// pushed into the future would hold it there.
     pub coverage_cutoff_active: AtomicI64,
     /// 1 when this pipeline's configuration was accepted, 0 when it was held back at load.
     ///

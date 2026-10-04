@@ -198,6 +198,7 @@ fn pipeline(source: &str, target: &str) -> ResolvedPipeline {
         watermark_uri: None,
         dedup_timestamp: Some("_timestamp".into()),
         dedup_key: Some("order_id".into()),
+        dedup_partition: Vec::new(),
         write_mode: Default::default(),
         upsert_key: None,
         upsert_lookback: None,

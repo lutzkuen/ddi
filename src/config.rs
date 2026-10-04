@@ -322,8 +322,9 @@ pub struct PipelineConfig {
     /// first start against a populated target, after the source was replaced — and only
     /// there must it be non-decreasing in the order rows arrive in the source. A table
     /// written from a multi-partition Kafka topic is append-only and still does not meet
-    /// that, and `watermark_uri` does not help it: where this is set, the watermark table is
-    /// not read. See [`crate::dedup`].
+    /// that, unless `dedup_partition` names the column it is ordered within, and
+    /// `watermark_uri` does not help it: where this is set, the watermark table is not read.
+    /// See [`crate::dedup`].
     #[serde(default)]
     pub dedup_timestamp: Option<String>,
 
@@ -333,6 +334,30 @@ pub struct PipelineConfig {
     /// instant as the rebuild's newest is assumed covered and dropped.
     #[serde(default)]
     pub dedup_key: Option<String>,
+
+    /// The column, or columns, `dedup_timestamp` is ordered within: one cut-off per value
+    /// instead of one for the whole target.
+    ///
+    /// For a source written from a multi-partition Kafka topic — `"kafka_partition"`, or
+    /// `["kafka_topic", "kafka_partition"]` when one table is fed from several topics. Kafka
+    /// orders only within a partition, so a single cut-off takes a lagging partition's late
+    /// rows for covered ones; with this set, a row is covered only when its own partition's
+    /// newest value in the target is at or past it, and a partition the target holds no row
+    /// of has nothing covered. The ordering requirement relaxes to match: `dedup_timestamp`
+    /// must be non-decreasing in arrival order within each value, which `kafka_offset` always
+    /// is — so it may serve as `dedup_timestamp` here, for one topic on one cluster.
+    ///
+    /// The target must carry these columns, and the source columns of the same names must
+    /// hold the same values: the cut-off is read from the one and the rescan bound from the
+    /// other. Integer or string columns only, never null. In dbt:
+    /// `meta: {ddi_partition: kafka_partition}`. See [`crate::dedup`].
+    #[serde(
+        default,
+        deserialize_with = "one_or_many::deserialize",
+        serialize_with = "one_or_many::serialize",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub dedup_partition: Vec<String>,
 
     /// Append every row, or merge it onto the key it already has. See [`crate::upsert`].
     #[serde(default)]
@@ -428,6 +453,14 @@ pub struct PipelineConfig {
     #[serde(skip)]
     pub stage_for: Option<String>,
 
+    /// Why the dbt meta this pipeline was derived from cannot be read, if it cannot. Set only
+    /// by [`crate::dbt::convert::pipelines`], never read from or written to TOML.
+    ///
+    /// Carried to the resolver rather than returned as an error, so one model with a malformed
+    /// `ddi_partition` is held back by name and the rest of the project runs.
+    #[serde(skip)]
+    pub meta_problem: Option<String>,
+
     /// Fully qualified catalog names, so a location can be re-resolved while running.
     /// Filled in from the dbt manifest.
     #[serde(default)]
@@ -504,6 +537,9 @@ pub struct ResolvedPipeline {
     pub dedup_timestamp: Option<String>,
     /// Row identity, for resolving ties at the watermark instant.
     pub dedup_key: Option<String>,
+    /// The columns the cut-off is kept per value of. Empty for one cut-off over the whole
+    /// target. See [`PipelineConfig::dedup_partition`].
+    pub dedup_partition: Vec<String>,
     /// Append, or merge onto the key already stored.
     pub write_mode: WriteMode,
     /// Row identity for the merge. Always `Some` once `write_mode` is `Upsert` — resolve
@@ -904,6 +940,9 @@ impl Resolved {
 /// than a half this code invented. A staged pipeline that fails here is left unexpanded and
 /// rejected by the resolver under its own name.
 fn staged_problem(p: &PipelineConfig) -> Option<String> {
+    if let Some(m) = &p.meta_problem {
+        return Some(m.clone());
+    }
     if p.upsert_key.is_none() && p.dedup_key.is_none() {
         return Some(
             "write_mode = \"staged_upsert\" needs upsert_key (or dedup_key, which it falls \
@@ -940,7 +979,93 @@ fn staged_problem(p: &PipelineConfig) -> Option<String> {
             crate::stage::SUFFIX
         ));
     }
+    // Both halves would carry it, and both be refused under names the operator never wrote.
+    dedup_partition_problem(p)
+}
+
+/// Why this pipeline's `dedup_partition` cannot be what it means, if it cannot.
+///
+/// Only what the config alone can show. That the target has the columns, of a type that can
+/// be grouped by, is checked against the target on every open — see
+/// [`crate::dedup::require_columns`].
+fn dedup_partition_problem(p: &PipelineConfig) -> Option<String> {
+    if p.dedup_partition.is_empty() {
+        return None;
+    }
+    if p.dedup_timestamp.is_none() {
+        return Some(
+            "dedup_partition groups the dedup_timestamp cut-off, and there is no \
+             dedup_timestamp to group. Set dedup_timestamp (in dbt: \
+             `meta: {ddi_timestamp: ...}`), or remove dedup_partition."
+                .into(),
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for c in &p.dedup_partition {
+        if c.trim().is_empty() {
+            return Some("dedup_partition contains an empty column name".into());
+        }
+        if Some(c) == p.dedup_timestamp.as_ref() {
+            return Some(format!(
+                "dedup_partition lists {c:?}, which is dedup_timestamp. A cut-off per value of \
+                 the sequence covers only exact repeats of it, which is not a cut-off. Name the \
+                 column the sequence is ordered within, such as kafka_partition."
+            ));
+        }
+        if Some(c) == p.dedup_key.as_ref() {
+            return Some(format!(
+                "dedup_partition lists {c:?}, which is dedup_key. A row's identity is not a \
+                 grouping: one cut-off per key is unbounded state. Name the column the \
+                 sequence is ordered within, such as kafka_partition."
+            ));
+        }
+        if !seen.insert(c) {
+            return Some(format!(
+                "dedup_partition lists {c:?} twice; a column cannot group the cut-off twice."
+            ));
+        }
+    }
     None
+}
+
+/// A string or a list of strings, read as a list and written back the way it came.
+///
+/// One column is the common case, and writing it as a list of one is the kind of thing nobody
+/// remembers to do. An empty list is refused rather than read as absent, as dbt's
+/// `ddi_partition: []` is: it says the key is set and means it is not, and absent is the
+/// single cut-off, which loses a lagging partition's late rows without a word. Absence itself
+/// never reaches this: `#[serde(default)]` answers it.
+mod one_or_many {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+        Ok(match OneOrMany::deserialize(d)? {
+            OneOrMany::One(s) => vec![s],
+            OneOrMany::Many(v) if v.is_empty() => {
+                return Err(D::Error::custom(
+                    "dedup_partition = [] names no column; name the column(s) the sequence is \
+                     ordered within, such as \"kafka_partition\", or remove the key for a \
+                     single cut-off",
+                ))
+            }
+            OneOrMany::Many(v) => v,
+        })
+    }
+
+    pub fn serialize<S: Serializer>(v: &[String], s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            [one] => one.serialize(s),
+            many => many.serialize(s),
+        }
+    }
 }
 
 /// Turn every `staged_upsert` entry into the two ordinary pipelines that implement it.
@@ -1557,6 +1682,9 @@ impl Config {
     }
 
     fn resolve_one(&self, p: &PipelineConfig, d: &Defaults) -> Result<ResolvedPipeline> {
+        if let Some(m) = &p.meta_problem {
+            return Err(Error::Config(m.clone()));
+        }
         if p.app_id.trim().is_empty() {
             return Err(Error::Config(
                 "app_id must not be empty — it is the offset key".into(),
@@ -1685,6 +1813,7 @@ impl Config {
                 }
             }
         }
+        dedup_partition_problem(p).map_or(Ok(()), |m| Err(Error::Config(m)))?;
         let upsert_lookback = p
             .upsert_lookback
             .as_deref()
@@ -1737,6 +1866,7 @@ impl Config {
                 .or_else(|| self.storage.watermark_uri.clone()),
             dedup_timestamp: p.dedup_timestamp.clone(),
             dedup_key: p.dedup_key.clone(),
+            dedup_partition: p.dedup_partition.clone(),
             write_mode: p.write_mode,
             upsert_key,
             upsert_lookback,
@@ -2213,6 +2343,100 @@ apply_max_latency_secs = 900
         let r = staged();
         assert_eq!(r[0].stage_for.as_deref(), Some("/tmp/silver/style"));
         assert!(r[1].stage_for.is_none());
+    }
+
+    #[test]
+    fn both_staged_halves_carry_dedup_partition() {
+        // The apply half is where a rebuild's window lives, and the ingest half can open a
+        // replaced-source window against its own stage: both cut-offs must be per partition.
+        let toml = format!("{STAGED}dedup_partition = \"kafka_partition\"\n");
+        let r = Config::from_toml_str(&toml).unwrap().resolve().unwrap();
+        assert_eq!(r.len(), 2);
+        for half in &r {
+            assert_eq!(half.dedup_partition, ["kafka_partition"], "{}", half.name);
+        }
+    }
+
+    /// `UPSERT` as an appending pipeline, plus `extra`.
+    fn appending(extra: &str) -> Result<Vec<ResolvedPipeline>> {
+        Config::from_toml_str(&format!(
+            "{}{extra}\n",
+            UPSERT.replace("write_mode = \"upsert\"\n", "")
+        ))
+        .unwrap()
+        .resolve()
+    }
+
+    #[test]
+    fn dedup_partition_is_read_as_one_column_or_several() {
+        let r = appending("dedup_partition = \"kafka_partition\"").unwrap();
+        assert_eq!(r[0].dedup_partition, ["kafka_partition"]);
+        let r = appending("dedup_partition = [\"kafka_topic\", \"kafka_partition\"]").unwrap();
+        assert_eq!(r[0].dedup_partition, ["kafka_topic", "kafka_partition"]);
+        assert!(appending("").unwrap()[0].dedup_partition.is_empty());
+    }
+
+    #[test]
+    fn dedup_partition_needs_dedup_timestamp() {
+        // BASE has no dedup_timestamp.
+        let e = Config::from_toml_str(&format!("{BASE}dedup_partition = \"kafka_partition\"\n"))
+            .unwrap()
+            .resolve()
+            .unwrap_err();
+        assert!(matches!(e, Error::Config(_)), "got: {e}");
+        assert!(e.to_string().contains("dedup_timestamp"), "got: {e}");
+    }
+
+    #[test]
+    fn dedup_partition_cannot_be_the_timestamp_or_the_key() {
+        for (extra, named) in [
+            ("dedup_partition = \"_timestamp\"", "dedup_timestamp"),
+            ("dedup_partition = \"order_id\"", "dedup_key"),
+            (
+                "dedup_partition = [\"kafka_partition\", \"kafka_partition\"]",
+                "twice",
+            ),
+        ] {
+            let e = appending(extra).unwrap_err();
+            assert!(matches!(e, Error::Config(_)), "{extra}: {e}");
+            assert!(e.to_string().contains(named), "{extra}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_empty_dedup_partition_is_refused() {
+        for extra in ["dedup_partition = \"\"", "dedup_partition = [\" \"]"] {
+            let e = appending(extra).unwrap_err();
+            assert!(e.to_string().contains("empty column name"), "{extra}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_empty_dedup_partition_list_is_refused_rather_than_read_as_absent() {
+        // A templated `{{ cols | tojson }}` that rendered nothing. Read as absent it would be
+        // the single cut-off, which loses a lagging partition's late rows without a word.
+        let toml = format!(
+            "{}dedup_partition = []\n",
+            UPSERT.replace("write_mode = \"upsert\"\n", "")
+        );
+        let e = Config::from_toml_str(&toml).unwrap_err().to_string();
+        assert!(e.contains("dedup_partition = [] names no column"), "{e}");
+    }
+
+    #[test]
+    fn a_staged_pipeline_with_a_bad_dedup_partition_is_named_as_the_operator_wrote_it() {
+        for extra in [
+            "dedup_partition = \"_timestamp\"",
+            "dedup_partition = [\"kafka_partition\", \"kafka_partition\"]",
+            "dedup_partition = \"\"",
+        ] {
+            let toml = format!("{STAGED}{extra}\n");
+            let r = Config::from_toml_str(&toml).unwrap().resolve_all().unwrap();
+            let names: Vec<_> = r.rejected.iter().map(|x| x.name.as_str()).collect();
+            assert_eq!(names, ["style"], "{extra}");
+            assert!(r.rejected[0].reason.contains("dedup_partition"), "{extra}");
+            assert!(r.pipelines.is_empty(), "{extra}");
+        }
     }
 
     #[test]

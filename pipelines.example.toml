@@ -96,6 +96,14 @@ write_mode = "upsert"
 # row by row, so the order rows reach the source in does not matter here; that is only
 # needed to recognise what a rebuild, or a target loaded before the first start, covered.
 dedup_timestamp = "_timestamp"
+# Bronze written from a multi-partition Kafka topic (kafka-delta-ingest) orders _timestamp
+# only within a partition, so a lagging partition's late rows look covered to a single
+# cut-off after a rebuild. Keep one per partition instead; the target must carry the column,
+# and every row written must have a value in it, upsert or not.
+# Add the topic, ["kafka_topic", "kafka_partition"], when one table is fed from several. An
+# appending pipeline may use dedup_timestamp = "kafka_offset" with it; an upserting one should
+# keep a timestamp, which the merge also compares across partitions.
+# dedup_partition = "kafka_partition"
 # What a row is matched on. Defaults to dedup_key.
 upsert_key      = "order_id"
 # Optional cost ceiling: never look further back than this, however far the target's file
