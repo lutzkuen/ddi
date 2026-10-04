@@ -337,9 +337,11 @@ pub enum Error {
     /// Checked when a pipeline opens or refreshes its target, rather than discovered by a
     /// failed commit: another engine can upgrade a table's protocol while a pipeline is
     /// writing it, and delta-rs reads a column-mapped table but refuses to write one. See
-    /// docs/kafka-design.md §4.5.
+    /// docs/kafka-design.md §4.5. A Kafka pipeline's data-quality table is asked the same
+    /// before every write, and the refusal is then the cause beneath
+    /// [`Self::DataQualityWrite`].
     #[error(
-        "target {target_uri} needs a writer this build cannot be: {detail}. Nothing was \
+        "table {target_uri} needs a writer this build cannot be: {detail}. Nothing was \
          written. Either write this table with a build that supports it, or point the pipeline \
          at a table without the feature; column mapping in particular cannot be removed from a \
          table in place."
@@ -436,7 +438,118 @@ pub enum Error {
     Other(String),
 }
 
+/// How a Kafka pipeline handles an error its step raises (docs/kafka-design.md §3.6).
+///
+/// Only consumer-fatal errors make a member leave its group; everything else is held, paused
+/// and retried in place, so that one member's trouble never rebalances the others. M3 adds a
+/// `BlockingPartition` class with the errors that pause one partition, which no error of this
+/// build is yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KafkaClass {
+    /// Another writer got there first, or the handle fell behind log cleanup: reset in place,
+    /// and keep the batch while it is still valid.
+    Replan,
+    /// Worth retrying in a moment: hold the batch, pause every owned partition, back off
+    /// 1 s doubling to 60 s, stay in the group. `ddi_kafka_retrying = 1`.
+    Transient,
+    /// Out of capacity, a fact about the machine: hold the batch, pause every owned
+    /// partition, back off the full `RETRY_MAX`, stay in the group, and raise
+    /// `ddi_capacity_exhausted`. Retried a second later, it would re-run the same work into the
+    /// same full directory, every backoff period, as [`Error::Capacity`] says.
+    Capacity,
+    /// Needs an operator, and holds the whole pipeline: pause every owned partition, set the
+    /// gauge, stay in the group, re-check every `blocked_recheck_secs`.
+    BlockingPipeline,
+    /// Refused when the pipeline opens, before it joins its group: `RETRY_MAX` backoff.
+    OpenRefusal,
+    /// The consumer cannot go on: the supervisor drops it, backs off and reopens.
+    ConsumerFatal,
+}
+
 impl Error {
+    /// The class of an error a Kafka pipeline's step raised (docs/kafka-design.md §3.6): its
+    /// commit, the data-quality write before it, and the refreshes around them.
+    ///
+    /// Read by variant, never by text, with one exception that has no variant: delta-rs's
+    /// error for a checkpoint another engine wrote that it cannot read
+    /// ([`crate::storage::is_unreadable_checkpoint`]), which a reset steps over. At open
+    /// everything that stops the pipeline refuses (`OpenRefusal`) whatever its class here.
+    ///
+    /// A [`Self::DataQualityWrite`] is classified by its cause, and apart from the same error
+    /// raised by the target: whatever failed, it failed on the data-quality table, so it is
+    /// never a Replan of the target ([`Self::data_quality_class`]).
+    pub fn kafka_class(&self) -> KafkaClass {
+        use deltalake::kernel::transaction::TransactionError;
+        match self {
+            Error::Capacity(_) => KafkaClass::Capacity,
+            Error::DataQualityWrite { source, .. } => source.data_quality_class(),
+            Error::DataQualityConflict { .. } => KafkaClass::Transient,
+            Error::Fenced { .. } | Error::OffsetLogTruncated { .. } => KafkaClass::Replan,
+            Error::Delta(
+                DeltaTableError::VersionAlreadyExists(_)
+                | DeltaTableError::Transaction {
+                    source:
+                        TransactionError::CommitConflict(_)
+                        | TransactionError::VersionAlreadyExists(_)
+                        | TransactionError::MaxCommitAttempts(_),
+                },
+            ) => KafkaClass::Replan,
+            Error::Delta(e) if crate::storage::is_unreadable_checkpoint(e) => KafkaClass::Replan,
+            Error::Delta(e) if is_unwritable(e) => KafkaClass::BlockingPipeline,
+            // A store outage, and anything else delta-rs raises: retried, and visible as
+            // `ddi_kafka_retrying` while it lasts.
+            Error::Delta(_) | Error::Io(_) => KafkaClass::Transient,
+            // A refresh that fell back to a full open, which folds a store outage and a table
+            // removed while running into this variant: each retry opens again.
+            Error::Config(_) => KafkaClass::Transient,
+            Error::KafkaTxnRetention { .. }
+            | Error::TargetProtocolUnsupported { .. }
+            | Error::TargetReplaced { .. } => KafkaClass::BlockingPipeline,
+            // The SQL, or the rows against the target's schema: the same batch fails the same
+            // way until someone changes one or the other.
+            Error::Transform(_) | Error::Evaluation(_) | Error::Schema(_) => {
+                KafkaClass::BlockingPipeline
+            }
+            Error::KafkaOffsetMissing { .. } => KafkaClass::OpenRefusal,
+            // An internal invariant, and the errors of a Delta source, which a Kafka pipeline
+            // has none of.
+            Error::Other(_)
+            | Error::ChangeCommit { .. }
+            | Error::CommitTooLarge { .. }
+            | Error::DeletionVectorUnsupported { .. }
+            | Error::UnsupportedProtocol { .. }
+            | Error::CursorUnavailable { .. }
+            | Error::BootstrapUnreachable { .. }
+            | Error::SourceFileVacuumed { .. }
+            | Error::SourceReplaced { .. } => KafkaClass::ConsumerFatal,
+        }
+    }
+
+    /// The class of this error as the cause beneath a [`Self::DataQualityWrite`]: the table of
+    /// causes in docs/kafka-design.md §3.6.
+    ///
+    /// - the store failed, a commit is missing under a stale handle, the reopen after a failure
+    ///   failed (`Config`), or any other delta-rs error: Transient, the write is retried and
+    ///   reopens the table first;
+    /// - a full spill directory: Capacity;
+    /// - a table the rejects cannot be written to — its protocol, column mapping, a schema the
+    ///   rejects do not fit — or a commit of its log that cannot be read: Blocking, pipeline,
+    ///   because retrying the same write cannot help until someone changes the table;
+    /// - an internal invariant (a batch that cannot be assembled): Consumer-fatal.
+    fn data_quality_class(&self) -> KafkaClass {
+        match self {
+            Error::DataQualityWrite { source, .. } => source.data_quality_class(),
+            Error::Capacity(_) => KafkaClass::Capacity,
+            Error::TargetProtocolUnsupported { .. } => KafkaClass::BlockingPipeline,
+            Error::Delta(e) if is_store_fault(e) => KafkaClass::Transient,
+            Error::Delta(e) if is_unwritable(e) || is_unfit(e) || is_unreadable_log(e) => {
+                KafkaClass::BlockingPipeline
+            }
+            Error::Other(_) => KafkaClass::ConsumerFatal,
+            _ => KafkaClass::Transient,
+        }
+    }
+
     /// Whether this ran out of capacity: a [`Self::Capacity`], or one beneath a
     /// [`Self::DataQualityWrite`].
     ///
@@ -454,6 +567,46 @@ impl Error {
             _ => false,
         }
     }
+}
+
+/// The object store failed: worth retrying.
+fn is_store_fault(e: &DeltaTableError) -> bool {
+    use deltalake::kernel::transaction::TransactionError;
+    matches!(
+        e,
+        DeltaTableError::ObjectStore { .. }
+            | DeltaTableError::Io { .. }
+            | DeltaTableError::Transaction {
+                source: TransactionError::ObjectStore { .. }
+                    | TransactionError::LogStoreError { .. },
+            }
+    )
+}
+
+/// The table's protocol asks for a writer this build cannot be, or one the rows' types need is
+/// not enabled on it.
+fn is_unwritable(e: &DeltaTableError) -> bool {
+    use deltalake::kernel::transaction::TransactionError;
+    matches!(
+        e,
+        DeltaTableError::Transaction {
+            source: TransactionError::UnsupportedTableFeatures(_)
+                | TransactionError::TableFeaturesRequired(_),
+        }
+    )
+}
+
+/// The rows do not fit the table's schema: a field count, a cast.
+fn is_unfit(e: &DeltaTableError) -> bool {
+    matches!(
+        e,
+        DeltaTableError::Arrow { .. } | DeltaTableError::SchemaMismatch { .. }
+    )
+}
+
+/// A commit of the table's log is not one delta-rs can parse.
+fn is_unreadable_log(e: &DeltaTableError) -> bool {
+    matches!(e, DeltaTableError::InvalidJsonLog { .. })
 }
 
 impl From<deltalake::datafusion::error::DataFusionError> for Error {
@@ -525,6 +678,208 @@ mod tests {
     /// `DataQualityWrite`, which matching the variant at the top misses (main.rs's `RETRY_MAX`
     /// and the capacity gauge do just that). Nothing else beneath one is capacity, nor is a
     /// conflict past the retries in place.
+    /// Every row of docs/kafka-design.md §3.6 that an error of this build can fall in, read
+    /// by variant and never by text — the one exception being delta-rs's foreign-checkpoint
+    /// error, which has no variant of its own. A cause beneath `DataQualityWrite` is classified
+    /// apart from the same error raised by the target: never a Replan.
+    #[test]
+    fn every_error_has_its_kafka_class() {
+        use deltalake::kernel::transaction::{CommitConflictError, TransactionError};
+        use deltalake::logstore::object_store;
+        use KafkaClass::*;
+
+        let outage = || {
+            DeltaTableError::from(object_store::Error::Generic {
+                store: "Azure",
+                source: "503 Server Busy".into(),
+            })
+        };
+        let transaction = |source| DeltaTableError::Transaction { source };
+        let unreadable_commit = || {
+            let json_err = serde_json::from_str::<serde_json::Value>("{not json").unwrap_err();
+            DeltaTableError::InvalidJsonLog {
+                json_err,
+                line: "Error at line 1, column 2".into(),
+                version: 4,
+            }
+        };
+        let arrow = || DeltaTableError::Arrow {
+            source: deltalake::arrow::error::ArrowError::SchemaError("no such field".into()),
+        };
+        let protocol = || Error::TargetProtocolUnsupported {
+            target_uri: "/lake/orders__ddi_dq".into(),
+            detail: "it uses column mapping".into(),
+        };
+        let beneath = |cause: Error| Error::DataQualityWrite {
+            dq_uri: "/lake/orders__ddi_dq".into(),
+            rows: 3,
+            source: Box::new(cause),
+        };
+
+        let rows: Vec<(Error, KafkaClass)> = vec![
+            // Raised by the target's own commit, or the reads before it.
+            (
+                Error::Delta(transaction(TransactionError::CommitConflict(
+                    CommitConflictError::ConcurrentTransaction,
+                ))),
+                Replan,
+            ),
+            (
+                Error::Delta(transaction(TransactionError::CommitConflict(
+                    CommitConflictError::MetadataChanged,
+                ))),
+                Replan,
+            ),
+            (
+                Error::Delta(transaction(TransactionError::VersionAlreadyExists(4))),
+                Replan,
+            ),
+            (
+                Error::Delta(transaction(TransactionError::MaxCommitAttempts(15))),
+                Replan,
+            ),
+            (
+                Error::Delta(DeltaTableError::VersionAlreadyExists(4)),
+                Replan,
+            ),
+            (
+                Error::Delta(DeltaTableError::Generic(
+                    "Invalid data type for Delta Lake: Timestamp(Millisecond, None)".into(),
+                )),
+                Replan,
+            ),
+            (
+                Error::OffsetLogTruncated {
+                    table_uri: "/lake/orders".into(),
+                    version: 4,
+                },
+                Replan,
+            ),
+            (
+                Error::Fenced {
+                    app_id: "orders".into(),
+                    partition: 3,
+                    expected: Some(4),
+                    found: Some(9),
+                },
+                Replan,
+            ),
+            (Error::Delta(outage()), Transient),
+            (
+                Error::Io(std::io::Error::other("connection reset by peer")),
+                Transient,
+            ),
+            (
+                Error::Config("cannot open \"/lake/orders\": 503".into()),
+                Transient,
+            ),
+            (
+                Error::DataQualityConflict {
+                    dq_uri: "/lake/orders__ddi_dq".into(),
+                    rows: 3,
+                    attempts: 4,
+                    detail: "MetadataChanged".into(),
+                },
+                Transient,
+            ),
+            (
+                Error::Capacity("the spill directory is full".into()),
+                Capacity,
+            ),
+            (
+                Error::KafkaTxnRetention {
+                    target_uri: "/lake/orders".into(),
+                    retention: "interval 1 days".into(),
+                },
+                BlockingPipeline,
+            ),
+            (protocol(), BlockingPipeline),
+            (
+                Error::Delta(transaction(TransactionError::UnsupportedTableFeatures(
+                    vec![serde_json::from_str("\"identityColumns\"").unwrap()],
+                ))),
+                BlockingPipeline,
+            ),
+            (
+                Error::TargetReplaced {
+                    target_uri: "/lake/orders".into(),
+                    opened: "a".into(),
+                    found: "b".into(),
+                },
+                BlockingPipeline,
+            ),
+            (
+                Error::Transform("no such column: note".into()),
+                BlockingPipeline,
+            ),
+            (
+                Error::Schema("column note is missing".into()),
+                BlockingPipeline,
+            ),
+            (
+                Error::KafkaOffsetMissing {
+                    app_id: "orders".into(),
+                    partitions: vec![1, 3],
+                },
+                OpenRefusal,
+            ),
+            (
+                Error::Other("internal: a broken invariant".into()),
+                ConsumerFatal,
+            ),
+            (Error::ChangeCommit { version: 4 }, ConsumerFatal),
+            // Beneath a failed data-quality write: about that table, never the target's.
+            (beneath(Error::Delta(outage())), Transient),
+            (
+                beneath(Error::Delta(transaction(TransactionError::ObjectStore {
+                    source: object_store::Error::Generic {
+                        store: "Azure",
+                        source: "timeout".into(),
+                    },
+                }))),
+                Transient,
+            ),
+            (
+                beneath(Error::Delta(DeltaTableError::InvalidVersion(1))),
+                Transient,
+            ),
+            (beneath(Error::Config("cannot open".into())), Transient),
+            (
+                beneath(Error::OffsetLogTruncated {
+                    table_uri: "/lake/orders__ddi_dq".into(),
+                    version: 1,
+                }),
+                Transient,
+            ),
+            (
+                beneath(Error::Delta(transaction(TransactionError::CommitConflict(
+                    CommitConflictError::ConcurrentTransaction,
+                )))),
+                Transient,
+            ),
+            (beneath(Error::Capacity("full".into())), Capacity),
+            (beneath(beneath(Error::Capacity("full".into()))), Capacity),
+            (beneath(protocol()), BlockingPipeline),
+            (
+                beneath(Error::Delta(transaction(
+                    TransactionError::TableFeaturesRequired(
+                        serde_json::from_str("\"timestampNtz\"").unwrap(),
+                    ),
+                ))),
+                BlockingPipeline,
+            ),
+            (beneath(Error::Delta(arrow())), BlockingPipeline),
+            (beneath(Error::Delta(unreadable_commit())), BlockingPipeline),
+            (
+                beneath(Error::Other("cannot assemble".into())),
+                ConsumerFatal,
+            ),
+        ];
+        for (e, class) in rows {
+            assert_eq!(e.kafka_class(), class, "{e:?}");
+        }
+    }
+
     #[test]
     fn a_capacity_failure_beneath_a_data_quality_write_is_capacity() {
         let beneath = |cause: Error| Error::DataQualityWrite {

@@ -418,9 +418,11 @@ impl DataQuality {
     /// one some way, and a lost reject is worse than a duplicate (I9).
     ///
     /// Every other failure is [`Error::DataQualityWrite`], with what failed beneath it as it
-    /// was raised — delta-rs's error, `Capacity`, or the `Config` of a failed reopen — so that
-    /// the pipeline can tell a fault worth retrying from a table it cannot write, and neither
-    /// from a failure of the target (§3.6).
+    /// was raised — delta-rs's error, `Capacity`, the `Config` of a failed reopen, or the
+    /// `TargetProtocolUnsupported` a table with a protocol or column mapping delta-rs cannot
+    /// write is refused with before anything is written — so that the pipeline can tell a
+    /// fault worth retrying from a table it cannot write, and neither from a failure of the
+    /// target ([`Error::kafka_class`], §3.6).
     ///
     /// [`Self::write`] and its equality rule are untouched by any of this.
     pub async fn write_kafka(
@@ -522,6 +524,10 @@ impl DataQuality {
         offsets: &KafkaOffsets,
         write_id: &str,
     ) -> std::result::Result<(), Attempt> {
+        // Asked first, as of a target: delta-rs reads a column-mapped table and refuses to
+        // write one only once it is writing, with an error of no type of its own, which would
+        // be retried as a passing fault for as long as the table stays as it is.
+        crate::fence::refuse_unwritable_protocol(&self.table).map_err(Attempt::Failed)?;
         let ranges: serde_json::Map<String, serde_json::Value> = offsets
             .ranges
             .iter()
@@ -1257,6 +1263,7 @@ mod tests {
 
     // ---------------------------------------------------------------- commits that go wrong
 
+    use crate::error::KafkaClass;
     use deltalake::logstore::object_store::{
         self, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
         ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
@@ -1645,9 +1652,9 @@ mod tests {
     /// Every way `write_kafka` fails is an error a retry loop can sort by type rather than by
     /// its text (docs/kafka-design.md §3.6): a failed write with what failed typed beneath
     /// it, or a conflict that outlasted the retries. Never a bare cause, which would read as
-    /// the target's. A table the rejects cannot be written to is delta-rs's protocol or Arrow
-    /// error beneath, the variants §3.6 classifies as Blocking; a log cleaned up under a stale
-    /// data-quality handle is delta-rs's `InvalidVersion` beneath, Transient, which the reopen
+    /// the target's. A table the rejects cannot be written to is the protocol refusal, or
+    /// delta-rs's protocol or Arrow error, beneath: Blocking. A log cleaned up under a stale
+    /// data-quality handle is delta-rs's `InvalidVersion` beneath: Transient, which the reopen
     /// after it cures.
     #[tokio::test]
     async fn dq_write_failures_are_typed() {
@@ -1698,6 +1705,7 @@ mod tests {
         )
         .await;
         let e = fail(wrong).await;
+        assert_eq!(e.kafka_class(), KafkaClass::BlockingPipeline, "{e:?}");
         assert!(
             matches!(
                 cause(&e),
@@ -1720,6 +1728,7 @@ mod tests {
         ));
         create_with(extra, with_extra).await;
         let e = fail(extra).await;
+        assert_eq!(e.kafka_class(), KafkaClass::BlockingPipeline, "{e:?}");
         assert!(
             matches!(cause(&e), Error::Delta(DeltaTableError::Arrow { .. })),
             "{e:?}"
@@ -1738,14 +1747,12 @@ mod tests {
              \"writerFeatures\":[\"timestampNtz\",\"identityColumns\"]}}\n",
         )
         .unwrap();
+        // Refused before anything is written, as a target with that protocol is.
         let e = fail(upgraded).await;
+        assert_eq!(e.kafka_class(), KafkaClass::BlockingPipeline, "{e:?}");
         assert!(
-            matches!(
-                cause(&e),
-                Error::Delta(DeltaTableError::Transaction {
-                    source: TransactionError::UnsupportedTableFeatures(_)
-                })
-            ),
+            matches!(cause(&e), Error::TargetProtocolUnsupported { detail, .. }
+                if detail.contains("IdentityColumns")),
             "{e:?}"
         );
 
@@ -1788,6 +1795,7 @@ mod tests {
             matches!(cause(&e), Error::Delta(DeltaTableError::InvalidVersion(1))),
             "{e:?}"
         );
+        assert_eq!(e.kafka_class(), KafkaClass::Transient, "{e:?}");
         // The failure reopened the handle, so the batch's next attempt goes through.
         assert_eq!(
             stale
@@ -1796,6 +1804,122 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    /// Commit `version` of the data-quality table at `path` by hand, as another engine that
+    /// turns column mapping on writes it: the protocol gains the `columnMapping` feature, and
+    /// every column a field id and a physical name.
+    fn turn_on_column_mapping(path: &str, version: u64) {
+        let zero = std::fs::read_to_string(format!("{path}/_delta_log/{:020}.json", 0)).unwrap();
+        let lines: Vec<serde_json::Value> = zero
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let mut metadata = lines
+            .iter()
+            .find(|l| l.get("metaData").is_some())
+            .unwrap()
+            .clone();
+        let mut schema: serde_json::Value =
+            serde_json::from_str(metadata["metaData"]["schemaString"].as_str().unwrap()).unwrap();
+        let fields = schema["fields"].as_array_mut().unwrap();
+        for (i, field) in fields.iter_mut().enumerate() {
+            field["metadata"] = serde_json::json!({
+                "delta.columnMapping.id": i + 1,
+                "delta.columnMapping.physicalName": format!("col-{i}"),
+            });
+        }
+        let max = fields.len();
+        metadata["metaData"]["schemaString"] = serde_json::json!(schema.to_string());
+        metadata["metaData"]["configuration"]["delta.columnMapping.mode"] =
+            serde_json::json!("name");
+        metadata["metaData"]["configuration"]["delta.columnMapping.maxColumnId"] =
+            serde_json::json!(max.to_string());
+        let protocol = serde_json::json!({"protocol": {
+            "minReaderVersion": 3, "minWriterVersion": 7,
+            "readerFeatures": ["timestampNtz", "columnMapping"],
+            "writerFeatures": ["timestampNtz", "columnMapping"],
+        }});
+        let info = serde_json::json!({"commitInfo": {
+            "timestamp": 1_700_000_000_000i64, "operation": "SET TBLPROPERTIES"
+        }});
+        std::fs::write(
+            format!("{path}/_delta_log/{version:020}.json"),
+            format!("{info}\n{protocol}\n{metadata}\n"),
+        )
+        .unwrap();
+    }
+
+    /// The data files under the table at `path`.
+    fn data_files(path: &str) -> usize {
+        std::fs::read_dir(path)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".parquet")
+            })
+            .count()
+    }
+
+    /// delta-rs reads a column-mapped table and refuses to write one, with an error that is
+    /// not its protocol error. The write asks first, so the cause is the typed refusal a
+    /// target gets, which §3.6 classifies Blocking, pipeline: retrying cannot help until
+    /// someone points the pipeline at another table. And nothing is written first.
+    #[tokio::test]
+    async fn dq_column_mapped_table_is_refused_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        turn_on_column_mapping(path, 1);
+        let mut dq = open_dq(path).await;
+
+        let e = dq
+            .write_kafka(
+                &[undecodable(0, &[3], MALFORMED)],
+                &read(&[(0, (0, 9))]),
+                NOW,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(cause(&e), Error::TargetProtocolUnsupported { detail, .. }
+                if detail.contains("ColumnMapping")),
+            "{e:?}"
+        );
+        assert_eq!(e.kafka_class(), KafkaClass::BlockingPipeline);
+        assert!(!std::path::Path::new(&format!("{path}/_delta_log/{:020}.json", 2)).exists());
+        assert_eq!(data_files(path), 0, "refused before anything was written");
+    }
+
+    /// A commit of the data-quality table that cannot be read stops the write with a cause
+    /// §3.6 classifies Blocking, pipeline: retrying cannot help until someone repairs the log,
+    /// and it is no internal fault of the consumer's, which would make it leave its group.
+    #[tokio::test]
+    async fn dq_unreadable_commit_is_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+        // Another writer's commit, after this handle's version, that is not JSON.
+        std::fs::write(
+            format!("{path}/_delta_log/{:020}.json", 1),
+            "{\"commitInfo\": not json at all",
+        )
+        .unwrap();
+
+        let e = dq
+            .write_kafka(
+                &[undecodable(0, &[3], MALFORMED)],
+                &read(&[(0, (0, 9))]),
+                NOW,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::DataQualityWrite { .. }), "{e:?}");
+        assert_eq!(e.kafka_class(), KafkaClass::BlockingPipeline, "{e:?}");
     }
 
     /// An object store that refuses the commit: the store's own error, typed beneath.
@@ -1833,6 +1957,7 @@ mod tests {
             matches!(cause(&e), Error::Delta(DeltaTableError::ObjectStore { .. })),
             "{e:?}"
         );
+        assert_eq!(e.kafka_class(), KafkaClass::Transient);
     }
 
     /// A rival that changes the table's metadata first, every time: the retries in place run
@@ -1869,6 +1994,7 @@ mod tests {
             "{e:?}"
         );
         assert_eq!(dq.kafka_counters().conflict_retries(), 3);
+        assert_eq!(e.kafka_class(), KafkaClass::Transient);
         assert_eq!(struck.load(Ordering::SeqCst), 4, "one rival per attempt");
     }
 }
