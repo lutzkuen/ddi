@@ -1386,6 +1386,11 @@ pub(super) fn resolve_entries(
     (ok, rejected)
 }
 
+/// How many of `running` read Kafka.
+pub fn count(running: &[ResolvedPipeline]) -> usize {
+    running.iter().filter(|p| p.kafka.is_some()).count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2461,6 +2466,30 @@ url = "http://my-sr:8081"
         assert!(
             e.contains("broker"),
             "a misspelt section key is an error too: {e}"
+        );
+    }
+
+    #[test]
+    fn the_budget_reserves_for_each_running_kafka_pipeline() {
+        use crate::budget::{Budget, KAFKA_RESERVE_BYTES};
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let cfg = config(&format!(
+            "[runtime]\nmax_memory = \"1GiB\"\n{DELTA}{SECTION}{}{}",
+            entry("a", ""),
+            entry("b", "")
+        ));
+        let r = cfg.resolve_all_with(true).unwrap();
+        assert_eq!(running(&r), ["orders", "a", "b"]);
+        assert_eq!(
+            cfg.budget(&r.pipelines).unwrap().per_pipeline(),
+            Budget::resolve_reserving(Some(GIB), 3, 2 * KAFKA_RESERVE_BYTES)
+                .unwrap()
+                .per_pipeline()
+        );
+        // Delta pipelines alone get the budget they always did.
+        assert_eq!(
+            cfg.budget(&r.pipelines[..1]).unwrap().per_pipeline(),
+            Budget::resolve(Some(GIB), 1).per_pipeline()
         );
     }
 

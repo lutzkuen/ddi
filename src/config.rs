@@ -1296,14 +1296,20 @@ impl Config {
     /// Called once at startup, with the pipelines that are actually going to run — not the
     /// ones written down, since a rejected pipeline allocates nothing and dividing by it
     /// would make everyone else's share too small.
-    pub fn budget(&self, running: usize) -> Result<crate::budget::Budget> {
+    ///
+    /// Each Kafka pipeline among them first sets aside
+    /// [`crate::budget::KAFKA_RESERVE_BYTES`] for librdkafka, which holds it outside every
+    /// bound the budget sets (docs/kafka-design.md §3.7). Without one, this is the budget it
+    /// always was.
+    pub fn budget(&self, running: &[ResolvedPipeline]) -> Result<crate::budget::Budget> {
         let configured = self
             .runtime
             .max_memory
             .as_deref()
             .map(|s| parse_size(s, "runtime.max_memory"))
             .transpose()?;
-        Ok(crate::budget::Budget::resolve(configured, running))
+        let reserved = kafka::count(running) as u64 * crate::budget::KAFKA_RESERVE_BYTES;
+        crate::budget::Budget::resolve_reserving(configured, running.len(), reserved)
     }
 
     /// The process's spill budget, resolved and probed against the filesystem.

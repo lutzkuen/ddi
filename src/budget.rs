@@ -74,6 +74,12 @@ const BATCH_SHARE: f64 = 0.5;
 /// raise it is the only order that cannot OOM on the way to learning the ratio.
 const ASSUMED_AMPLIFICATION: f64 = 8.0;
 
+/// What one Kafka pipeline holds that no pool or batch bound here covers: librdkafka's
+/// prefetch queue (`queued.max.messages.kbytes = 16384`, see `config::kafka`) and about as
+/// much again in its threads and buffers (docs/kafka-design.md §3.7). Set aside before the
+/// rest is divided, so the shares are what the pipelines can actually use.
+pub const KAFKA_RESERVE_BYTES: u64 = 32 * 1024 * 1024;
+
 impl Budget {
     /// Work out the budget once, from configuration and from the container.
     ///
@@ -81,14 +87,49 @@ impl Budget {
     /// deployment that sets neither still gets a bound and one that sets both gets the
     /// tighter. `pipelines` is what it is divided by.
     pub fn resolve(configured: Option<u64>, pipelines: usize) -> Self {
+        Self {
+            per_pipeline: Self::total(configured).map(|t| t / (pipelines.max(1) as u64)),
+        }
+    }
+
+    /// As [`Self::resolve`], with `reserved` bytes set aside before the rest is divided:
+    /// memory the process will hold that nothing here bounds, such as librdkafka's per Kafka
+    /// pipeline ([`KAFKA_RESERVE_BYTES`]).
+    ///
+    /// A budget that cannot hold the reservation at all is an error rather than a share of
+    /// nothing: every DataFusion operation would fail on its first byte, and the process
+    /// would be over its limit before it read a message.
+    pub fn resolve_reserving(
+        configured: Option<u64>,
+        pipelines: usize,
+        reserved: u64,
+    ) -> Result<Self> {
+        let total = Self::total(configured);
+        if let Some(t) = total {
+            if reserved > 0 && t <= reserved {
+                return Err(Error::Config(format!(
+                    "the memory budget, {}, cannot hold the {} set aside for librdkafka ({} per \
+                     Kafka pipeline) before any pipeline gets a share. Raise [runtime] \
+                     max_memory or the container's limit, or run fewer Kafka pipelines in this \
+                     process.",
+                    bytesize::ByteSize(t),
+                    bytesize::ByteSize(reserved),
+                    bytesize::ByteSize(KAFKA_RESERVE_BYTES)
+                )));
+            }
+        }
+        Ok(Self {
+            per_pipeline: total.map(|t| (t - reserved.min(t)) / (pipelines.max(1) as u64)),
+        })
+    }
+
+    /// The whole process's budget: `configured` or the container's, whichever is smaller.
+    fn total(configured: Option<u64>) -> Option<u64> {
         let from_cgroup = cgroup_limit().map(|l| (l as f64 * SHARE_OF_CGROUP) as u64);
-        let total = match (configured, from_cgroup) {
+        match (configured, from_cgroup) {
             (Some(c), Some(g)) => Some(c.min(g)),
             (Some(c), None) => Some(c),
             (None, g) => g,
-        };
-        Self {
-            per_pipeline: total.map(|t| t / (pipelines.max(1) as u64)),
         }
     }
 
@@ -320,6 +361,31 @@ mod tests {
     fn one_pipeline_gets_the_whole_budget_and_zero_does_not_divide_by_zero() {
         assert_eq!(Budget::resolve(Some(1000), 1).per_pipeline(), Some(1000));
         assert_eq!(Budget::resolve(Some(1000), 0).per_pipeline(), Some(1000));
+    }
+
+    #[test]
+    fn kafka_pipelines_reserve_memory_before_shares() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let b = Budget::resolve_reserving(Some(GIB), 4, 2 * KAFKA_RESERVE_BYTES).unwrap();
+        assert_eq!(b.per_pipeline(), Some((GIB - 64 * 1024 * 1024) / 4));
+        // Nothing reserved is exactly `resolve`.
+        assert_eq!(
+            Budget::resolve_reserving(Some(GIB), 4, 0)
+                .unwrap()
+                .per_pipeline(),
+            Budget::resolve(Some(GIB), 4).per_pipeline()
+        );
+        // A budget that cannot hold the reservation says so, with the numbers.
+        let e = Budget::resolve_reserving(Some(64 * 1024 * 1024), 3, 2 * KAFKA_RESERVE_BYTES)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("librdkafka"), "{e}");
+        assert!(e.contains("max_memory"), "{e}");
+        // No budget is still no budget, with or without Kafka.
+        if cgroup_limit().is_none() {
+            let b = Budget::resolve_reserving(None, 4, KAFKA_RESERVE_BYTES).unwrap();
+            assert_eq!(b.per_pipeline(), None);
+        }
     }
 
     #[test]

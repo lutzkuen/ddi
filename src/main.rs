@@ -204,7 +204,7 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
     }
     // Divided by what will actually run, not by what was written down: a held-back pipeline
     // allocates nothing, and counting it would make everyone else's share too small.
-    let budget = cfg.budget(pipelines.len())?;
+    let budget = cfg.budget(&pipelines)?;
     budget.clone().install();
 
     // The third and fourth process-wide limits. The spill budget is the only one whose
