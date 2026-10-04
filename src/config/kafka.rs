@@ -251,6 +251,14 @@ impl KafkaSettings {
         self.0.get(key).map(String::as_str)
     }
 
+    /// The value of librdkafka's setting `name`, under whichever of its names it is set.
+    pub fn property(&self, name: &str) -> Option<&str> {
+        let property = librdkafka_property(name);
+        self.iter()
+            .find(|(k, _)| librdkafka_property(k) == property)
+            .map(|(_, v)| v)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
@@ -273,6 +281,12 @@ impl KafkaSettings {
 
     fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
         self.0.insert(key.into(), value.into());
+    }
+
+    /// Sets `key`, replacing the setting under any other name librdkafka reads it by: a later
+    /// layer wins, whichever name either layer wrote it under.
+    fn set(&mut self, key: &str, value: impl Into<String>) {
+        set_property(&mut self.0, key, value.into());
     }
 
     /// The value as it may be logged: itself, or `<redacted>` for a secret key.
@@ -594,6 +608,29 @@ fn librdkafka_property(key: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// `map[key] = value`, after removing the setting under every other name librdkafka reads
+/// it by, so that no two names for one setting reach the client.
+fn set_property(map: &mut BTreeMap<String, String>, key: &str, value: String) {
+    let property = librdkafka_property(key);
+    map.retain(|k, _| librdkafka_property(k) != property);
+    map.insert(key.to_string(), value);
+}
+
+/// Refuses one table that writes one librdkafka setting under two names: nothing says which
+/// of the two it means.
+fn refuse_two_names(keys: &[&str], place: &str) -> Result<()> {
+    let mut seen: BTreeMap<std::borrow::Cow<'_, str>, &str> = BTreeMap::new();
+    for key in keys {
+        if let Some(first) = seen.insert(librdkafka_property(key), key) {
+            return Err(Error::Config(format!(
+                "{place}: {first:?} and {key:?} are one librdkafka setting under two names, \
+                 and nothing says which value is meant; keep one"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The values [`FORCED_KEYS`] get, in the order they are applied.
 fn forced_values(brokers: &str, group_id: &str) -> [(&'static str, String); 7] {
     [
@@ -663,8 +700,9 @@ impl ResolvedKafka {
             }
         }
 
+        // A later layer replaces an earlier one's setting under any of librdkafka's names for it.
         for (k, v) in self.settings.iter() {
-            out.insert(k, v);
+            out.set(k, v);
         }
         for (key, var) in &self.settings_env {
             let value = env(var).ok_or_else(|| {
@@ -673,7 +711,7 @@ impl ResolvedKafka {
                      not set"
                 ))
             })?;
-            out.insert(key.as_str(), value);
+            out.set(key, value);
         }
 
         // Steps 1 and 2 never set a forced key, so any here came from the user, and a value
@@ -682,7 +720,7 @@ impl ResolvedKafka {
         for key in out.keys() {
             refuse_forced_key(key, "settings")?;
         }
-        check_values(&out, |key| out.contains_key(key)).map_err(Error::Config)?;
+        check_values(&out, |key| out.property(key).is_some()).map_err(Error::Config)?;
 
         for (k, v) in forced_values(&self.brokers, &self.group_id) {
             out.insert(k, v);
@@ -747,7 +785,7 @@ fn check_values(
     // Rule 8. kdi ran with librdkafka's default `range,roundrobin` (CONFIGURATION.md:129).
     // `cooperative-sticky` is accepted when the consumer is created (probe, §0.3.21), and
     // incremental rebalancing is exactly what deferred assignment cannot follow.
-    if let Some(s) = settings.get("partition.assignment.strategy") {
+    if let Some(s) = settings.property("partition.assignment.strategy") {
         let strategies: Vec<String> = s
             .split(',')
             .map(|x| x.trim().to_ascii_lowercase())
@@ -762,11 +800,9 @@ fn check_values(
     }
 
     // Rule 9. The build has no libsasl2; librdkafka's own default mechanism is GSSAPI, so a
-    // SASL protocol without a mechanism asks for it too.
-    let mechanism = settings
-        .get("sasl.mechanisms")
-        .or_else(|| settings.get("sasl.mechanism"));
-    if let Some(m) = mechanism {
+    // SASL protocol without a mechanism asks for it too. Each layer has replaced the one
+    // before under either name, so the one value here is the one librdkafka gets.
+    if let Some(m) = settings.property("sasl.mechanisms") {
         if m.trim().eq_ignore_ascii_case("GSSAPI") {
             return Err(
                 "sasl.mechanism = \"GSSAPI\" (Kerberos) is not supported: this build \
@@ -777,9 +813,9 @@ fn check_values(
         }
     }
     let sasl = settings
-        .get("security.protocol")
+        .property("security.protocol")
         .is_some_and(|p| p.trim().to_ascii_lowercase().starts_with("sasl_"));
-    if sasl && !has_key("sasl.mechanism") && !has_key("sasl.mechanisms") {
+    if sasl && !has_key("sasl.mechanisms") {
         return Err(
             "security.protocol is SASL but sasl.mechanism is not set, and librdkafka's \
              default mechanism is GSSAPI (Kerberos), which this build does not have. \
@@ -789,7 +825,7 @@ fn check_values(
     }
 
     // Rule 15.
-    if let Some(level) = settings.get("isolation.level") {
+    if let Some(level) = settings.property("isolation.level") {
         if level.trim().eq_ignore_ascii_case("read_uncommitted") {
             warnings.push(
                 "isolation.level = \"read_uncommitted\": rows of transactions that are later \
@@ -1245,19 +1281,27 @@ impl Config {
                 p.settings_env.keys().map(String::as_str).collect(),
             ),
         ] {
-            for key in keys {
+            for key in &keys {
                 refuse_forced_key(key, place)?;
             }
+            refuse_two_names(&keys, place)?;
         }
-        let mut settings = s.settings.clone();
-        for (k, v) in p.settings.iter() {
-            settings.insert(k, v);
+        // The pipeline's key wins, under any of librdkafka's names for the setting.
+        let mut settings = KafkaSettings::default();
+        for (k, v) in s.settings.iter().chain(p.settings.iter()) {
+            settings.set(k, v);
         }
-        let mut settings_env = s.settings_env.clone();
-        settings_env.extend(p.settings_env.clone());
+        let mut settings_env = BTreeMap::new();
+        for (k, v) in s.settings_env.iter().chain(&p.settings_env) {
+            set_property(&mut settings_env, k, v.clone());
+        }
         warnings.extend(
             check_values(&settings, |key| {
-                settings.contains_key(key) || settings_env.contains_key(key)
+                let property = librdkafka_property(key);
+                settings.property(key).is_some()
+                    || settings_env
+                        .keys()
+                        .any(|k| librdkafka_property(k) == property)
             })
             .map_err(Error::Config)?,
         );
@@ -2673,6 +2717,77 @@ url = "http://my-sr:8081"
             )
         ));
         assert_eq!(running(&r), ["events"], "{r:?}");
+    }
+
+    #[test]
+    fn a_later_layer_replaces_an_earlier_layers_spelling() {
+        let sasl = "\"security.protocol\" = \"SASL_SSL\"\n";
+        let layered = |section: &str, pipeline: &str| {
+            resolve(&format!(
+                "{SECTION}[kafka.settings]\n{sasl}{section}\n{}",
+                entry("events", &format!("[kafka.pipeline.settings]\n{pipeline}"))
+            ))
+        };
+        // `sasl.mechanism` is librdkafka's alias of `sasl.mechanisms` (rdkafka_conf.c:992): the
+        // pipeline's own key wins under whichever name either layer used.
+        let r = layered(
+            "\"sasl.mechanisms\" = \"SCRAM-SHA-256\"",
+            "\"sasl.mechanism\" = \"SCRAM-SHA-512\"",
+        );
+        let k = kafka(&r, "events");
+        assert_eq!(k.settings.get("sasl.mechanism"), Some("SCRAM-SHA-512"));
+        assert_eq!(k.settings.get("sasl.mechanisms"), None, "{:?}", k.settings);
+        let s = settings_of(&r, "events", &[]).unwrap();
+        assert_eq!(
+            (s.get("sasl.mechanism"), s.get("sasl.mechanisms")),
+            (Some("SCRAM-SHA-512"), None)
+        );
+
+        // So GSSAPI is judged where it wins, under either name.
+        let r = layered(
+            "\"sasl.mechanism\" = \"GSSAPI\"",
+            "\"sasl.mechanisms\" = \"SCRAM-SHA-512\"",
+        );
+        let s = settings_of(&r, "events", &[]).unwrap();
+        assert_eq!(
+            (s.get("sasl.mechanism"), s.get("sasl.mechanisms")),
+            (None, Some("SCRAM-SHA-512"))
+        );
+        let r = layered(
+            "\"sasl.mechanisms\" = \"SCRAM-SHA-512\"",
+            "\"sasl.mechanism\" = \"GSSAPI\"",
+        );
+        assert!(held(&r, "events").contains("GSSAPI"), "{r:?}");
+
+        // settings_env, the later layer, replaces a setting's other spelling at open.
+        let r = resolve(&format!(
+            "{SECTION}{}",
+            entry(
+                "events",
+                &format!(
+                    "[kafka.pipeline.settings]\n{sasl}\"sasl.mechanism\" = \"SCRAM-SHA-512\"\n\
+                     [kafka.pipeline.settings_env]\n\"sasl.mechanisms\" = \"MECH\""
+                )
+            )
+        ));
+        let s = settings_of(&r, "events", &[("MECH", "SCRAM-SHA-256")]).unwrap();
+        assert_eq!(
+            (s.get("sasl.mechanism"), s.get("sasl.mechanisms")),
+            (None, Some("SCRAM-SHA-256"))
+        );
+
+        // Two names for one setting in one table: nothing says which one is meant.
+        let reason = refused(
+            "",
+            &format!(
+                "[kafka.pipeline.settings]\n{sasl}\"sasl.mechanism\" = \"SCRAM-SHA-512\"\n\
+                 \"sasl.mechanisms\" = \"SCRAM-SHA-256\""
+            ),
+        );
+        assert!(
+            reason.contains("\"sasl.mechanism\"") && reason.contains("\"sasl.mechanisms\""),
+            "{reason}"
+        );
     }
 
     /// [`librdkafka_property`] against librdkafka itself: a value set under one name is what

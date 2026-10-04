@@ -466,6 +466,8 @@ Later steps win, mirroring kdi (lib.rs:1297-1341):
    - The PEM variables → `ssl.certificate.pem`, `ssl.key.pem`, `ssl.ca.pem`.
 3. `[kafka.settings]`, then `[kafka.pipeline.settings]`.
 4. `settings_env`, section first and then pipeline. A missing variable is a config error.
+
+   In steps 3 and 4 a later layer replaces an earlier one's setting under any name librdkafka sets it by (`sasl.mechanism` is its alias of `sasl.mechanisms`, rdkafka_conf.c:992; for `topic.` see §2.5), so the map never holds two names for one setting, which rdkafka's `ClientConfig` would apply in `HashMap` order (config.rs:197, 296-300). One table that writes one setting under two names is refused. Rules 8, 9 and 15 read the setting, under whichever name it ended up.
 5. **Forced keys.** It is a config error for the user to set any of these:
    - `bootstrap.servers` (from `brokers`) and `group.id` (from `group_id`);
    - `enable.auto.commit=false`, `enable.auto.offset.store=false`;
