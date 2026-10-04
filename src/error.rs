@@ -362,6 +362,29 @@ pub enum Error {
         found: String,
     },
 
+    /// kafka-delta-ingest wrote this app_id's offsets, ddi has not taken them over yet, and
+    /// partitions whose topic holds messages have no offset among them.
+    ///
+    /// Each is a partition kafka-delta-ingest never wrote a row for, or one whose offset
+    /// expired under `delta.setTransactionRetentionDuration` while it ran; the table cannot
+    /// tell the two apart, and reading the second again from offset 0 would duplicate it.
+    /// Raised once, when a pipeline opens, before it joins its group: an explicit
+    /// `starting_offsets` entry per partition is the acknowledgment
+    /// (docs/kafka-design.md §4.4).
+    #[error(
+        "app_id {app_id:?}: kafka-delta-ingest wrote this table's offsets, and partition(s) \
+         {partitions:?} have none although their topic holds messages. Each is either a \
+         partition kafka-delta-ingest never wrote a row for, or one whose offset expired under \
+         delta.setTransactionRetentionDuration, which reading from offset 0 would duplicate; \
+         the table cannot tell which. Check the data (`ddi kafka plan` prints the evidence) and \
+         give each an explicit starting_offsets entry, the next offset to read. Nothing was \
+         read or written, and the pipeline has not joined its group."
+    )]
+    KafkaOffsetMissing {
+        app_id: String,
+        partitions: Vec<i32>,
+    },
+
     #[error("transform error: {0}")]
     Transform(String),
 

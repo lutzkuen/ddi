@@ -1128,6 +1128,7 @@ mod tests {
             cleanup_logs: false,
             baseline: false,
             override_reason: None,
+            takeover_marker: false,
         }
     }
 

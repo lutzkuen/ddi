@@ -24,6 +24,13 @@
 //! them. What delta-rs cannot see is what the snapshot itself already holds; that is what
 //! [`Fence::verify`] checks, for a partition no commit of ours has carried since the handle
 //! last moved.
+//!
+//! # Taking them over
+//!
+//! ddi resumes offsets kafka-delta-ingest wrote, under the same appIds. The first commit ddi
+//! makes under an app_id also writes the takeover marker ([`takeover_marker_app_id`]), a
+//! `txn` nothing ever removes, so from then on the table says for good which of the two
+//! wrote last ([`era`]). Before that, [`takeover_check`] is the one check a takeover needs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -68,6 +75,142 @@ pub fn txn_app_id(app_id: &str, partition: i32) -> String {
     format!("{app_id}-{partition}")
 }
 
+/// The version the takeover marker is written with. Any would do: what counts is that the
+/// appId has a `txn` at all.
+pub const TAKEOVER_MARKER_VERSION: i64 = 1;
+
+/// The `txn` appId that records that ddi has taken over `app_id`'s offsets in a target: the
+/// takeover marker (docs/kafka-design.md §4.3).
+///
+/// Written once, by the first Kafka commit of `app_id` whose read snapshot lacks it
+/// ([`Fence::takeover_marker_due`]), and by no commit after. Nothing removes it: the protocol
+/// has no action that takes a `txn` out of a table, every checkpoint writer keeps every
+/// `txn`, and this one carries no `lastUpdated`, so not even
+/// `delta.setTransactionRetentionDuration`, which a target is refused with anyway, could
+/// expire it. Its presence is therefore exactly "ddi has committed under this app_id here".
+/// No property of the partitions' own `txn`s can say that: kafka-delta-ingest stamps each with
+/// a `lastUpdated` and ddi does not, but checkpoint writers rewrite the field (delta-rs up to
+/// 0.17.3 nulls it, Trino writes 0 for a `txn` without one), and a commit's metadata does not
+/// survive a checkpoint at all.
+///
+/// Never the appId of a partition's offset, `<a>-<p>`, of any app_id `a`: it ends in `.ddi`,
+/// not in digits.
+pub fn takeover_marker_app_id(app_id: &str) -> String {
+    format!("{app_id}.ddi")
+}
+
+/// The partition `txn_app_id` holds the offset of for `app_id`: `p` for `<app_id>-<p>`.
+pub fn partition_of(app_id: &str, txn_app_id: &str) -> Option<i32> {
+    let digits = txn_app_id.strip_prefix(app_id)?.strip_prefix('-')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Who has written one app_id's offsets in a target (docs/kafka-design.md §4.4 step 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Era {
+    /// Nobody: no partition has an offset, and there is no takeover marker.
+    Fresh,
+    /// kafka-delta-ingest, and ddi has not taken them over: some partition has an offset, and
+    /// there is no takeover marker.
+    Kdi,
+    /// ddi: the takeover marker is there.
+    Ddi,
+}
+
+/// The era of `app_id`'s offsets, from `txns` as [`read_txns`] returns them for every
+/// partition of its topic and for [`takeover_marker_app_id`].
+///
+/// Exact: the marker is there or it is not, and a partition has an offset or it has not.
+/// Nothing is inferred from who wrote a `txn`, nor from its `lastUpdated`.
+pub fn era(app_id: &str, txns: &BTreeMap<String, TxnState>) -> Era {
+    let held = |id: &str| txns.get(id).is_some_and(|t| t.version.is_some());
+    if held(&takeover_marker_app_id(app_id)) {
+        Era::Ddi
+    } else if txns
+        .iter()
+        .any(|(id, t)| t.version.is_some() && partition_of(app_id, id).is_some())
+    {
+        Era::Kdi
+    } else {
+        Era::Fresh
+    }
+}
+
+/// The one check taking over kafka-delta-ingest's offsets needs, made when a pipeline opens,
+/// before it joins its group (docs/kafka-design.md §4.4 step 3).
+///
+/// `partitions` holds every partition of the topic, from metadata, with its offset in the
+/// target (`None`: no `txn`) and its high watermark; `acknowledged` the partitions an explicit
+/// `starting_offsets` entry names (a `"*"` names none).
+///
+/// In [`Era::Kdi`] a partition without an offset whose topic holds messages is one
+/// kafka-delta-ingest never wrote a row for, or one whose offset expired under
+/// `delta.setTransactionRetentionDuration` while it ran, and the table cannot tell which.
+/// Reading the second from offset 0 would duplicate it, so unless every such partition is
+/// acknowledged this refuses with [`Error::KafkaOffsetMissing`], naming all of them. A
+/// partition whose topic held nothing had no message, so no offset of it can have expired.
+///
+/// In [`Era::Ddi`] there is nothing to check. The member whose commit wrote the marker passed
+/// this check while the marker was absent, under the same acknowledgments (every member reads
+/// one config), and no offset has gone missing since, because ddi's never expire. A partition
+/// without one is new, or one nothing of is in the table ([`start_without_offset`]).
+/// [`Era::Fresh`] starts where `starting_offsets` says.
+pub fn takeover_check(
+    app_id: &str,
+    era: Era,
+    partitions: &BTreeMap<i32, (Option<i64>, i64)>,
+    acknowledged: &BTreeSet<i32>,
+) -> Result<()> {
+    if era != Era::Kdi {
+        return Ok(());
+    }
+    let missing: Vec<i32> = partitions
+        .iter()
+        .filter(|(p, (stored, high))| stored.is_none() && *high > 0 && !acknowledged.contains(p))
+        .map(|(p, _)| *p)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::KafkaOffsetMissing {
+        app_id: app_id.to_string(),
+        partitions: missing,
+    })
+}
+
+/// Where a partition without an offset starts reading, in a target that is not fresh
+/// (docs/kafka-design.md §4.4, the `None` rows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoTxnStart {
+    /// At its explicit `starting_offsets` entry, an acknowledgment.
+    Explicit(i64),
+    /// At exactly offset 0: nothing of the partition is in the table.
+    Zero,
+    /// Blocked, `KafkaOffsetsUnavailable`: the topic no longer holds offset `wanted`.
+    Unavailable { wanted: i64, low: i64 },
+    /// Blocked, `KafkaOffsetsRegressed`: the topic does not hold offset `wanted` yet.
+    Regressed { wanted: i64, high: i64 },
+}
+
+/// Where a partition without an offset starts, from its watermarks and its explicit
+/// `starting_offsets` entry, if it has one: there, if the topic holds it; otherwise at
+/// exactly offset 0, unless messages ddi never read were trimmed (EO-M4a).
+///
+/// The same in both eras of a target that is not fresh: in [`Era::Kdi`], [`takeover_check`]
+/// has refused at open every partition this would start at 0 when it may have had an offset.
+pub fn start_without_offset(low: i64, high: i64, explicit: Option<i64>) -> NoTxnStart {
+    match explicit {
+        Some(wanted) if wanted < low => NoTxnStart::Unavailable { wanted, low },
+        Some(wanted) if wanted > high => NoTxnStart::Regressed { wanted, high },
+        Some(wanted) => NoTxnStart::Explicit(wanted),
+        None if low == 0 => NoTxnStart::Zero,
+        None => NoTxnStart::Unavailable { wanted: 0, low },
+    }
+}
+
 /// One appId's newest `txn`, and what the commit that wrote it says about it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TxnState {
@@ -77,99 +220,13 @@ pub struct TxnState {
     /// The message at that offset, as the commit that wrote the `txn` recorded it in
     /// `ddi.kafka.marks`. `None` when that commit recorded none, or recorded one for a
     /// different offset, and when the `txn` was found only in a checkpoint, which keeps no
-    /// commit metadata.
+    /// commit metadata, and the commit below it was not reached.
     pub mark: Option<MessageMark>,
-    /// The `txn`'s `lastUpdated`, which says who wrote it ([`Self::writer`]) and whether it
-    /// can expire ([`Self::may_expire`]).
-    pub last_updated: LastUpdated,
     /// The decoder the commit that wrote the `txn` recorded in `ddi.kafka.decoder`, as a
     /// Kafka data-quality commit records the one that judged its rejects
     /// ([`crate::dq::decoder_identity`]). `None` for any other commit, and when the `txn` was
     /// found only in a checkpoint.
     pub decoder: Option<String>,
-}
-
-impl TxnState {
-    /// Who wrote this `txn`, as its `lastUpdated` says.
-    pub fn writer(&self) -> Writer {
-        match (self.version, self.last_updated) {
-            (Some(_), LastUpdated::Absent) => Writer::Ddi,
-            (Some(_), LastUpdated::At(_)) => Writer::Other,
-            (Some(_), LastUpdated::Unknown) | (None, _) => Writer::Unknown,
-        }
-    }
-
-    /// Whether this `txn` can expire under `delta.setTransactionRetentionDuration`: it has a
-    /// `lastUpdated`, or it was read where its `lastUpdated` could not be seen.
-    pub fn may_expire(&self) -> bool {
-        self.version.is_some() && self.last_updated != LastUpdated::Absent
-    }
-}
-
-/// A `txn`'s `lastUpdated`.
-///
-/// The protocol expires a `txn` under `delta.setTransactionRetentionDuration` by this field
-/// alone, and one without it never (set_transaction.rs:10-21). It is also what tells the two
-/// writers of a Kafka pipeline's offsets apart: kafka-delta-ingest stamps every `txn` with
-/// the time it wrote it (delta_helpers.rs:29-40), ddi never stamps one (`Transaction::new`).
-/// A checkpoint keeps it with the `txn`, so the answer is the same whether the `txn` was read
-/// from the commit that wrote it or from a checkpoint above that commit.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LastUpdated {
-    /// The `txn` has none.
-    Absent,
-    /// The `txn` has one: milliseconds since the epoch.
-    At(i64),
-    /// Not known: there is no `txn`, or the kernel answered for a checkpoint this cannot read,
-    /// and the kernel gives the version alone.
-    #[default]
-    Unknown,
-}
-
-/// Who wrote an appId's newest `txn`, as its `lastUpdated` says.
-///
-/// ddi and a stopped kafka-delta-ingest are the only writers of a Kafka pipeline's offsets
-/// (docs/kafka-design.md §4.3), and [`LastUpdated`] tells them apart exactly, wherever the
-/// `txn` was read. Who wrote the *commit* is not asked: a `txn` read from a checkpoint has no
-/// commit, and on a table only ddi has written offsets to that happens whenever a checkpoint
-/// lands above ddi's last commit — another pipeline sharing the target, or another engine's
-/// OPTIMIZE at a checkpoint-interval version.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Writer {
-    /// ddi: the `txn` has no `lastUpdated`, and never expires.
-    Ddi,
-    /// kafka-delta-ingest: the `txn` has a `lastUpdated`, and can expire.
-    Other,
-    /// Not known: there is no `txn`, or its `lastUpdated` could not be seen.
-    Unknown,
-}
-
-/// Whether kafka-delta-ingest wrote these offsets: some `txn` among them is its, and none is
-/// ddi's (docs/kafka-design.md §4.4 step 2).
-///
-/// `txns` are one app_id's, as [`read_txns`] returns them for every partition of its topic.
-pub fn kdi_era(txns: &BTreeMap<String, TxnState>) -> bool {
-    let writers: Vec<Writer> = txns.values().map(TxnState::writer).collect();
-    writers.contains(&Writer::Other) && !writers.contains(&Writer::Ddi)
-}
-
-/// Whether a partition that has no offset among `txns` may have had one that expired, so
-/// that reading it again from offset 0 could duplicate it (docs/kafka-design.md §4.4, the
-/// `None` row; EO-M4b).
-///
-/// Only a `txn` with a `lastUpdated` can expire, and the writer that stamps one stamps every
-/// `txn` it writes. So it may when some `txn` of this app_id can expire ([`TxnState::may_expire`],
-/// a `lastUpdated` not seen counting as one), and the table's history ever set
-/// `delta.setTransactionRetentionDuration`, which `retention_ever_set` says. Who wrote the
-/// commits does not enter into it: kafka-delta-ingest's offsets read from a checkpoint alone
-/// can have lost a sibling exactly as those read from its commits can.
-///
-/// `txns` are one app_id's, as [`read_txns`] returns them for every partition of its topic.
-pub fn offset_may_have_expired(
-    txns: &BTreeMap<String, TxnState>,
-    retention_ever_set: bool,
-) -> bool {
-    retention_ever_set && txns.values().any(TxnState::may_expire)
 }
 
 /// What reading offsets has cost, for `ddi_kafka_offset_lookups_total`,
@@ -231,13 +288,14 @@ impl LookupCounters {
 ///    time, stopping as soon as every appId has been found. Each found `txn` takes its mark
 ///    from `ddi.kafka.marks` in the same commit, when that commit is ddi's (`ddi.appId`).
 /// 4. For the appIds still missing, the checkpoint's `txn` column, read once. What it
-///    answers comes with its `lastUpdated` but no mark: a checkpoint keeps no commitInfo.
+///    answers comes without a mark: a checkpoint keeps no commitInfo.
 /// 5. Only if that checkpoint cannot be read here: the kernel, one appId at a time, counted
-///    in [`LookupCounters::fallbacks`]. It answers with the version alone.
-/// 6. For what steps 4 and 5 answered, the commits below the checkpoint, newest first,
-///    [`IN_FLIGHT`] at a time, until each of those appIds has been met: the newest commit
-///    with its `txn` gives back the mark beside it, and for a kernel answer its `lastUpdated`,
-///    when that `txn` holds the version answered. Without them the re-read check of a resume
+///    in [`LookupCounters::fallbacks`].
+/// 6. For the partitions' offsets steps 4 and 5 answered (appIds `<a>-<p>`: no other `txn`
+///    has a mark, the takeover marker among them), the commits below the checkpoint, newest
+///    first, [`IN_FLIGHT`] at a time, until each of those appIds has been met: the newest
+///    commit with its `txn` gives back the mark beside it, when that `txn` holds the version
+///    answered. Without them the re-read check of a resume
 ///    (docs/kafka-design.md §4.4, I19) is off for the partition until it carries data again.
 ///    Bounded twice: by [`BELOW_CHECKPOINT_READS`] commits, counted in
 ///    [`LookupCounters::below_checkpoint_reads`], and by the first commit log cleanup has
@@ -385,14 +443,12 @@ async fn walk(
         .collect();
     match checkpoint_txns(store, &checkpoint, &rest).await {
         Ok(txns) => {
-            for (id, (version, last_updated)) in txns {
+            for (id, version) in txns {
                 found.insert(
                     id,
                     TxnState {
                         version: Some(version),
-                        mark: None,
-                        last_updated,
-                        decoder: None,
+                        ..TxnState::default()
                     },
                 );
             }
@@ -411,7 +467,7 @@ async fn walk(
     }
     let answered: BTreeSet<&str> = rest
         .into_iter()
-        .filter(|id| found.contains_key(*id))
+        .filter(|id| found.contains_key(*id) && may_carry_a_mark(id))
         .collect();
     if below == Below::Marks && !answered.is_empty() {
         below_checkpoint(table, checkpoint.version, answered, found, counters).await?;
@@ -457,9 +513,6 @@ async fn below_checkpoint(
             if written.version == answer.version {
                 answer.mark = written.mark;
                 answer.decoder = written.decoder;
-                if answer.last_updated == LastUpdated::Unknown {
-                    answer.last_updated = written.last_updated;
-                }
             }
         }
         if answered.is_empty() {
@@ -524,21 +577,13 @@ struct LogLine {
     commit_info: Option<CommitInfo>,
 }
 
+/// A `txn` action, as far as it is read here: its `lastUpdated` is not, since nothing here
+/// depends on who wrote a `txn` or when.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TxnAction {
     app_id: String,
     version: i64,
-    /// Absent and `null` alike mean the `txn` has none.
-    #[serde(default)]
-    last_updated: Option<i64>,
-}
-
-impl TxnAction {
-    fn last_updated(&self) -> LastUpdated {
-        self.last_updated
-            .map_or(LastUpdated::Absent, LastUpdated::At)
-    }
 }
 
 /// The keys of a commitInfo this module reads. ddi writes them at its top level, beside
@@ -591,13 +636,11 @@ fn record_commit(
         .and_then(serde_json::Value::as_str);
     for txn in txns {
         let mark = ddi_app_id.and_then(|app_id| mark_for(marks, app_id, &txn));
-        let last_updated = txn.last_updated();
         found.insert(
             txn.app_id,
             TxnState {
                 version: Some(txn.version),
                 mark,
-                last_updated,
                 decoder: decoder.map(str::to_string),
             },
         );
@@ -615,11 +658,8 @@ fn mark_for(
     app_id: &str,
     txn: &TxnAction,
 ) -> Option<MessageMark> {
-    let partition = txn.app_id.strip_prefix(app_id)?.strip_prefix('-')?;
-    if partition.is_empty() || !partition.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let [offset, timestamp_ms, value_len] = marks?.get(partition)?.as_array()?.as_slice() else {
+    let partition = partition_of(app_id, &txn.app_id)?.to_string();
+    let [offset, timestamp_ms, value_len] = marks?.get(&partition)?.as_array()?.as_slice() else {
         return None;
     };
     let mark = MessageMark {
@@ -628,6 +668,15 @@ fn mark_for(
         value_len: u32::try_from(value_len.as_u64()?).ok()?,
     };
     (mark.offset == txn.version).then_some(mark)
+}
+
+/// Whether a `txn` with this appId can have a mark beside it: one that names a partition,
+/// `<a>-<p>`. The takeover marker and a Delta pipeline's offset cannot, so the walk below a
+/// checkpoint is not sent after them.
+fn may_carry_a_mark(app_id: &str) -> bool {
+    app_id
+        .rsplit_once('-')
+        .is_some_and(|(a, p)| partition_of(a, app_id).is_some() && !p.is_empty())
 }
 
 /// A complete checkpoint: every file that makes it up.
@@ -785,11 +834,10 @@ fn complete(version: u64, files: Vec<(CheckpointFile, ObjectMeta)>) -> Option<Ch
         })
 }
 
-/// One `txn` of a checkpoint: its appId, version and `lastUpdated`.
-type CheckpointTxn = (String, i64, LastUpdated);
+/// One `txn` of a checkpoint: its appId and version.
+type CheckpointTxn = (String, i64);
 
-/// The version and `lastUpdated` each wanted appId has in `checkpoint`, or why the checkpoint
-/// cannot be read.
+/// The version each wanted appId has in `checkpoint`, or why the checkpoint cannot be read.
 ///
 /// Reads the `txn` column and nothing else: a parquet checkpoint is projected to it, so the
 /// columns another engine writes in its own way (`stats_parsed` above all) are never decoded.
@@ -799,7 +847,7 @@ async fn checkpoint_txns(
     store: Arc<dyn ObjectStore>,
     checkpoint: &Checkpoint,
     wanted: &BTreeSet<&str>,
-) -> std::result::Result<BTreeMap<String, (i64, LastUpdated)>, String> {
+) -> std::result::Result<BTreeMap<String, i64>, String> {
     let mut txns = BTreeMap::new();
     for file in &checkpoint.files {
         let in_file = if file.location.as_ref().ends_with(".json") {
@@ -807,17 +855,16 @@ async fn checkpoint_txns(
         } else {
             parquet_txns(store.clone(), file).await?
         };
-        for (id, version, last_updated) in in_file {
+        for (id, version) in in_file {
             if !wanted.contains(id.as_str()) {
                 continue;
             }
             // A checkpoint is the reconciled state: one txn per appId. Two that disagree mean
             // it is not a checkpoint this can read.
-            if let Some(other) = txns.insert(id.clone(), (version, last_updated)) {
-                if other != (version, last_updated) {
+            if let Some(other) = txns.insert(id.clone(), version) {
+                if other != version {
                     return Err(format!(
-                        "it holds two txns for appId {id:?}, {other:?} and {:?}",
-                        (version, last_updated)
+                        "it holds two txns for appId {id:?}, versions {other} and {version}"
                     ));
                 }
             }
@@ -841,8 +888,7 @@ async fn json_txns(
     let mut txns = Vec::new();
     for line in serde_json::Deserializer::from_slice(&bytes).into_iter::<LogLine>() {
         if let Some(txn) = line.map_err(|e| e.to_string())?.txn {
-            let last_updated = txn.last_updated();
-            txns.push((txn.app_id, txn.version, last_updated));
+            txns.push((txn.app_id, txn.version));
         }
     }
     Ok(txns)
@@ -904,15 +950,8 @@ async fn parquet_txns(
         let app_ids = app_ids.as_string::<i32>();
         let versions = cast(versions, &DataType::Int64)?;
         let versions = versions.as_primitive::<Int64Type>();
-        // The protocol's checkpoint schema has it. A checkpoint without it, or with it in a
-        // shape that is no timestamp, does not say whether its txns can expire.
-        let last_updated = match txn.column_by_name("lastUpdated") {
-            Some(a) if matches!(a.data_type(), DataType::Int64 | DataType::Int32) => {
-                Some(cast(a, &DataType::Int64)?)
-            }
-            _ => None,
-        };
-        let last_updated = last_updated.as_ref().map(|a| a.as_primitive::<Int64Type>());
+        // `lastUpdated` is not read: checkpoint writers do not agree on it (delta-rs up to
+        // 0.17.3 nulls it, Trino writes 0 for a txn without one), and nothing here needs it.
         for row in 0..txn.len() {
             if txn.is_null(row) || app_ids.is_null(row) {
                 continue; // a row for another kind of action
@@ -923,12 +962,7 @@ async fn parquet_txns(
                     app_ids.value(row)
                 ));
             }
-            let stamp = match last_updated {
-                None => LastUpdated::Unknown,
-                Some(a) if a.is_null(row) => LastUpdated::Absent,
-                Some(a) => LastUpdated::At(a.value(row)),
-            };
-            txns.push((app_ids.value(row).to_string(), versions.value(row), stamp));
+            txns.push((app_ids.value(row).to_string(), versions.value(row)));
         }
     }
     Ok(txns)
@@ -967,6 +1001,8 @@ fn missing_commit(table: &DeltaTable, version: u64) -> Error {
 /// - The handle a commit is made from changes only through our own commits, which leave
 ///   carried exactly what they asserted ([`Self::committed`]), and through deliberate
 ///   refreshes, each followed by [`Self::reset`].
+/// - The first commit whose read snapshot lacks the takeover marker writes it, and no commit
+///   after ([`Self::takeover_marker_due`]).
 #[derive(Debug)]
 pub struct Fence {
     app_id: String,
@@ -976,6 +1012,14 @@ pub struct Fence {
     /// Owned partitions whose offset is known at the handle's version: read there by
     /// [`Self::reset`] or [`Self::verify`], or asserted by every commit since.
     carried: BTreeSet<i32>,
+    /// Whether the takeover marker ([`takeover_marker_app_id`]) is in the table at the
+    /// handle's version: read there by [`Self::reset`] or [`Self::verify`], or written by a
+    /// commit of ours since. `None` until a read succeeds.
+    ///
+    /// Once `Some(true)`, never read again: nothing removes a marker, so it is in the table
+    /// at every later version, whichever handle reads it. That keeps a reset at our own newest
+    /// commit, which does not carry it, to the one GET.
+    marker: Option<bool>,
     lookups: Arc<LookupCounters>,
 }
 
@@ -986,7 +1030,44 @@ impl Fence {
             app_id: app_id.into(),
             base: BTreeMap::new(),
             carried: BTreeSet::new(),
+            marker: None,
             lookups: Arc::new(LookupCounters::default()),
+        }
+    }
+
+    /// Whether the next commit writes the takeover marker: it was not in the table at the
+    /// handle's version (docs/kafka-design.md §4.3).
+    ///
+    /// Exact once [`Self::reset`] or [`Self::verify`] has read the handle's version, as the
+    /// latter does before every commit. Before any read it says yes: writing the marker where
+    /// it already is costs at most one `ConcurrentTransaction` against another member doing
+    /// the same, while leaving it out of the table would make the next open check a takeover
+    /// that has already happened.
+    ///
+    /// Two members that both find it absent both write it, and delta-rs refuses the second
+    /// commit (`ConcurrentTransaction`), as it refuses any commit carrying a `txn` that another
+    /// wrote after its snapshot. That member replans, finds the marker, and writes it no more.
+    pub fn takeover_marker_due(&self) -> bool {
+        self.marker != Some(true)
+    }
+
+    /// The appIds a read at the handle's version asks about for `partitions`, and the takeover
+    /// marker's when it is not known to be there.
+    fn ids_to_read(&self, partitions: &[i32]) -> Vec<String> {
+        let mut ids: Vec<String> = partitions
+            .iter()
+            .map(|p| txn_app_id(&self.app_id, *p))
+            .collect();
+        if self.marker != Some(true) {
+            ids.push(takeover_marker_app_id(&self.app_id));
+        }
+        ids
+    }
+
+    /// Take the takeover marker's state from a read at the handle's version that asked for it.
+    fn read_marker(&mut self, txns: &BTreeMap<String, TxnState>) {
+        if let Some(txn) = txns.get(&takeover_marker_app_id(&self.app_id)) {
+            self.marker = Some(txn.version.is_some());
         }
     }
 
@@ -1007,14 +1088,18 @@ impl Fence {
     /// Unverifiable (docs/kafka-design.md §4.4) until it carries data again.
     ///
     /// Every owned partition is then carried: all of them were just read at the handle's
-    /// version. On an error nothing is carried, so that no offset is trusted until a reset
-    /// succeeds.
+    /// version. So is the takeover marker, in the same pass, unless it is known to be there
+    /// already. On an error nothing is carried, so that no offset is trusted until a reset
+    /// succeeds, and the marker is not known unless it was before.
     pub async fn reset(&mut self, table: &DeltaTable, owned: &[i32]) -> Result<()> {
-        let ids: Vec<String> = owned.iter().map(|p| txn_app_id(&self.app_id, *p)).collect();
+        let ids = self.ids_to_read(owned);
         let txns = match read_txns(table, &ids, &self.lookups).await {
             Ok(txns) => txns,
             Err(e) => {
                 self.carried.clear();
+                if self.marker == Some(false) {
+                    self.marker = None;
+                }
                 return Err(e);
             }
         };
@@ -1027,6 +1112,7 @@ impl Fence {
             })
             .collect();
         self.carried = owned.iter().copied().collect();
+        self.read_marker(&txns);
         Ok(())
     }
 
@@ -1037,6 +1123,9 @@ impl Fence {
     /// steady state every batch partition is carried and nothing is read. A mismatch is
     /// [`Error::Fenced`]: somebody else committed the partition, and the batch was read from
     /// the wrong place.
+    ///
+    /// The takeover marker is read in the same pass when it is not known at the handle's
+    /// version, so that [`Self::takeover_marker_due`] is exact for the commit that follows.
     pub async fn verify(
         &mut self,
         table: &DeltaTable,
@@ -1047,7 +1136,7 @@ impl Fence {
             .copied()
             .filter(|p| !self.carried.contains(p))
             .collect();
-        if unverified.is_empty() {
+        if unverified.is_empty() && self.marker.is_some() {
             return Ok(());
         }
         if let Some(p) = unverified.iter().find(|p| !self.base.contains_key(p)) {
@@ -1057,13 +1146,17 @@ impl Fence {
                 self.app_id
             )));
         }
-        let ids: Vec<String> = unverified
+        let mut ids: Vec<String> = unverified
             .iter()
             .map(|p| txn_app_id(&self.app_id, *p))
             .collect();
+        if self.marker.is_none() {
+            ids.push(takeover_marker_app_id(&self.app_id));
+        }
         // [`read_txns`] without its step 6: only the versions are compared.
         refuse_txn_retention(table)?;
         let txns = read(table, &ids, &self.lookups, Below::Nothing).await?;
+        self.read_marker(&txns);
         for (p, id) in unverified.iter().zip(&ids) {
             let expected = self.base[p].0;
             let found = txns.get(id).and_then(|t| t.version);
@@ -1124,8 +1217,14 @@ impl Fence {
     ///
     /// Every owned partition it asserted now has that offset, and is carried; nothing else
     /// is, because the commit may have been rebased over another writer's, which this fence
-    /// has not read. A partition forgotten since the commit was built stays forgotten.
+    /// has not read. A partition forgotten since the commit was built stays forgotten. The
+    /// takeover marker is in the table if the commit wrote it; otherwise what this fence knew
+    /// of it stands, which is all [`Self::takeover_marker_due`] needs (one that was there is
+    /// there still).
     pub fn committed(&mut self, offsets: &KafkaOffsets) {
+        if offsets.takeover_marker {
+            self.marker = Some(true);
+        }
         let mut carried = BTreeSet::new();
         for (p, version) in &offsets.assert {
             if let Some(base) = self.base.get_mut(p) {
@@ -1272,6 +1371,7 @@ mod tests {
             cleanup_logs: false,
             baseline: false,
             override_reason: None,
+            takeover_marker: false,
         }
     }
 
@@ -1299,13 +1399,43 @@ mod tests {
         let ranges_map: BTreeMap<i32, (i64, i64)> = ranges.iter().copied().collect();
         fence.verify(&table, &ranges_map).await?;
         let (assert, marks) = fence.assert_map(&ranges_map, &BTreeMap::new());
-        let offsets = offsets(ranges, &assert, &marks);
+        let mut offsets = offsets(ranges, &assert, &marks);
+        offsets.takeover_marker = fence.takeover_marker_due();
         let empty = RecordBatch::new_empty(schema_of(&table));
         let table = Sink::new(APP, 0)
             .commit_kafka(table, vec![empty], &offsets)
             .await?;
         fence.committed(&offsets);
         Ok(table)
+    }
+
+    /// A txn-only commit that writes the takeover marker and nothing else: a table ddi has
+    /// taken over, before any partition of it has an offset.
+    async fn take_over(table: DeltaTable) -> DeltaTable {
+        let mut marked = offsets(&[], &BTreeMap::new(), &BTreeMap::new());
+        marked.takeover_marker = true;
+        let empty = RecordBatch::new_empty(schema_of(&table));
+        Sink::new(APP, 0)
+            .commit_kafka(table, vec![empty], &marked)
+            .await
+            .unwrap()
+    }
+
+    /// The txns commit `version` of the table at `dir` writes, (appId, version), read from its
+    /// JSON as it lies in the log.
+    fn txns_in_commit(dir: &std::path::Path, version: u64) -> Vec<(String, i64)> {
+        let commit = std::fs::read_to_string(log_file(dir, &commit_name(version))).unwrap();
+        commit
+            .lines()
+            .filter_map(|l| {
+                let line: serde_json::Value = serde_json::from_str(l).unwrap();
+                let txn = line.get("txn")?;
+                Some((
+                    txn["appId"].as_str().unwrap().to_string(),
+                    txn["version"].as_i64().unwrap(),
+                ))
+            })
+            .collect()
     }
 
     fn ids(partitions: impl IntoIterator<Item = i32>) -> Vec<String> {
@@ -1579,9 +1709,11 @@ mod tests {
     async fn fence_disjoint_partitions_do_not_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
-        create(path).await;
+        // Taken over already: the first commits' race to write the marker is
+        // `two_members_racing_to_take_over_conflict_once`.
+        take_over(create(path).await).await;
 
-        // Two members of one group, each with its own handle on version 0.
+        // Two members of one group, each with its own handle on version 1.
         let (mut a_table, mut b_table) = (open(path).await, open(path).await);
         let (mut a, mut b) = (Fence::new(APP), Fence::new(APP));
         a.reset(&a_table, &[0, 1]).await.unwrap();
@@ -1601,8 +1733,8 @@ mod tests {
         b_table = fenced_commit(&mut b, b_table, &[(2, (5, 8))])
             .await
             .unwrap();
-        assert_eq!(a_table.version(), Some(3));
-        assert_eq!(b_table.version(), Some(4));
+        assert_eq!(a_table.version(), Some(4));
+        assert_eq!(b_table.version(), Some(5));
 
         let table = open(path).await;
         let counters = LookupCounters::default();
@@ -1730,7 +1862,8 @@ mod tests {
         let path = dir.path().to_str().unwrap();
         create(path).await;
 
-        let table = assert_txns(open(path).await, &[(0, 1), (1, 2), (2, 3)]).await;
+        let table = take_over(open(path).await).await;
+        let table = assert_txns(table, &[(0, 1), (1, 2), (2, 3)]).await;
         let mut fence = Fence::new(APP);
         fence.reset(&table, &[0, 1, 2]).await.unwrap();
         let ranges = BTreeMap::from([(0, (2, 5))]);
@@ -1811,16 +1944,23 @@ mod tests {
         refuse_txn_retention(&plain).unwrap();
     }
 
-    /// What the refusal protects against, and why ddi's own offsets need no protecting: a
-    /// `txn` without `lastUpdated` survives the property being set after the fact, and a
-    /// checkpoint written under it; one with an old `lastUpdated`, as kafka-delta-ingest
-    /// wrote them, does not.
+    /// What the refusal protects against, and why ddi's own offsets and its takeover marker
+    /// need no protecting: a `txn` without `lastUpdated` survives the property being set after
+    /// the fact, and a checkpoint written under it; one with an old `lastUpdated`, as
+    /// kafka-delta-ingest wrote them, does not.
     #[tokio::test]
     async fn txns_without_last_updated_never_expire() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         create(path).await;
-        assert_txns(open(path).await, &[(0, 5)]).await;
+        let mut first = offsets(&[(0, (5, 5))], &BTreeMap::from([(0, 5)]), &BTreeMap::new());
+        first.takeover_marker = true;
+        let table = open(path).await;
+        let empty = RecordBatch::new_empty(schema_of(&table));
+        Sink::new(APP, 0)
+            .commit_kafka(table, vec![empty], &first)
+            .await
+            .unwrap();
         kdi_commit(dir.path(), 2, "app-1", 7, 1_000);
         let table = open(path)
             .await
@@ -1848,6 +1988,13 @@ mod tests {
             BTreeMap::from([(0, Some(5)), (1, None)]),
             "and a checkpoint written under the property keeps ours"
         );
+        let marker = reopened
+            .snapshot()
+            .unwrap()
+            .transaction_version(reopened.log_store().as_ref(), takeover_marker_app_id(APP))
+            .await
+            .unwrap();
+        assert_eq!(marker, Some(TAKEOVER_MARKER_VERSION), "the marker too");
 
         assert!(matches!(
             refuse_txn_retention(&reopened),
@@ -1859,21 +2006,31 @@ mod tests {
     async fn read_txns_one_get_in_steady_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
-        create(path).await;
-        // Enough history, and a checkpoint, that anything but the head would show.
-        let mut table = open(path).await;
+        // Enough history, and a checkpoint, that anything but the head would show. The first
+        // commit took the table over, and no later one carries the marker.
+        let mut table = take_over(create(path).await).await; // 1
         for offset in 0..12 {
             table = assert_txns(table, &[(0, offset), (1, 100 + offset), (2, 200 + offset)]).await;
-        }
+        } // 2..=13
         deltalake::checkpoints::create_checkpoint(&table, None)
             .await
             .unwrap();
-        assert_txns(table, &[(0, 12), (1, 112), (2, 212)]).await;
+        assert_txns(table, &[(0, 12), (1, 112), (2, 212)]).await; // 14
 
+        // A fence's first reset looks for the marker too, which the head does not carry: back
+        // to the checkpoint, once in the fence's life.
         let (table, store) = counted(path).await;
         let mut fence = Fence::new(APP);
         fence.reset(&table, &[0, 1, 2]).await.unwrap();
-        assert_eq!(store.gets(), vec!["_delta_log/00000000000000000013.json"]);
+        assert!(!fence.takeover_marker_due());
+        assert!(store
+            .gets()
+            .contains(&"_delta_log/00000000000000000013.checkpoint.parquet".to_string()));
+
+        // Every reset after it, a GET of the head and nothing else.
+        store.reset();
+        fence.reset(&table, &[0, 1, 2]).await.unwrap();
+        assert_eq!(store.gets(), vec!["_delta_log/00000000000000000014.json"]);
         assert_eq!(store.lists.load(Ordering::SeqCst), 0);
         assert_eq!(store.heads.load(Ordering::SeqCst), 0);
         assert_eq!(fence.base(1), Some((Some(112), None)));
@@ -1885,7 +2042,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(fence.lookups().lookups(), 1, "only the reset read anything");
+        assert_eq!(
+            fence.lookups().lookups(),
+            2,
+            "only the resets read anything"
+        );
 
         // And the walk after it still stops at the head.
         store.reset();
@@ -2189,14 +2350,7 @@ mod tests {
             .map(|p| (p, txns[&txn_app_id(APP, p)].version))
             .collect();
         assert_eq!(got, expected);
-        assert_eq!(txns["app-0"].writer(), Writer::Ddi);
-        assert_eq!(
-            txns["app-1"].last_updated,
-            LastUpdated::Absent,
-            "a checkpoint keeps the txn's lastUpdated, and ddi's has none"
-        );
-        assert_eq!(txns["app-1"].writer(), Writer::Ddi);
-        assert_eq!(txns["app-9"].writer(), Writer::Unknown);
+        assert_eq!(txns["app-1"].mark, None, "a checkpoint keeps no commitInfo");
 
         // And with no `_last_checkpoint` at all.
         std::fs::remove_file(log_file(dir.path(), "_last_checkpoint")).unwrap();
@@ -2394,50 +2548,10 @@ mod tests {
             "the three appIds the walk did not find went to the kernel, one each"
         );
         assert_eq!(counters.lookups(), 1);
-
-        // The kernel gives the version alone; commit 1, below the checkpoint it stood in for,
-        // gives back the lastUpdated of the two txns it wrote.
-        let txns = read_txns(&table, &ids(0..4), &counters).await.unwrap();
-        assert_eq!(txns["app-0"].writer(), Writer::Ddi, "read from commit 3");
-        assert_eq!(txns["app-1"].last_updated, LastUpdated::Absent);
-        assert_eq!(txns["app-2"].writer(), Writer::Ddi);
-        assert!(!offset_may_have_expired(&txns, true), "{txns:?}");
-    }
-
-    /// A txn whose `lastUpdated` could not be seen — the kernel answered it, and the commit
-    /// that wrote it was not found — counts as one that can expire, and as nobody's.
-    #[test]
-    fn a_txn_whose_last_updated_is_not_known_may_expire() {
-        let state = |version: Option<i64>, last_updated| TxnState {
-            version,
-            mark: None,
-            last_updated,
-            decoder: None,
-        };
-        let cases = [
-            (state(Some(1), LastUpdated::Absent), Writer::Ddi, false),
-            (state(Some(1), LastUpdated::At(5)), Writer::Other, true),
-            (state(Some(1), LastUpdated::Unknown), Writer::Unknown, true),
-            (state(None, LastUpdated::Unknown), Writer::Unknown, false),
-        ];
-        for (txn, writer, may_expire) in cases {
-            assert_eq!(txn.writer(), writer, "{txn:?}");
-            assert_eq!(txn.may_expire(), may_expire, "{txn:?}");
-        }
-        let one = |txn: TxnState| BTreeMap::from([("app-0".to_string(), txn)]);
-        assert!(offset_may_have_expired(
-            &one(state(Some(1), LastUpdated::Unknown)),
-            true
-        ));
-        assert!(!offset_may_have_expired(
-            &one(state(Some(1), LastUpdated::Absent)),
-            true
-        ));
-        assert!(!kdi_era(&one(state(Some(1), LastUpdated::Unknown))));
     }
 
     #[tokio::test]
-    async fn read_txns_returns_marks_and_writer() {
+    async fn read_txns_returns_marks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         let table = create(path).await;
@@ -2474,7 +2588,6 @@ mod tests {
             TxnState {
                 version: Some(9),
                 mark: Some(mark),
-                last_updated: LastUpdated::Absent,
                 decoder: None,
             }
         );
@@ -2483,7 +2596,6 @@ mod tests {
             TxnState {
                 version: Some(4),
                 mark: None,
-                last_updated: LastUpdated::Absent,
                 decoder: None,
             }
         );
@@ -2492,15 +2604,11 @@ mod tests {
             TxnState {
                 version: Some(7),
                 mark: None,
-                last_updated: LastUpdated::At(1_700_000_000_000),
                 decoder: None,
-            }
+            },
+            "kafka-delta-ingest's commit records no mark"
         );
         assert_eq!(txns["app-3"], TxnState::default());
-        assert_eq!(
-            [0, 1, 2, 3].map(|p| txns[&txn_app_id(APP, p)].writer()),
-            [Writer::Ddi, Writer::Ddi, Writer::Other, Writer::Unknown]
-        );
 
         // The fence takes the marks with the offsets.
         let mut fence = Fence::new(APP);
@@ -2525,13 +2633,13 @@ mod tests {
         .unwrap()
     }
 
-    /// A table only ddi has written offsets to, where another pipeline sharing it as a target
-    /// commits often enough for delta-rs to checkpoint above ddi's last commit. The offsets are
-    /// then read from the checkpoint, which keeps no commitInfo but keeps each txn's
-    /// `lastUpdated`: they are still ddi's, and must not read as somebody else's, or the table
-    /// would look like kafka-delta-ingest's.
+    /// A table ddi has taken over, where another pipeline sharing it as a target commits
+    /// often enough for delta-rs to checkpoint above ddi's last commit. The offsets and the
+    /// takeover marker are then read from the checkpoint, which keeps no commitInfo: the era is
+    /// still ddi's, and the marks come back from below the checkpoint. With the commits below it
+    /// cleaned up, the marks are gone, and the era is not.
     #[tokio::test]
-    async fn read_txns_checkpoint_above_our_last_commit_still_reads_as_ddis() {
+    async fn a_checkpoint_above_our_last_commit_keeps_the_era_and_the_marks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         let table = create_with(path, &[("delta.checkpointInterval", "10")]).await;
@@ -2541,16 +2649,14 @@ mod tests {
             value_len: 42,
         };
         let empty = RecordBatch::new_empty(schema_of(&table));
+        let mut first = offsets(
+            &[(0, (5, 9)), (1, (4, 4))],
+            &BTreeMap::from([(0, 9), (1, 4)]),
+            &BTreeMap::from([(0, mark)]),
+        );
+        first.takeover_marker = true;
         Sink::new(APP, 0)
-            .commit_kafka(
-                table,
-                vec![empty],
-                &offsets(
-                    &[(0, (5, 9)), (1, (4, 4))],
-                    &BTreeMap::from([(0, 9), (1, 4)]),
-                    &BTreeMap::from([(0, mark)]),
-                ),
-            )
+            .commit_kafka(table, vec![empty], &first)
             .await
             .unwrap(); // 1
 
@@ -2571,8 +2677,10 @@ mod tests {
         assert_eq!(table.version(), Some(12));
         assert!(log_file(dir.path(), "00000000000000000009.checkpoint.parquet").exists());
 
+        let mut wanted = ids(0..2);
+        wanted.push(takeover_marker_app_id(APP));
         let counters = LookupCounters::default();
-        let txns = read_txns(&open(path).await, &ids(0..2), &counters)
+        let txns = read_txns(&open(path).await, &wanted, &counters)
             .await
             .unwrap();
         assert_eq!(
@@ -2580,51 +2688,55 @@ mod tests {
             TxnState {
                 version: Some(9),
                 mark: Some(mark),
-                last_updated: LastUpdated::Absent,
                 decoder: None,
             },
-            "and its mark comes back from commit 1, below the checkpoint"
+            "its mark comes back from commit 1, below the checkpoint"
         );
         assert_eq!(txns["app-1"].version, Some(4));
-        assert_eq!(txns["app-1"].writer(), Writer::Ddi);
-        assert!(!kdi_era(&txns), "ddi wrote every offset here: {txns:?}");
-        assert!(
-            !offset_may_have_expired(&txns, true),
-            "and none of them can expire: {txns:?}"
-        );
+        assert_eq!(era(APP, &txns), Era::Ddi);
 
-        // A txn kafka-delta-ingest wrote, in a commit still in the log, is another writer's.
-        kdi_commit(dir.path(), 13, "kdi-0", 7, 1_700_000_000_000);
-        let kdi = read_txns(&open(path).await, &["kdi-0".to_string()], &counters)
+        // Log cleanup takes the commits below the checkpoint.
+        for v in 0..=8 {
+            std::fs::remove_file(log_file(dir.path(), &commit_name(v))).unwrap();
+        }
+        let txns = read_txns(&open(path).await, &wanted, &counters)
             .await
             .unwrap();
-        assert_eq!(kdi["kdi-0"].writer(), Writer::Other);
-        assert!(kdi_era(&kdi), "{kdi:?}");
-        assert!(offset_may_have_expired(&kdi, true), "{kdi:?}");
-        assert!(!offset_may_have_expired(&kdi, false), "{kdi:?}");
+        assert_eq!(txns["app-0"].version, Some(9));
+        assert_eq!(txns["app-0"].mark, None, "the commit that had it is gone");
+        assert_eq!(era(APP, &txns), Era::Ddi, "the marker is a txn, and stays");
+
+        // Another app_id's offsets, which kafka-delta-ingest wrote and ddi never took over.
+        kdi_commit(dir.path(), 13, "kdi-0", 7, 1_700_000_000_000);
+        let kdi = read_txns(
+            &open(path).await,
+            &["kdi-0".to_string(), takeover_marker_app_id("kdi")],
+            &counters,
+        )
+        .await
+        .unwrap();
+        assert_eq!(era("kdi", &kdi), Era::Kdi, "{kdi:?}");
     }
 
     /// The same when the commit at the checkpoint is another engine's own, as when Trino's
     /// OPTIMIZE lands at a checkpoint-interval version and checkpoints there: the walk reads
     /// that commit, which carries no txn, and then the checkpoint.
     #[tokio::test]
-    async fn read_txns_foreign_checkpoint_at_the_head_still_reads_as_ddis() {
+    async fn a_foreign_checkpoint_at_the_head_keeps_the_era() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         let mut table = create(path).await;
         for i in 0..3i64 {
             let assert = BTreeMap::from([(0, i), (1, 100 + i)]);
             let batch = rows(&table, &[i]);
+            let mut batch_offsets = offsets(
+                &[(0, (i, i)), (1, (100 + i, 100 + i))],
+                &assert,
+                &BTreeMap::new(),
+            );
+            batch_offsets.takeover_marker = i == 0;
             table = Sink::new(APP, 0)
-                .commit_kafka(
-                    table,
-                    vec![batch],
-                    &offsets(
-                        &[(0, (i, i)), (1, (100 + i, 100 + i))],
-                        &assert,
-                        &BTreeMap::new(),
-                    ),
-                )
+                .commit_kafka(table, vec![batch], &batch_offsets)
                 .await
                 .unwrap();
         }
@@ -2634,15 +2746,15 @@ mod tests {
             .await
             .unwrap();
 
+        let mut wanted = ids(0..2);
+        wanted.push(takeover_marker_app_id(APP));
         let counters = LookupCounters::default();
-        let txns = read_txns(&open(path).await, &ids(0..2), &counters)
+        let txns = read_txns(&open(path).await, &wanted, &counters)
             .await
             .unwrap();
         assert_eq!(txns["app-0"].version, Some(2));
         assert_eq!(txns["app-1"].version, Some(102));
-        assert!(txns.values().all(|t| t.writer() == Writer::Ddi), "{txns:?}");
-        assert!(!kdi_era(&txns), "ddi wrote every offset here: {txns:?}");
-        assert!(!offset_may_have_expired(&txns, true), "{txns:?}");
+        assert_eq!(era(APP, &txns), Era::Ddi, "{txns:?}");
     }
 
     /// Commit `version` by hand: commit `from`'s `metaData`, without the table property `key`,
@@ -2669,13 +2781,14 @@ mod tests {
         .unwrap();
     }
 
-    /// kafka-delta-ingest's offsets, answered by a checkpoint alone, on a table whose history
-    /// set `delta.setTransactionRetentionDuration`: two partitions' offsets expired under it,
-    /// and the checkpoint written meanwhile dropped them. Who wrote the one left is in that
-    /// checkpoint, as its `lastUpdated`, and so a partition without an offset is one whose
-    /// offset may have expired (docs/kafka-design.md §4.4), not one to read again from 0.
+    /// kafka-delta-ingest's offsets, answered by a checkpoint alone, on a table that once set
+    /// `delta.setTransactionRetentionDuration`: two partitions' offsets expired under it, the
+    /// checkpoint written meanwhile dropped them, and log cleanup has taken every commit that
+    /// shows the property was ever set. The takeover check needs none of that history: in
+    /// kafka-delta-ingest's era, a partition without an offset whose topic holds messages is
+    /// refused until it is acknowledged (docs/kafka-design.md §4.4, EO-M4b).
     #[tokio::test]
-    async fn kdi_txns_answered_by_a_checkpoint_guard_a_missing_offset() {
+    async fn expired_kdi_offsets_are_caught_by_the_takeover_check() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         create(path).await;
@@ -2701,32 +2814,35 @@ mod tests {
         deltalake::checkpoints::create_checkpoint(&table, None)
             .await
             .unwrap();
-        // Log cleanup took kafka-delta-ingest's commits; the one that set the property is
-        // still there for M3's history scan.
-        for v in 0..=3 {
+        for v in 0..=4 {
             std::fs::remove_file(log_file(dir.path(), &commit_name(v))).unwrap();
         }
 
         let table = open(path).await;
+        let mut wanted = ids(0..3);
+        wanted.push(takeover_marker_app_id(APP));
         let counters = LookupCounters::default();
-        let txns = read_txns(&table, &ids(0..3), &counters).await.unwrap();
+        let txns = read_txns(&table, &wanted, &counters).await.unwrap();
         assert_eq!(
             [0, 1, 2].map(|p| txns[&txn_app_id(APP, p)].version),
             [None, Some(9), None],
             "{txns:?}"
         );
         assert_eq!(counters.fallbacks(), 0);
-        assert_eq!(
-            txns["app-1"].last_updated,
-            LastUpdated::At(now),
-            "the checkpoint keeps lastUpdated"
+        assert_eq!(era(APP, &txns), Era::Kdi);
+
+        // Partitions 0 and 2 have no offset and their topic holds messages: a read from 0
+        // could duplicate them.
+        let partitions: BTreeMap<i32, (Option<i64>, i64)> = [(0, 8), (1, 10), (2, 5)]
+            .into_iter()
+            .map(|(p, high)| (p, (txns[&txn_app_id(APP, p)].version, high)))
+            .collect();
+        let e = takeover_check(APP, era(APP, &txns), &partitions, &BTreeSet::new()).unwrap_err();
+        assert!(
+            matches!(&e, Error::KafkaOffsetMissing { partitions, .. } if partitions == &vec![0, 2]),
+            "{e:?}"
         );
-        assert_eq!(txns["app-1"].writer(), Writer::Other);
-        assert!(kdi_era(&txns), "{txns:?}");
-        // Partitions 0 and 2 have no offset; a read from 0 would duplicate them.
-        assert!(offset_may_have_expired(&txns, true), "{txns:?}");
-        // Without the property in the table's history, nothing can have expired.
-        assert!(!offset_may_have_expired(&txns, false), "{txns:?}");
+        takeover_check(APP, era(APP, &txns), &partitions, &BTreeSet::from([0, 2])).unwrap();
     }
 
     /// The mark of the message at `offset`, made up for a test.
@@ -2935,6 +3051,324 @@ mod tests {
         assert_eq!(below.iter().min(), Some(&44));
         assert_eq!(fence.lookups().below_checkpoint_reads(), 256);
         assert_eq!(fence.lookups().marks_unfound(), 1, "partition 1");
+    }
+
+    // ------------------------------------------------------------ the takeover marker
+
+    /// The marker is written by the first commit whose read snapshot lacks it, and by no
+    /// commit after: re-asserted by every commit, a shared appId would make every two
+    /// members' concurrent commits conflict.
+    #[tokio::test]
+    async fn takeover_marker_written_once_and_only_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        let marker = takeover_marker_app_id(APP);
+        assert_eq!(marker, "app.ddi");
+
+        let table = open(path).await;
+        let mut fence = Fence::new(APP);
+        fence.reset(&table, &[0, 1]).await.unwrap();
+        assert!(
+            fence.takeover_marker_due(),
+            "absent at the handle's version"
+        );
+        let table = fenced_commit(&mut fence, table, &[(0, (0, 4))])
+            .await
+            .unwrap(); // 1
+        assert_eq!(
+            txns_in_commit(dir.path(), 1),
+            vec![("app-0".to_string(), 4), (marker.clone(), 1)]
+        );
+        assert!(!fence.takeover_marker_due(), "its own commit wrote it");
+
+        let table = fenced_commit(&mut fence, table, &[(0, (5, 6)), (1, (0, 2))])
+            .await
+            .unwrap(); // 2
+        assert_eq!(
+            txns_in_commit(dir.path(), 2),
+            vec![("app-0".to_string(), 6), ("app-1".to_string(), 2)],
+            "a commit after the first does not carry it"
+        );
+
+        // A member that reads the table afterwards finds it, and never writes it either.
+        let mut other = Fence::new(APP);
+        other.reset(&open(path).await, &[2]).await.unwrap();
+        assert!(!other.takeover_marker_due());
+        fenced_commit(&mut other, open(path).await, &[(2, (0, 1))])
+            .await
+            .unwrap(); // 3
+        assert_eq!(
+            txns_in_commit(dir.path(), 3),
+            vec![("app-2".to_string(), 1)]
+        );
+
+        // Once seen it stays seen: a marker is never removed. A reset at our own newest
+        // commit, which does not carry it, reads the head alone.
+        let (counted_table, store) = counted(path).await;
+        let mut fence = Fence::new(APP);
+        fence.reset(&counted_table, &[2]).await.unwrap();
+        assert!(!fence.takeover_marker_due());
+        store.reset();
+        fence.reset(&counted_table, &[2]).await.unwrap();
+        assert_eq!(store.gets(), vec!["_delta_log/00000000000000000003.json"]);
+        assert!(!fence.takeover_marker_due());
+        drop(table);
+    }
+
+    /// Two members that both read the table before either took it over both write the marker
+    /// in their first commit. delta-rs refuses the second, as it refuses any commit carrying
+    /// a txn another wrote after its snapshot; that member re-reads, finds the marker, and
+    /// commits without it.
+    #[tokio::test]
+    async fn two_members_racing_to_take_over_conflict_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        let (a_table, b_table) = (open(path).await, open(path).await);
+        let (mut a, mut b) = (Fence::new(APP), Fence::new(APP));
+        a.reset(&a_table, &[0]).await.unwrap();
+        b.reset(&b_table, &[1]).await.unwrap();
+        assert!(a.takeover_marker_due() && b.takeover_marker_due());
+
+        fenced_commit(&mut a, a_table, &[(0, (0, 3))])
+            .await
+            .unwrap(); // 1
+        let e = fenced_commit(&mut b, b_table, &[(1, (0, 5))])
+            .await
+            .unwrap_err();
+        assert!(is_concurrent_transaction(&e), "got: {e}");
+
+        // The Replan: re-read at the table's version.
+        let b_table = open(path).await;
+        b.reset(&b_table, &[1]).await.unwrap();
+        assert!(!b.takeover_marker_due());
+        fenced_commit(&mut b, b_table, &[(1, (0, 5))])
+            .await
+            .unwrap(); // 2
+        assert_eq!(
+            txns_in_commit(dir.path(), 2),
+            vec![("app-1".to_string(), 5)]
+        );
+        let counters = LookupCounters::default();
+        let txns = read_txns(&open(path).await, &[takeover_marker_app_id(APP)], &counters)
+            .await
+            .unwrap();
+        assert_eq!(txns[&takeover_marker_app_id(APP)].version, Some(1));
+    }
+
+    /// Rewrite the single-part checkpoint at `version` as another writer would have written
+    /// it: every txn's `lastUpdated` replaced by `stamp`. `None` is null, as delta-rs up to
+    /// 0.17.3 wrote it for every txn, kafka-delta-ingest's included; `Some(0)` is what Trino
+    /// writes for a txn without one.
+    fn restamp_checkpoint(dir: &std::path::Path, version: u64, stamp: Option<i64>) {
+        use deltalake::arrow::array::{ArrayRef, Int64Array, StructArray};
+        use deltalake::arrow::compute::concat_batches;
+        use deltalake::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use deltalake::parquet::arrow::ArrowWriter;
+
+        let file = log_file(dir, &format!("{version:020}.checkpoint.parquet"));
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&file).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+        let all = concat_batches(&batches[0].schema(), &batches).unwrap();
+        let index = all.schema().index_of("txn").unwrap();
+        let txn = all.column(index).as_struct().clone();
+        let (fields, children, nulls) = txn.into_parts();
+        let children: Vec<ArrayRef> = fields
+            .iter()
+            .zip(children)
+            .map(|(f, child)| match f.name().as_str() {
+                "lastUpdated" => Arc::new(Int64Array::from(vec![stamp; child.len()])) as ArrayRef,
+                _ => child,
+            })
+            .collect();
+        let restamped = StructArray::new(fields, children, nulls);
+        let mut columns = all.columns().to_vec();
+        columns[index] = Arc::new(restamped);
+        let rewritten = RecordBatch::try_new(all.schema(), columns).unwrap();
+        let mut writer =
+            ArrowWriter::try_new(std::fs::File::create(&file).unwrap(), all.schema(), None)
+                .unwrap();
+        writer.write(&rewritten).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// The era read from a checkpoint alone, the commits below it cleaned up: the marker is a
+    /// txn, which every checkpoint writer keeps, whatever it does to `lastUpdated`. Nothing
+    /// is read from `lastUpdated`, so a checkpoint that nulled kafka-delta-ingest's stamps (old
+    /// delta-rs) or stamped ddi's with 0 (Trino) changes no answer.
+    #[tokio::test]
+    async fn takeover_marker_survives_checkpoints() {
+        let ids_and_marker = || {
+            let mut ids = ids(0..3);
+            ids.push(takeover_marker_app_id(APP));
+            ids
+        };
+        let era_of = |table: DeltaTable| async move {
+            let counters = LookupCounters::default();
+            let txns = read_txns(&table, &ids_and_marker(), &counters)
+                .await
+                .unwrap();
+            assert_eq!(counters.fallbacks(), 0);
+            era(APP, &txns)
+        };
+
+        // kafka-delta-ingest's offsets, then ddi's takeover; checkpointed, every way.
+        for stamp in [None, Some(None), Some(Some(0))] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().to_str().unwrap();
+            create(path).await;
+            kdi_commit(dir.path(), 1, "app-0", 7, 1_700_000_000_000);
+            kdi_commit(dir.path(), 2, "app-1", 9, 1_700_000_000_000);
+            assert_eq!(era_of(open(path).await).await, Era::Kdi, "{stamp:?}");
+            let mut fence = Fence::new(APP);
+            let table = open(path).await;
+            fence.reset(&table, &[0, 1]).await.unwrap();
+            let table = fenced_commit(&mut fence, table, &[(0, (8, 10))])
+                .await
+                .unwrap(); // 3
+            deltalake::checkpoints::create_checkpoint(&table, None)
+                .await
+                .unwrap();
+            if let Some(stamp) = stamp {
+                restamp_checkpoint(dir.path(), 3, stamp);
+            }
+            for v in 0..=3 {
+                std::fs::remove_file(log_file(dir.path(), &commit_name(v))).unwrap();
+            }
+            assert_eq!(era_of(open(path).await).await, Era::Ddi, "{stamp:?}");
+        }
+
+        // kafka-delta-ingest's alone: still its, however the checkpoint stamped them.
+        for stamp in [None, Some(None), Some(Some(0))] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().to_str().unwrap();
+            create(path).await;
+            kdi_commit(dir.path(), 1, "app-0", 7, 1_700_000_000_000);
+            kdi_commit(dir.path(), 2, "app-1", 9, 1_700_000_000_000);
+            deltalake::checkpoints::create_checkpoint(&open(path).await, None)
+                .await
+                .unwrap();
+            if let Some(stamp) = stamp {
+                restamp_checkpoint(dir.path(), 2, stamp);
+            }
+            for v in 0..=2 {
+                std::fs::remove_file(log_file(dir.path(), &commit_name(v))).unwrap();
+            }
+            assert_eq!(era_of(open(path).await).await, Era::Kdi, "{stamp:?}");
+        }
+    }
+
+    #[test]
+    fn era_is_read_from_the_marker_and_the_partition_txns_alone() {
+        let state = |version: Option<i64>| TxnState {
+            version,
+            ..TxnState::default()
+        };
+        let txns = |entries: &[(&str, Option<i64>)]| -> BTreeMap<String, TxnState> {
+            entries
+                .iter()
+                .map(|(id, v)| (id.to_string(), state(*v)))
+                .collect()
+        };
+        let cases: &[(&[(&str, Option<i64>)], Era)] = &[
+            (&[], Era::Fresh),
+            (
+                &[("app-0", None), ("app-1", None), ("app.ddi", None)],
+                Era::Fresh,
+            ),
+            // Not this app_id's partition offsets, nor a marker.
+            (
+                &[
+                    ("other-0", Some(3)),
+                    ("app", Some(3)),
+                    ("app.dq", Some(3)),
+                    ("app-", Some(3)),
+                    ("app-x", Some(3)),
+                    ("app-1.5", Some(3)),
+                    ("app.ddi-0", Some(3)),
+                    ("other.ddi", Some(1)),
+                ],
+                Era::Fresh,
+            ),
+            (&[("app-0", Some(4)), ("app-1", None)], Era::Kdi),
+            (&[("app-12", Some(0))], Era::Kdi),
+            (&[("app-0", Some(4)), ("app.ddi", Some(1))], Era::Ddi),
+            (&[("app-0", None), ("app.ddi", Some(1))], Era::Ddi),
+        ];
+        for (entries, expected) in cases {
+            assert_eq!(era(APP, &txns(entries)), *expected, "{entries:?}");
+        }
+    }
+
+    /// The one check a takeover of kafka-delta-ingest's offsets makes, at open, over every
+    /// partition of the topic: a partition without an offset whose topic holds messages may
+    /// be one whose offset expired, and needs an explicit `starting_offsets` entry. Once ddi
+    /// has taken over, a partition without an offset is one nothing of is in the table.
+    #[test]
+    fn takeover_check_needs_an_acknowledgment_only_in_kdis_era() {
+        // (stored, high) per partition.
+        let partitions = BTreeMap::from([
+            (0, (Some(41), 50)),
+            (1, (None, 7)),
+            (2, (None, 0)),
+            (3, (None, 12)),
+        ]);
+        let none = BTreeSet::new();
+        let e = takeover_check(APP, Era::Kdi, &partitions, &none).unwrap_err();
+        assert!(
+            matches!(&e, Error::KafkaOffsetMissing { app_id, partitions }
+                if app_id == APP && partitions == &vec![1, 3]),
+            "every such partition, named: {e:?}"
+        );
+        assert!(e.to_string().contains("[1, 3]"), "{e}");
+
+        // One acknowledged is not enough.
+        let e = takeover_check(APP, Era::Kdi, &partitions, &BTreeSet::from([1])).unwrap_err();
+        assert!(
+            matches!(&e, Error::KafkaOffsetMissing { partitions, .. } if partitions == &vec![3]),
+            "{e:?}"
+        );
+        takeover_check(APP, Era::Kdi, &partitions, &BTreeSet::from([1, 3])).unwrap();
+
+        // ddi's era and a fresh app_id ask nothing.
+        takeover_check(APP, Era::Ddi, &partitions, &none).unwrap();
+        takeover_check(APP, Era::Fresh, &partitions, &none).unwrap();
+
+        // Where a partition without an offset starts then, in either era.
+        assert_eq!(start_without_offset(0, 7, None), NoTxnStart::Zero);
+        assert_eq!(start_without_offset(0, 0, None), NoTxnStart::Zero);
+        assert_eq!(
+            start_without_offset(3, 7, None),
+            NoTxnStart::Unavailable { wanted: 0, low: 3 },
+            "messages ddi never read were trimmed"
+        );
+        assert_eq!(
+            start_without_offset(3, 12, Some(5)),
+            NoTxnStart::Explicit(5)
+        );
+        assert_eq!(
+            start_without_offset(3, 12, Some(12)),
+            NoTxnStart::Explicit(12)
+        );
+        assert_eq!(
+            start_without_offset(0, 12, Some(0)),
+            NoTxnStart::Explicit(0)
+        );
+        assert_eq!(
+            start_without_offset(3, 12, Some(2)),
+            NoTxnStart::Unavailable { wanted: 2, low: 3 }
+        );
+        assert_eq!(
+            start_without_offset(3, 12, Some(13)),
+            NoTxnStart::Regressed {
+                wanted: 13,
+                high: 12
+            }
+        );
     }
 
     #[tokio::test]

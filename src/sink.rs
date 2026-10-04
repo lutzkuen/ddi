@@ -169,11 +169,19 @@ impl Sink {
     /// for, and none of the Delta source's provenance: a Kafka pipeline has no source table, no
     /// lookups and no coverage window.
     fn kafka_properties(&self, offsets: &KafkaOffsets) -> CommitProperties {
-        let txns = offsets
+        let mut txns: Vec<Transaction> = offsets
             .assert
             .iter()
             .map(|(p, last)| Transaction::new(crate::fence::txn_app_id(&self.app_id, *p), *last))
             .collect();
+        // Once, in the first Kafka commit whose snapshot lacks it, and never again: in every
+        // commit, a shared appId would make every two members' concurrent commits conflict.
+        if offsets.takeover_marker {
+            txns.push(Transaction::new(
+                crate::fence::takeover_marker_app_id(&self.app_id),
+                crate::fence::TAKEOVER_MARKER_VERSION,
+            ));
+        }
         let ranges: serde_json::Map<String, serde_json::Value> = offsets
             .ranges
             .iter()
@@ -529,6 +537,10 @@ pub struct KafkaOffsets {
     pub baseline: bool,
     /// Why an operator moved these offsets by hand, when one did (§4.8).
     pub override_reason: Option<String>,
+    /// Whether this commit writes the takeover marker, `<app_id>.ddi`: it is the first Kafka
+    /// commit of this app_id whose read snapshot lacks it ([`crate::fence::Fence::takeover_marker_due`],
+    /// docs/kafka-design.md §4.3).
+    pub takeover_marker: bool,
 }
 
 /// A message, recorded well enough to tell whether reading its offset again returns it.
@@ -639,6 +651,7 @@ mod tests {
             cleanup_logs: false,
             baseline: false,
             override_reason: None,
+            takeover_marker: false,
         }
     }
 
@@ -857,6 +870,48 @@ mod tests {
             // 0 sets nothing, which is what a dropped setting looks like.
             assert_eq!(files_added_with(0, kafka).await, 1, "kafka: {kafka}");
         }
+    }
+
+    /// A commit asked to write the takeover marker writes it beside the partitions' txns, as
+    /// `<app_id>.ddi` at version 1, and one not asked writes none.
+    #[tokio::test]
+    async fn kafka_commit_writes_the_takeover_marker_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let table = create(path, false).await;
+
+        let mut offsets = read(&[(0, (0, 4))]);
+        offsets.takeover_marker = true;
+        let batch = rows(&table, &[1]);
+        let sink = Sink::new("app", 0);
+        let table = sink
+            .commit_kafka(table, vec![batch], &offsets)
+            .await
+            .unwrap();
+        let batch = rows(&table, &[2]);
+        let table = sink
+            .commit_kafka(table, vec![batch], &read(&[(0, (5, 6))]))
+            .await
+            .unwrap();
+
+        let txns = |actions: Vec<Action>| -> Vec<(String, i64)> {
+            actions
+                .into_iter()
+                .filter_map(|a| match a {
+                    Action::Txn(t) => Some((t.app_id, t.version)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            txns(actions_at(&table, 1).await),
+            vec![("app-0".to_string(), 4), ("app.ddi".to_string(), 1)]
+        );
+        assert_eq!(
+            txns(actions_at(&table, 2).await),
+            vec![("app-0".to_string(), 6)]
+        );
+        assert_eq!(txn(&table, "app.ddi").await, Some(1));
     }
 
     #[tokio::test]
