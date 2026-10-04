@@ -485,8 +485,14 @@ impl Error {
             Error::DataQualityWrite { source, .. } => source.data_quality_class(),
             Error::DataQualityConflict { .. } => KafkaClass::Transient,
             Error::Fenced { .. } | Error::OffsetLogTruncated { .. } => KafkaClass::Replan,
+            // `InvalidVersion`: a commit missing from the target's log during the conflict
+            // check, which log cleanup removed under a handle that trails the head (EO-m8).
+            // Retried from the same handle it fails the same way; a reset reads the table as
+            // it is. Beneath a `DataQualityWrite` it is Transient instead: `write_kafka` has
+            // already reopened that table.
             Error::Delta(
-                DeltaTableError::VersionAlreadyExists(_)
+                DeltaTableError::InvalidVersion(_)
+                | DeltaTableError::VersionAlreadyExists(_)
                 | DeltaTableError::Transaction {
                     source:
                         TransactionError::CommitConflict(_)
@@ -742,6 +748,9 @@ mod tests {
                 Error::Delta(DeltaTableError::VersionAlreadyExists(4)),
                 Replan,
             ),
+            // A commit log cleanup removed under a handle trailing the head, met in the
+            // conflict check (EO-m8): a reset, not a retry from the same handle.
+            (Error::Delta(DeltaTableError::InvalidVersion(4)), Replan),
             (
                 Error::Delta(DeltaTableError::Generic(
                     "Invalid data type for Delta Lake: Timestamp(Millisecond, None)".into(),
