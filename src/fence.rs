@@ -3381,13 +3381,15 @@ mod tests {
             version,
             ..TxnState::default()
         };
-        let txns = |entries: &[(&str, Option<i64>)]| -> BTreeMap<String, TxnState> {
+        /// The txns read: (appId, version).
+        type Read<'a> = &'a [(&'a str, Option<i64>)];
+        let txns = |entries: Read| -> BTreeMap<String, TxnState> {
             entries
                 .iter()
                 .map(|(id, v)| (id.to_string(), state(*v)))
                 .collect()
         };
-        let cases: &[(&[(&str, Option<i64>)], Era)] = &[
+        let cases: &[(Read, Era)] = &[
             (&[], Era::Fresh),
             (
                 &[("app-0", None), ("app-1", None), ("app.ddi", None)],
