@@ -905,7 +905,7 @@ Why no topic id (EO-M4): rdkafka 0.39 exposes no topic id, and DescribeTopics wo
 | 7 | A rebalance while a batch is buffered | Revoke flush commits it (time-boxed), else drops it | Automatic; the next owner reads the txn |
 | 8 | kdi still running with the same app_id | ddi side is fenced. kdi side: `are_partition_offsets_match` (lib.rs:1164-1186) plus delta-rs 0.26's checker **(verify in the nightly `kdi_and_ddi_race`)**. kdi re-asserts all its assigned partitions, so during a handover both sides conflict on every commit for the moving partitions | The runbook stops kdi first |
 | 9 | DQ write OK, target commit fails | DQ rows and marks present | Replay skips coordinate-carrying undecodables at offsets ≤ the mark (I9); the rest are written again (a visible duplicate, never a loss) |
-| 10 | DQ write fails | Nothing advanced | DQ conflict: up to 3 in-place retries; then Transient |
+| 10 | DQ write fails | Nothing advanced | DQ conflict: our own landed commit is recognised by `ddi.kafka.dqWriteId` (row 3 on the DQ table); otherwise up to 3 in-place retries, then Transient. A failure that is not a conflict but may have landed is retried with the batch, and can duplicate the rejects that are never skipped (I9) |
 | 11 | Retention passed stored+1 (at assign, or mid-fetch as -140) | Mid-fetch: buffer committed first. Partition blocked (`KafkaOffsetsUnavailable`), others continue | Operator: `set-offsets --next <low> --acknowledge-skip "<reason>"` |
 | 12 | stored ≥ high: topic recreated or wrong cluster | Partition blocked (`KafkaOffsetsRegressed`) | Operator: new app_id, or `set-offsets --allow-replay` |
 | 13 | Topic recreated and refilled past stored | Re-read mark mismatch → `KafkaTopicReplaced` (I19) | Operator: new app_id, or `set-offsets` |
@@ -1144,7 +1144,9 @@ They travel as `Batch.rejects` and are written **before** the target commit (pip
 3. **Commit** the remaining rows, with txns `<app_id>.dq-<p> = max(m_p, last_p)` for every batch partition and metadata `ddi.appId`, `ddi.kafka.offsets`.
    - The DQ row's `source_version` column holds the rejected message's offset, or −1 when unknown. Its partition is in `payload`.
    - Members own disjoint partitions, so their DQ appIds never collide (I21).
-4. **On `ConcurrentTransaction`, `VersionAlreadyExists` or `MaxCommitAttempts`** (a zombie or a handover): refresh the DQ handle and go back to step 1, up to 3 times; then Transient. A DQ conflict is never a supervisor error.
+4. **On `ConcurrentTransaction`, `VersionAlreadyExists` or `MaxCommitAttempts`:** refresh the DQ handle, then look for this write's own commit among those that landed since its read version. Every Kafka DQ commit records `ddi.kafka.dqWriteId`, unique to its `write_kafka` call.
+   - Found: the commit landed and the acknowledgement of its PUT was lost; the retried PUT met it (§4.7 row 3). The write is done. Writing again would duplicate every reject that is never skipped, without any crash.
+   - Not found (a zombie or a handover): go back to step 1, up to 3 times; then Transient. A DQ conflict is never a supervisor error.
 
 Why this is safe: Kafka offsets identify one message per topic incarnation, and incarnations are checked by §4.4. `set-offsets` moves the DQ marks with the target txns. Whether a message decodes depends only on its bytes and its writer schema, which a replay cannot change, so an undecodable is rejected again on every replay. So a skipped reject is always already in the table (I9). Delta pipelines keep `write`'s equality rule unchanged.
 

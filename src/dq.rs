@@ -456,9 +456,12 @@ impl DataQuality {
     ///    whatever has changed in between; any other reject is written each time.
     /// 3. Commit the rest, each row's `source_version` its offset (−1 without one), with
     ///    `<app_id>.dq-<p>` = max(mark, last offset read) for every partition of the batch.
-    /// 4. A commit that conflicts on a mark — a zombie, or a handover — reopens the table and
-    ///    goes back to step 1, up to [`KAFKA_CONFLICT_RETRIES`] times. After that it is an
-    ///    ordinary error for the pipeline to retry, never one that replans the target.
+    /// 4. A commit that conflicts on a mark reopens the table. When the commit that won is
+    ///    this write's own — it landed, and the acknowledgement of its PUT was lost — the
+    ///    write is done ([`Self::landed`]). When it is another writer's — a zombie, or a
+    ///    handover — the write goes back to step 1, up to [`KAFKA_CONFLICT_RETRIES`] times.
+    ///    After that it is an ordinary error for the pipeline to retry, never one that
+    ///    replans the target.
     ///
     /// [`Self::write`] and its equality rule are untouched by any of this.
     pub async fn write_kafka(
@@ -475,27 +478,48 @@ impl DataQuality {
             .iter()
             .map(|r| self.coordinates(r, &offsets.ranges))
             .collect();
+        // Recorded with the commit, so that a conflict can be told from this write's own
+        // commit having landed already (`Self::landed`).
+        let write_id = write_id();
 
         let mut retries = 0;
         loop {
+            let read_version = self.table.version();
             match self
-                .try_write_kafka(rejected, &coordinates, offsets, now_micros)
+                .try_write_kafka(rejected, &coordinates, offsets, &write_id, now_micros)
                 .await
             {
                 Ok(written) => return Ok(written),
-                Err(Attempt::Conflict(e)) if retries < KAFKA_CONFLICT_RETRIES => {
-                    retries += 1;
-                    self.kafka.conflict_retries.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        app_id = %self.app_id,
-                        dq_uri = %self.uri,
-                        attempt = retries,
-                        "another writer recorded rejects for one of this batch's partitions \
-                         first ({e}); re-reading the marks and trying again"
-                    );
+                Err(Attempt::Conflict {
+                    error: e,
+                    written,
+                    skipped,
+                }) => {
                     self.table = self.storage.open(&self.uri).await?;
-                }
-                Err(Attempt::Conflict(e)) => {
+                    if self.landed(read_version, &write_id).await? {
+                        debug!(
+                            app_id = %self.app_id,
+                            dq_uri = %self.uri,
+                            "the commit reported as a conflict ({e}) is this write's own, which \
+                             landed before its acknowledgement was lost; not writing it twice"
+                        );
+                        self.kafka
+                            .rows_skipped
+                            .fetch_add(skipped, Ordering::Relaxed);
+                        return Ok(written);
+                    }
+                    if retries < KAFKA_CONFLICT_RETRIES {
+                        retries += 1;
+                        self.kafka.conflict_retries.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            app_id = %self.app_id,
+                            dq_uri = %self.uri,
+                            attempt = retries,
+                            "another writer recorded rejects for one of this batch's \
+                             partitions first ({e}); re-reading the marks and trying again"
+                        );
+                        continue;
+                    }
                     return Err(Error::Other(format!(
                         "cannot write {rows} rejected row(s) to the data-quality table {:?}: \
                          another writer kept recording rejects for the same partitions, \
@@ -503,7 +527,7 @@ impl DataQuality {
                          lost; it is tried again.",
                         self.uri,
                         KAFKA_CONFLICT_RETRIES + 1
-                    )))
+                    )));
                 }
                 Err(Attempt::Failed(e)) => {
                     // As in `write`: the next attempt starts from the table as it is now, so
@@ -523,6 +547,7 @@ impl DataQuality {
         rejected: &[Rejected],
         coordinates: &[Vec<Option<(i32, i64)>>],
         offsets: &KafkaOffsets,
+        write_id: &str,
         now_micros: i64,
     ) -> std::result::Result<usize, Attempt> {
         // Every reject's coordinates are in these partitions, or it has none.
@@ -617,6 +642,10 @@ impl DataQuality {
                     "ddi.kafka.offsets".to_string(),
                     serde_json::Value::Object(ranges),
                 ),
+                (
+                    KAFKA_WRITE_ID.to_string(),
+                    serde_json::Value::from(write_id),
+                ),
             ]);
 
         // As in `write`, and for the same reason: no runtime nobody configured.
@@ -640,7 +669,11 @@ impl DataQuality {
                     .fetch_add(skipped, Ordering::Relaxed);
                 Ok(written)
             }
-            Err(e) if is_conflict(&e) => Err(Attempt::Conflict(e)),
+            Err(e) if is_conflict(&e) => Err(Attempt::Conflict {
+                error: e,
+                written,
+                skipped,
+            }),
             Err(e) => Err(Attempt::Failed(Error::Other(format!(
                 "cannot write {written} rejected row(s) to the data-quality table {:?}: {e}. \
                  The batch was not committed, so nothing was lost — but this pipeline cannot \
@@ -648,6 +681,33 @@ impl DataQuality {
                 self.uri
             )))),
         }
+    }
+
+    /// Whether this write's own commit, the one recording `write_id`, is among those that
+    /// landed after `read_version` on the table as just reopened.
+    ///
+    /// A conflict is not always another writer's. When the response to a commit's PUT is
+    /// lost and the PUT is retried, it finds the version taken by that very commit, and
+    /// delta-rs then reports the commit's own marks as a conflict (docs/kafka-design.md §4.7
+    /// row 3). Tried again, the write would record every reject that is never skipped a second
+    /// time. Read newest first, which is where that commit is. A commit no longer in the log
+    /// ends the search: one that cannot be read is not known to be this write's, and writing
+    /// again costs a duplicate, never a lost reject.
+    async fn landed(&self, read_version: Option<u64>, write_id: &str) -> Result<bool> {
+        let Some(head) = self.table.version() else {
+            return Ok(false);
+        };
+        let after = read_version.map_or(0, |v| v + 1);
+        let log_store = self.table.log_store();
+        for version in (after..=head).rev() {
+            let Some(commit) = log_store.read_commit_entry(version).await? else {
+                return Ok(false);
+            };
+            if write_id_of(&commit).as_deref() == Some(write_id) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Each row's partition and offset, where its `<prefix>partition` and `<prefix>offset`
@@ -708,9 +768,49 @@ fn rejected_again_on_a_replay(reason: &str) -> bool {
 
 /// How one attempt of [`DataQuality::write_kafka`] ended, when it did not write.
 enum Attempt {
-    /// Another commit wrote one of the same marks first: worth trying again in place.
-    Conflict(DeltaTableError),
+    /// A commit wrote one of the same marks first: another writer's, worth trying again in
+    /// place, or this attempt's own, landed already. `written` and `skipped` are the rows the
+    /// attempt wrote and left out, which are what it did if the commit is its own.
+    Conflict {
+        error: DeltaTableError,
+        written: usize,
+        skipped: u64,
+    },
     Failed(Error),
+}
+
+/// The commitInfo key a Kafka data-quality commit records its write's id under.
+const KAFKA_WRITE_ID: &str = "ddi.kafka.dqWriteId";
+
+/// An id for one [`DataQuality::write_kafka`] call, which its commit records: no commit of
+/// another call, in this process or any other, records the same one.
+fn write_id() -> String {
+    use std::hash::BuildHasher;
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    // Keyed at random in every process, so two processes with one pid and one clock reading
+    // still differ.
+    let random =
+        std::collections::hash_map::RandomState::new().hash_one((std::process::id(), nanos, n));
+    format!("{random:016x}-{nanos:x}-{n}")
+}
+
+/// The write id a data-quality commit records, if it records one.
+fn write_id_of(commit: &[u8]) -> Option<String> {
+    serde_json::Deserializer::from_slice(commit)
+        .into_iter::<serde_json::Value>()
+        .map_while(std::result::Result::ok)
+        .find_map(|line| {
+            Some(
+                line.get("commitInfo")?
+                    .get(KAFKA_WRITE_ID)?
+                    .as_str()?
+                    .to_string(),
+            )
+        })
 }
 
 /// Did a commit fail because another one landed first on something it asserted?
@@ -1470,5 +1570,189 @@ mod tests {
         assert!(rows
             .iter()
             .all(|r| r.2.as_deref().unwrap().contains("\"order_id\"")));
+    }
+
+    // ---------------------------------------------------------------- commits that go wrong
+
+    use deltalake::logstore::object_store::{
+        self, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+    use deltalake::Path;
+    use futures::stream::BoxStream;
+    use std::sync::atomic::AtomicU32;
+
+    /// What [`FlakyCommits`] does to a conditional PUT of a commit file.
+    #[derive(Clone, Copy, Debug)]
+    enum Fault {
+        /// Write it, then say it already exists, the first time only: what the PUT retried
+        /// after its response was lost gets back.
+        LandsThenSaysItExists,
+    }
+
+    /// An object store that gets one thing wrong about commits, and passes everything else
+    /// through.
+    #[derive(Debug)]
+    struct FlakyCommits {
+        inner: Arc<dyn ObjectStore>,
+        fault: Fault,
+        /// How often the fault has struck.
+        struck: Arc<AtomicU32>,
+    }
+
+    fn is_commit(location: &Path) -> bool {
+        location
+            .as_ref()
+            .rsplit_once("_delta_log/")
+            .and_then(|(_, name)| name.strip_suffix(".json"))
+            .is_some_and(|v| v.len() == 20 && v.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    impl std::fmt::Display for FlakyCommits {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FlakyCommits({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FlakyCommits {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            let commit = matches!(opts.mode, PutMode::Create) && is_commit(location);
+            match self.fault {
+                Fault::LandsThenSaysItExists => {
+                    let put = self.inner.put_opts(location, payload, opts).await?;
+                    if commit && self.struck.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(object_store::Error::AlreadyExists {
+                            path: location.to_string(),
+                            source: "the response to the first attempt was lost".into(),
+                        });
+                    }
+                    Ok(put)
+                }
+            }
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// `dq`'s table, from here on reached through a store with `fault`, until it is reopened.
+    async fn with_fault(dq: &mut DataQuality, fault: Fault) -> Arc<AtomicU32> {
+        let plain = deltalake::open_table(deltalake::ensure_table_uri(&dq.uri).unwrap())
+            .await
+            .unwrap();
+        let store = plain.log_store();
+        let struck = Arc::new(AtomicU32::new(0));
+        let flaky = deltalake::logstore::default_logstore(
+            Arc::new(FlakyCommits {
+                inner: store.object_store(None),
+                fault,
+                struck: struck.clone(),
+            }),
+            store.root_object_store(None),
+            store.config().location(),
+            store.config().options(),
+        );
+        let mut table = DeltaTable::new(flaky, plain.config.clone());
+        table.load().await.unwrap();
+        dq.table = table;
+        struck
+    }
+
+    /// The data-quality commit landed, but the response to its PUT was lost, and the retried
+    /// PUT found the version taken — by itself. delta-rs then meets its own marks in the
+    /// winning commit and reports a conflict (§4.7 row 3). That commit is this write's, so the
+    /// write is done: tried again, it would record every reject that is never skipped a
+    /// second time, in a process that never crashed.
+    #[tokio::test]
+    async fn dq_commit_that_landed_unacknowledged_is_not_written_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+        let struck = with_fault(&mut dq, Fault::LandsThenSaysItExists).await;
+
+        let not_found = format!("{KAFKA_SCHEMA_NOT_FOUND}: id 42 (404, error code 40403)");
+        let batch = [
+            undecodable(0, &[3, 7], MALFORMED),
+            undecodable(0, &[5], &not_found),
+            uncoordinated(&[1]),
+        ];
+        assert_eq!(
+            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(struck.load(Ordering::SeqCst), 1, "the fault struck");
+
+        let rows = recorded(path).await;
+        assert_eq!(rows.len(), 4, "each reject once: {rows:?}");
+        let table = deltalake::open_table(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(table.version(), Some(1), "one commit");
+        assert_eq!(txn(path, "app.dq-0").await, Some(9));
+        assert_eq!(
+            dq.kafka_counters().conflict_retries(),
+            0,
+            "nobody else was there to conflict with"
+        );
     }
 }
