@@ -162,6 +162,22 @@ pub async fn read_txns(
     counters: &LookupCounters,
 ) -> Result<BTreeMap<String, TxnState>> {
     refuse_txn_retention(table)?;
+    read_own_txns(table, app_ids, counters).await
+}
+
+/// [`read_txns`] on a table every `txn` of which is ddi's own, without its refusal of
+/// `delta.setTransactionRetentionDuration`.
+///
+/// The refusal is there because a `txn` with a `lastUpdated`, as kafka-delta-ingest wrote
+/// them, can expire under the property, and the walk does not filter for that. ddi's own
+/// carry none and never expire, so on a table only ddi writes `txn`s to — the data-quality
+/// table's marks ([`crate::dq::DataQuality::write_kafka`]) — the property changes nothing
+/// read here, and refusing it would stop rejects being recorded for nothing.
+pub(crate) async fn read_own_txns(
+    table: &DeltaTable,
+    app_ids: &[String],
+    counters: &LookupCounters,
+) -> Result<BTreeMap<String, TxnState>> {
     let wanted: BTreeSet<&str> = app_ids.iter().map(String::as_str).collect();
     let mut found = BTreeMap::new();
     if !wanted.is_empty() {

@@ -1136,7 +1136,7 @@ Conform rejects are added to `rejects` in the same DQ write, so there is one DQ 
 - `columns` = `None`, and `reasons` = `avro: <error>`.
 
 They travel as `Batch.rejects` and are written **before** the target commit (pipeline.rs:793-825) by `DataQuality::write_kafka` (EO-M1, EO-m9, PO-M6):
-1. **Read the marks.** `fence::read_txns` on the DQ handle gives `m_p` = txn `<app_id>.dq-<p>` for each batch partition. DQ tables are small, so this is one or two GETs.
+1. **Read the marks.** `fence::read_own_txns` on the DQ handle gives `m_p` = txn `<app_id>.dq-<p>` for each batch partition. DQ tables are small, so this is one or two GETs. It is `read_txns` without the refusal of `delta.setTransactionRetentionDuration` (§4.6), which is for the target: a mark has no `lastUpdated` and never expires, so the property changes nothing here.
 2. **Filter.** A reject is skipped when it is deterministic, carries coordinates `(p, o)`, and `o ≤ m_p`.
    - Coordinates come from the `<prefix>partition`/`<prefix>offset` columns of the rejected row. Undecodables and transform-evaluation rejects (source rows) always have them; coerce and conform rejects have them when the SQL kept the columns (`SELECT *`).
    - "Schema not found" rejects are **never** skipped: the registry can change between attempts.

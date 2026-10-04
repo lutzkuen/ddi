@@ -433,7 +433,9 @@ impl DataQuality {
     ///
     /// Returns how many rows were written. In steps (docs/kafka-design.md §5.7):
     /// 1. Read the marks `<app_id>.dq-<p>` of the batch's partitions, and of any partition a
-    ///    reject names, from this table's handle ([`fence::read_txns`]).
+    ///    reject names, from this table's handle (`fence::read_own_txns`: a mark never
+    ///    expires, so `delta.setTransactionRetentionDuration` is not refused here, as it is
+    ///    on a target).
     /// 2. Skip a reject recorded at or below its partition's mark: one with coordinates — its
     ///    `<prefix>partition` and `<prefix>offset` columns — whose reason is deterministic,
     ///    which every reason is but [`KAFKA_SCHEMA_NOT_FOUND`].
@@ -516,7 +518,7 @@ impl DataQuality {
             .iter()
             .map(|p| kafka_app_id_for(&self.app_id, *p))
             .collect();
-        let txns = fence::read_txns(&self.table, &ids, &self.kafka.lookups)
+        let txns = fence::read_own_txns(&self.table, &ids, &self.kafka.lookups)
             .await
             .map_err(Attempt::Failed)?;
         let marks: BTreeMap<i32, i64> = partitions
@@ -1188,6 +1190,45 @@ mod tests {
         let rows = recorded(path).await;
         assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![2, 4, 7]);
         assert_eq!(txn(path, "app.dq-0").await, Some(8));
+    }
+
+    /// `delta.setTransactionRetentionDuration` is refused on a target because a `txn` written
+    /// with a `lastUpdated`, as kafka-delta-ingest wrote them, can expire under it. A
+    /// data-quality table holds only ddi's marks, which have none and never expire, so the
+    /// property is no reason to stop recording rejects there.
+    #[tokio::test]
+    async fn dq_txn_retention_on_the_data_quality_table_is_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        DeltaTable::try_from_url(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap()
+            .create()
+            .with_columns(columns())
+            .with_configuration([(
+                "delta.setTransactionRetentionDuration",
+                Some("interval 1 days"),
+            )])
+            .with_save_mode(SaveMode::ErrorIfExists)
+            .await
+            .unwrap();
+        let mut dq = open_dq(path).await;
+
+        let batch = [undecodable(0, &[3], MALFORMED)];
+        assert_eq!(
+            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(txn(path, "app.dq-0").await, Some(9));
+        // And the mark is read back as on any other table: the replay is skipped.
+        assert_eq!(
+            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     /// `write` keeps the equality rule and the commit it always made: one `txn` under
