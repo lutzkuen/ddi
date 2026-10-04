@@ -65,13 +65,17 @@
 //! (docs/kafka-design.md §5.7).
 //!
 //! Only a message that could not be decoded is skipped, when its offset is at or below its
-//! partition's mark: whether it decodes depends on its bytes and its writer schema alone,
-//! and both are fixed for good. Every other reject was judged against things a replay can
-//! find changed — the target's schema after an ALTER TABLE, the union of writer schemas,
-//! the SQL, a value the SQL computes from `now()` — so a retry can reject a row at an offset
-//! below the mark that the first attempt took, and skipping it would leave it in neither
-//! table. Those, a message whose writer schema the registry did not have, and a reject that
-//! names no offset are always written: a duplicate row is visible, a lost one is not.
+//! partition's mark and the decoder that set the mark is this one: whether it decodes
+//! depends on its bytes, its writer schema and the decoder build, the first two fixed for
+//! good and the third named in every commit ([`decoder_identity`], under
+//! `ddi.kafka.decoder`). A mark another build set, or one read from a checkpoint, which keeps
+//! no commitInfo, skips nothing; the next commit moves it to what that batch read, judged by
+//! this decoder alone. Every other reject was judged against things a replay can find
+//! changed — the target's schema after an ALTER TABLE, the union of writer schemas, the SQL,
+//! a value the SQL computes from `now()` — so a retry can reject a row at an offset below the
+//! mark that the first attempt took, and skipping it would leave it in neither table. Those,
+//! a message whose writer schema the registry did not have, and a reject that names no
+//! offset are always written: a duplicate row is visible, a lost one is not.
 
 use deltalake::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Int64Array, RecordBatch, StringArray,
@@ -121,8 +125,9 @@ pub fn kafka_app_id_for(app_id: &str, partition: i32) -> String {
 /// decoded at all (docs/kafka-design.md §5.7). No other reject's reason begins so.
 ///
 /// The only rejects [`DataQuality::write_kafka`] skips on a replay, when they are at or
-/// below their partition's mark: whether a message decodes depends on nothing but its bytes
-/// and its writer schema, which no retry changes.
+/// below their partition's mark and this decoder set it: whether a message decodes depends
+/// on nothing but its bytes, its writer schema and the decoder build ([`decoder_identity`]),
+/// and a retry by the same build changes none of them.
 pub const KAFKA_UNDECODABLE: &str = "avro:";
 
 /// How the reason a Kafka message is rejected with begins when its writer schema was not in
@@ -139,6 +144,25 @@ pub const KAFKA_METADATA_PREFIX: &str = "kafka_";
 /// How often a Kafka DQ write that conflicted is tried again in place, before it is left to
 /// the pipeline's own retry.
 const KAFKA_CONFLICT_RETRIES: u32 = 3;
+
+/// The commitInfo key a Kafka data-quality commit records its decoder under
+/// ([`decoder_identity`]).
+pub const KAFKA_DECODER: &str = "ddi.kafka.decoder";
+
+/// The generation of ddi's own decoding: raised by every change that can make a message
+/// decode that did not, or fail that did — a strictness check, a framing rule, an
+/// arrow-avro upgrade.
+pub const DECODER_GENERATION: u32 = 1;
+
+/// Which decoder judged a Kafka batch's messages: `<ddi version>/<DECODER_GENERATION>`.
+///
+/// Recorded in every Kafka data-quality commit, and compared with the one that set a mark
+/// before the mark skips an undecodable ([`DataQuality::write_kafka`]): the decoder is the
+/// one input to "this message does not decode" that a replay can change. M2 adds arrow-avro's
+/// version, the decoder it builds on.
+pub fn decoder_identity() -> String {
+    format!("{}/{DECODER_GENERATION}", env!("CARGO_PKG_VERSION"))
+}
 
 /// The table's columns, for whoever creates it.
 ///
@@ -213,6 +237,8 @@ pub struct DataQuality {
     table: DeltaTable,
     /// `<prefix>partition` and `<prefix>offset` are where a Kafka reject's coordinates are.
     kafka_prefix: String,
+    /// The decoder that judged the Kafka rejects this writes: [`decoder_identity`].
+    decoder: String,
     kafka: Arc<KafkaCounters>,
 }
 
@@ -264,6 +290,7 @@ impl DataQuality {
                 storage: storage.clone(),
                 table,
                 kafka_prefix: KAFKA_METADATA_PREFIX.to_string(),
+                decoder: decoder_identity(),
                 kafka: Arc::new(KafkaCounters::default()),
             })),
             Err(_) => Ok(None),
@@ -448,14 +475,20 @@ impl DataQuality {
     /// Returns how many rows were written. In steps (docs/kafka-design.md §5.7):
     /// 1. Read the marks `<app_id>.dq-<p>` of the batch's partitions from this table's handle
     ///    (`fence::read_own_txns`: a mark never expires, so
-    ///    `delta.setTransactionRetentionDuration` is not refused here, as it is on a target).
-    /// 2. Skip a reject recorded at or below its partition's mark: one with coordinates — its
-    ///    `<prefix>partition` and `<prefix>offset` columns, naming an offset the batch read —
-    ///    that could not be decoded ([`KAFKA_UNDECODABLE`]), unless its writer schema was not
-    ///    found ([`KAFKA_SCHEMA_NOT_FOUND`]). Only those are rejected again on a replay,
-    ///    whatever has changed in between; any other reject is written each time.
+    ///    `delta.setTransactionRetentionDuration` is not refused here, as it is on a target),
+    ///    each with the decoder the commit that set it recorded ([`KAFKA_DECODER`]): none for a
+    ///    mark a checkpoint answered.
+    /// 2. Skip a reject recorded at or below its partition's mark, when this decoder set the
+    ///    mark: one with coordinates — its `<prefix>partition` and `<prefix>offset` columns,
+    ///    naming an offset the batch read — that could not be decoded ([`KAFKA_UNDECODABLE`]),
+    ///    unless its writer schema was not found ([`KAFKA_SCHEMA_NOT_FOUND`]). Only those are
+    ///    rejected again on a replay by the same decoder, whatever else has changed in
+    ///    between; any other reject is written each time, and so is every one under a mark
+    ///    another decoder set, or one whose decoder is not known.
     /// 3. Commit the rest, each row's `source_version` its offset (−1 without one), with
-    ///    `<app_id>.dq-<p>` = max(mark, last offset read) for every partition of the batch.
+    ///    `<app_id>.dq-<p>` = max(mark, last offset read) for every partition of the batch
+    ///    whose mark this decoder set, and the last offset read for every other, under this
+    ///    decoder's name. A mark this decoder set then always stands for offsets it judged.
     /// 4. A commit that conflicts on a mark reopens the table. When the commit that won is
     ///    this write's own — it landed, and the acknowledgement of its PUT was lost — the
     ///    write is done ([`Self::landed`]). When it is another writer's — a zombie, or a
@@ -570,10 +603,15 @@ impl DataQuality {
         let txns = fence::read_own_txns(&self.table, &ids, &self.kafka.lookups)
             .await
             .map_err(|cause| Attempt::Failed { rows: all, cause })?;
-        let marks: BTreeMap<i32, i64> = partitions
+        // Each mark, and whether this decoder set it: only then does it skip anything.
+        let marks: BTreeMap<i32, (i64, bool)> = partitions
             .iter()
             .zip(&ids)
-            .filter_map(|(p, id)| Some((*p, txns.get(id)?.version?)))
+            .filter_map(|(p, id)| {
+                let txn = txns.get(id)?;
+                let ours = txn.decoder.as_deref() == Some(self.decoder.as_str());
+                Some((*p, (txn.version?, ours)))
+            })
             .collect();
 
         let mut source_versions = Vec::new();
@@ -588,7 +626,9 @@ impl DataQuality {
                 .map(|(at, reason)| {
                     let recorded = at.is_some_and(|(p, offset)| {
                         rejected_again_on_a_replay(reason)
-                            && marks.get(&p).is_some_and(|mark| offset <= *mark)
+                            && marks
+                                .get(&p)
+                                .is_some_and(|(mark, ours)| *ours && offset <= *mark)
                     });
                     !recorded
                 })
@@ -637,8 +677,14 @@ impl DataQuality {
                 cause,
             })?;
 
+        // A mark this decoder set never moves back. Another's moves to what this batch read:
+        // kept above it, it would stand for offsets this decoder never judged, under this
+        // decoder's name.
         let txns = offsets.ranges.iter().map(|(p, (_, last))| {
-            let mark = marks.get(p).map_or(*last, |m| (*m).max(*last));
+            let mark = match marks.get(p) {
+                Some((mark, true)) => (*mark).max(*last),
+                _ => *last,
+            };
             Transaction::new(kafka_app_id_for(&self.app_id, *p), mark)
         });
         let ranges: serde_json::Map<String, serde_json::Value> = offsets
@@ -660,6 +706,10 @@ impl DataQuality {
                 (
                     KAFKA_WRITE_ID.to_string(),
                     serde_json::Value::from(write_id),
+                ),
+                (
+                    KAFKA_DECODER.to_string(),
+                    serde_json::Value::from(self.decoder.clone()),
                 ),
             ]);
 
@@ -1350,11 +1400,12 @@ mod tests {
         assert_eq!(dq.kafka_counters().rows_skipped(), 1);
     }
 
-    /// A batch that read below a partition's mark leaves the mark where it is. A zombie that
-    /// recorded up to 8, then the new owner's batch up to 5: moved back to 5, the mark would
-    /// let a later replay up to 8 record the rejects above 5 again. The lower batch has to
-    /// commit for the mark to move at all, which only a reject that is never skipped makes it
-    /// do.
+    /// A batch that read below a partition's mark this decoder set leaves the mark where it
+    /// is. A zombie that recorded up to 8, then the new owner's batch up to 5: moved back to 5,
+    /// the mark would let a later replay up to 8 record the rejects above 5 again. The lower
+    /// batch has to commit for the mark to move at all, which only a reject that is never
+    /// skipped makes it do. (A mark another decoder set does move back, which costs only such
+    /// duplicates: `dq_a_mark_another_decoder_set_does_not_skip`.)
     #[tokio::test]
     async fn dq_mark_never_moves_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -1527,6 +1578,176 @@ mod tests {
         let rows = recorded(path).await;
         assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![2, 4, 7]);
         assert_eq!(txn(path, "app.dq-0").await, Some(8));
+    }
+
+    /// Commit `version` of the data-quality table at `path` by hand, as another build of ddi
+    /// would have: partition `partition`'s mark at `mark`, under `decoder` (`None`: a commit
+    /// that records none, as ddi's did before it recorded one). No rows: only the mark is
+    /// read back.
+    fn mark_by(path: &str, version: u64, partition: i32, mark: i64, decoder: Option<&str>) {
+        let mut info = serde_json::json!({
+            "timestamp": 1_700_000_000_000i64, "operation": "WRITE", "ddi.appId": "app",
+            "ddi.kafka.offsets": {partition.to_string(): [0, mark]}
+        });
+        if let Some(decoder) = decoder {
+            info[KAFKA_DECODER] = serde_json::json!(decoder);
+        }
+        let txn = serde_json::json!({"txn": {"appId": kafka_app_id_for("app", partition), "version": mark}});
+        std::fs::write(
+            format!("{path}/_delta_log/{version:020}.json"),
+            format!("{}\n{txn}\n", serde_json::json!({ "commitInfo": info })),
+        )
+        .unwrap();
+    }
+
+    /// The decoder a data-quality commit records, from the table's newest commit.
+    async fn decoder_of_head(path: &str) -> Option<serde_json::Value> {
+        info_of(&head_commit(path).await).remove(KAFKA_DECODER)
+    }
+
+    /// Every Kafka data-quality commit records the decoder that judged its rejects, and an
+    /// undecodable at or below a mark is skipped when that same decoder set the mark.
+    #[tokio::test]
+    async fn dq_same_decoder_skips_by_its_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+        let batch = [undecodable(0, &[3], MALFORMED)];
+        assert_eq!(
+            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            decoder_of_head(path).await,
+            Some(serde_json::json!(decoder_identity()))
+        );
+        let marks = fence::read_own_txns(
+            &dq.table,
+            &[kafka_app_id_for("app", 0)],
+            &LookupCounters::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(marks["app.dq-0"].version, Some(9));
+        assert_eq!(marks["app.dq-0"].decoder, Some(decoder_identity()));
+        assert_eq!(
+            open_dq(path)
+                .await
+                .write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// A mark another decoder set says nothing about what this one rejects: a stricter build
+    /// can reject a message the other decoded, at an offset under its mark, and skipped that
+    /// reject would be in neither table. So every undecodable is written again, a visible
+    /// duplicate, and the mark moves to what this batch read, judged by this decoder alone —
+    /// kept at the other's, it would let this decoder's next batch skip what it never judged.
+    #[tokio::test]
+    async fn dq_a_mark_another_decoder_set_does_not_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        mark_by(path, 1, 0, 100, Some("0.0.0/0"));
+        let mut dq = open_dq(path).await;
+
+        // The other build's batch reached 100, and its target commit did not land. This one
+        // reads the same messages in smaller batches.
+        let first = [undecodable(0, &[60], MALFORMED)];
+        assert_eq!(
+            dq.write_kafka(&first, &read(&[(0, (51, 70))]), NOW)
+                .await
+                .unwrap(),
+            1,
+            "written again"
+        );
+        assert_eq!(txn(path, "app.dq-0").await, Some(70), "not max(100, 70)");
+        let second = [undecodable(0, &[80], MALFORMED)];
+        assert_eq!(
+            dq.write_kafka(&second, &read(&[(0, (71, 100))]), NOW)
+                .await
+                .unwrap(),
+            1,
+            "this decoder never judged offset 80"
+        );
+        assert_eq!(txn(path, "app.dq-0").await, Some(100));
+        assert_eq!(dq.kafka_counters().rows_skipped(), 0);
+
+        // A commit that records no decoder is not this one's either.
+        mark_by(path, 3, 1, 50, None);
+        let mut dq = open_dq(path).await;
+        assert_eq!(
+            dq.write_kafka(
+                &[undecodable(1, &[7], MALFORMED)],
+                &read(&[(1, (0, 9))]),
+                NOW
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(txn(path, "app.dq-1").await, Some(9));
+    }
+
+    /// A mark a checkpoint answered comes without the commit that set it, so without the
+    /// decoder that commit recorded: an undecodable under it is written again.
+    #[tokio::test]
+    async fn dq_a_mark_answered_by_a_checkpoint_does_not_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+        let batch = [undecodable(0, &[3], MALFORMED)];
+        assert_eq!(
+            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
+                .await
+                .unwrap(),
+            1
+        ); // 1
+           // Another member records partition 1's rejects, and a checkpoint lands above
+           // partition 0's last commit.
+        let mut other = open_dq(path).await;
+        for offset in 10..13 {
+            other
+                .write_kafka(
+                    &[undecodable(1, &[offset], MALFORMED)],
+                    &read(&[(1, (offset, offset))]),
+                    NOW,
+                )
+                .await
+                .unwrap();
+        } // 2..=4
+        let table = deltalake::open_table(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap();
+        deltalake::checkpoints::create_checkpoint(&table, None)
+            .await
+            .unwrap();
+        other
+            .write_kafka(
+                &[undecodable(1, &[13], MALFORMED)],
+                &read(&[(1, (13, 13))]),
+                NOW,
+            )
+            .await
+            .unwrap(); // 5
+
+        assert_eq!(
+            open_dq(path)
+                .await
+                .write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
+                .await
+                .unwrap(),
+            1,
+            "written again"
+        );
+        let versions: Vec<i64> = recorded(path).await.iter().map(|r| r.0).collect();
+        assert_eq!(versions, vec![3, 3, 10, 11, 12, 13]);
     }
 
     /// `delta.setTransactionRetentionDuration` is refused on a target because a `txn` written

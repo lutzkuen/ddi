@@ -58,7 +58,7 @@ Design A was reuse-first, design B correctness-first. "rev." marks a decision ch
 | 6 | SQL over several writer schemas | **A, rev.:** align to `U`, but `U` = latest ∪ seen. The newest type wins and rows that cannot be cast go to DQ (PO-M7). |
 | 7 | STRING-column parity | **rev.:** rendered by Arrow type plus key presence (PO-B1, PO-M2). Default false for new tables; must be set explicitly on kdi tables. |
 | 8 | Parity reference | **rev.:** the apache-avro version inside the production kdi image (PO-M1), not the fork's 0.21/0.22. |
-| 9 | DQ idempotence | **rev.:** per-partition DQ txns `<app_id>.dq-<p>`, each holding the last offset covered; deterministic rejects at offsets ≤ it are skipped. dq.rs's argument for equality (a version can mean different data after a rewind, dq.rs:262-280) does not carry over: a Kafka offset names one message for the life of a topic incarnation, which §4.4 checks, and `set-offsets` moves the marks with the txns. Members never share a DQ appId (EO-M1). |
+| 9 | DQ idempotence | **rev.:** per-partition DQ txns `<app_id>.dq-<p>`, each holding the last offset covered; undecodables at offsets ≤ it are skipped when the decoder that set it is the current one (§5.7). dq.rs's argument for equality (a version can mean different data after a rewind, dq.rs:262-280) does not carry over: a Kafka offset names one message for the life of a topic incarnation, which §4.4 checks, and `set-offsets` moves the marks with the txns. Members never share a DQ appId (EO-M1). |
 | 10 | Retention gap | **B:** recovered only by `ddi kafka set-offsets --acknowledge-skip "<reason>"`, recorded in the commit. |
 | 11 | Missing offset while siblings have one | **rev.:** exactly offset 0; `low > 0` needs an acknowledged skip. Never the low watermark (EO-M4a). |
 | 12 | Baseline commit | **rev.:** on a fresh app_id whenever any partition starts above 0. |
@@ -748,7 +748,7 @@ This replaces kdi's `--ends_at_latest_offsets` (bug #228) and `position()`, whic
 | I6 | After a revoke, the partition's buffered rows have been committed or dropped before `unassign()`, and its txn is never asserted again. Messages for partitions that are not Ready never reach the buffer | `revoke_flushes_before_unassign`, `revoke_flush_timeout_drops`, `revoked_partition_not_reasserted`, `lost_revoke_drops` |
 | I7 | Only eager assignment exists | `cooperative_rejected_at_load`, unit `cooperative_protocol_in_callback_is_fatal` |
 | I8 | Every consumed offset becomes a target row, a DQ row, a counted tombstone, or a row the SQL filtered. Never an uncounted drop | `accounting_identity` |
-| I9 | A reject is never lost. Only an undecodable with coordinates is skipped on a replay; any other reject (no coordinates, schema not found, or a transform, conform or coerce reject, whose classification can change) is written again on a replay after a crash or a failed target commit between the DQ and target commits | `dq_crash_between_dq_and_target`, `dq_marks_skip_recorded_offsets` |
+| I9 | A reject is never lost. Only an undecodable with coordinates is skipped on a replay, and only under a mark the same decoder set; any other reject (no coordinates, schema not found, or a transform, conform or coerce reject, whose classification can change), and any under a mark another or an unknown decoder set, is written again on a replay after a crash or a failed target commit between the DQ and target commits | `dq_crash_between_dq_and_target`, `dq_marks_skip_recorded_offsets`, `dq_a_mark_another_decoder_set_does_not_skip` |
 | I10 | One malformed message cannot change or lose another message's row | `truncated_message_isolated`, `trailing_bytes_isolated`, `unknown_schema_id_isolated`, `no_magic_byte_isolated` |
 | I11 | Each row is decoded with its own writer schema and mapped to target columns by name, recursively | `writer_schema_switch_mid_batch`, `nested_struct_by_name`, `field_added_and_removed` |
 | I12 | With `kdi_compat` and `kdi_null_text`, every (Avro type, nullability, target type) value equals what the production kdi wrote | `kdi_parity_matrix`, `kdi_null_text_matrix`, `kdi_takeover_fixture` |
@@ -778,7 +778,8 @@ There is one `table.write()` per batch, through `Sink::commit_kafka` and the sam
 ```rust
 pub fn txn_app_id(app_id: &str, p: i32) -> String { format!("{app_id}-{p}") }       // kdi delta_helpers.rs:70-72
 
-pub struct TxnState { pub version: Option<i64>, pub mark: Option<MessageMark>, pub last_updated: LastUpdated }
+pub struct TxnState { pub version: Option<i64>, pub mark: Option<MessageMark>, pub last_updated: LastUpdated,
+                      pub decoder: Option<String> }   // decoder: `ddi.kafka.decoder` of the commit (a DQ mark's, §5.7)
 pub enum LastUpdated { Absent, At(i64), Unknown }   // the txn's own field; Unknown: answered by the kernel (step 3)
 impl TxnState {
     pub fn writer(&self) -> Writer;         // Absent → Ddi, At(_) → Other, Unknown or no txn → Unknown
@@ -923,7 +924,7 @@ Why no topic id (EO-M4): rdkafka 0.39 exposes no topic id, and DescribeTopics wo
 | 6 | Two deployments with the same app_id, different groups | Every interleaved commit conflicts; alternating progress, no duplicates | Alert on `fenced_total` rate; fix the deployment |
 | 7 | A rebalance while a batch is buffered | Revoke flush commits it (time-boxed), else drops it | Automatic; the next owner reads the txn |
 | 8 | kdi still running with the same app_id | ddi side is fenced. kdi side: `are_partition_offsets_match` (lib.rs:1164-1186) plus delta-rs 0.26's checker **(verify in the nightly `kdi_and_ddi_race`)**. kdi re-asserts all its assigned partitions, so during a handover both sides conflict on every commit for the moving partitions | The runbook stops kdi first |
-| 9 | DQ write OK, target commit fails | DQ rows and marks present | Replay skips coordinate-carrying undecodables at offsets ≤ the mark (I9); the rest are written again (a visible duplicate, never a loss) |
+| 9 | DQ write OK, target commit fails | DQ rows and marks present | Replay skips coordinate-carrying undecodables at offsets ≤ the mark when the same decoder set it (I9); the rest are written again (a visible duplicate, never a loss) |
 | 10 | DQ write fails | Nothing advanced | DQ conflict: our own landed commit is recognised by `ddi.kafka.dqWriteId` (row 3 on the DQ table); otherwise up to 3 in-place retries, then Transient. A failure that is not a conflict but may have landed is retried with the batch, and can duplicate the rejects that are never skipped (I9) |
 | 11 | Retention passed stored+1 (at assign, or mid-fetch as -140) | Mid-fetch: buffer committed first. Partition blocked (`KafkaOffsetsUnavailable`), others continue | Operator: `set-offsets --next <low> --acknowledge-skip "<reason>"` |
 | 12 | stored ≥ high: topic recreated or wrong cluster | Partition blocked (`KafkaOffsetsRegressed`) | Operator: new app_id, or `set-offsets --allow-replay` |
@@ -968,7 +969,7 @@ It exits non-zero on blocking findings.
   - moving forward past offsets that are still retained requires `--acknowledge-skip "<reason>"`, recorded as `ddi.kafka.offsetOverride`;
   - moving backwards requires `--allow-replay`;
   - `--all-partitions` applies one rule to each.
-- **DQ marks** for the same partitions are set to `O − 1` in the DQ table, so a replay records its rejects again (duplicates, never a loss).
+- **DQ marks** for the same partitions are set to `O − 1` in the DQ table, in a commit that records no `ddi.kafka.decoder`, so a replay records its rejects again (duplicates, never a loss): such a mark skips nothing (§5.7).
 - **A running owner** conflicts on its next commit, or notices at its blocked recheck, then resets and reads the new value.
 
 **`ddi status`** prints the per-partition stored offset, writer, watermarks and block reason for Kafka pipelines.
@@ -1155,12 +1156,14 @@ Conform rejects are added to `rejects` in the same DQ write, so there is one DQ 
 - `columns` = `None`, and `reasons` = `avro: <error>`. No other reject's reason may start with `avro:` (`dq::KAFKA_UNDECODABLE`): the filter in step 2 below tells undecodables by it, so a union-alignment or conform reject must be worded otherwise.
 
 They travel as `Batch.rejects` and are written **before** the target commit (pipeline.rs:793-825) by `DataQuality::write_kafka` (EO-M1, EO-m9, PO-M6):
-1. **Read the marks.** `fence::read_own_txns` on the DQ handle gives `m_p` = txn `<app_id>.dq-<p>` for each batch partition. DQ tables are small, so this is one or two GETs. It is `read_txns` without the refusal of `delta.setTransactionRetentionDuration` (§4.6), which is for the target: a mark has no `lastUpdated` and never expires, so the property changes nothing here.
-2. **Filter.** A reject is skipped when it is an undecodable (its reason starts with `avro:`), carries coordinates `(p, o)`, and `o ≤ m_p`.
+1. **Read the marks.** `fence::read_own_txns` on the DQ handle gives `m_p` = txn `<app_id>.dq-<p>` for each batch partition, with `d_p`, the decoder the commit that set it recorded under `ddi.kafka.decoder` (`TxnState::decoder`). DQ tables are small, so this is one or two GETs. It is `read_txns` without the refusal of `delta.setTransactionRetentionDuration` (§4.6), which is for the target: a mark has no `lastUpdated` and never expires, so the property changes nothing here. Nor does it read below a checkpoint (§4.3 step 4): a mark a checkpoint answered has no `d_p`, and skips nothing.
+2. **Filter.** A reject is skipped when it is an undecodable (its reason starts with `avro:`), carries coordinates `(p, o)`, `o ≤ m_p`, and `d_p` is this build's decoder (`dq::decoder_identity()`, `"<ddi version>/<DECODER_GENERATION>"`; M2 bumps the generation with every change to what decodes, and adds arrow-avro's version).
+   - A mark another decoder set, or one whose decoder is unknown (answered by a checkpoint, or set by a commit that records none), skips nothing: a stricter build can reject a message the other decoded, at an offset under its mark, and that reject would be in neither table. It is written again, a visible duplicate.
    - Coordinates come from the `<prefix>partition`/`<prefix>offset` columns of the rejected row. Undecodables and transform-evaluation rejects (source rows) always have them; coerce and conform rejects have them when the SQL kept the columns (`SELECT *`). They count only when they name an offset the batch read, inside its range for that partition: a message's own coordinates always do, so anything else under those names (values the SQL computed, or a payload's own fields read under the default prefix where the pipeline set another) is treated as no coordinates.
    - "Schema not found" rejects are **never** skipped: the registry can change between attempts.
    - Nor is any reject that is not an undecodable: transform-evaluation, conform, coerce and union-alignment rejects are judged against the target's schema, the union `U` (§5.5), the SQL (which may call `now()`), all of which can change between two attempts at one batch. After an `ALTER TABLE` on the target (§4.7 row 20) the retried batch's fresh coercer can reject a row at an offset below the mark that the first attempt wrote to the target's failed commit; skipping it would leave it in neither table. They are written on every attempt.
-3. **Commit** the remaining rows, with txns `<app_id>.dq-<p> = max(m_p, last_p)` for every batch partition and metadata `ddi.appId`, `ddi.kafka.offsets`.
+3. **Commit** the remaining rows, with txns `<app_id>.dq-<p> = max(m_p, last_p)` for every batch partition whose `d_p` is this decoder and `last_p` for every other, and metadata `ddi.appId`, `ddi.kafka.offsets`, `ddi.kafka.decoder`.
+   - Moving another decoder's mark down to `last_p` is what keeps step 2 exact. Kept at `max`, the commit would name this decoder for offsets in `(last_p, m_p]` it never judged, and its next batch over them would skip a reject the other decoder never made. A lower mark only means fewer skips, so more duplicates and never a loss; a mark this decoder set never moves back.
    - The DQ row's `source_version` column holds the rejected message's offset, or −1 when unknown. Its partition is in `payload`.
    - Members own disjoint partitions, so their DQ appIds never collide (I21).
 4. **On `ConcurrentTransaction`, `VersionAlreadyExists` or `MaxCommitAttempts`:** refresh the DQ handle, then look for this write's own commit among those that landed since its read version. Every Kafka DQ commit records `ddi.kafka.dqWriteId`, unique to its `write_kafka` call.
@@ -1168,7 +1171,7 @@ They travel as `Batch.rejects` and are written **before** the target commit (pip
    - Not found (a zombie or a handover): go back to step 1, up to 3 times; then `DataQualityConflict`, Transient. A DQ conflict is never a supervisor error.
 5. **Any other failure** is `DataQualityWrite { dq_uri, rows, source }`, with the cause typed beneath it as it was raised (delta-rs's error, `Capacity`, `OffsetLogTruncated`), so §3.6 classifies it without reading text, and never as a failure of the target.
 
-Why this is safe: Kafka offsets identify one message per topic incarnation, and incarnations are checked by §4.4. `set-offsets` moves the DQ marks with the target txns. Whether a message decodes depends only on its bytes and its writer schema, which a replay cannot change, so an undecodable is rejected again on every replay. So a skipped reject is always already in the table (I9). Delta pipelines keep `write`'s equality rule unchanged.
+Why this is safe: Kafka offsets identify one message per topic incarnation, and incarnations are checked by §4.4. `set-offsets` moves the DQ marks with the target txns, and records no decoder, so its marks skip nothing. Whether a message decodes depends only on its bytes, its writer schema and the decoder build; a replay cannot change the first two, and step 2 skips only under a mark the same decoder set, which by step 3 stands for offsets that decoder judged in a commit that landed. A replay starts at the target's offset + 1, never below the first offset of a batch whose DQ commit landed before it, so every offset it skips was judged by that commit. So a skipped reject is always already in the table (I9). Delta pipelines keep `write`'s equality rule unchanged.
 
 **Cap.** More than `max_evaluation_rejects_per_batch` undecodables in one batch (default 100, config.rs:37-42) is Blocking: "this looks like a format or registry misconfiguration, not bad data".
 
@@ -1423,7 +1426,8 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
   - `dq_two_writers_disjoint_partitions_no_conflict`, `dq_same_partition_conflict_retried_in_place`;
   - `dq_delta_write_unchanged` (equality rule pinned);
   - `dq_only_an_undecodable_is_skipped_by_the_mark`, `dq_coordinates_outside_the_batch_are_none`, `dq_mark_never_moves_back`, `dq_txn_retention_on_the_data_quality_table_is_not_refused`;
-  - `dq_commit_that_landed_unacknowledged_is_not_written_twice`, `dq_write_failures_are_typed`, `dq_store_fault_is_typed`, `dq_conflict_past_the_retries_in_place_is_typed`.
+  - `dq_commit_that_landed_unacknowledged_is_not_written_twice`, `dq_write_failures_are_typed`, `dq_store_fault_is_typed`, `dq_conflict_past_the_retries_in_place_is_typed`;
+  - `dq_same_decoder_skips_by_its_mark`, `dq_a_mark_another_decoder_set_does_not_skip`, `dq_a_mark_answered_by_a_checkpoint_does_not_skip`.
 
 **M1, config:**
 - every §2.5 rule;

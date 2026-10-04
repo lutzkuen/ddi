@@ -82,6 +82,11 @@ pub struct TxnState {
     /// The `txn`'s `lastUpdated`, which says who wrote it ([`Self::writer`]) and whether it
     /// can expire ([`Self::may_expire`]).
     pub last_updated: LastUpdated,
+    /// The decoder the commit that wrote the `txn` recorded in `ddi.kafka.decoder`, as a
+    /// Kafka data-quality commit records the one that judged its rejects
+    /// ([`crate::dq::decoder_identity`]). `None` for any other commit, and when the `txn` was
+    /// found only in a checkpoint.
+    pub decoder: Option<String>,
 }
 
 impl TxnState {
@@ -387,6 +392,7 @@ async fn walk(
                         version: Some(version),
                         mark: None,
                         last_updated,
+                        decoder: None,
                     },
                 );
             }
@@ -450,6 +456,7 @@ async fn below_checkpoint(
             // moved it on — at or above `bottom`, and gone — wrote. Its mark is not this one's.
             if written.version == answer.version {
                 answer.mark = written.mark;
+                answer.decoder = written.decoder;
                 if answer.last_updated == LastUpdated::Unknown {
                     answer.last_updated = written.last_updated;
                 }
@@ -534,7 +541,7 @@ impl TxnAction {
     }
 }
 
-/// The two keys of a commitInfo this module reads. ddi writes them at its top level, beside
+/// The keys of a commitInfo this module reads. ddi writes them at its top level, beside
 /// delta-rs's own.
 #[derive(Deserialize)]
 struct CommitInfo {
@@ -542,6 +549,8 @@ struct CommitInfo {
     app_id: Option<serde_json::Value>,
     #[serde(rename = "ddi.kafka.marks")]
     marks: Option<serde_json::Value>,
+    #[serde(rename = "ddi.kafka.decoder")]
+    decoder: Option<serde_json::Value>,
 }
 
 /// Add the wanted `txn`s commit `version` writes to `found`, unless a newer commit already
@@ -576,6 +585,10 @@ fn record_commit(
         .and_then(|i| i.app_id.as_ref())
         .and_then(serde_json::Value::as_str);
     let marks = info.as_ref().and_then(|i| i.marks.as_ref());
+    let decoder = info
+        .as_ref()
+        .and_then(|i| i.decoder.as_ref())
+        .and_then(serde_json::Value::as_str);
     for txn in txns {
         let mark = ddi_app_id.and_then(|app_id| mark_for(marks, app_id, &txn));
         let last_updated = txn.last_updated();
@@ -585,6 +598,7 @@ fn record_commit(
                 version: Some(txn.version),
                 mark,
                 last_updated,
+                decoder: decoder.map(str::to_string),
             },
         );
     }
@@ -2398,6 +2412,7 @@ mod tests {
             version,
             mark: None,
             last_updated,
+            decoder: None,
         };
         let cases = [
             (state(Some(1), LastUpdated::Absent), Writer::Ddi, false),
@@ -2460,6 +2475,7 @@ mod tests {
                 version: Some(9),
                 mark: Some(mark),
                 last_updated: LastUpdated::Absent,
+                decoder: None,
             }
         );
         assert_eq!(
@@ -2468,6 +2484,7 @@ mod tests {
                 version: Some(4),
                 mark: None,
                 last_updated: LastUpdated::Absent,
+                decoder: None,
             }
         );
         assert_eq!(
@@ -2476,6 +2493,7 @@ mod tests {
                 version: Some(7),
                 mark: None,
                 last_updated: LastUpdated::At(1_700_000_000_000),
+                decoder: None,
             }
         );
         assert_eq!(txns["app-3"], TxnState::default());
@@ -2563,6 +2581,7 @@ mod tests {
                 version: Some(9),
                 mark: Some(mark),
                 last_updated: LastUpdated::Absent,
+                decoder: None,
             },
             "and its mark comes back from commit 1, below the checkpoint"
         );
