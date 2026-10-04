@@ -230,6 +230,85 @@ pub enum Error {
         detail: String,
     },
 
+    /// A partition's offset in the target is not the one this writer last read or wrote.
+    ///
+    /// Raised before a commit by the fence over partitioned offsets (docs/kafka-design.md
+    /// §4.3), when a partition the batch carries is looked up at the snapshot the commit is
+    /// planned against. Somebody else committed that partition in between, so the batch was
+    /// read from the wrong place: the writer re-reads its offsets from the target rather than
+    /// retrying it.
+    #[error(
+        "partition {partition} of app_id {app_id:?}: the target holds offset {} where this \
+         writer expected {}. Another writer has committed this partition since: a second \
+         deployment with the same app_id, or a consumer the group has since replaced. Nothing \
+         was written; the pipeline re-reads its offsets from the target and carries on from \
+         there.",
+        .found.map_or_else(|| "none".to_string(), |o| o.to_string()),
+        .expected.map_or_else(|| "none".to_string(), |o| o.to_string())
+    )]
+    Fenced {
+        app_id: String,
+        partition: i32,
+        /// The offset this writer last read or committed for the partition.
+        expected: Option<i64>,
+        /// The offset the target holds.
+        found: Option<i64>,
+    },
+
+    /// The target sets `delta.setTransactionRetentionDuration`, under which an offset can
+    /// expire.
+    ///
+    /// Delta forgets a `txn` whose recorded time is older than that duration.
+    /// kafka-delta-ingest records one on each, so on a table it wrote, the offset of a
+    /// partition no commit has re-asserted for that long (a quiet topic, or a gap between
+    /// stopping it and starting ddi) is forgotten, and the partition would have to be read
+    /// again. ddi's own `txn` actions record no time and never expire, and the property is
+    /// refused when the pipeline opens and on every refresh, before any offset can go. See
+    /// docs/kafka-design.md §4.6.
+    #[error(
+        "target {target_uri} sets delta.setTransactionRetentionDuration = {retention}. Delta \
+         forgets an offset whose recorded time is older than that, as kafka-delta-ingest's \
+         offsets have one, and a partition whose offset is forgotten would have to be read \
+         again. Remove the property from the table; nothing was written, and the pipeline goes \
+         on once it is gone."
+    )]
+    KafkaTxnRetention {
+        target_uri: String,
+        retention: String,
+    },
+
+    /// The target's protocol asks for a writer feature this build cannot write.
+    ///
+    /// Checked when a pipeline opens or refreshes its target, rather than discovered by a
+    /// failed commit: another engine can upgrade a table's protocol while a pipeline is
+    /// writing it, and delta-rs reads a column-mapped table but refuses to write one. See
+    /// docs/kafka-design.md §4.5.
+    #[error(
+        "target {target_uri} needs a writer this build cannot be: {detail}. Nothing was \
+         written. Either write this table with a build that supports it, or point the pipeline \
+         at a table without the feature; column mapping in particular cannot be removed from a \
+         table in place."
+    )]
+    TargetProtocolUnsupported { target_uri: String, detail: String },
+
+    /// The target is no longer the table this pipeline opened.
+    ///
+    /// Its id changed: it was dropped and recreated, or another table was put at its path.
+    /// The offsets this pipeline holds were read from the old table, so it writes nothing
+    /// more to the new one until a restart, which reads the new table's offsets as it finds
+    /// them.
+    #[error(
+        "target {target_uri} is no longer the table this pipeline opened: its table id was \
+         {opened} and is now {found}. It was dropped and recreated, or another table was put \
+         in its place. Nothing more is written to it until the pipeline is restarted, which \
+         reads the new table's offsets as it finds them."
+    )]
+    TargetReplaced {
+        target_uri: String,
+        opened: String,
+        found: String,
+    },
+
     #[error("transform error: {0}")]
     Transform(String),
 
@@ -311,6 +390,37 @@ mod tests {
 
         let e = Error::from(DataFusionError::Plan("no such column".into()));
         assert!(matches!(e, Error::Transform(_)), "{e}");
+    }
+
+    #[test]
+    fn a_fenced_partition_says_what_the_target_holds_and_what_was_expected() {
+        let m = Error::Fenced {
+            app_id: "orders".into(),
+            partition: 3,
+            expected: Some(41),
+            found: Some(57),
+        }
+        .to_string();
+        assert!(
+            m.contains(
+                "partition 3 of app_id \"orders\": the target holds offset 57 where this \
+                 writer expected 41"
+            ),
+            "{m}"
+        );
+
+        // A partition with no offset yet is "none", not a number that could be read as one.
+        let m = Error::Fenced {
+            app_id: "orders".into(),
+            partition: 0,
+            expected: None,
+            found: Some(9),
+        }
+        .to_string();
+        assert!(
+            m.contains("offset 9 where this writer expected none"),
+            "{m}"
+        );
     }
 
     #[test]
