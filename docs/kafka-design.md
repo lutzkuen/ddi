@@ -285,6 +285,7 @@ There is no `ddi.sourceVersion` on Kafka commits: it is written but never read (
      - an upsert whose no-op merge falls back to the zero-row commit;
      - **an append to a target partitioned by a string column;**
      - **the same target with an all-rejected batch** (zero-row commit on a partitioned table).
+   - Added after the refactor, from golden files the pre-refactor code (ffa2a1a) wrote, which pass unchanged after it: a **coverage window** (zero-row commits that record `ddi.cutoff.*`, then the closing commit, which records none), and **two batches committed by one pipeline** (what one batch leaves in the sink, read by the next commit). One more test, outside the golden files, pins what delta-rs does after a commit (a checkpoint, the cleanup of expired commits), which no commit's JSON shows.
    - It reads every `_delta_log/*.json` of the target and DQ tables and normalises timestamps, uuids, file paths and `operationMetrics` timings. It then compares the actions plus the key/value set of `commitInfo` against a checked-in golden file. `commitInfo` is a map, so its key order was never stable byte for byte.
 2. **Code motion** is reviewed with `git diff --color-moved=dimmed-zebra`. The only non-moved lines are those in the table above, plus the conform hook.
 3. **Commit API.** `Sink::commit`/`properties` and `DataQuality::write` are untouched, so Delta commit JSON cannot change.
@@ -1384,7 +1385,9 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
 ### 9.1 Unit tests (no broker)
 
 **M0, sink, fence and DQ:**
-- `delta_commit_golden`, written first, with six shapes including the partitioned target.
+- `delta_commit_golden`, written first, with six shapes including the partitioned target; then `bootstrap_window`, `two_batches_in_one_process` and `a_commit_still_checkpoints_and_cleans_up_the_log` (§1.3).
+- Pinned through the pipeline, in the existing integration files: the range a published multi-commit batch spans (`a_batch_of_several_source_commits_publishes_where_it_started`, and its fully filtered twin), and the DQ-before-target order (`a_data_quality_write_that_fails_leaves_the_target_where_it_was`).
+- Sink: `target_file_size_splits_a_commits_files`, on both kinds of commit.
 - Commits: `kafka_commit_writes_n_txns` (`transaction_version("app-0") == 9`, `"app"` → None, `ddi.kafka.offsets` and `ddi.kafka.marks` present, no `ddi.sourceVersion`); `kafka_empty_commit_carries_txns_only`, also on a partitioned target.
 - delta-rs pin: `fence_concurrent_txn_rejected_by_delta_rs`. Two handles on one snapshot both commit `a-0`, and the second fails with `CommitConflict(ConcurrentTransaction)`, so a delta-rs bump that changes this fails CI.
 - Fence: `fence_disjoint_partitions_do_not_conflict`, `fence_base_mismatch_detected`, `none_partition_verified_before_first_commit`, `revoked_partition_not_reasserted`.
@@ -1393,12 +1396,15 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
 - Txn reader:
   - `read_txns_one_get_in_steady_state`, with a counting object store;
   - `read_txns_walks_back_to_checkpoint`, `read_txns_reads_checkpoint_txn_column`, `read_txns_multipart_checkpoint`;
-  - `read_txns_foreign_checkpoint_falls_back_to_kernel`;
-  - `read_txns_returns_marks_and_writer`.
+  - `read_txns_foreign_checkpoint_falls_back_to_kernel`, `read_txns_on_a_replayed_handle_still_reads_the_checkpoint`;
+  - `read_txns_returns_marks_and_writer`, `read_txns_checkpoint_above_our_last_commit_leaves_the_writer_unknown`, `read_txns_foreign_checkpoint_at_the_head_leaves_the_writer_unknown`;
+  - `read_txns_missing_commit_zero_is_an_error_at_version_zero`, `read_txns_commit_removed_by_cleanup_is_a_typed_error`.
 - DQ:
   - `dq_marks_skip_recorded_offsets`, `dq_schema_not_found_never_skipped`, `dq_without_coordinates_written`;
   - `dq_two_writers_disjoint_partitions_no_conflict`, `dq_same_partition_conflict_retried_in_place`;
-  - `dq_delta_write_unchanged` (equality rule pinned).
+  - `dq_delta_write_unchanged` (equality rule pinned);
+  - `dq_only_an_undecodable_is_skipped_by_the_mark`, `dq_coordinates_outside_the_batch_are_none`, `dq_mark_never_moves_back`, `dq_txn_retention_on_the_data_quality_table_is_not_refused`;
+  - `dq_commit_that_landed_unacknowledged_is_not_written_twice`, `dq_write_failures_are_typed`, `dq_store_fault_is_typed`, `dq_conflict_past_the_retries_in_place_is_typed`.
 
 **M1, config:**
 - every §2.5 rule;
