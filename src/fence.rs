@@ -186,9 +186,11 @@ async fn walk(
     let store = log_store.object_store(None);
     let checkpoint = newest_checkpoint(store.as_ref(), log_store.log_path(), head).await?;
     // Without a checkpoint the walk has to reach version 0, which must therefore still be
-    // there.
+    // there. The head's own commit may be missing only where a checkpoint at the head stands
+    // in for it, so that is what is compared: `bottom` is 0 without a checkpoint too, and a
+    // handle at version 0 would otherwise take a missing commit 0 for an empty log.
     let bottom = checkpoint.as_ref().map_or(0, |c| c.version);
-    if head_commit.is_none() && bottom != head {
+    if head_commit.is_none() && checkpoint.as_ref().map(|c| c.version) != Some(head) {
         return Err(missing_commit(table, head));
     }
 
@@ -1722,6 +1724,39 @@ mod tests {
         assert!(
             e.to_string().contains("commit 2 is no longer in its log"),
             "{e}"
+        );
+    }
+
+    /// Without a checkpoint the walk has to reach version 0, and that holds when version 0 is
+    /// the handle's own: a table created with its offsets in commit 0, dropped and recreated
+    /// at the same path under a handle still on it, has no commit 0 to read them from, which
+    /// is not the same as having none.
+    #[tokio::test]
+    async fn read_txns_missing_commit_zero_is_an_error_at_version_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        let zero = log_file(dir.path(), &commit_name(0));
+        let mut commit = std::fs::read_to_string(&zero).unwrap();
+        if !commit.ends_with('\n') {
+            commit.push('\n');
+        }
+        commit.push_str("{\"txn\":{\"appId\":\"app-0\",\"version\":5}}\n");
+        std::fs::write(&zero, commit).unwrap();
+
+        let table = open(path).await;
+        assert_eq!(table.version(), Some(0));
+        let counters = LookupCounters::default();
+        assert_eq!(
+            versions(&table, [0], &counters).await,
+            BTreeMap::from([(0, Some(5))])
+        );
+
+        std::fs::remove_file(&zero).unwrap();
+        let e = read_txns(&table, &ids([0]), &counters).await.unwrap_err();
+        assert!(
+            matches!(e, Error::OffsetLogTruncated { version: 0, .. }),
+            "got: {e:?}"
         );
     }
 
