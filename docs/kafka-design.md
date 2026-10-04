@@ -116,6 +116,7 @@ Design A was reuse-first, design B correctness-first. "rev." marks a decision ch
     - A SASL_SSL / SCRAM-SHA-512 consumer is created without error.
     - `cooperative-sticky` is accepted when the consumer is created, so config must reject it.
     - rdkafka-sys reuses ddi's locked zstd-sys 2.0.16; a fresh resolve would pick 2.1.0.
+    - **Corrected in M1:** the probe resolved 2.1.0, so it never met what 2.0.16 does. rdkafka-sys asks for zstd-sys's default features, and 2.0.16's defaults include `bindgen` (2.1.0's do not). A `kafka` build therefore runs bindgen over `zstd.h` and needs libclang with clang's resource headers (`stddef.h`); the lockfile gains bindgen, clang-sys and their deps. The Delta-only build is untouched: `cargo tree -e normal` without features is identical.
 
 ---
 
@@ -307,7 +308,7 @@ There is no `ddi.sourceVersion` on Kafka commits: it is written but never read (
 | src/sink.rs | always | `Offsets`, `KafkaOffsets`, `MessageMark`, `commit_kafka`, private `write` | +110 |
 | src/fence.rs | always | Txn naming; `read_txns` (backward walk, checkpoint `txn` column, kernel fallback); `Fence`; takeover marker, era, takeover check; retention, protocol and table-id refusals | 450 |
 | src/dq.rs | always | `write_kafka` (plain append, protocol refusal, in-place conflict retry) | +160 |
-| src/config.rs | always | `KafkaConfig`, `KafkaPipelineConfig`, `ResolvedKafka`, merge into `resolve_all`, validation, kdi env-name defaults | +500 |
+| src/config.rs, src/config/kafka.rs | always | `KafkaConfig`, `KafkaPipelineConfig`, `ResolvedKafka`, merge into `resolve_all`, validation, kdi env-name defaults, the §2.4 merge as a pure function (`ResolvedKafka::client_settings`) | +65 and 1390, + 1120 of tests |
 | src/error.rs | always | Kafka error variants (§3.6), with no rdkafka types; `Error::kafka_class`, the §3.6 classes read by variant | +230 |
 | src/metrics.rs | always | `kafka: Option<Arc<KafkaMetrics>>` on `PipelineMetrics`, rendered after the existing block only when `Some` | +220 |
 | src/budget.rs | always | Per-Kafka-pipeline reservation | +20 |
@@ -501,6 +502,18 @@ Each failure is a `Rejection`: the pipeline is held back and `ddi_pipeline_confi
 14. **Delta-only keys** (`lookups`, `write_mode`, `publish`, `dedup_*`, `upsert_*`) are not in the struct, so `deny_unknown_fields` rejects them.
 15. **`isolation.level = read_uncommitted`:** accepted, with a warning.
 
+**Added in M1** (each a `Rejection` unless said otherwise):
+- `topic` must be a Kafka topic name (1-249 of `[A-Za-z0-9._-]`, not `.`/`..`), which also keeps out librdkafka's `^regex` subscriptions; an explicit empty `group_id`, `subject` or `dq_uri` is refused.
+- A SASL `security.protocol` without `sasl.mechanism` (or `sasl.mechanisms`) is rule 9: librdkafka's default mechanism is GSSAPI. A mechanism named in `settings_env` counts, and its value is judged at open.
+- The forced keys include their aliases, `metadata.broker.list` and `auto.commit.enable`. Setting `group.protocol` at all is rule 7, which covers rule 8's second sentence.
+- `starting_offsets`: `"*"` takes `earliest`/`latest` only, `{}` names nothing, and a map with partition keys in `[kafka]` is refused (partitions belong to one topic). `explicit` (§4.4 step 7) is the pipeline's own key only: `[kafka]`'s value is a fleet default, set by the example config.
+- `blocked_recheck_secs ≥ 1`.
+- Rule 4's last clause covers the DQ table too: a Kafka and a Delta pipeline with one app_id and one DQ table are both refused (Delta's equality rule could take a Kafka reject for its own). A Kafka target that is a staged_upsert stage is refused.
+- `[kafka.schema_registry]` and the pipeline's own table merge key by key. `[kafka]` and `[[kafka.pipeline]]` also take `max_evaluation_rejects_per_batch` and `max_output_rows_per_batch`, which §2.2's table defaults from `[kafka]`.
+- Parse errors stay fatal for the file, as for `[[pipeline]]` (rule 14, wrong types). `starting_offsets` is parsed loosely (any string, any table of strings and integers) so its shapes are rule 12's per-pipeline rejections.
+- Rule 10 and the completeness of an explicit map need the environment and the broker: they are in `ResolvedKafka::client_settings` (tested now, called by M3's open) and in M3's start resolution. Nothing is read at load, so `ddi validate` passes where the secrets are not set.
+- A manifest with no streamable model is no longer an error when Kafka pipelines exist; it is a warning, and they run.
+
 ---
 
 ## 3. Consumer loop
@@ -524,7 +537,7 @@ apache-avro = "=<version in the production kdi binary>"   # parity tests only; s
 
 - **`ssl`** runs mklove with `--enable-ssl` against system OpenSSL 3. SASL PLAIN and SCRAM-SHA-256/512 come with it; no libsasl2 is needed. This is settled by the probe build (§0.3.21); M1 keeps it as a regression check: `builtin.features ⊇ ssl,sasl_scram,zstd`.
 - **`sasl` is not enabled.** It maps to `gssapi`, i.e. Kerberos only (rdkafka-sys Cargo.toml:48-61).
-- **`zstd`** reuses the locked `zstd-sys 2.0.16+zstd.1.5.7`, built bundled. Snappy and lz4 are built into librdkafka; gzip uses zlib through `libz-sys`.
+- **`zstd`** reuses the locked `zstd-sys 2.0.16+zstd.1.5.7`, built bundled. Snappy and lz4 are built into librdkafka; gzip uses zlib through `libz-sys`. Feature unification turns on 2.0.16's default `bindgen` in a `kafka` build (§0.3.21), so that build needs libclang; librdkafka itself only takes the library's path (`DEP_ZSTD_ROOT`).
 - **Not `rskafka`:** it has no consumer groups.
 
 ### 3.2 `DdiContext` (src/kafka/context.rs)
@@ -1420,11 +1433,12 @@ FROM source
 
 ## 8. Build and packaging
 
-**Settled today** (§0.3.21): the C build works on this laptop with the chosen features, and no libsasl2 or libzstd is needed. The M1 build in ddi is a regression check, not an experiment.
+**Settled today** (§0.3.21): the C build works on this laptop with the chosen features, and no libsasl2 or libzstd is needed. The M1 build in ddi is a regression check, not an experiment. **M1:** libclang is, through zstd-sys 2.0.16's default `bindgen` (§0.3.21); this laptop has libclang-18 but not clang's resource headers, so its `kafka` builds set `BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include"`.
 
 **Cargo.** As in §3.1. `kafka` is ddi's first `[features]` section. `Cargo.lock` lists the optional crates even with the feature off, and `--locked` builds without features still work. **Do not run `cargo update`.** Add the crates with `cargo add`/targeted resolution, so zstd-sys stays at the locked 2.0.16. New crates:
 - rdkafka, rdkafka-sys, openssl-sys, libz-sys, num_enum (+derive), slab, vcpkg (build only);
 - arrow-avro, strum_macros 0.28;
+- **M1, from zstd-sys's `bindgen`:** bindgen 0.72.1, clang-sys, cexpr, nom 7, minimal-lexical, libloading, itertools 0.13, shlex 1.3; and proc-macro-crate with toml_edit 0.25, toml_datetime 1.1, toml_parser and winnow 1.0 for num_enum_derive. 22 entries in all; none of the 436 before changed;
 - apache-avro (the production version) and its tree, dev only.
 
 **Laptop.**
@@ -1435,7 +1449,7 @@ FROM source
 
 ```dockerfile
 ARG DDI_FEATURES=                     # empty until M3 ships; then "kafka"
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev zlib1g-dev …   # already in rust:1.97-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev zlib1g-dev make libclang-dev   # all but libclang-dev already in rust:1.97-bookworm
 RUN … cargo build --release --locked --features "$DDI_FEATURES" …     # lines 24-25 AND 27, so the dependency-cache layer still works
 # runtime stage, line 31: add libssl3 explicitly (today it only arrives through ca-certificates → openssl)
 RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and prints librdkafka 2.12.1
@@ -1800,6 +1814,8 @@ Each milestone can be reviewed and merged on its own. Days are dev-days at ddi's
 | **M4** | **kdi compatibility and tooling.** SCRAM/SSL env compat and the SASL job (test 26); `ddi kafka plan` (era and takeover verdict, NO_TXN evidence, mapping via backward peek, `kdi_compat` advice, collisions); `ddi kafka clone-table`; `kdi_takeover_fixture`; translation checks (`* REPLACE`, quoted multi-level access, `to_char`, string→timestamp); cleanup gating | Test 26 and the takeover test green; `plan` golden output on the fixture; the clone keeps column case and has no column mapping | 5 |
 | **M5** | **Operations.** `ddi kafka set-offsets` (`--next`, acknowledgments, `--all-partitions`; no DQ marks, no takeover marker, refused on a fresh app_id: `set_offsets_refused_on_a_fresh_app_id`); docs (README Kafka section, USING_DDI, `pipelines.example.toml`, metrics reference, runbook, docs/alerts.yml); optional statsd shim (+1 d) only if open question 4 says so | `set-offsets` guard tests (forward needs an ack, backward needs `--allow-replay`, writes no takeover marker, a running owner picks it up); doc review | 3 |
 | **M6** | **Pilot cutover.** Comparison SQL recipes; runbook executed on one low-traffic topic (shadow → compare → switch); rollback rehearsal | The §10.3 gates pass on the pilot and stay green for 3 days after the switch; `kdi_ddi_alternate` green | 1.5 + soak |
+
+**M1 as built.** Until M3, a build with the feature resolves a Kafka pipeline and `ddi validate` shows it (with a "not run by this build yet" line), while `run`, `once` and `status` hold it back by name (`config_valid = 0`) and `Pipeline::open` refuses one; M3 removes both. With every Kafka pipeline held back, the budget reserves nothing yet. User documentation stays in M5. The apache-avro dev-dependency waits for M-1's version.
 
 **Total: about 38 dev-days** (range 33-43), plus soak and roughly 0.25 day per further table. This is above the critique's 30-35 because their findings added scope: deferred revoke flush, stay-in-group error handling, the txn walker in M0, and null-text presence.
 
