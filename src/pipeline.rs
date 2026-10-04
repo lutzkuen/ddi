@@ -1173,11 +1173,7 @@ impl Pipeline {
         let now = chrono::Utc::now().naive_utc().and_utc().timestamp_micros();
         match offsets {
             Offsets::Version(txn_version) => dq.write(rejects, *txn_version, now).await,
-            // Unreachable: nothing builds a Kafka position before
-            // `DataQuality::write_kafka` (docs/kafka-design.md §5.7) is here to take this arm.
-            Offsets::Kafka(_) => Err(Error::Other(
-                "internal: recording a Kafka batch's rejects is not implemented".into(),
-            )),
+            Offsets::Kafka(offsets) => dq.write_kafka(rejects, offsets, now).await,
         }
     }
 

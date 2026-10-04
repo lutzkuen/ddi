@@ -49,18 +49,42 @@
 //! can fail, or a lookup running on `use_current` whose head moved in between, can reject a
 //! row on the replay that the first attempt did not, and that row then reaches neither
 //! table.
+//!
+//! # Kafka: a mark per partition
+//!
+//! A Kafka batch has no single version to key that skip on, and the members of a consumer
+//! group write one DQ table side by side, so one shared `txn` would make every pair of them
+//! conflict. [`DataQuality::write_kafka`] keeps one mark per partition instead, under
+//! `<app_id>.dq-<p>` ([`kafka_app_id_for`]): the last offset of that partition whose rejects
+//! are recorded. Members own disjoint partitions, so their marks never collide.
+//!
+//! The skip is per row, and `<=` rather than the equality above, because the argument for
+//! equality does not carry over: a source version can mean different data after a rewind,
+//! but an offset names one message for the life of a topic, a resume checks it is still the
+//! same topic, and moving offsets by hand moves these marks with them
+//! (docs/kafka-design.md §5.7). A reject is skipped when it is recorded at or below its
+//! partition's mark, and its classification cannot change on a replay. One that names no
+//! offset, or whose writer schema the registry did not have, is always written: a duplicate
+//! row is visible, a lost one is not.
 
-use deltalake::arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray};
-use deltalake::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use deltalake::kernel::transaction::CommitProperties;
+use deltalake::arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
+};
+use deltalake::arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef, TimeUnit};
+use deltalake::kernel::transaction::{CommitProperties, TransactionError};
 use deltalake::kernel::{DataType as DeltaType, PrimitiveType, StructField, Transaction};
 use deltalake::protocol::SaveMode;
-use deltalake::DeltaTable;
+use deltalake::{DeltaTable, DeltaTableError};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
+use crate::fence::{self, LookupCounters};
 use crate::schema::Rejected;
+use crate::sink::KafkaOffsets;
 
 /// The suffix appended to a target's URI to find its data-quality table.
 pub const SUFFIX: &str = "__ddi_dq";
@@ -77,6 +101,30 @@ pub fn uri_for(target_uri: &str) -> String {
 pub fn app_id_for(app_id: &str) -> String {
     format!("{app_id}.dq")
 }
+
+/// The `txn` appId a Kafka pipeline's mark for one partition is stored under in its DQ
+/// table: the last offset of `partition` whose rejects are recorded there.
+///
+/// One per partition rather than one per pipeline, because the members of a consumer group
+/// each write their own partitions' rejects, and would otherwise all conflict on one appId.
+pub fn kafka_app_id_for(app_id: &str, partition: i32) -> String {
+    format!("{app_id}.dq-{partition}")
+}
+
+/// How the reason a Kafka message is rejected with begins when its writer schema was not in
+/// the registry.
+///
+/// Such a reject is never skipped on a replay ([`DataQuality::write_kafka`]): the schema can
+/// be registered between two attempts, and the same message then decodes.
+pub const KAFKA_SCHEMA_NOT_FOUND: &str = "avro: schema not found";
+
+/// The prefix of the columns a Kafka reject carries its coordinates in, until the pipeline
+/// says otherwise (`metadata_prefix`).
+pub const KAFKA_METADATA_PREFIX: &str = "kafka_";
+
+/// How often a Kafka DQ write that conflicted is tried again in place, before it is left to
+/// the pipeline's own retry.
+const KAFKA_CONFLICT_RETRIES: u32 = 3;
 
 /// The table's columns, for whoever creates it.
 ///
@@ -149,6 +197,36 @@ pub struct DataQuality {
     uri: String,
     storage: crate::storage::Storage,
     table: DeltaTable,
+    /// `<prefix>partition` and `<prefix>offset` are where a Kafka reject's coordinates are.
+    kafka_prefix: String,
+    kafka: Arc<KafkaCounters>,
+}
+
+/// What recording a Kafka pipeline's rejects has cost and saved, for
+/// `ddi_kafka_dq_rows_skipped_total`, `ddi_kafka_dq_conflict_retries_total` and the offset
+/// lookups its marks take.
+#[derive(Debug, Default)]
+pub struct KafkaCounters {
+    rows_skipped: AtomicU64,
+    conflict_retries: AtomicU64,
+    lookups: LookupCounters,
+}
+
+impl KafkaCounters {
+    /// Rejects not written because their partition's mark says they already were.
+    pub fn rows_skipped(&self) -> u64 {
+        self.rows_skipped.load(Ordering::Relaxed)
+    }
+
+    /// Writes tried again after a conflict on a mark.
+    pub fn conflict_retries(&self) -> u64 {
+        self.conflict_retries.load(Ordering::Relaxed)
+    }
+
+    /// The reads of the marks.
+    pub fn lookups(&self) -> &LookupCounters {
+        &self.lookups
+    }
 }
 
 impl DataQuality {
@@ -171,6 +249,8 @@ impl DataQuality {
                 uri: uri.to_string(),
                 storage: storage.clone(),
                 table,
+                kafka_prefix: KAFKA_METADATA_PREFIX.to_string(),
+                kafka: Arc::new(KafkaCounters::default()),
             })),
             Err(_) => Ok(None),
         }
@@ -178,6 +258,16 @@ impl DataQuality {
 
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    /// Read a Kafka reject's coordinates from `<prefix>partition` and `<prefix>offset`.
+    pub fn set_kafka_metadata_prefix(&mut self, prefix: impl Into<String>) {
+        self.kafka_prefix = prefix.into();
+    }
+
+    /// The counters [`Self::write_kafka`] adds to.
+    pub fn kafka_counters(&self) -> &Arc<KafkaCounters> {
+        &self.kafka
     }
 
     /// Write every reject in this batch for `source_version`, unless they are already there.
@@ -304,16 +394,31 @@ impl DataQuality {
             payload.extend(payloads(&r.rows)?);
         }
         let n = reasons.len();
+        self.assemble(
+            vec![source_version; n],
+            columns,
+            reasons,
+            payload,
+            now_micros,
+        )
+    }
 
+    /// The data-quality batch for these rows, one `source_version` each.
+    fn assemble(
+        &self,
+        source_versions: Vec<i64>,
+        columns: Vec<Option<String>>,
+        reasons: Vec<String>,
+        payload: Vec<Option<String>>,
+        now_micros: i64,
+    ) -> Result<RecordBatch> {
+        let n = reasons.len();
         RecordBatch::try_new(
             arrow_schema(),
             vec![
                 Arc::new(StringArray::from(vec![self.app_id.as_str(); n])) as ArrayRef,
                 Arc::new(StringArray::from(vec![self.pipeline.as_str(); n])) as ArrayRef,
-                Arc::new(deltalake::arrow::array::Int64Array::from(vec![
-                    source_version;
-                    n
-                ])) as ArrayRef,
+                Arc::new(Int64Array::from(source_versions)) as ArrayRef,
                 Arc::new(StringArray::from(columns)) as ArrayRef,
                 Arc::new(StringArray::from(reasons)) as ArrayRef,
                 Arc::new(StringArray::from(payload)) as ArrayRef,
@@ -322,6 +427,266 @@ impl DataQuality {
         )
         .map_err(|e| Error::Other(format!("cannot assemble the data-quality batch: {e}")))
     }
+
+    /// Write the rejects of a Kafka batch that read `offsets.ranges`, except those already
+    /// recorded, and move each of its partitions' marks to the last offset it read.
+    ///
+    /// Returns how many rows were written. In steps (docs/kafka-design.md §5.7):
+    /// 1. Read the marks `<app_id>.dq-<p>` of the batch's partitions, and of any partition a
+    ///    reject names, from this table's handle ([`fence::read_txns`]).
+    /// 2. Skip a reject recorded at or below its partition's mark: one with coordinates — its
+    ///    `<prefix>partition` and `<prefix>offset` columns — whose reason is deterministic,
+    ///    which every reason is but [`KAFKA_SCHEMA_NOT_FOUND`].
+    /// 3. Commit the rest, each row's `source_version` its offset (−1 without one), with
+    ///    `<app_id>.dq-<p>` = max(mark, last offset read) for every partition of the batch.
+    /// 4. A commit that conflicts on a mark — a zombie, or a handover — reopens the table and
+    ///    goes back to step 1, up to [`KAFKA_CONFLICT_RETRIES`] times. After that it is an
+    ///    ordinary error for the pipeline to retry, never one that replans the target.
+    ///
+    /// [`Self::write`] and its equality rule are untouched by any of this.
+    pub async fn write_kafka(
+        &mut self,
+        rejected: &[Rejected],
+        offsets: &KafkaOffsets,
+        now_micros: i64,
+    ) -> Result<usize> {
+        let rows: usize = rejected.iter().map(Rejected::len).sum();
+        if rows == 0 {
+            return Ok(0);
+        }
+        let coordinates: Vec<Vec<Option<(i32, i64)>>> =
+            rejected.iter().map(|r| self.coordinates(r)).collect();
+
+        let mut retries = 0;
+        loop {
+            match self
+                .try_write_kafka(rejected, &coordinates, offsets, now_micros)
+                .await
+            {
+                Ok(written) => return Ok(written),
+                Err(Attempt::Conflict(e)) if retries < KAFKA_CONFLICT_RETRIES => {
+                    retries += 1;
+                    self.kafka.conflict_retries.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        app_id = %self.app_id,
+                        dq_uri = %self.uri,
+                        attempt = retries,
+                        "another writer recorded rejects for one of this batch's partitions \
+                         first ({e}); re-reading the marks and trying again"
+                    );
+                    self.table = self.storage.open(&self.uri).await?;
+                }
+                Err(Attempt::Conflict(e)) => {
+                    return Err(Error::Other(format!(
+                        "cannot write {rows} rejected row(s) to the data-quality table {:?}: \
+                         another writer kept recording rejects for the same partitions, \
+                         {} times in a row ({e}). The batch was not committed, so nothing was \
+                         lost; it is tried again.",
+                        self.uri,
+                        KAFKA_CONFLICT_RETRIES + 1
+                    )))
+                }
+                Err(Attempt::Failed(e)) => {
+                    // As in `write`: the next attempt starts from the table as it is now, so
+                    // a handle that has fallen behind log cleanup does not fail it again.
+                    if let Ok(table) = self.storage.open(&self.uri).await {
+                        self.table = table;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// One pass of steps 1-3 of [`Self::write_kafka`].
+    async fn try_write_kafka(
+        &mut self,
+        rejected: &[Rejected],
+        coordinates: &[Vec<Option<(i32, i64)>>],
+        offsets: &KafkaOffsets,
+        now_micros: i64,
+    ) -> std::result::Result<usize, Attempt> {
+        let partitions: BTreeSet<i32> = offsets
+            .ranges
+            .keys()
+            .copied()
+            .chain(coordinates.iter().flatten().flatten().map(|(p, _)| *p))
+            .collect();
+        let ids: Vec<String> = partitions
+            .iter()
+            .map(|p| kafka_app_id_for(&self.app_id, *p))
+            .collect();
+        let txns = fence::read_txns(&self.table, &ids, &self.kafka.lookups)
+            .await
+            .map_err(Attempt::Failed)?;
+        let marks: BTreeMap<i32, i64> = partitions
+            .iter()
+            .zip(&ids)
+            .filter_map(|(p, id)| Some((*p, txns.get(id)?.version?)))
+            .collect();
+
+        let mut source_versions = Vec::new();
+        let mut columns = Vec::new();
+        let mut reasons = Vec::new();
+        let mut payload = Vec::new();
+        let mut skipped = 0u64;
+        for (r, coordinates) in rejected.iter().zip(coordinates) {
+            let keep: Vec<bool> = coordinates
+                .iter()
+                .zip(&r.reasons)
+                .map(|(at, reason)| {
+                    let recorded = at.is_some_and(|(p, offset)| {
+                        !reason.starts_with(KAFKA_SCHEMA_NOT_FOUND)
+                            && marks.get(&p).is_some_and(|mark| offset <= *mark)
+                    });
+                    !recorded
+                })
+                .collect();
+            skipped += keep.iter().filter(|k| !**k).count() as u64;
+            if !keep.iter().any(|k| *k) {
+                continue;
+            }
+            let rows = deltalake::arrow::compute::filter_record_batch(
+                &r.rows,
+                &BooleanArray::from(keep.clone()),
+            )
+            .map_err(|e| {
+                Attempt::Failed(Error::Other(format!(
+                    "cannot set aside the rejects already recorded: {e}"
+                )))
+            })?;
+            payload.extend(payloads(&rows).map_err(Attempt::Failed)?);
+            for (i, kept) in keep.iter().enumerate() {
+                if *kept {
+                    source_versions.push(coordinates[i].map_or(-1, |(_, offset)| offset));
+                    columns.push(r.columns[i].clone());
+                    reasons.push(r.reasons[i].clone());
+                }
+            }
+        }
+
+        if reasons.is_empty() {
+            debug!(
+                app_id = %self.app_id,
+                skipped,
+                "every reject of this batch is already in the data-quality table; not writing \
+                 them twice"
+            );
+            self.kafka
+                .rows_skipped
+                .fetch_add(skipped, Ordering::Relaxed);
+            return Ok(0);
+        }
+        let written = reasons.len();
+        let batch = self
+            .assemble(source_versions, columns, reasons, payload, now_micros)
+            .map_err(Attempt::Failed)?;
+
+        let txns = offsets.ranges.iter().map(|(p, (_, last))| {
+            let mark = marks.get(p).map_or(*last, |m| (*m).max(*last));
+            Transaction::new(kafka_app_id_for(&self.app_id, *p), mark)
+        });
+        let ranges: serde_json::Map<String, serde_json::Value> = offsets
+            .ranges
+            .iter()
+            .map(|(p, (first, last))| (p.to_string(), serde_json::json!([first, last])))
+            .collect();
+        let props = CommitProperties::default()
+            .with_application_transactions(txns.collect())
+            .with_metadata([
+                (
+                    "ddi.appId".to_string(),
+                    serde_json::Value::from(self.app_id.clone()),
+                ),
+                (
+                    "ddi.kafka.offsets".to_string(),
+                    serde_json::Value::Object(ranges),
+                ),
+            ]);
+
+        // As in `write`, and for the same reason: no runtime nobody configured.
+        let session = Arc::new(crate::budget::delta_session(&self.table).map_err(Attempt::Failed)?);
+        // A clone rather than the handle itself, so that a failed write leaves a usable
+        // handle behind even when the table cannot be reopened.
+        let written_table = self
+            .table
+            .clone()
+            .write(vec![batch])
+            .with_session_state(session)
+            .with_save_mode(SaveMode::Append)
+            .with_cast_safety(false)
+            .with_commit_properties(props)
+            .await;
+        match written_table {
+            Ok(t) => {
+                self.table = t;
+                self.kafka
+                    .rows_skipped
+                    .fetch_add(skipped, Ordering::Relaxed);
+                Ok(written)
+            }
+            Err(e) if is_conflict(&e) => Err(Attempt::Conflict(e)),
+            Err(e) => Err(Attempt::Failed(Error::Other(format!(
+                "cannot write {written} rejected row(s) to the data-quality table {:?}: {e}. \
+                 The batch was not committed, so nothing was lost — but this pipeline cannot \
+                 make progress until the table is writable.",
+                self.uri
+            )))),
+        }
+    }
+
+    /// Each row's partition and offset, where its `<prefix>partition` and `<prefix>offset`
+    /// columns are integers and both are set.
+    ///
+    /// A row without them — a transform's output that dropped the columns, or computed
+    /// something else under their names — has no coordinates, and is always written.
+    fn coordinates(&self, rejected: &Rejected) -> Vec<Option<(i32, i64)>> {
+        let column = |name: String| {
+            let c = rejected.rows.column_by_name(&name)?;
+            if !c.data_type().is_integer() {
+                return None;
+            }
+            // An integer too wide for i64 becomes null, and so has no coordinates.
+            deltalake::arrow::compute::cast(c, &DataType::Int64).ok()
+        };
+        let partitions = column(format!("{}partition", self.kafka_prefix));
+        let offsets = column(format!("{}offset", self.kafka_prefix));
+        let (Some(partitions), Some(offsets)) = (partitions, offsets) else {
+            return vec![None; rejected.len()];
+        };
+        let (partitions, offsets) = (
+            partitions.as_primitive::<Int64Type>(),
+            offsets.as_primitive::<Int64Type>(),
+        );
+        (0..rejected.len())
+            .map(|i| {
+                if partitions.is_null(i) || offsets.is_null(i) {
+                    return None;
+                }
+                Some((i32::try_from(partitions.value(i)).ok()?, offsets.value(i)))
+            })
+            .collect()
+    }
+}
+
+/// How one attempt of [`DataQuality::write_kafka`] ended, when it did not write.
+enum Attempt {
+    /// Another commit wrote one of the same marks first: worth trying again in place.
+    Conflict(DeltaTableError),
+    Failed(Error),
+}
+
+/// Did a commit fail because another one landed first on something it asserted?
+fn is_conflict(e: &DeltaTableError) -> bool {
+    matches!(
+        e,
+        DeltaTableError::VersionAlreadyExists(_)
+            | DeltaTableError::Transaction {
+                source: TransactionError::CommitConflict(_)
+                    | TransactionError::VersionAlreadyExists(_)
+                    | TransactionError::MaxCommitAttempts(_),
+            }
+    )
 }
 
 /// Each row of `batch`, as its own JSON object.
@@ -359,7 +724,6 @@ fn payloads(batch: &RecordBatch) -> Result<Vec<Option<String>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deltalake::arrow::array::Int64Array;
 
     #[test]
     fn the_table_sits_next_to_the_target() {
@@ -433,5 +797,430 @@ mod tests {
                 a.name()
             );
         }
+    }
+
+    // ---------------------------------------------------------------- Kafka rejects
+
+    use deltalake::arrow::array::Int32Array;
+    use deltalake::kernel::Action;
+    use futures::TryStreamExt;
+
+    const NOW: i64 = 1_700_000_000_000_000;
+    const MALFORMED: &str = "avro: malformed body: unexpected end of input";
+
+    async fn create_dq(path: &str) {
+        DeltaTable::try_from_url(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap()
+            .create()
+            .with_columns(columns())
+            .with_save_mode(SaveMode::ErrorIfExists)
+            .await
+            .unwrap();
+    }
+
+    async fn open_dq(path: &str) -> DataQuality {
+        DataQuality::open(&crate::storage::Storage::default(), path, "app", "orders")
+            .await
+            .unwrap()
+            .expect("the table was just created")
+    }
+
+    /// Messages of `partition` at `offsets` the decoder set aside, as it sets them aside.
+    fn undecodable(partition: i32, offsets: &[i64], reason: &str) -> Rejected {
+        let n = offsets.len();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("kafka_topic", DataType::Utf8, false),
+            Field::new("kafka_partition", DataType::Int32, false),
+            Field::new("kafka_offset", DataType::Int64, false),
+            Field::new("kafka_value_b64", DataType::Utf8, true),
+        ]));
+        let rows = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["orders"; n])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![partition; n])) as ArrayRef,
+                Arc::new(Int64Array::from(offsets.to_vec())) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("AAAAKg=="); n])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        Rejected {
+            rows,
+            reasons: vec![reason.to_string(); n],
+            columns: vec![None; n],
+        }
+    }
+
+    /// A transform's output row that would not coerce, without the coordinate columns.
+    fn uncoordinated(order_ids: &[i64]) -> Rejected {
+        let n = order_ids.len();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("amount", DataType::Utf8, true),
+        ]));
+        let rows = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(order_ids.to_vec())) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("n/a"); n])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        Rejected {
+            rows,
+            reasons: vec!["cannot cast 'n/a' to DECIMAL(10,2)".to_string(); n],
+            columns: vec![Some("amount".to_string()); n],
+        }
+    }
+
+    /// A Kafka batch that read `ranges`.
+    fn read(ranges: &[(i32, (i64, i64))]) -> KafkaOffsets {
+        KafkaOffsets {
+            topic: "orders".into(),
+            group_id: "ddi-orders".into(),
+            ranges: ranges.iter().copied().collect(),
+            assert: ranges.iter().map(|(p, (_, last))| (*p, *last)).collect(),
+            marks: BTreeMap::new(),
+            cleanup_logs: false,
+            baseline: false,
+            override_reason: None,
+        }
+    }
+
+    /// Every row of the table: (source_version, reason, payload), in source_version order.
+    async fn recorded(path: &str) -> Vec<(i64, String, Option<String>)> {
+        let table = deltalake::open_table(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap();
+        let (_, stream) = table.scan_table().await.unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let mut rows = Vec::new();
+        // The scan may hand text back as any of Arrow's string types.
+        let text = |b: &RecordBatch, name: &str| {
+            deltalake::arrow::compute::cast(b.column_by_name(name).unwrap(), &DataType::Utf8)
+                .unwrap()
+        };
+        for b in &batches {
+            let version = b.column_by_name("source_version").unwrap();
+            let version = version.as_primitive::<Int64Type>();
+            let (reason, payload) = (text(b, "reason"), text(b, "payload"));
+            let (reason, payload) = (reason.as_string::<i32>(), payload.as_string::<i32>());
+            for i in 0..b.num_rows() {
+                rows.push((
+                    version.value(i),
+                    reason.value(i).to_string(),
+                    payload.is_valid(i).then(|| payload.value(i).to_string()),
+                ));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    async fn txn(path: &str, app_id: &str) -> Option<i64> {
+        let table = deltalake::open_table(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap();
+        table
+            .snapshot()
+            .unwrap()
+            .transaction_version(table.log_store().as_ref(), app_id)
+            .await
+            .unwrap()
+    }
+
+    async fn head_commit(path: &str) -> Vec<Action> {
+        let table = deltalake::open_table(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap();
+        let version = table.version().unwrap();
+        let raw = table
+            .log_store()
+            .read_commit_entry(version)
+            .await
+            .unwrap()
+            .unwrap();
+        deltalake::logstore::get_actions(version, &raw).unwrap()
+    }
+
+    fn txns_of(actions: &[Action]) -> Vec<(String, i64)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Txn(t) => Some((t.app_id.clone(), t.version)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn info_of(actions: &[Action]) -> std::collections::HashMap<String, serde_json::Value> {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                Action::CommitInfo(ci) => Some(ci.info.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_kafka_mark_is_one_app_id_per_partition() {
+        assert_eq!(kafka_app_id_for("orders", 3), "orders.dq-3");
+        assert_ne!(kafka_app_id_for("orders", 3), app_id_for("orders"));
+        // Never one the target's offsets are kept under (`<app_id>-<p>`).
+        assert_ne!(
+            kafka_app_id_for("orders", 3),
+            crate::fence::txn_app_id("orders", 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn dq_marks_skip_recorded_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+
+        let batch = [undecodable(0, &[3, 7], MALFORMED)];
+        assert_eq!(
+            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(txn(path, "app.dq-0").await, Some(9));
+        let actions = head_commit(path).await;
+        assert_eq!(txns_of(&actions), vec![("app.dq-0".to_string(), 9)]);
+        let info = info_of(&actions);
+        assert_eq!(info["ddi.appId"], serde_json::json!("app"));
+        assert_eq!(info["ddi.kafka.offsets"], serde_json::json!({"0": [0, 9]}));
+        assert!(!info.contains_key("ddi.sourceVersion"), "{info:?}");
+
+        // The target commit failed, and the batch is read again: by this process, or by the
+        // next owner of the partition, which has only the table to go on.
+        assert_eq!(
+            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
+                .await
+                .unwrap(),
+            0
+        );
+        let mut next_owner = open_dq(path).await;
+        assert_eq!(
+            next_owner
+                .write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(dq.kafka_counters().rows_skipped(), 2);
+
+        // A batch that overlaps the recorded one: offset 7 is there already, 11 is not.
+        let wider = [undecodable(0, &[7, 11], MALFORMED)];
+        assert_eq!(
+            next_owner
+                .write_kafka(&wider, &read(&[(0, (5, 12))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(txn(path, "app.dq-0").await, Some(12));
+
+        let rows = recorded(path).await;
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![3, 7, 11],
+            "source_version holds each message's offset"
+        );
+        let payload = rows[2].2.as_deref().unwrap();
+        assert!(payload.contains("\"kafka_partition\":0"), "{payload}");
+        assert!(payload.contains("\"kafka_offset\":11"), "{payload}");
+    }
+
+    #[tokio::test]
+    async fn dq_schema_not_found_never_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+
+        let not_found = format!("{KAFKA_SCHEMA_NOT_FOUND}: id 42 (404, error code 40403)");
+        let batch = [
+            undecodable(0, &[3], &not_found),
+            undecodable(0, &[4], MALFORMED),
+        ];
+        assert_eq!(
+            dq.write_kafka(&batch, &read(&[(0, (0, 4))]), NOW)
+                .await
+                .unwrap(),
+            2
+        );
+        // On the replay the registry may have the schema, and the message decode: its reject
+        // is recorded again rather than taken for the one already there.
+        assert_eq!(
+            dq.write_kafka(&batch, &read(&[(0, (0, 4))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let rows = recorded(path).await;
+        let versions: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(versions, vec![3, 3, 4]);
+        assert!(rows[..2].iter().all(|r| r.1 == not_found));
+    }
+
+    #[tokio::test]
+    async fn dq_without_coordinates_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+
+        // A coerce reject from SQL that dropped the kafka_ columns, and an undecodable whose
+        // offset is null: neither names a message, so neither can be found again.
+        let mut no_offset = undecodable(1, &[0], MALFORMED);
+        let schema = no_offset.rows.schema();
+        let nullable = Arc::new(Schema::new(
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone().with_nullable(true))
+                .collect::<Vec<_>>(),
+        ));
+        let mut columns = no_offset.rows.columns().to_vec();
+        columns[2] = Arc::new(Int64Array::from(vec![None::<i64>]));
+        no_offset.rows = RecordBatch::try_new(nullable, columns).unwrap();
+        let batch = [uncoordinated(&[41, 42]), no_offset];
+
+        let offsets = read(&[(0, (0, 8)), (1, (0, 3))]);
+        assert_eq!(dq.write_kafka(&batch, &offsets, NOW).await.unwrap(), 3);
+        assert_eq!(dq.write_kafka(&batch, &offsets, NOW).await.unwrap(), 3);
+        assert_eq!(dq.kafka_counters().rows_skipped(), 0);
+
+        let rows = recorded(path).await;
+        assert_eq!(rows.len(), 6);
+        assert!(
+            rows.iter().all(|r| r.0 == -1),
+            "no offset to record: {rows:?}"
+        );
+        // The marks move all the same: a batch's partitions are covered whatever they held.
+        assert_eq!(txn(path, "app.dq-0").await, Some(8));
+        assert_eq!(txn(path, "app.dq-1").await, Some(3));
+
+        // Under another metadata prefix, kafka_partition and kafka_offset are just columns.
+        let mut prefixed = open_dq(path).await;
+        prefixed.set_kafka_metadata_prefix("meta_");
+        let batch = [undecodable(0, &[5], MALFORMED)];
+        assert_eq!(
+            prefixed
+                .write_kafka(&batch, &read(&[(0, (0, 8))]), NOW)
+                .await
+                .unwrap(),
+            1,
+            "below the mark, but not known to be"
+        );
+    }
+
+    #[tokio::test]
+    async fn dq_two_writers_disjoint_partitions_no_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        // Two members of one group, both with a handle on version 0.
+        let (mut a, mut b) = (open_dq(path).await, open_dq(path).await);
+
+        let from_a = [undecodable(0, &[1], MALFORMED)];
+        let from_b = [undecodable(1, &[2], MALFORMED)];
+        assert_eq!(
+            a.write_kafka(&from_a, &read(&[(0, (0, 5))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            b.write_kafka(&from_b, &read(&[(1, (0, 6))]), NOW)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(a.kafka_counters().conflict_retries(), 0);
+        assert_eq!(
+            b.kafka_counters().conflict_retries(),
+            0,
+            "rebased by delta-rs, never retried here"
+        );
+
+        assert_eq!(txn(path, "app.dq-0").await, Some(5));
+        assert_eq!(txn(path, "app.dq-1").await, Some(6));
+        assert_eq!(recorded(path).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dq_same_partition_conflict_retried_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        // A zombie and the partition's new owner, both with a handle on version 0. The owner
+        // records the batch first; the zombie then records the same batch and one more.
+        let (mut owner, mut zombie) = (open_dq(path).await, open_dq(path).await);
+        let first = [undecodable(0, &[2, 4], MALFORMED)];
+        assert_eq!(
+            owner
+                .write_kafka(&first, &read(&[(0, (0, 5))]), NOW)
+                .await
+                .unwrap(),
+            2
+        );
+
+        let again = [undecodable(0, &[2, 4, 7], MALFORMED)];
+        assert_eq!(
+            zombie
+                .write_kafka(&again, &read(&[(0, (0, 8))]), NOW)
+                .await
+                .unwrap(),
+            1,
+            "re-read the mark after the conflict, and wrote only what it did not cover"
+        );
+        assert_eq!(zombie.kafka_counters().conflict_retries(), 1);
+        assert_eq!(zombie.kafka_counters().rows_skipped(), 2);
+
+        let rows = recorded(path).await;
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![2, 4, 7]);
+        assert_eq!(txn(path, "app.dq-0").await, Some(8));
+    }
+
+    /// `write` keeps the equality rule and the commit it always made: one `txn` under
+    /// `<app_id>.dq` holding the batch's source version, and `ddi.sourceVersion` beside it.
+    #[tokio::test]
+    async fn dq_delta_write_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+        let rejects = [uncoordinated(&[1, 2])];
+
+        assert_eq!(dq.write(&rejects, 5, NOW).await.unwrap(), 2);
+        let actions = head_commit(path).await;
+        assert_eq!(txns_of(&actions), vec![("app.dq".to_string(), 5)]);
+        let info = info_of(&actions);
+        assert_eq!(info["ddi.sourceVersion"], serde_json::json!(5));
+        assert_eq!(info["ddi.appId"], serde_json::json!("app"));
+        assert!(!info.contains_key("ddi.kafka.offsets"), "{info:?}");
+
+        // The same version again is the replay the skip exists for.
+        assert_eq!(dq.write(&rejects, 5, NOW).await.unwrap(), 0);
+        // A lower one is a rewind, and is written: `>=` would swallow it.
+        assert_eq!(dq.write(&rejects, 3, NOW).await.unwrap(), 2);
+        assert_eq!(txn(path, "app.dq").await, Some(3));
+
+        let rows = recorded(path).await;
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![3, 3, 5, 5]
+        );
+        assert!(rows
+            .iter()
+            .all(|r| r.2.as_deref().unwrap().contains("\"order_id\"")));
     }
 }
