@@ -1480,6 +1480,7 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
 
 - **New `kafka-sasl`:** a second Redpanda with SASL/SCRAM-SHA-512 on 19092 (`rpk security user create … --mechanism SCRAM-SHA-512`, `enable_sasl=true`) **(verify flags, M4)**.
 - **`image`** job: builds with `kafka` from M3.
+- **New `image-kafka`** (M1): builds docker/Dockerfile with `DDI_FEATURES=kafka` (release, not pushed, its own gha cache scope) and checks that `--version` prints `librdkafka 2.12.1`. Until M3 it is the only build of what the image will ship: the thin-LTO release link of the `kafka` binary, the Dockerfile's kafka path and the in-image `--version` against the runtime stage's libssl3. When `image` switches to `kafka` in M3, this job builds the Delta-only variant (`DDI_FEATURES=`) instead, so both stay built.
 - **Nightly `kdi-parity`** (`schedule` + `workflow_dispatch`): `kdi_and_ddi_race` and `kdi_ddi_alternate` (§9.4), using the production kdi image.
 
 **Licensing.**

@@ -132,6 +132,33 @@ jobs:
       # tags just pushed names the same image, so the primary (SHA) tag is enough here.
       - run: docker run --rm ${{ steps.tag.outputs.primary }} --version
 
+  image-kafka:
+    name: container image (kafka feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Until M3 the published image above is Delta-only (DDI_FEATURES empty), and check-kafka
+      # builds debug binaries on the runner. Without this job nothing builds what the image
+      # will ship from M3 on: the `kafka` release binary (its thin-LTO, single-unit link of a
+      # static librdkafka and bundled zstd), through the Dockerfile's own kafka path (libclang
+      # for bindgen, the dependency-cache layer with the feature, the in-image `--version`
+      # against the runtime stage's libssl3). Built here and never pushed, with a cache scope
+      # of its own so it does not evict the published image's.
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-args: DDI_FEATURES=kafka
+          push: false
+          load: true
+          tags: ddi:kafka-ci
+          cache-from: type=gha,scope=kafka
+          cache-to: type=gha,mode=max,scope=kafka
+      # The image says which librdkafka it linked; a build that lost it, or linked another,
+      # fails here.
+      - run: docker run --rm ddi:kafka-ci --version | tee /dev/stderr | grep -F 'librdkafka 2.12.1'
+
   licenses:
     name: licence policy
     runs-on: ubuntu-latest
