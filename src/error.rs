@@ -281,7 +281,7 @@ pub enum Error {
     /// fault is worth retrying in a moment, a table with the wrong schema is not. Whatever the
     /// cause, it is about the data-quality table, and the target needs no replan for it — not
     /// even when the cause is one that would replan the target had the target raised it, such
-    /// as a commit log cleanup removed under a stale data-quality handle.
+    /// as a commit missing under a stale data-quality handle after log cleanup.
     #[error(
         "cannot write {rows} rejected row(s) to the data-quality table {dq_uri:?}: {source}. \
          The batch was not committed, so nothing was lost — but this pipeline cannot make \
@@ -293,13 +293,15 @@ pub enum Error {
         source: Box<Error>,
     },
 
-    /// Another writer kept recording rejects for a Kafka batch's partitions in its
-    /// data-quality table, past the retries in place: a zombie, or a handover still under way.
-    /// Nothing was written, and the batch is tried again (docs/kafka-design.md §5.7).
+    /// A Kafka batch's rejects kept conflicting with other commits to its data-quality table,
+    /// past the retries in place: another engine changing the table's metadata or protocol
+    /// each time, or more concurrent commits than delta-rs retries. Another member's rejects
+    /// are no conflict: both are plain appends. Nothing was written, and the batch is tried
+    /// again (docs/kafka-design.md §5.7).
     #[error(
-        "cannot write {rows} rejected row(s) to the data-quality table {dq_uri:?}: another \
-         writer kept recording rejects for the same partitions, {attempts} times in a row \
-         ({detail}). The batch was not committed, so nothing was lost; it is tried again."
+        "cannot write {rows} rejected row(s) to the data-quality table {dq_uri:?}: the commit \
+         conflicted with another, {attempts} times in a row ({detail}). The batch was not \
+         committed, so nothing was lost; it is tried again."
     )]
     DataQualityConflict {
         dq_uri: String,

@@ -1165,7 +1165,9 @@ impl Pipeline {
     ///
     /// Errors rather than swallowing: if the rejects cannot be recorded, the target must not
     /// commit either, or the offset would advance past rows that went nowhere. Failing here
-    /// leaves the whole batch to be retried, which is why the write is idempotent.
+    /// leaves the whole batch to be retried. A Delta batch's rejects are then not written
+    /// twice ([`DataQuality::write`]'s equality rule); a Kafka batch's are, a visible
+    /// duplicate rather than a possible loss (docs/kafka-design.md §5.7).
     async fn write_rejects(&mut self, rejects: &[Rejected], offsets: &Offsets) -> Result<usize> {
         let Some(dq) = self.dq.as_mut() else {
             // Unreachable: rejects are only produced when a table was opened.

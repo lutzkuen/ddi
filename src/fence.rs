@@ -222,11 +222,6 @@ pub struct TxnState {
     /// different offset, and when the `txn` was found only in a checkpoint, which keeps no
     /// commit metadata, and the commit below it was not reached.
     pub mark: Option<MessageMark>,
-    /// The decoder the commit that wrote the `txn` recorded in `ddi.kafka.decoder`, as a
-    /// Kafka data-quality commit records the one that judged its rejects
-    /// ([`crate::dq::decoder_identity`]). `None` for any other commit, and when the `txn` was
-    /// found only in a checkpoint.
-    pub decoder: Option<String>,
 }
 
 /// What reading offsets has cost, for `ddi_kafka_offset_lookups_total`,
@@ -320,24 +315,6 @@ pub async fn read_txns(
 ) -> Result<BTreeMap<String, TxnState>> {
     refuse_txn_retention(table)?;
     read(table, app_ids, counters, Below::Marks).await
-}
-
-/// [`read_txns`] on a table every `txn` of which is ddi's own, without its refusal of
-/// `delta.setTransactionRetentionDuration`, and without its step 6.
-///
-/// The refusal is there because a `txn` with a `lastUpdated`, as kafka-delta-ingest wrote
-/// them, can expire under the property, and the walk does not filter for that. ddi's own
-/// carry none and never expire, so on a table only ddi writes `txn`s to — the data-quality
-/// table's marks ([`crate::dq::DataQuality::write_kafka`]) — the property changes nothing
-/// read here, and refusing it would stop rejects being recorded for nothing. The marks are
-/// read on every write, and one a checkpoint answered skips nothing there (it comes without
-/// the decoder that set it), so the commits below the checkpoint are not worth reading.
-pub(crate) async fn read_own_txns(
-    table: &DeltaTable,
-    app_ids: &[String],
-    counters: &LookupCounters,
-) -> Result<BTreeMap<String, TxnState>> {
-    read(table, app_ids, counters, Below::Nothing).await
 }
 
 /// Whether [`read_txns`]' step 6 reads below the checkpoint.
@@ -512,7 +489,6 @@ async fn below_checkpoint(
             // `bottom` moved on before log cleanup took it. Its mark is not this one's.
             if written.version == answer.version {
                 answer.mark = written.mark;
-                answer.decoder = written.decoder;
             }
         }
         if answered.is_empty() {
@@ -594,8 +570,6 @@ struct CommitInfo {
     app_id: Option<serde_json::Value>,
     #[serde(rename = "ddi.kafka.marks")]
     marks: Option<serde_json::Value>,
-    #[serde(rename = "ddi.kafka.decoder")]
-    decoder: Option<serde_json::Value>,
 }
 
 /// Add the wanted `txn`s commit `version` writes to `found`, unless a newer commit already
@@ -630,10 +604,6 @@ fn record_commit(
         .and_then(|i| i.app_id.as_ref())
         .and_then(serde_json::Value::as_str);
     let marks = info.as_ref().and_then(|i| i.marks.as_ref());
-    let decoder = info
-        .as_ref()
-        .and_then(|i| i.decoder.as_ref())
-        .and_then(serde_json::Value::as_str);
     for txn in txns {
         let mark = ddi_app_id.and_then(|app_id| mark_for(marks, app_id, &txn));
         found.insert(
@@ -641,7 +611,6 @@ fn record_commit(
             TxnState {
                 version: Some(txn.version),
                 mark,
-                decoder: decoder.map(str::to_string),
             },
         );
     }
@@ -2113,9 +2082,12 @@ mod tests {
         assert_eq!(counters.lookups(), 1, "one walk, for five appIds");
         assert_eq!(counters.fallbacks(), 0);
 
-        // Where only the versions are wanted, the walk goes no further than the checkpoint.
+        // Where only the versions are wanted, as in `Fence::verify`, the walk goes no further
+        // than the checkpoint.
         store.reset();
-        read_own_txns(&table, &ids(0..5), &counters).await.unwrap();
+        super::read(&table, &ids(0..5), &counters, Below::Nothing)
+            .await
+            .unwrap();
         let mut read = store.commits_read();
         read.sort_unstable();
         assert_eq!(read, vec![3, 4, 5, 6, 7, 8]);
@@ -2588,7 +2560,6 @@ mod tests {
             TxnState {
                 version: Some(9),
                 mark: Some(mark),
-                decoder: None,
             }
         );
         assert_eq!(
@@ -2596,7 +2567,6 @@ mod tests {
             TxnState {
                 version: Some(4),
                 mark: None,
-                decoder: None,
             }
         );
         assert_eq!(
@@ -2604,7 +2574,6 @@ mod tests {
             TxnState {
                 version: Some(7),
                 mark: None,
-                decoder: None,
             },
             "kafka-delta-ingest's commit records no mark"
         );
@@ -2688,7 +2657,6 @@ mod tests {
             TxnState {
                 version: Some(9),
                 mark: Some(mark),
-                decoder: None,
             },
             "its mark comes back from commit 1, below the checkpoint"
         );

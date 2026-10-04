@@ -50,36 +50,23 @@
 //! row on the replay that the first attempt did not, and that row then reaches neither
 //! table.
 //!
-//! # Kafka: a mark per partition
+//! # Kafka: no skip at all
 //!
-//! A Kafka batch has no single version to key that skip on, and the members of a consumer
-//! group write one DQ table side by side, so one shared `txn` would make every pair of them
-//! conflict. [`DataQuality::write_kafka`] keeps one mark per partition instead, under
-//! `<app_id>.dq-<p>` ([`kafka_app_id_for`]): the last offset of that partition whose rejects
-//! are recorded. Members own disjoint partitions, so their marks never collide.
+//! A Kafka batch's rejects are a plain append ([`DataQuality::write_kafka`]), each row with
+//! its message's offset in `source_version` where the row says which message it came from, and
+//! nothing that would let a replay skip them. A replay after the rejects landed and the target
+//! commit did not writes them again: a visible duplicate, which a reader removes by the
+//! message's partition and offset (docs/kafka-design.md §5.7, I9).
 //!
-//! The skip is per row, and `<=` rather than the equality above, because the argument for
-//! equality does not carry over: a source version can mean different data after a rewind,
-//! but an offset names one message for the life of a topic, a resume checks it is still the
-//! same topic, and moving offsets by hand moves these marks with them
-//! (docs/kafka-design.md §5.7).
-//!
-//! Only a message that could not be decoded is skipped, when its offset is at or below its
-//! partition's mark and the decoder that set the mark is this one: whether it decodes
-//! depends on its bytes, its writer schema and the decoder build, the first two fixed for
-//! good and the third named in every commit ([`decoder_identity`], under
-//! `ddi.kafka.decoder`). A mark another build set, or one read from a checkpoint, which keeps
-//! no commitInfo, skips nothing; the next commit moves it to what that batch read, judged by
-//! this decoder alone. Every other reject was judged against things a replay can find
-//! changed — the target's schema after an ALTER TABLE, the union of writer schemas, the SQL,
-//! a value the SQL computes from `now()` — so a retry can reject a row at an offset below the
-//! mark that the first attempt took, and skipping it would leave it in neither table. Those,
-//! a message whose writer schema the registry did not have, and a reject that names no
-//! offset are always written: a duplicate row is visible, a lost one is not.
+//! Every skip tried for Kafka lost a reject some way: a reject is judged against things a
+//! replay can find changed (the target's schema after an ALTER TABLE, the union of writer
+//! schemas, the SQL, the decoder build), and a mark per partition says nothing about which
+//! offsets below it a replay would reject. Losing one is worse than recording one twice. And
+//! with no `txn` in it, a commit here never contends with another member's, which the
+//! members of a consumer group, all writing one DQ table, would otherwise do on every write.
 
 use deltalake::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Int64Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use deltalake::arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef, TimeUnit};
 use deltalake::kernel::transaction::{CommitProperties, TransactionError};
@@ -92,7 +79,6 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
-use crate::fence::{self, LookupCounters};
 use crate::schema::Rejected;
 use crate::sink::KafkaOffsets;
 
@@ -112,31 +98,6 @@ pub fn app_id_for(app_id: &str) -> String {
     format!("{app_id}.dq")
 }
 
-/// The `txn` appId a Kafka pipeline's mark for one partition is stored under in its DQ
-/// table: the last offset of `partition` whose rejects are recorded there.
-///
-/// One per partition rather than one per pipeline, because the members of a consumer group
-/// each write their own partitions' rejects, and would otherwise all conflict on one appId.
-pub fn kafka_app_id_for(app_id: &str, partition: i32) -> String {
-    format!("{app_id}.dq-{partition}")
-}
-
-/// How the reason a Kafka message is rejected with begins when the message could not be
-/// decoded at all (docs/kafka-design.md §5.7). No other reject's reason begins so.
-///
-/// The only rejects [`DataQuality::write_kafka`] skips on a replay, when they are at or
-/// below their partition's mark and this decoder set it: whether a message decodes depends
-/// on nothing but its bytes, its writer schema and the decoder build ([`decoder_identity`]),
-/// and a retry by the same build changes none of them.
-pub const KAFKA_UNDECODABLE: &str = "avro:";
-
-/// How the reason a Kafka message is rejected with begins when its writer schema was not in
-/// the registry.
-///
-/// The one undecodable never skipped on a replay ([`DataQuality::write_kafka`]): the schema
-/// can be registered between two attempts, and the same message then decodes.
-pub const KAFKA_SCHEMA_NOT_FOUND: &str = "avro: schema not found";
-
 /// The prefix of the columns a Kafka reject carries its coordinates in, until the pipeline
 /// says otherwise (`metadata_prefix`).
 pub const KAFKA_METADATA_PREFIX: &str = "kafka_";
@@ -144,25 +105,6 @@ pub const KAFKA_METADATA_PREFIX: &str = "kafka_";
 /// How often a Kafka DQ write that conflicted is tried again in place, before it is left to
 /// the pipeline's own retry.
 const KAFKA_CONFLICT_RETRIES: u32 = 3;
-
-/// The commitInfo key a Kafka data-quality commit records its decoder under
-/// ([`decoder_identity`]).
-pub const KAFKA_DECODER: &str = "ddi.kafka.decoder";
-
-/// The generation of ddi's own decoding: raised by every change that can make a message
-/// decode that did not, or fail that did — a strictness check, a framing rule, an
-/// arrow-avro upgrade.
-pub const DECODER_GENERATION: u32 = 1;
-
-/// Which decoder judged a Kafka batch's messages: `<ddi version>/<DECODER_GENERATION>`.
-///
-/// Recorded in every Kafka data-quality commit, and compared with the one that set a mark
-/// before the mark skips an undecodable ([`DataQuality::write_kafka`]): the decoder is the
-/// one input to "this message does not decode" that a replay can change. M2 adds arrow-avro's
-/// version, the decoder it builds on.
-pub fn decoder_identity() -> String {
-    format!("{}/{DECODER_GENERATION}", env!("CARGO_PKG_VERSION"))
-}
 
 /// The table's columns, for whoever creates it.
 ///
@@ -237,35 +179,20 @@ pub struct DataQuality {
     table: DeltaTable,
     /// `<prefix>partition` and `<prefix>offset` are where a Kafka reject's coordinates are.
     kafka_prefix: String,
-    /// The decoder that judged the Kafka rejects this writes: [`decoder_identity`].
-    decoder: String,
     kafka: Arc<KafkaCounters>,
 }
 
-/// What recording a Kafka pipeline's rejects has cost and saved, for
-/// `ddi_kafka_dq_rows_skipped_total`, `ddi_kafka_dq_conflict_retries_total` and the offset
-/// lookups its marks take.
+/// What recording a Kafka pipeline's rejects has cost, for
+/// `ddi_kafka_dq_conflict_retries_total`.
 #[derive(Debug, Default)]
 pub struct KafkaCounters {
-    rows_skipped: AtomicU64,
     conflict_retries: AtomicU64,
-    lookups: LookupCounters,
 }
 
 impl KafkaCounters {
-    /// Rejects not written because their partition's mark says they already were.
-    pub fn rows_skipped(&self) -> u64 {
-        self.rows_skipped.load(Ordering::Relaxed)
-    }
-
-    /// Writes tried again after a conflict on a mark.
+    /// Writes tried again in place after a conflict that was not their own commit.
     pub fn conflict_retries(&self) -> u64 {
         self.conflict_retries.load(Ordering::Relaxed)
-    }
-
-    /// The reads of the marks.
-    pub fn lookups(&self) -> &LookupCounters {
-        &self.lookups
     }
 }
 
@@ -290,7 +217,6 @@ impl DataQuality {
                 storage: storage.clone(),
                 table,
                 kafka_prefix: KAFKA_METADATA_PREFIX.to_string(),
-                decoder: decoder_identity(),
                 kafka: Arc::new(KafkaCounters::default()),
             })),
             Err(_) => Ok(None),
@@ -469,37 +395,32 @@ impl DataQuality {
         .map_err(|e| Error::Other(format!("cannot assemble the data-quality batch: {e}")))
     }
 
-    /// Write the rejects of a Kafka batch that read `offsets.ranges`, except those already
-    /// recorded, and move each of its partitions' marks to the last offset it read.
+    /// Write the rejects of a Kafka batch that read `offsets.ranges`, as a plain append.
     ///
-    /// Returns how many rows were written. In steps (docs/kafka-design.md §5.7):
-    /// 1. Read the marks `<app_id>.dq-<p>` of the batch's partitions from this table's handle
-    ///    (`fence::read_own_txns`: a mark never expires, so
-    ///    `delta.setTransactionRetentionDuration` is not refused here, as it is on a target),
-    ///    each with the decoder the commit that set it recorded ([`KAFKA_DECODER`]): none for a
-    ///    mark a checkpoint answered.
-    /// 2. Skip a reject recorded at or below its partition's mark, when this decoder set the
-    ///    mark: one with coordinates — its `<prefix>partition` and `<prefix>offset` columns,
-    ///    naming an offset the batch read — that could not be decoded ([`KAFKA_UNDECODABLE`]),
-    ///    unless its writer schema was not found ([`KAFKA_SCHEMA_NOT_FOUND`]). Only those are
-    ///    rejected again on a replay by the same decoder, whatever else has changed in
-    ///    between; any other reject is written each time, and so is every one under a mark
-    ///    another decoder set, or one whose decoder is not known.
-    /// 3. Commit the rest, each row's `source_version` its offset (−1 without one), with
-    ///    `<app_id>.dq-<p>` = max(mark, last offset read) for every partition of the batch
-    ///    whose mark this decoder set, and the last offset read for every other, under this
-    ///    decoder's name. A mark this decoder set then always stands for offsets it judged.
-    /// 4. A commit that conflicts on a mark reopens the table. When the commit that won is
-    ///    this write's own — it landed, and the acknowledgement of its PUT was lost — the
-    ///    write is done ([`Self::landed`]). When it is another writer's — a zombie, or a
-    ///    handover — the write goes back to step 1, up to [`KAFKA_CONFLICT_RETRIES`] times.
-    ///    After that it is [`Error::DataQualityConflict`], for the pipeline to retry, never an
-    ///    error that replans the target.
+    /// Returns how many rows were written: every reject, every time (docs/kafka-design.md
+    /// §5.7). In steps:
+    /// 1. Each row's `source_version` is its message's offset, where its `<prefix>partition`
+    ///    and `<prefix>offset` columns name an offset the batch read ([`Self::coordinates`]),
+    ///    and −1 otherwise. Its partition is in its payload, beside the offset.
+    /// 2. One commit appends them, with no `txn`, and records `ddi.appId`,
+    ///    `ddi.kafka.offsets` and `ddi.kafka.dqWriteId`, an id unique to this call.
+    /// 3. A commit that ends in a conflict (another engine changed the table's metadata or
+    ///    protocol, or delta-rs ran out of attempts) reopens the table. When the commit that
+    ///    landed is this write's own — it did land, and the acknowledgement of its PUT was
+    ///    lost — the write is done ([`Self::landed`]); otherwise it goes back to step 2, up to
+    ///    [`KAFKA_CONFLICT_RETRIES`] times. After that it is [`Error::DataQualityConflict`],
+    ///    for the pipeline to retry, never an error that replans the target. Another member's
+    ///    append is no conflict: delta-rs rebases a plain append over another.
+    ///
+    /// A replay of the batch, after these rejects landed and the target commit did not, writes
+    /// them again: a visible duplicate, which a reader removes by partition and offset. Nothing
+    /// is skipped, because every rule tried for knowing that a reject is already recorded lost
+    /// one some way, and a lost reject is worse than a duplicate (I9).
     ///
     /// Every other failure is [`Error::DataQualityWrite`], with what failed beneath it as it
-    /// was raised — delta-rs's error, `Capacity`, or the `OffsetLogTruncated` of a handle left
-    /// behind by log cleanup — so that the pipeline can tell a fault worth retrying from a
-    /// table it cannot write, and neither from a failure of the target (§3.6).
+    /// was raised — delta-rs's error, `Capacity`, or the `Config` of a failed reopen — so that
+    /// the pipeline can tell a fault worth retrying from a table it cannot write, and neither
+    /// from a failure of the target (§3.6).
     ///
     /// [`Self::write`] and its equality rule are untouched by any of this.
     pub async fn write_kafka(
@@ -512,10 +433,9 @@ impl DataQuality {
         if rows == 0 {
             return Ok(0);
         }
-        let coordinates: Vec<Vec<Option<(i32, i64)>>> = rejected
-            .iter()
-            .map(|r| self.coordinates(r, &offsets.ranges))
-            .collect();
+        let batch = self
+            .kafka_batch(rejected, &offsets.ranges, now_micros)
+            .map_err(|cause| self.unwritable(rows, cause))?;
         // Recorded with the commit, so that a conflict can be told from this write's own
         // commit having landed already (`Self::landed`).
         let write_id = write_id();
@@ -523,56 +443,10 @@ impl DataQuality {
         let mut retries = 0;
         loop {
             let read_version = self.table.version();
-            match self
-                .try_write_kafka(rejected, &coordinates, offsets, &write_id, now_micros)
-                .await
-            {
-                Ok(written) => return Ok(written),
-                Err(Attempt::Conflict {
-                    error: e,
-                    written,
-                    skipped,
-                }) => {
-                    self.table = match self.storage.open(&self.uri).await {
-                        Ok(table) => table,
-                        Err(cause) => return Err(self.unwritable(written, cause)),
-                    };
-                    let landed = match self.landed(read_version, &write_id).await {
-                        Ok(landed) => landed,
-                        Err(cause) => return Err(self.unwritable(written, cause)),
-                    };
-                    if landed {
-                        debug!(
-                            app_id = %self.app_id,
-                            dq_uri = %self.uri,
-                            "the commit reported as a conflict ({e}) is this write's own, which \
-                             landed before its acknowledgement was lost; not writing it twice"
-                        );
-                        self.kafka
-                            .rows_skipped
-                            .fetch_add(skipped, Ordering::Relaxed);
-                        return Ok(written);
-                    }
-                    if retries < KAFKA_CONFLICT_RETRIES {
-                        retries += 1;
-                        self.kafka.conflict_retries.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            app_id = %self.app_id,
-                            dq_uri = %self.uri,
-                            attempt = retries,
-                            "another writer recorded rejects for one of this batch's \
-                             partitions first ({e}); re-reading the marks and trying again"
-                        );
-                        continue;
-                    }
-                    return Err(Error::DataQualityConflict {
-                        dq_uri: self.uri.clone(),
-                        rows: written,
-                        attempts: KAFKA_CONFLICT_RETRIES + 1,
-                        detail: e.to_string(),
-                    });
-                }
-                Err(Attempt::Failed { rows, cause }) => {
+            let e = match self.try_write_kafka(&batch, offsets, &write_id).await {
+                Ok(()) => return Ok(rows),
+                Err(Attempt::Conflict(e)) => e,
+                Err(Attempt::Failed(cause)) => {
                     // As in `write`: the next attempt starts from the table as it is now, so
                     // a handle that has fallen behind log cleanup does not fail it again.
                     if let Ok(table) = self.storage.open(&self.uri).await {
@@ -580,176 +454,121 @@ impl DataQuality {
                     }
                     return Err(self.unwritable(rows, cause));
                 }
+            };
+            self.table = match self.storage.open(&self.uri).await {
+                Ok(table) => table,
+                Err(cause) => return Err(self.unwritable(rows, cause)),
+            };
+            let landed = match self.landed(read_version, &write_id).await {
+                Ok(landed) => landed,
+                Err(cause) => return Err(self.unwritable(rows, cause)),
+            };
+            if landed {
+                debug!(
+                    app_id = %self.app_id,
+                    dq_uri = %self.uri,
+                    "the commit reported as a conflict ({e}) is preceded by this write's own, \
+                     which landed before its acknowledgement was lost; not writing it twice"
+                );
+                return Ok(rows);
             }
+            if retries < KAFKA_CONFLICT_RETRIES {
+                retries += 1;
+                self.kafka.conflict_retries.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    app_id = %self.app_id,
+                    dq_uri = %self.uri,
+                    attempt = retries,
+                    "recording this batch's rejects conflicted with another commit ({e}); \
+                     trying again on the table as it is now"
+                );
+                continue;
+            }
+            return Err(Error::DataQualityConflict {
+                dq_uri: self.uri.clone(),
+                rows,
+                attempts: KAFKA_CONFLICT_RETRIES + 1,
+                detail: e.to_string(),
+            });
         }
     }
 
-    /// One pass of steps 1-3 of [`Self::write_kafka`].
-    async fn try_write_kafka(
-        &mut self,
+    /// Step 1 of [`Self::write_kafka`]: every reject of the batch, each with its message's
+    /// offset as its `source_version`, or −1.
+    fn kafka_batch(
+        &self,
         rejected: &[Rejected],
-        coordinates: &[Vec<Option<(i32, i64)>>],
-        offsets: &KafkaOffsets,
-        write_id: &str,
+        ranges: &BTreeMap<i32, (i64, i64)>,
         now_micros: i64,
-    ) -> std::result::Result<usize, Attempt> {
-        let all: usize = rejected.iter().map(Rejected::len).sum();
-        // Every reject's coordinates are in these partitions, or it has none.
-        let partitions: Vec<i32> = offsets.ranges.keys().copied().collect();
-        let ids: Vec<String> = partitions
-            .iter()
-            .map(|p| kafka_app_id_for(&self.app_id, *p))
-            .collect();
-        let txns = fence::read_own_txns(&self.table, &ids, &self.kafka.lookups)
-            .await
-            .map_err(|cause| Attempt::Failed { rows: all, cause })?;
-        // Each mark, and whether this decoder set it: only then does it skip anything.
-        let marks: BTreeMap<i32, (i64, bool)> = partitions
-            .iter()
-            .zip(&ids)
-            .filter_map(|(p, id)| {
-                let txn = txns.get(id)?;
-                let ours = txn.decoder.as_deref() == Some(self.decoder.as_str());
-                Some((*p, (txn.version?, ours)))
-            })
-            .collect();
-
+    ) -> Result<RecordBatch> {
         let mut source_versions = Vec::new();
         let mut columns = Vec::new();
         let mut reasons = Vec::new();
         let mut payload = Vec::new();
-        let mut skipped = 0u64;
-        for (r, coordinates) in rejected.iter().zip(coordinates) {
-            let keep: Vec<bool> = coordinates
-                .iter()
-                .zip(&r.reasons)
-                .map(|(at, reason)| {
-                    let recorded = at.is_some_and(|(p, offset)| {
-                        rejected_again_on_a_replay(reason)
-                            && marks
-                                .get(&p)
-                                .is_some_and(|(mark, ours)| *ours && offset <= *mark)
-                    });
-                    !recorded
-                })
-                .collect();
-            skipped += keep.iter().filter(|k| !**k).count() as u64;
-            if !keep.iter().any(|k| *k) {
-                continue;
-            }
-            let rows = deltalake::arrow::compute::filter_record_batch(
-                &r.rows,
-                &BooleanArray::from(keep.clone()),
-            )
-            .map_err(|e| Attempt::Failed {
-                rows: all,
-                cause: Error::Other(format!(
-                    "cannot set aside the rejects already recorded: {e}"
-                )),
-            })?;
-            payload.extend(payloads(&rows).map_err(|cause| Attempt::Failed { rows: all, cause })?);
-            for (i, kept) in keep.iter().enumerate() {
-                if *kept {
-                    source_versions.push(coordinates[i].map_or(-1, |(_, offset)| offset));
-                    columns.push(r.columns[i].clone());
-                    reasons.push(r.reasons[i].clone());
-                }
-            }
+        for r in rejected {
+            let coordinates = self.coordinates(r, ranges);
+            source_versions.extend(coordinates.iter().map(|c| c.map_or(-1, |(_, o)| o)));
+            columns.extend(r.columns.iter().cloned());
+            reasons.extend(r.reasons.iter().cloned());
+            payload.extend(payloads(&r.rows)?);
         }
+        self.assemble(source_versions, columns, reasons, payload, now_micros)
+    }
 
-        if reasons.is_empty() {
-            debug!(
-                app_id = %self.app_id,
-                skipped,
-                "every reject of this batch is already in the data-quality table; not writing \
-                 them twice"
-            );
-            self.kafka
-                .rows_skipped
-                .fetch_add(skipped, Ordering::Relaxed);
-            return Ok(0);
-        }
-        let written = reasons.len();
-        let batch = self
-            .assemble(source_versions, columns, reasons, payload, now_micros)
-            .map_err(|cause| Attempt::Failed {
-                rows: written,
-                cause,
-            })?;
-
-        // A mark this decoder set never moves back. Another's moves to what this batch read:
-        // kept above it, it would stand for offsets this decoder never judged, under this
-        // decoder's name.
-        let txns = offsets.ranges.iter().map(|(p, (_, last))| {
-            let mark = match marks.get(p) {
-                Some((mark, true)) => (*mark).max(*last),
-                _ => *last,
-            };
-            Transaction::new(kafka_app_id_for(&self.app_id, *p), mark)
-        });
+    /// Step 2 of [`Self::write_kafka`], once.
+    async fn try_write_kafka(
+        &mut self,
+        batch: &RecordBatch,
+        offsets: &KafkaOffsets,
+        write_id: &str,
+    ) -> std::result::Result<(), Attempt> {
         let ranges: serde_json::Map<String, serde_json::Value> = offsets
             .ranges
             .iter()
             .map(|(p, (first, last))| (p.to_string(), serde_json::json!([first, last])))
             .collect();
-        let props = CommitProperties::default()
-            .with_application_transactions(txns.collect())
-            .with_metadata([
-                (
-                    "ddi.appId".to_string(),
-                    serde_json::Value::from(self.app_id.clone()),
-                ),
-                (
-                    "ddi.kafka.offsets".to_string(),
-                    serde_json::Value::Object(ranges),
-                ),
-                (
-                    KAFKA_WRITE_ID.to_string(),
-                    serde_json::Value::from(write_id),
-                ),
-                (
-                    KAFKA_DECODER.to_string(),
-                    serde_json::Value::from(self.decoder.clone()),
-                ),
-            ]);
+        // No `txn`: a plain append, which delta-rs rebases over any other.
+        let props = CommitProperties::default().with_metadata([
+            (
+                "ddi.appId".to_string(),
+                serde_json::Value::from(self.app_id.clone()),
+            ),
+            (
+                "ddi.kafka.offsets".to_string(),
+                serde_json::Value::Object(ranges),
+            ),
+            (
+                KAFKA_WRITE_ID.to_string(),
+                serde_json::Value::from(write_id),
+            ),
+        ]);
 
         // As in `write`, and for the same reason: no runtime nobody configured.
-        let session =
-            crate::budget::delta_session(&self.table).map_err(|cause| Attempt::Failed {
-                rows: written,
-                cause,
-            })?;
+        let session = crate::budget::delta_session(&self.table).map_err(Attempt::Failed)?;
         let session = Arc::new(session);
         // A clone rather than the handle itself, so that a failed write leaves a usable
         // handle behind even when the table cannot be reopened.
-        let written_table = self
+        let written = self
             .table
             .clone()
-            .write(vec![batch])
+            .write(vec![batch.clone()])
             .with_session_state(session)
             .with_save_mode(SaveMode::Append)
             .with_cast_safety(false)
             .with_commit_properties(props)
             .await;
-        match written_table {
+        match written {
             Ok(t) => {
                 self.table = t;
-                self.kafka
-                    .rows_skipped
-                    .fetch_add(skipped, Ordering::Relaxed);
-                Ok(written)
+                Ok(())
             }
-            Err(e) if is_conflict(&e) => Err(Attempt::Conflict {
-                error: e,
-                written,
-                skipped,
-            }),
+            Err(e) if is_conflict(&e) => Err(Attempt::Conflict(e)),
             // Typed, as the target's own write is: a full spill directory is out of capacity,
             // and anything else is delta-rs's error as it came.
-            Err(e) => Err(Attempt::Failed {
-                rows: written,
-                cause: crate::spill::classify_delta(e, "data-quality: writing rejects"),
-            }),
+            Err(e) => Err(Attempt::Failed(crate::spill::classify_delta(
+                e,
+                "data-quality: writing rejects",
+            ))),
         }
     }
 
@@ -765,13 +584,15 @@ impl DataQuality {
     /// Whether this write's own commit, the one recording `write_id`, is among those that
     /// landed after `read_version` on the table as just reopened.
     ///
-    /// A conflict is not always another writer's. When the response to a commit's PUT is
-    /// lost and the PUT is retried, it finds the version taken by that very commit, and
-    /// delta-rs then reports the commit's own marks as a conflict (docs/kafka-design.md §4.7
-    /// row 3). Tried again, the write would record every reject that is never skipped a second
-    /// time. Read newest first, which is where that commit is. A commit no longer in the log
-    /// ends the search: one that cannot be read is not known to be this write's, and writing
-    /// again costs a duplicate, never a lost reject.
+    /// A conflict does not mean the write did not land. When the response to a commit's PUT is
+    /// lost and the PUT is retried, it finds the version taken by that very commit; delta-rs
+    /// then checks the commits since its snapshot, its own among them, and gives up when a
+    /// later one conflicts (another engine's metadata change, or its attempts run out), though
+    /// its own is in (docs/kafka-design.md §4.7 row 10). Tried again, the write would record
+    /// every reject a second time, in a process that never crashed. Read newest first. A
+    /// commit no longer in the log ends the search: one that cannot be read is not known to be
+    /// this write's, and writing again costs a duplicate, never a lost reject. One that is
+    /// there but does not parse is not this write's, which wrote valid JSON.
     async fn landed(&self, read_version: Option<u64>, write_id: &str) -> Result<bool> {
         let Some(head) = self.table.version() else {
             return Ok(false);
@@ -794,12 +615,11 @@ impl DataQuality {
     /// read.
     ///
     /// A row without them — a transform's output that dropped the columns — has no
-    /// coordinates, and is always written. So has one whose columns name a message the batch
-    /// did not read: a message's own coordinates always lie inside the batch, so those are
-    /// something else under the same names — values the SQL computed, or a payload's own
-    /// fields read under the default prefix where the pipeline set another. Taken at their
-    /// word, they would be checked against another partition's mark, or below the batch's
-    /// range, and the reject skipped.
+    /// coordinates. Nor has one whose columns name a message the batch did not read: a
+    /// message's own coordinates always lie inside the batch, so those are something else
+    /// under the same names — values the SQL computed, or a payload's own fields read under
+    /// the default prefix where the pipeline set another — and recorded as its offset they
+    /// would name another message.
     fn coordinates(
         &self,
         rejected: &Rejected,
@@ -838,25 +658,13 @@ impl DataQuality {
     }
 }
 
-/// Whether a Kafka reject with this reason is one every replay of its message rejects
-/// again: a message that could not be decoded, for a reason other than a writer schema the
-/// registry did not have yet.
-fn rejected_again_on_a_replay(reason: &str) -> bool {
-    reason.starts_with(KAFKA_UNDECODABLE) && !reason.starts_with(KAFKA_SCHEMA_NOT_FOUND)
-}
-
 /// How one attempt of [`DataQuality::write_kafka`] ended, when it did not write.
 enum Attempt {
-    /// A commit wrote one of the same marks first: another writer's, worth trying again in
-    /// place, or this attempt's own, landed already. `written` and `skipped` are the rows the
-    /// attempt wrote and left out, which are what it did if the commit is its own.
-    Conflict {
-        error: DeltaTableError,
-        written: usize,
-        skipped: u64,
-    },
-    /// Anything else, about `rows` of the batch's rejects.
-    Failed { rows: usize, cause: Error },
+    /// delta-rs gave up on a conflict: another writer's commit, worth trying again in place,
+    /// unless this attempt's own landed before it.
+    Conflict(DeltaTableError),
+    /// Anything else.
+    Failed(Error),
 }
 
 /// The commitInfo key a Kafka data-quality commit records its write's id under.
@@ -893,7 +701,7 @@ fn write_id_of(commit: &[u8]) -> Option<String> {
         })
 }
 
-/// Did a commit fail because another one landed first on something it asserted?
+/// Did a commit fail because another one landed first and changed what it was planned on?
 fn is_conflict(e: &DeltaTableError) -> bool {
     matches!(
         e,
@@ -1208,110 +1016,106 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn a_kafka_mark_is_one_app_id_per_partition() {
-        assert_eq!(kafka_app_id_for("orders", 3), "orders.dq-3");
-        assert_ne!(kafka_app_id_for("orders", 3), app_id_for("orders"));
-        // Never one the target's offsets are kept under (`<app_id>-<p>`).
-        assert_ne!(
-            kafka_app_id_for("orders", 3),
-            crate::fence::txn_app_id("orders", 3)
-        );
-    }
-
+    /// A Kafka batch's rejects are a plain append: no `txn`, so that no two writers of the
+    /// table ever contend on one, and each row with its message's offset where it is known.
     #[tokio::test]
-    async fn dq_marks_skip_recorded_offsets() {
+    async fn dq_kafka_commit_is_a_plain_append() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         create_dq(path).await;
         let mut dq = open_dq(path).await;
 
-        let batch = [undecodable(0, &[3, 7], MALFORMED)];
+        let batch = [undecodable(0, &[3, 7], MALFORMED), uncoordinated(&[41])];
         assert_eq!(
             dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
                 .await
                 .unwrap(),
-            2
+            3
         );
-        assert_eq!(txn(path, "app.dq-0").await, Some(9));
         let actions = head_commit(path).await;
-        assert_eq!(txns_of(&actions), vec![("app.dq-0".to_string(), 9)]);
+        assert_eq!(txns_of(&actions), vec![], "no txn: {actions:?}");
         let info = info_of(&actions);
         assert_eq!(info["ddi.appId"], serde_json::json!("app"));
         assert_eq!(info["ddi.kafka.offsets"], serde_json::json!({"0": [0, 9]}));
-        assert!(!info.contains_key("ddi.sourceVersion"), "{info:?}");
-
-        // The target commit failed, and the batch is read again: by this process, or by the
-        // next owner of the partition, which has only the table to go on.
-        assert_eq!(
-            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
-                .await
-                .unwrap(),
-            0
-        );
-        let mut next_owner = open_dq(path).await;
-        assert_eq!(
-            next_owner
-                .write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(dq.kafka_counters().rows_skipped(), 2);
-
-        // A batch that overlaps the recorded one: offset 7 is there already, 11 is not.
-        let wider = [undecodable(0, &[7, 11], MALFORMED)];
-        assert_eq!(
-            next_owner
-                .write_kafka(&wider, &read(&[(0, (5, 12))]), NOW)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(txn(path, "app.dq-0").await, Some(12));
+        assert!(info["ddi.kafka.dqWriteId"].is_string(), "{info:?}");
+        for absent in ["ddi.sourceVersion", "ddi.kafka.decoder"] {
+            assert!(!info.contains_key(absent), "{absent} in {info:?}");
+        }
 
         let rows = recorded(path).await;
         assert_eq!(
             rows.iter().map(|r| r.0).collect::<Vec<_>>(),
-            vec![3, 7, 11],
-            "source_version holds each message's offset"
+            vec![-1, 3, 7],
+            "source_version holds each message's offset, -1 where it has none"
         );
         let payload = rows[2].2.as_deref().unwrap();
         assert!(payload.contains("\"kafka_partition\":0"), "{payload}");
-        assert!(payload.contains("\"kafka_offset\":11"), "{payload}");
+        assert!(payload.contains("\"kafka_offset\":7"), "{payload}");
     }
 
+    /// The target commit failed after the rejects were recorded, and the batch is read again:
+    /// by this process, or by the next owner of the partition. Its rejects are written again,
+    /// a visible duplicate a reader removes by (partition, offset); a skip that judged them
+    /// recorded could lose one, which is worse.
     #[tokio::test]
-    async fn dq_schema_not_found_never_skipped() {
+    async fn dq_a_replay_writes_its_rejects_again() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         create_dq(path).await;
         let mut dq = open_dq(path).await;
 
-        let not_found = format!("{KAFKA_SCHEMA_NOT_FOUND}: id 42 (404, error code 40403)");
-        let batch = [
-            undecodable(0, &[3], &not_found),
-            undecodable(0, &[4], MALFORMED),
-        ];
+        let batch = [undecodable(0, &[3], MALFORMED)];
+        let offsets = read(&[(0, (0, 9))]);
+        assert_eq!(dq.write_kafka(&batch, &offsets, NOW).await.unwrap(), 1);
+        assert_eq!(dq.write_kafka(&batch, &offsets, NOW).await.unwrap(), 1);
+        let rows = recorded(path).await;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0], rows[1], "the same reject, twice");
+
+        let mut next_owner = open_dq(path).await;
         assert_eq!(
-            dq.write_kafka(&batch, &read(&[(0, (0, 4))]), NOW)
+            next_owner.write_kafka(&batch, &offsets, NOW).await.unwrap(),
+            1
+        );
+        assert_eq!(recorded(path).await.len(), 3);
+    }
+
+    /// Two members of a group write rejects side by side, for the same partition even, as a
+    /// zombie and the partition's new owner do: plain appends, which delta-rs rebases over each
+    /// other, so neither conflicts nor retries.
+    #[tokio::test]
+    async fn dq_two_members_append_without_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        // Both with a handle on version 0.
+        let (mut a, mut b) = (open_dq(path).await, open_dq(path).await);
+
+        let from_a = [undecodable(0, &[2, 4], MALFORMED)];
+        let from_b = [undecodable(0, &[2, 4, 7], MALFORMED)];
+        assert_eq!(
+            a.write_kafka(&from_a, &read(&[(0, (0, 5))]), NOW)
                 .await
                 .unwrap(),
             2
         );
-        // On the replay the registry may have the schema, and the message decode: its reject
-        // is recorded again rather than taken for the one already there.
         assert_eq!(
-            dq.write_kafka(&batch, &read(&[(0, (0, 4))]), NOW)
+            b.write_kafka(&from_b, &read(&[(0, (0, 8))]), NOW)
                 .await
                 .unwrap(),
-            1
+            3
         );
-
+        assert_eq!(a.kafka_counters().conflict_retries(), 0);
+        assert_eq!(
+            b.kafka_counters().conflict_retries(),
+            0,
+            "rebased by delta-rs, never retried here"
+        );
         let rows = recorded(path).await;
-        let versions: Vec<i64> = rows.iter().map(|r| r.0).collect();
-        assert_eq!(versions, vec![3, 3, 4]);
-        assert!(rows[..2].iter().all(|r| r.1 == not_found));
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![2, 2, 4, 4, 7]
+        );
     }
 
     #[tokio::test]
@@ -1322,7 +1126,7 @@ mod tests {
         let mut dq = open_dq(path).await;
 
         // A coerce reject from SQL that dropped the kafka_ columns, and an undecodable whose
-        // offset is null: neither names a message, so neither can be found again.
+        // offset is null: neither names a message, so neither has an offset to record.
         let mut no_offset = undecodable(1, &[0], MALFORMED);
         let schema = no_offset.rows.schema();
         let nullable = Arc::new(Schema::new(
@@ -1339,18 +1143,13 @@ mod tests {
 
         let offsets = read(&[(0, (0, 8)), (1, (0, 3))]);
         assert_eq!(dq.write_kafka(&batch, &offsets, NOW).await.unwrap(), 3);
-        assert_eq!(dq.write_kafka(&batch, &offsets, NOW).await.unwrap(), 3);
-        assert_eq!(dq.kafka_counters().rows_skipped(), 0);
 
         let rows = recorded(path).await;
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.len(), 3);
         assert!(
             rows.iter().all(|r| r.0 == -1),
             "no offset to record: {rows:?}"
         );
-        // The marks move all the same: a batch's partitions are covered whatever they held.
-        assert_eq!(txn(path, "app.dq-0").await, Some(8));
-        assert_eq!(txn(path, "app.dq-1").await, Some(3));
 
         // Under another metadata prefix, kafka_partition and kafka_offset are just columns.
         let mut prefixed = open_dq(path).await;
@@ -1361,105 +1160,16 @@ mod tests {
                 .write_kafka(&batch, &read(&[(0, (0, 8))]), NOW)
                 .await
                 .unwrap(),
-            1,
-            "below the mark, but not known to be"
-        );
-    }
-
-    /// Only an undecodable is skipped by its partition's mark. A row the transform, the
-    /// conform or the coercer set aside was judged against the target's schema, the SQL and
-    /// the union of writer schemas, any of which can change between two attempts at one
-    /// batch — an ALTER TABLE on the target in between (§4.7 row 20) is enough. A retry can
-    /// then reject a row the first attempt did not, at an offset already under the mark, and
-    /// it has to be written: a duplicate is visible, a row in neither table is not.
-    #[tokio::test]
-    async fn dq_only_an_undecodable_is_skipped_by_the_mark() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-        create_dq(path).await;
-        let mut dq = open_dq(path).await;
-
-        // The first attempt: offset 3 does not decode, and every other row fits the target.
-        let first = [undecodable(0, &[3], MALFORMED)];
-        let batch = read(&[(0, (1, 10))]);
-        assert_eq!(dq.write_kafka(&first, &batch, NOW).await.unwrap(), 1);
-        assert_eq!(txn(path, "app.dq-0").await, Some(10));
-
-        // The target commit failed on a new column, and the retry's coercer rejects offset 7.
-        let coerced = rejected_with(
-            &[("kafka_", 0, 7)],
-            "value does not fit \"note\" (Utf8 -> Int32)",
-        );
-        let retry = [undecodable(0, &[3], MALFORMED), coerced];
-        assert_eq!(
-            dq.write_kafka(&retry, &batch, NOW).await.unwrap(),
-            1,
-            "offset 3 is recorded already; offset 7 is new"
-        );
-        let versions: Vec<i64> = recorded(path).await.iter().map(|r| r.0).collect();
-        assert_eq!(versions, vec![3, 7]);
-        assert_eq!(dq.kafka_counters().rows_skipped(), 1);
-    }
-
-    /// A batch that read below a partition's mark this decoder set leaves the mark where it
-    /// is. A zombie that recorded up to 8, then the new owner's batch up to 5: moved back to 5,
-    /// the mark would let a later replay up to 8 record the rejects above 5 again. The lower
-    /// batch has to commit for the mark to move at all, which only a reject that is never
-    /// skipped makes it do. (A mark another decoder set does move back, which costs only such
-    /// duplicates: `dq_a_mark_another_decoder_set_does_not_skip`.)
-    #[tokio::test]
-    async fn dq_mark_never_moves_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-        create_dq(path).await;
-        let mut dq = open_dq(path).await;
-
-        let upper = [undecodable(0, &[7], MALFORMED)];
-        assert_eq!(
-            dq.write_kafka(&upper, &read(&[(0, (0, 8))]), NOW)
-                .await
-                .unwrap(),
             1
         );
-        assert_eq!(txn(path, "app.dq-0").await, Some(8));
-
-        let lower = [uncoordinated(&[1])];
-        assert_eq!(
-            dq.write_kafka(&lower, &read(&[(0, (0, 5))]), NOW)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(txn(path, "app.dq-0").await, Some(8), "max(8, 5)");
-        assert_eq!(
-            dq.write_kafka(&upper, &read(&[(0, (6, 8))]), NOW)
-                .await
-                .unwrap(),
-            0,
-            "the replay of offset 7 is still covered"
-        );
-    }
-
-    #[test]
-    fn only_an_undecodable_is_rejected_again_on_every_replay() {
-        assert!(rejected_again_on_a_replay(MALFORMED));
-        assert!(rejected_again_on_a_replay("avro: no magic byte"));
-        assert!(KAFKA_SCHEMA_NOT_FOUND.starts_with(KAFKA_UNDECODABLE));
-        for reason in [
-            format!("{KAFKA_SCHEMA_NOT_FOUND}: id 42 (404, error code 40403)"),
-            "value does not fit \"note\" (Utf8 -> Int32)".to_string(),
-            "cannot cast 'n/a' to DECIMAL(10,2)".to_string(),
-            "writer schema 7 field \"amount\" cannot be read as DECIMAL(10,2)".to_string(),
-        ] {
-            assert!(!rejected_again_on_a_replay(&reason), "{reason}");
-        }
+        assert_eq!(recorded(path).await.iter().filter(|r| r.0 == 5).count(), 0);
     }
 
     /// A message's coordinates always lie inside what its batch read. A reject whose
     /// `<prefix>partition` and `<prefix>offset` lie outside — computed by the SQL under those
     /// names, or a payload's own fields read under the default prefix where the pipeline set
-    /// another — names no message of the batch, and is written rather than checked against
-    /// another partition's mark, or an offset the batch never read.
+    /// another — names no message of the batch, and its row records no offset rather than one
+    /// that names another message.
     #[tokio::test]
     async fn dq_coordinates_outside_the_batch_are_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -1473,7 +1183,6 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(txn(path, "app.dq-0").await, Some(100));
 
         // A batch that read partition 1 only, with a reject that says partition 0.
         let other_partition = [rejected_with(&[("kafka_", 0, 5)], MALFORMED)];
@@ -1509,284 +1218,6 @@ mod tests {
             versions,
             vec![-1, -1, -1, 50],
             "no offset to record for those"
-        );
-        assert_eq!(dq.kafka_counters().rows_skipped(), 0);
-    }
-
-    #[tokio::test]
-    async fn dq_two_writers_disjoint_partitions_no_conflict() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-        create_dq(path).await;
-        // Two members of one group, both with a handle on version 0.
-        let (mut a, mut b) = (open_dq(path).await, open_dq(path).await);
-
-        let from_a = [undecodable(0, &[1], MALFORMED)];
-        let from_b = [undecodable(1, &[2], MALFORMED)];
-        assert_eq!(
-            a.write_kafka(&from_a, &read(&[(0, (0, 5))]), NOW)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            b.write_kafka(&from_b, &read(&[(1, (0, 6))]), NOW)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(a.kafka_counters().conflict_retries(), 0);
-        assert_eq!(
-            b.kafka_counters().conflict_retries(),
-            0,
-            "rebased by delta-rs, never retried here"
-        );
-
-        assert_eq!(txn(path, "app.dq-0").await, Some(5));
-        assert_eq!(txn(path, "app.dq-1").await, Some(6));
-        assert_eq!(recorded(path).await.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn dq_same_partition_conflict_retried_in_place() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-        create_dq(path).await;
-        // A zombie and the partition's new owner, both with a handle on version 0. The owner
-        // records the batch first; the zombie then records the same batch and one more.
-        let (mut owner, mut zombie) = (open_dq(path).await, open_dq(path).await);
-        let first = [undecodable(0, &[2, 4], MALFORMED)];
-        assert_eq!(
-            owner
-                .write_kafka(&first, &read(&[(0, (0, 5))]), NOW)
-                .await
-                .unwrap(),
-            2
-        );
-
-        let again = [undecodable(0, &[2, 4, 7], MALFORMED)];
-        assert_eq!(
-            zombie
-                .write_kafka(&again, &read(&[(0, (0, 8))]), NOW)
-                .await
-                .unwrap(),
-            1,
-            "re-read the mark after the conflict, and wrote only what it did not cover"
-        );
-        assert_eq!(zombie.kafka_counters().conflict_retries(), 1);
-        assert_eq!(zombie.kafka_counters().rows_skipped(), 2);
-
-        let rows = recorded(path).await;
-        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![2, 4, 7]);
-        assert_eq!(txn(path, "app.dq-0").await, Some(8));
-    }
-
-    /// Commit `version` of the data-quality table at `path` by hand, as another build of ddi
-    /// would have: partition `partition`'s mark at `mark`, under `decoder` (`None`: a commit
-    /// that records none, as ddi's did before it recorded one). No rows: only the mark is
-    /// read back.
-    fn mark_by(path: &str, version: u64, partition: i32, mark: i64, decoder: Option<&str>) {
-        let mut info = serde_json::json!({
-            "timestamp": 1_700_000_000_000i64, "operation": "WRITE", "ddi.appId": "app",
-            "ddi.kafka.offsets": {partition.to_string(): [0, mark]}
-        });
-        if let Some(decoder) = decoder {
-            info[KAFKA_DECODER] = serde_json::json!(decoder);
-        }
-        let txn = serde_json::json!({"txn": {"appId": kafka_app_id_for("app", partition), "version": mark}});
-        std::fs::write(
-            format!("{path}/_delta_log/{version:020}.json"),
-            format!("{}\n{txn}\n", serde_json::json!({ "commitInfo": info })),
-        )
-        .unwrap();
-    }
-
-    /// The decoder a data-quality commit records, from the table's newest commit.
-    async fn decoder_of_head(path: &str) -> Option<serde_json::Value> {
-        info_of(&head_commit(path).await).remove(KAFKA_DECODER)
-    }
-
-    /// Every Kafka data-quality commit records the decoder that judged its rejects, and an
-    /// undecodable at or below a mark is skipped when that same decoder set the mark.
-    #[tokio::test]
-    async fn dq_same_decoder_skips_by_its_mark() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-        create_dq(path).await;
-        let mut dq = open_dq(path).await;
-        let batch = [undecodable(0, &[3], MALFORMED)];
-        assert_eq!(
-            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            decoder_of_head(path).await,
-            Some(serde_json::json!(decoder_identity()))
-        );
-        let marks = fence::read_own_txns(
-            &dq.table,
-            &[kafka_app_id_for("app", 0)],
-            &LookupCounters::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(marks["app.dq-0"].version, Some(9));
-        assert_eq!(marks["app.dq-0"].decoder, Some(decoder_identity()));
-        assert_eq!(
-            open_dq(path)
-                .await
-                .write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
-                .await
-                .unwrap(),
-            0
-        );
-    }
-
-    /// A mark another decoder set says nothing about what this one rejects: a stricter build
-    /// can reject a message the other decoded, at an offset under its mark, and skipped that
-    /// reject would be in neither table. So every undecodable is written again, a visible
-    /// duplicate, and the mark moves to what this batch read, judged by this decoder alone —
-    /// kept at the other's, it would let this decoder's next batch skip what it never judged.
-    #[tokio::test]
-    async fn dq_a_mark_another_decoder_set_does_not_skip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-        create_dq(path).await;
-        mark_by(path, 1, 0, 100, Some("0.0.0/0"));
-        let mut dq = open_dq(path).await;
-
-        // The other build's batch reached 100, and its target commit did not land. This one
-        // reads the same messages in smaller batches.
-        let first = [undecodable(0, &[60], MALFORMED)];
-        assert_eq!(
-            dq.write_kafka(&first, &read(&[(0, (51, 70))]), NOW)
-                .await
-                .unwrap(),
-            1,
-            "written again"
-        );
-        assert_eq!(txn(path, "app.dq-0").await, Some(70), "not max(100, 70)");
-        let second = [undecodable(0, &[80], MALFORMED)];
-        assert_eq!(
-            dq.write_kafka(&second, &read(&[(0, (71, 100))]), NOW)
-                .await
-                .unwrap(),
-            1,
-            "this decoder never judged offset 80"
-        );
-        assert_eq!(txn(path, "app.dq-0").await, Some(100));
-        assert_eq!(dq.kafka_counters().rows_skipped(), 0);
-
-        // A commit that records no decoder is not this one's either.
-        mark_by(path, 3, 1, 50, None);
-        let mut dq = open_dq(path).await;
-        assert_eq!(
-            dq.write_kafka(
-                &[undecodable(1, &[7], MALFORMED)],
-                &read(&[(1, (0, 9))]),
-                NOW
-            )
-            .await
-            .unwrap(),
-            1
-        );
-        assert_eq!(txn(path, "app.dq-1").await, Some(9));
-    }
-
-    /// A mark a checkpoint answered comes without the commit that set it, so without the
-    /// decoder that commit recorded: an undecodable under it is written again.
-    #[tokio::test]
-    async fn dq_a_mark_answered_by_a_checkpoint_does_not_skip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-        create_dq(path).await;
-        let mut dq = open_dq(path).await;
-        let batch = [undecodable(0, &[3], MALFORMED)];
-        assert_eq!(
-            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
-                .await
-                .unwrap(),
-            1
-        ); // 1
-           // Another member records partition 1's rejects, and a checkpoint lands above
-           // partition 0's last commit.
-        let mut other = open_dq(path).await;
-        for offset in 10..13 {
-            other
-                .write_kafka(
-                    &[undecodable(1, &[offset], MALFORMED)],
-                    &read(&[(1, (offset, offset))]),
-                    NOW,
-                )
-                .await
-                .unwrap();
-        } // 2..=4
-        let table = deltalake::open_table(deltalake::ensure_table_uri(path).unwrap())
-            .await
-            .unwrap();
-        deltalake::checkpoints::create_checkpoint(&table, None)
-            .await
-            .unwrap();
-        other
-            .write_kafka(
-                &[undecodable(1, &[13], MALFORMED)],
-                &read(&[(1, (13, 13))]),
-                NOW,
-            )
-            .await
-            .unwrap(); // 5
-
-        assert_eq!(
-            open_dq(path)
-                .await
-                .write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
-                .await
-                .unwrap(),
-            1,
-            "written again"
-        );
-        let versions: Vec<i64> = recorded(path).await.iter().map(|r| r.0).collect();
-        assert_eq!(versions, vec![3, 3, 10, 11, 12, 13]);
-    }
-
-    /// `delta.setTransactionRetentionDuration` is refused on a target because a `txn` written
-    /// with a `lastUpdated`, as kafka-delta-ingest wrote them, can expire under it. A
-    /// data-quality table holds only ddi's marks, which have none and never expire, so the
-    /// property is no reason to stop recording rejects there.
-    #[tokio::test]
-    async fn dq_txn_retention_on_the_data_quality_table_is_not_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-        DeltaTable::try_from_url(deltalake::ensure_table_uri(path).unwrap())
-            .await
-            .unwrap()
-            .create()
-            .with_columns(columns())
-            .with_configuration([(
-                "delta.setTransactionRetentionDuration",
-                Some("interval 1 days"),
-            )])
-            .with_save_mode(SaveMode::ErrorIfExists)
-            .await
-            .unwrap();
-        let mut dq = open_dq(path).await;
-
-        let batch = [undecodable(0, &[3], MALFORMED)];
-        assert_eq!(
-            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(txn(path, "app.dq-0").await, Some(9));
-        // And the mark is read back as on any other table: the replay is skipped.
-        assert_eq!(
-            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
-                .await
-                .unwrap(),
-            0
         );
     }
 
@@ -1840,9 +1271,13 @@ mod tests {
         /// Write it, then say it already exists, the first time only: what the PUT retried
         /// after its response was lost gets back.
         LandsThenSaysItExists,
-        /// Every time, write another writer's commit there first, which asserts mark 0 of
-        /// partition 0: a rival that always wins the race.
+        /// Every time, write another engine's change of the table's metadata there first: a
+        /// rival that always wins the race, with a commit a plain append conflicts with.
         RivalFirst,
+        /// Write it, have another writer change the table's metadata in the next version,
+        /// then say it already exists, the first time only: delta-rs then meets that change
+        /// in its conflict check, after its own commit, and reports a conflict.
+        LandsThenAlteredThenSaysItExists,
     }
 
     /// An object store that gets one thing wrong about commits, and passes everything else
@@ -1889,12 +1324,25 @@ mod tests {
                     }
                     Ok(put)
                 }
+                Fault::LandsThenAlteredThenSaysItExists => {
+                    let put = self.inner.put_opts(location, payload, opts).await?;
+                    if commit && self.struck.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let next = next_commit(location);
+                        let altered = metadata_change(self.inner.as_ref(), location).await;
+                        self.inner
+                            .put_opts(&next, altered.into(), PutOptions::default())
+                            .await?;
+                        return Err(object_store::Error::AlreadyExists {
+                            path: location.to_string(),
+                            source: "the response to the first attempt was lost".into(),
+                        });
+                    }
+                    Ok(put)
+                }
                 Fault::RivalFirst => {
                     if commit {
                         self.struck.fetch_add(1, Ordering::SeqCst);
-                        let rival = "{\"commitInfo\":{\"timestamp\":1700000000000,\
-                                     \"operation\":\"WRITE\",\"operationParameters\":{\"mode\":\"Append\"}}}\n\
-                                     {\"txn\":{\"appId\":\"app.dq-0\",\"version\":0}}\n";
+                        let rival = metadata_change(self.inner.as_ref(), location).await;
                         self.inner
                             .put_opts(location, rival.into(), PutOptions::default())
                             .await?;
@@ -1961,6 +1409,38 @@ mod tests {
         }
     }
 
+    /// The commit file after the one at `location`.
+    fn next_commit(location: &Path) -> Path {
+        let (dir, name) = location.as_ref().rsplit_once('/').unwrap();
+        let version: u64 = name.strip_suffix(".json").unwrap().parse().unwrap();
+        Path::from(format!("{dir}/{:020}.json", version + 1))
+    }
+
+    /// A commit that sets a table property, as another engine's `ALTER TABLE` writes it: the
+    /// `metaData` of the table's commit 0 at `<location's directory>`, with one more key.
+    async fn metadata_change(store: &dyn ObjectStore, location: &Path) -> String {
+        use deltalake::logstore::object_store::ObjectStoreExt;
+        let (dir, _) = location.as_ref().rsplit_once('/').unwrap();
+        let zero = store
+            .get(&Path::from(format!("{dir}/{:020}.json", 0)))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let mut metadata = std::str::from_utf8(&zero)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|l| l.get("metaData").is_some())
+            .unwrap();
+        metadata["metaData"]["configuration"]["comment"] = serde_json::json!("altered");
+        let info = serde_json::json!({"commitInfo": {
+            "timestamp": 1_700_000_000_000i64, "operation": "SET TBLPROPERTIES"
+        }});
+        format!("{info}\n{metadata}\n")
+    }
+
     fn sorted(
         listing: BoxStream<'static, object_store::Result<ObjectMeta>>,
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -1998,10 +1478,10 @@ mod tests {
     }
 
     /// The data-quality commit landed, but the response to its PUT was lost, and the retried
-    /// PUT found the version taken — by itself. delta-rs then meets its own marks in the
-    /// winning commit and reports a conflict (§4.7 row 3). That commit is this write's, so the
-    /// write is done: tried again, it would record every reject that is never skipped a
-    /// second time, in a process that never crashed.
+    /// PUT found the version taken — by itself. delta-rs then checks its own commit for a
+    /// conflict, finds none in a plain append, and lands the very same actions at the next
+    /// version: the same files, under the same `ddi.kafka.dqWriteId`, which the table counts
+    /// once. Each reject is recorded once, in a process that never crashed.
     #[tokio::test]
     async fn dq_commit_that_landed_unacknowledged_is_not_written_twice() {
         let dir = tempfile::tempdir().unwrap();
@@ -2010,32 +1490,82 @@ mod tests {
         let mut dq = open_dq(path).await;
         let struck = with_fault(&mut dq, Fault::LandsThenSaysItExists).await;
 
-        let not_found = format!("{KAFKA_SCHEMA_NOT_FOUND}: id 42 (404, error code 40403)");
-        let batch = [
-            undecodable(0, &[3, 7], MALFORMED),
-            undecodable(0, &[5], &not_found),
-            uncoordinated(&[1]),
-        ];
+        let batch = [undecodable(0, &[3, 7], MALFORMED), uncoordinated(&[1])];
         assert_eq!(
             dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
                 .await
                 .unwrap(),
-            4
+            3
         );
-        assert_eq!(struck.load(Ordering::SeqCst), 1, "the fault struck");
+        assert_eq!(
+            struck.load(Ordering::SeqCst),
+            2,
+            "the fault struck the first PUT, and delta-rs put the same commit again"
+        );
 
         let rows = recorded(path).await;
-        assert_eq!(rows.len(), 4, "each reject once: {rows:?}");
+        assert_eq!(rows.len(), 3, "each reject once: {rows:?}");
         let table = deltalake::open_table(deltalake::ensure_table_uri(path).unwrap())
             .await
             .unwrap();
-        assert_eq!(table.version(), Some(1), "one commit");
-        assert_eq!(txn(path, "app.dq-0").await, Some(9));
+        let at = |version: u64| {
+            let table = &table;
+            async move {
+                let raw = table
+                    .log_store()
+                    .read_commit_entry(version)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let actions = deltalake::logstore::get_actions(version, &raw).unwrap();
+                let files: Vec<String> = actions
+                    .iter()
+                    .filter_map(|a| match a {
+                        Action::Add(add) => Some(add.path.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                (files, info_of(&actions)[KAFKA_WRITE_ID].clone())
+            }
+        };
+        let (first, second) = (at(1).await, at(2).await);
+        assert_eq!(first, second, "the same files, under the same write");
+        assert_eq!(table.get_file_uris().unwrap().count(), first.0.len());
         assert_eq!(
             dq.kafka_counters().conflict_retries(),
             0,
             "nobody else was there to conflict with"
         );
+    }
+
+    /// The data-quality commit landed, the response to its PUT was lost, and before the retry
+    /// another engine changed the table's metadata. delta-rs's conflict check then meets that
+    /// change and gives up with a conflict, though its own commit is in. The write finds its
+    /// commit by `ddi.kafka.dqWriteId` and is done: tried again in place, it would record every
+    /// reject a second time, in a process that never crashed.
+    #[tokio::test]
+    async fn dq_landed_commit_is_found_when_a_conflict_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create_dq(path).await;
+        let mut dq = open_dq(path).await;
+        let struck = with_fault(&mut dq, Fault::LandsThenAlteredThenSaysItExists).await;
+
+        let batch = [undecodable(0, &[3, 7], MALFORMED), uncoordinated(&[1])];
+        assert_eq!(
+            dq.write_kafka(&batch, &read(&[(0, (0, 9))]), NOW)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(struck.load(Ordering::SeqCst), 1, "the fault struck");
+        let rows = recorded(path).await;
+        assert_eq!(rows.len(), 3, "each reject once: {rows:?}");
+        let table = deltalake::open_table(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(table.version(), Some(2), "ours, then the other engine's");
+        assert_eq!(dq.kafka_counters().conflict_retries(), 0);
     }
 
     /// The scheme every table reached through a [`Fault::RivalFirst`] store is opened by, so
@@ -2115,10 +1645,10 @@ mod tests {
     /// Every way `write_kafka` fails is an error a retry loop can sort by type rather than by
     /// its text (docs/kafka-design.md §3.6): a failed write with what failed typed beneath
     /// it, or a conflict that outlasted the retries. Never a bare cause, which would read as
-    /// the target's: a log cleaned up under a stale data-quality handle is
-    /// `OffsetLogTruncated` beneath, which on its own would replan the target. A table the
-    /// rejects cannot be written to is delta-rs's protocol or Arrow error beneath, the variants
-    /// §3.6 classifies as Blocking.
+    /// the target's. A table the rejects cannot be written to is delta-rs's protocol or Arrow
+    /// error beneath, the variants §3.6 classifies as Blocking; a log cleaned up under a stale
+    /// data-quality handle is delta-rs's `InvalidVersion` beneath, Transient, which the reopen
+    /// after it cures.
     #[tokio::test]
     async fn dq_write_failures_are_typed() {
         let dir = tempfile::tempdir().unwrap();
@@ -2255,7 +1785,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(cause(&e), Error::OffsetLogTruncated { version: 1, .. }),
+            matches!(cause(&e), Error::Delta(DeltaTableError::InvalidVersion(1))),
             "{e:?}"
         );
         // The failure reopened the handle, so the batch's next attempt goes through.
@@ -2305,8 +1835,8 @@ mod tests {
         );
     }
 
-    /// A rival that commits the same partition's mark first, every time: the retries in place
-    /// run out, and the error says so by its type.
+    /// A rival that changes the table's metadata first, every time: the retries in place run
+    /// out, and the error says so by its type.
     #[tokio::test]
     async fn dq_conflict_past_the_retries_in_place_is_typed() {
         let struck = rival_scheme();
