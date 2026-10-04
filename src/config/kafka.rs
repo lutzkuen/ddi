@@ -912,9 +912,14 @@ fn resolve_start(s: &StartingOffsets) -> std::result::Result<StartPolicy, String
                 );
             }
             let mut partitions = BTreeMap::new();
+            // The key each partition, and "*", was written under. i32's parse takes a sign,
+            // leading zeros and (trimmed) spaces, so "1", "01", "+1" and " 1" are four TOML
+            // keys for one partition, and only one offset can be its start.
+            let mut written: BTreeMap<Option<i32>, &str> = BTreeMap::new();
             let mut rest = None;
             for (key, value) in m {
                 if key.trim() == "*" {
+                    written_once(&mut written, None, key)?;
                     rest = Some(match value {
                         OffsetValue::Named(v) => named(v).ok_or_else(|| {
                             format!(
@@ -938,6 +943,7 @@ fn resolve_start(s: &StartingOffsets) -> std::result::Result<StartPolicy, String
                          more) nor \"*\""
                     )
                 })?;
+                written_once(&mut written, Some(p), key)?;
                 match value {
                     OffsetValue::Offset(o) if *o >= 0 => {
                         partitions.insert(p, *o);
@@ -959,6 +965,23 @@ fn resolve_start(s: &StartingOffsets) -> std::result::Result<StartPolicy, String
             }
             Ok(StartPolicy::Explicit { partitions, rest })
         }
+    }
+}
+
+/// Records that `key` names partition `p` (`None`: the rest, `"*"`), or says which key named
+/// it already.
+fn written_once<'a>(
+    written: &mut BTreeMap<Option<i32>, &'a str>,
+    p: Option<i32>,
+    key: &'a str,
+) -> std::result::Result<(), String> {
+    match written.insert(p, key) {
+        Some(first) => Err(format!(
+            "starting_offsets keys {first:?} and {key:?} both name {}, and only one can say \
+             where it starts; keep one",
+            p.map_or("the rest (\"*\")".to_string(), |p| format!("partition {p}"))
+        )),
+        None => Ok(()),
     }
 }
 
@@ -2972,6 +2995,29 @@ url = "http://my-sr:8081"
         ));
         let e = settings_of(&r, "events", &[]).unwrap_err().to_string();
         assert!(e.contains("\"MY_CERT\", which is not set"), "{e}");
+    }
+
+    // --------------------------------------------------------------------- one start
+
+    #[test]
+    fn two_spellings_of_one_partition_are_refused() {
+        // Rust's i32 parse takes a sign, leading zeros and (after trim) spaces: each is another
+        // TOML key for the same partition, and one of the two offsets would be dropped.
+        for (written, keys) in [
+            (r#"{ "1" = 100, "01" = 0 }"#, ["\"01\"", "\"1\""]),
+            (r#"{ "1" = 0, "+1" = 100 }"#, ["\"+1\"", "\"1\""]),
+            (r#"{ " 1" = 5, "1" = 7 }"#, ["\" 1\"", "\"1\""]),
+            ("{ 1 = 100, 01 = 0 }", ["\"01\"", "\"1\""]),
+            (
+                r#"{ "*" = "earliest", " *" = "latest" }"#,
+                ["\" *\"", "\"*\""],
+            ),
+        ] {
+            let reason = refused("", &format!("starting_offsets = {written}"));
+            for key in keys {
+                assert!(reason.contains(key), "{written}: {reason}");
+            }
+        }
     }
 
     /// [`librdkafka_property`] against librdkafka itself: a value set under one name is what
