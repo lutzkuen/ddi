@@ -1453,9 +1453,10 @@ FROM source
 **Dockerfile** (docker/Dockerfile:17-46):
 
 ```dockerfile
-ARG DDI_FEATURES=                     # empty until M3 ships; then "kafka"
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev zlib1g-dev make libclang-dev   # all but libclang-dev already in rust:1.97-bookworm
-RUN … cargo build --release --locked --features "$DDI_FEATURES" …     # lines 24-25 AND 27, so the dependency-cache layer still works
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev zlib1g-dev make   # all already in rust:1.97-bookworm; one layer for every feature set
+ARG DDI_FEATURES=                     # empty until M3 ships; then "kafka". After the shared layer: an ARG is in the environment, and so the cache key, of every RUN after it
+RUN case " $DDI_FEATURES " in *kafka*) apt-get update && apt-get install -y --no-install-recommends libclang-dev …;; esac   # bindgen's libclang, for a kafka build only (~65 MB, 432 MB installed)
+RUN … cargo build --release --locked --features "$DDI_FEATURES" …     # the dependency-cache build AND the final one, so the cache layer still works
 # runtime stage, line 31: add libssl3 explicitly (today it only arrives through ca-certificates → openssl)
 RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and prints librdkafka 2.12.1
 ```

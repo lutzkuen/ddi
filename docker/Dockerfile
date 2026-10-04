@@ -18,18 +18,27 @@
 
 # Build
 FROM rust:1.97-bookworm AS build
+# pkg-config and libssl-dev: OpenSSL 3 for librdkafka's TLS and SASL/SCRAM. zlib1g-dev: its
+# gzip codec, linked dynamically. make: librdkafka's own build. All of them already come with
+# the rust image; they are named so a base-image change cannot remove them silently, and they
+# install the same for every feature set, so this layer is shared by all of them.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev zlib1g-dev make \
+    && rm -rf /var/lib/apt/lists/*
 # Cargo features to build with: empty is the Delta-only binary; `kafka` adds the Kafka source
 # (docs/kafka-design.md), which stays empty here until that source is complete (M3).
 #   docker build --build-arg DDI_FEATURES=kafka -f docker/Dockerfile .
+# Declared after the layer above on purpose: every RUN after an ARG has it in its environment,
+# which is part of that RUN's cache key, so declared earlier it would split the shared layer.
 ARG DDI_FEATURES=
-# pkg-config and libssl-dev: OpenSSL 3 for librdkafka's TLS and SASL/SCRAM. zlib1g-dev: its
-# gzip codec, linked dynamically. make: librdkafka's own build. libclang-dev: the zstd-sys
-# this tree locks (2.0.16) turns on bindgen by default, and rdkafka-sys asks for its defaults.
-# All but libclang-dev already come with the rust image; they are named so a base-image change
-# cannot remove them silently. Only a `kafka` build uses any of them.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev zlib1g-dev make libclang-dev \
-    && rm -rf /var/lib/apt/lists/*
+# libclang-dev, for a `kafka` build only: the zstd-sys this tree locks (2.0.16) turns on
+# bindgen by default, and rdkafka-sys asks for its defaults. A Delta-only build needs none of
+# its ~65 MB (432 MB installed) of LLVM.
+RUN case " $DDI_FEATURES " in \
+        *kafka*) apt-get update \
+            && apt-get install -y --no-install-recommends libclang-dev \
+            && rm -rf /var/lib/apt/lists/* ;; \
+    esac
 WORKDIR /src
 # Cache the dependency build across source changes. Both builds take the same features, or
 # the second one rebuilds every dependency the first one cached.
