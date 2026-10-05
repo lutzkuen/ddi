@@ -1369,6 +1369,182 @@ async fn union_widening_wraps_branch() {
     assert_eq!(good.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
 }
 
+/// Row `i` of a union column: its branch's name, and the branch's struct as text fields.
+fn union_row(col: &dyn Array, i: usize) -> (String, Vec<(String, Option<String>)>) {
+    let u = col.as_any().downcast_ref::<UnionArray>().unwrap();
+    let DataType::Union(fields, _) = col.data_type() else {
+        panic!("{:?}", col.data_type())
+    };
+    let t = u.type_id(i);
+    let name = fields
+        .iter()
+        .find(|(id, _)| *id == t)
+        .unwrap()
+        .1
+        .name()
+        .clone();
+    let offset = u.value_offset(i);
+    let values = match u.child(t).as_struct_opt() {
+        Some(st) => st
+            .fields()
+            .iter()
+            .zip(st.columns())
+            .map(|(f, c)| {
+                let c = c.as_string::<i32>();
+                (
+                    f.name().clone(),
+                    c.is_valid(offset).then(|| c.value(offset).into()),
+                )
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    (name, values)
+}
+
+/// A union of records: a record goes into the branch of its own name, as Avro's resolution puts
+/// it, never just into the first record branch, which dropped its fields: in one writer schema's
+/// union, from an older plain record a newer one widened into a union, and when the records'
+/// fields alone cannot tell them apart. A field the chosen branch lacks would be lost, so a row
+/// holding a value there is rejected, and one holding a null is kept.
+#[tokio::test]
+async fn union_of_records_by_name() {
+    const PAY: &str = r#"{"type":"record","name":"Order","fields":[
+        {"name":"id","type":"long"},
+        {"name":"payment","type":["null",
+            {"type":"record","name":"Card","fields":[{"name":"last4","type":"string"}]},
+            {"type":"record","name":"Bank","fields":[{"name":"iban","type":"string"}]}]}]}"#;
+    let pay = |id: i64, branch: u32, v: Avro| {
+        record(vec![
+            ("id", Avro::Long(id)),
+            ("payment", Avro::Union(branch, Box::new(v))),
+        ])
+    };
+    let iban = "DE89370400440532013000";
+    let batches = decoded(
+        &[(1, PAY)],
+        vec![
+            (1, pay(0, 1, record(vec![("last4", s("1234"))]))),
+            (1, pay(1, 2, record(vec![("iban", s(iban))]))),
+            (1, pay(2, 0, Avro::Null)),
+        ],
+    )
+    .await;
+    let u = UnionSchema::build(&[registered(1, PAY)], "kafka_");
+    let mut rejects = Vec::new();
+    let aligned = u.align_all(batches, &mut rejects).unwrap();
+    assert!(rejects.is_empty(), "{:?}", reasons(&rejects));
+    let payment = aligned[0].column_by_name("payment").unwrap();
+    assert_eq!(
+        union_row(payment.as_ref(), 1),
+        ("Bank".into(), vec![("iban".into(), Some(iban.into()))])
+    );
+    let t = target(vec![
+        field("id", Delta::LONG, false),
+        field(
+            "payment",
+            strct(vec![
+                field("last4", Delta::STRING, true),
+                field("iban", Delta::STRING, true),
+            ]),
+            true,
+        ),
+    ]);
+    let out = SqlTransform::new("SELECT * FROM source")
+        .run(u.schema(), aligned)
+        .await
+        .unwrap();
+    let (good, rejects) = through(&mut conformer(t), out);
+    assert!(rejects.is_empty());
+    let mut rows = json(&good);
+    rows.sort_by_key(|r| r["id"].as_i64());
+    assert_eq!(
+        rows[1]["payment"],
+        serde_json::json!({"last4": null, "iban": iban})
+    );
+
+    // An older plain record, widened into the union: the branch of its name, whatever comes
+    // first, and also where the two records' fields are the same.
+    const BANK: &str = r#"{"type":"record","name":"Order","fields":[
+        {"name":"id","type":"long"},
+        {"name":"payment","type":{"type":"record","name":"Bank","fields":[{"name":"iban","type":"string"}]}}]}"#;
+    const SAME1: &str = r#"{"type":"record","name":"Order","fields":[
+        {"name":"id","type":"long"},
+        {"name":"payment","type":{"type":"record","name":"Bank","namespace":"pay","fields":[
+            {"name":"ref","type":"string"}]}}]}"#;
+    const SAME2: &str = r#"{"type":"record","name":"Order","fields":[
+        {"name":"id","type":"long"},
+        {"name":"payment","type":["null",
+            {"type":"record","name":"Card","namespace":"pay","fields":[{"name":"ref","type":"string"}]},
+            {"type":"record","name":"Bank","namespace":"pay","fields":[{"name":"ref","type":"string"}]}]}]}"#;
+    for (old, new, field_name, branch) in [
+        (BANK, PAY, "iban", "Bank"),
+        (SAME1, SAME2, "ref", "pay.Bank"),
+    ] {
+        let batches = decoded(
+            &[(1, old), (2, new)],
+            vec![(
+                1,
+                record(vec![
+                    ("id", Avro::Long(0)),
+                    ("payment", record(vec![(field_name, s(iban))])),
+                ]),
+            )],
+        )
+        .await;
+        let u = UnionSchema::build(&[registered(1, old), registered(2, new)], "kafka_");
+        let (aligned, rejected) = u.align(&batches[0]).unwrap();
+        assert!(rejected.is_none());
+        let payment = aligned.column_by_name("payment").unwrap();
+        assert_eq!(
+            union_row(payment.as_ref(), 0),
+            (branch.into(), vec![(field_name.into(), Some(iban.into()))])
+        );
+    }
+
+    // A newer Card without `exp`: an older Card's `exp` would be lost where it has a value.
+    const EXP: &str = r#"{"type":"record","name":"Order","fields":[
+        {"name":"id","type":"long"},
+        {"name":"payment","type":["null",
+            {"type":"record","name":"Card","fields":[
+                {"name":"last4","type":"string"},{"name":"exp","type":["null","string"]}]},
+            {"type":"record","name":"Bank","fields":[{"name":"iban","type":"string"}]}]}]}"#;
+    let card = |exp: Option<&str>| {
+        record(vec![
+            ("last4", s("1234")),
+            (
+                "exp",
+                match exp {
+                    Some(e) => Avro::Union(1, Box::new(s(e))),
+                    None => Avro::Union(0, Box::new(Avro::Null)),
+                },
+            ),
+        ])
+    };
+    let batches = decoded(
+        &[(1, EXP), (2, PAY)],
+        vec![
+            (1, pay(0, 1, card(Some("12/30")))),
+            (1, pay(1, 1, card(None))),
+        ],
+    )
+    .await;
+    let u = UnionSchema::build(&[registered(1, EXP), registered(2, PAY)], "kafka_");
+    let mut rejects = Vec::new();
+    let aligned = u.align_all(batches, &mut rejects).unwrap();
+    assert_eq!(rejected_offsets(&rejects), [0]);
+    assert!(
+        reasons(&rejects)[0].contains("payment (union branch Card).exp"),
+        "{:?}",
+        reasons(&rejects)
+    );
+    let payment = aligned[0].column_by_name("payment").unwrap();
+    assert_eq!(
+        union_row(payment.as_ref(), 0),
+        ("Card".into(), vec![("last4".into(), Some("1234".into()))])
+    );
+}
+
 const G1: &str = r#"{"type":"record","name":"G","fields":[
     {"name":"id","type":"long"},{"name":"name","type":"string"}]}"#;
 const G2: &str = r#"{"type":"record","name":"G","fields":[

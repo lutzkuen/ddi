@@ -137,14 +137,18 @@ struct Kdi<'a, 's> {
 }
 
 /// Fits arrays to types, by name at every depth.
-struct Fitter {
+struct Fitter<'n> {
     into: Dest,
     /// kafka-delta-ingest's text, for values going into a STRING (§5.6 steps 5 and 6). Off
     /// when fitting to `U`: only the target's STRING columns take it.
     text: KdiText,
+    /// Into `U`: the full Avro name of each named type (record, enum, fixed) of the rows'
+    /// writer schema, by the path that names its values ([`named_types`]), which the decoded
+    /// rows no longer carry. A plain value going into a union takes the branch of its name.
+    names: Option<&'n HashMap<String, String>>,
 }
 
-impl Fitter {
+impl Fitter<'_> {
     /// `array` in type `to`, its values matched to `to`'s by name at every depth. `path` names
     /// the value in a rejection (`customer.address.zip`). `top` is set for a top-level column of
     /// the target, whose plain values are left as they are, for the coercer to cast. `kdi` is
@@ -382,6 +386,22 @@ impl Fitter {
                 child
             };
             columns.push(child);
+        }
+        if matches!(self.into, Dest::Union { .. }) {
+            // Into `U` a record keeps every field: one the type there lacks (a branch of a
+            // union, which `U` takes from one writer schema) would be lost where it has a value.
+            for (field, child) in s.fields().iter().zip(s.columns()) {
+                if to_fields.find(field.name()).is_some() {
+                    continue;
+                }
+                let child_path = format!("{path}.{}", field.name());
+                let nulls = child.logical_nulls();
+                for i in (0..n).filter(|i| parent_valid(*i)) {
+                    if nulls.as_ref().is_none_or(|v| v.is_valid(i)) {
+                        bad.set(n, i, || self.dropped(&child_path));
+                    }
+                }
+            }
         }
         let out = if to_fields.is_empty() {
             StructArray::new_empty_fields(n, s.nulls().cloned())
@@ -628,7 +648,11 @@ impl Fitter {
     fn wrap_in_union(&self, array: &ArrayRef, to: &DataType, path: &str) -> Result<Fitted> {
         let fields = dense_union_fields(to, path)?;
         let n = array.len();
-        let (type_id, fitted) = self.branch_for(array, fields, path)?;
+        let name = self
+            .names
+            .and_then(|names| names.get(path))
+            .map(String::as_str);
+        let (type_id, fitted) = self.branch_for(array, fields, path, name)?;
         let null_branch = fields
             .iter()
             .find(|(_, f)| f.data_type() == &DataType::Null)
@@ -691,7 +715,12 @@ impl Fitter {
         let mut parts: BTreeMap<i8, Vec<ArrayRef>> = BTreeMap::new();
         for (type_id, field) in from_fields.iter() {
             let branch_path = format!("{path} (union branch {})", field.name());
-            let (target, fitted) = self.branch_for(u.child(type_id), to_fields, &branch_path)?;
+            let (target, fitted) = self.branch_for(
+                u.child(type_id),
+                to_fields,
+                &branch_path,
+                Some(field.name()),
+            )?;
             let earlier = parts.entry(target).or_default();
             let shift: usize = earlier.iter().map(|a| a.len()).sum();
             earlier.push(fitted.array.clone());
@@ -733,30 +762,41 @@ impl Fitter {
         })
     }
 
-    /// The branch of a union that values of `array`'s type go into, and the values fitted to it:
-    /// the branch of the same type; else the first of the same kind (a record, an array, a
-    /// map), fitted by name; else the first branch every value converts to, or failing that
-    /// the first any value converts to, its other values rejected; else none, and every value
-    /// is rejected.
+    /// The branch of a union that values of `array`'s type go into, and the values fitted to it
+    /// by name, as Avro's own resolution picks it where it picks one (Java's
+    /// `ResolvingGrammarGenerator.bestBranch`): the branch of the values' `name` (a source
+    /// union's branch, or the full name of a record, enum or fixed), or of their type; else, for
+    /// a record, the record branch holding most of its fields, all of them where one does (the
+    /// one with the fewest others); else, for an array or a map, the branch of that kind.
+    /// Failing those, which Avro refuses, the first branch every value converts to unchanged,
+    /// or failing that the first any value converts to, its other values rejected; else none,
+    /// and every value is rejected.
     fn branch_for(
         &self,
         array: &ArrayRef,
         fields: &UnionFields,
         path: &str,
+        name: Option<&str>,
     ) -> Result<(i8, Fitted)> {
         let from = array.data_type();
-        if let Some((type_id, _)) = fields.iter().find(|(_, f)| f.data_type() == from) {
-            return Ok((type_id, Fitted::clean(array.clone())));
-        }
-        let same_kind = |t: &DataType| {
-            matches!(
-                (from, t),
-                (DataType::Struct(_), DataType::Struct(_))
-                    | (DataType::List(_), DataType::List(_))
-                    | (DataType::Map(..), DataType::Map(..))
-            )
+        let relaxed = relax(from);
+        let named = name.and_then(|n| fields.iter().find(|(_, f)| f.name() == n));
+        let same = || {
+            fields
+                .iter()
+                .find(|(_, f)| f.data_type() == from || f.data_type() == &relaxed)
         };
-        if let Some((type_id, field)) = fields.iter().find(|(_, f)| same_kind(f.data_type())) {
+        let kind = || match from {
+            DataType::Struct(children) => best_record(children, fields),
+            DataType::List(_) => fields
+                .iter()
+                .find(|(_, f)| matches!(f.data_type(), DataType::List(_))),
+            DataType::Map(..) => fields
+                .iter()
+                .find(|(_, f)| matches!(f.data_type(), DataType::Map(..))),
+            _ => None,
+        };
+        if let Some((type_id, field)) = named.or_else(same).or_else(kind) {
             return Ok((
                 type_id,
                 self.fit(array, field.data_type(), path, false, None)?,
@@ -898,6 +938,19 @@ impl Fitter {
         )
     }
 
+    /// Into `U` only: a record's field the type there has no place for.
+    fn dropped(&self, path: &str) -> String {
+        let (writer, newest) = match self.into {
+            Dest::Union { writer, newest } => (writer, newest),
+            Dest::Target => (None, 0),
+        };
+        format!(
+            "writer schema {} field {path}: the union the SQL runs over has no such field here \
+             (its type comes from writer schema {newest}), and the value would be lost",
+            writer.map_or("?".to_string(), |w| w.to_string())
+        )
+    }
+
     fn null_into_not_null(&self, path: &str) -> String {
         format!("{path} is NOT NULL in the target, and this value is null")
     }
@@ -923,6 +976,30 @@ fn decimal_text(v: f64, precision: u8, scale: i8) -> Option<String> {
         return None;
     }
     Some(v.to_string())
+}
+
+/// The record branch of a union that a record of `children` goes into by its structure, as
+/// Avro's resolution does once no branch has its name: of the branches holding every one of
+/// its fields, the one with the fewest others; else the one holding most of them. None when no
+/// branch holds any.
+fn best_record<'a>(children: &Fields, fields: &'a UnionFields) -> Option<(i8, &'a FieldRef)> {
+    use std::cmp::Reverse;
+    fields
+        .iter()
+        .filter_map(|(type_id, field)| {
+            let DataType::Struct(theirs) = field.data_type() else {
+                return None;
+            };
+            let held = children
+                .iter()
+                .filter(|c| theirs.find(c.name()).is_some())
+                .count();
+            let rank = (held == children.len(), held, Reverse(theirs.len()));
+            (held > 0 || children.is_empty()).then_some((rank, (type_id, field)))
+        })
+        // The first of the best, as Avro takes the first branch that matches.
+        .reduce(|best, next| if next.0 > best.0 { next } else { best })
+        .map(|(_, found)| found)
 }
 
 /// Where each of `len` elements of `n` lists (or maps) stood in kafka-delta-ingest's JSON:
@@ -1255,6 +1332,7 @@ impl Conformer {
         let fitter = Fitter {
             into: Dest::Target,
             text: self.text,
+            names: None,
         };
         let ids = (self.text.any() && n > 0).then(|| self.writer_ids(batch));
         let writers = ids.map(|ids| self.writers(ids)).transpose()?;
@@ -1445,6 +1523,10 @@ pub struct UnionSchema {
     origin: HashMap<String, u32>,
     changes: Vec<TypeChange>,
     prefix: String,
+    /// Per member, the full Avro name of each named type, by the path of its values
+    /// ([`named_types`]): a plain record, enum or fixed that a newer member widened into a
+    /// union goes into the branch of its name.
+    names: HashMap<u32, HashMap<String, String>>,
 }
 
 impl UnionSchema {
@@ -1464,6 +1546,7 @@ impl UnionSchema {
         let mut origin = HashMap::new();
         let mut ids = Vec::new();
         let mut changes = Vec::new();
+        let mut names = HashMap::new();
         for member in ordered {
             let schema = match decoded_schema(member) {
                 Ok(s) => s,
@@ -1490,6 +1573,9 @@ impl UnionSchema {
                 continue;
             }
             ids.push(member.id);
+            if let Ok(raw) = crate::kafka::decode::raw_schema(member) {
+                names.insert(member.id, named_types(raw.fields()));
+            }
             for field in schema.fields() {
                 match fields.iter_mut().find(|f| f.name() == field.name()) {
                     Some(existing) => {
@@ -1521,6 +1607,7 @@ impl UnionSchema {
             origin,
             changes,
             prefix: prefix.to_string(),
+            names,
         }
     }
 
@@ -1596,6 +1683,7 @@ impl UnionSchema {
             let fitter = Fitter {
                 into: Dest::Union { writer, newest },
                 text: KdiText::default(),
+                names: writer.and_then(|w| self.names.get(&(w as u32))),
             };
             let fitted = fitter.fit(column, field.data_type(), field.name(), false, None)?;
             for (i, reason) in fitted.bad.iter().enumerate() {
@@ -1654,6 +1742,52 @@ fn mentions(text: &str, word: &str) -> bool {
             .is_none_or(|c| !ident(c));
         before && after
     })
+}
+
+/// The full Avro name of every named type (record, enum, fixed) among `fields`, the decoder's
+/// own schema for a writer schema (`decode::raw_schema`, whose fields carry the `avro.name` and
+/// `avro.namespace` arrow-avro puts on them), by the path [`Fitter`] names its values with:
+/// `a.b` for a record's field, `a[]` for an array's items, `a{}` for a map's values, and
+/// `a (union branch X)` for a union's branch. A full name is spelt as arrow-avro spells a
+/// union's branch (codec.rs:1201-1213), so it is the name of the branch it would be.
+fn named_types(fields: &Fields) -> HashMap<String, String> {
+    use arrow_avro::schema::{AVRO_NAMESPACE_METADATA_KEY, AVRO_NAME_METADATA_KEY};
+    fn visit(field: &Field, path: String, out: &mut HashMap<String, String>) {
+        let metadata = field.metadata();
+        if let Some(name) = metadata.get(AVRO_NAME_METADATA_KEY) {
+            let full = match metadata.get(AVRO_NAMESPACE_METADATA_KEY) {
+                Some(ns) if !name.contains('.') => format!("{ns}.{name}"),
+                _ => name.clone(),
+            };
+            out.insert(path.clone(), full);
+        }
+        match field.data_type() {
+            DataType::Struct(children) => {
+                for c in children {
+                    visit(c, format!("{path}.{}", c.name()), out);
+                }
+            }
+            DataType::List(item) => visit(item, format!("{path}[]"), out),
+            DataType::Map(entries, _) => {
+                if let DataType::Struct(kv) = entries.data_type() {
+                    if let Some(value) = kv.get(1) {
+                        visit(value, format!("{path}{{}}"), out);
+                    }
+                }
+            }
+            DataType::Union(branches, _) => {
+                for (_, b) in branches.iter() {
+                    visit(b, format!("{path} (union branch {})", b.name()), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashMap::new();
+    for f in fields {
+        visit(f, f.name().clone(), &mut out);
+    }
+    out
 }
 
 /// `t` with every field nullable, at every depth but a map's entries and keys, which Arrow
