@@ -1780,3 +1780,6 @@ pub async fn check_partition_columns(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod kdi_tests;
