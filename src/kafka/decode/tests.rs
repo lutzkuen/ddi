@@ -1452,6 +1452,90 @@ async fn a_chunk_that_cannot_be_flushed_is_isolated() {
         .contains("cannot build the column"));
 }
 
+/// The one-message-at-a-time fallback decodes every message of the chunk into one decoder,
+/// flushed after each, and builds a new decoder only after a message failed (it may hold part
+/// of a row). Building one per message cost a schema parse and fresh 1024-row builders each
+/// time: one bad row in an 8192-row chunk cost seconds of CPU.
+#[tokio::test]
+async fn a_chunk_that_cannot_be_flushed_builds_a_decoder_only_after_a_failure() {
+    /// arrow-avro, counting the decoders built, with a flush holding a poisoned message failing.
+    struct Counting(Arc<AtomicUsize>);
+    struct CountedDecoder {
+        inner: Box<dyn Decode>,
+        poisoned: bool,
+    }
+    impl DecodeFactory for Counting {
+        fn build(&self, id: u32, schema: &str) -> std::result::Result<Box<dyn Decode>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(CountedDecoder {
+                inner: ArrowAvro.build(id, schema)?,
+                poisoned: false,
+            }))
+        }
+    }
+    impl Decode for CountedDecoder {
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+        fn decode_one(&mut self, framed: &[u8]) -> std::result::Result<(), String> {
+            self.inner.decode_one(framed)?;
+            self.poisoned |= framed.ends_with(b"poison");
+            Ok(())
+        }
+        fn flush(&mut self) -> std::result::Result<Option<RecordBatch>, String> {
+            let b = self.inner.flush()?;
+            if std::mem::take(&mut self.poisoned) {
+                return Err("cannot build the column".into());
+            }
+            Ok(b)
+        }
+    }
+    let builds = Arc::new(AtomicUsize::new(0));
+    let mut d = KafkaDecoder::with_factory(
+        "orders",
+        "kafka_",
+        Schemas::with(&[(1, V1)]),
+        Arc::new(Counting(builds.clone())),
+    );
+    let poisoned = [7, 500];
+    feed_all(
+        &mut d,
+        (0..1000)
+            .map(|o| {
+                let name = if poisoned.contains(&o) {
+                    "poison"
+                } else {
+                    "fine"
+                };
+                message(o, Some(framed(1, V1, v1(o, name))))
+            })
+            .collect(),
+    )
+    .await;
+    let before = builds.load(Ordering::SeqCst);
+    let out = d.finish().unwrap();
+    // One to replace the decoder whose flush failed, and one after each poisoned message.
+    assert_eq!(builds.load(Ordering::SeqCst) - before, 1 + poisoned.len());
+    let kept: Vec<i64> = rows_by_offset(&out.batches).iter().map(|r| r.0).collect();
+    assert_eq!(
+        kept,
+        (0..1000)
+            .filter(|o| !poisoned.contains(o))
+            .collect::<Vec<_>>()
+    );
+    assert_rows_are_their_messages(&out.batches);
+    let bad: Vec<i64> = out.undecodable.iter().map(|u| u.offset).collect();
+    assert_eq!(bad, poisoned);
+
+    // The next batch decodes as usual.
+    feed_all(
+        &mut d,
+        vec![message(1000, Some(framed(1, V1, v1(1000, "fine"))))],
+    )
+    .await;
+    assert_eq!(rows_by_offset(&d.finish().unwrap().batches), [(1000, 1000)]);
+}
+
 // ------------------------------------------------------------- what holds the pipeline
 
 #[tokio::test]

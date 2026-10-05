@@ -707,32 +707,40 @@ impl Ctx<'_> {
         };
         match rows {
             Some(rows) => self.emit(rows, chunk, raw, out),
-            None => {
-                // Each message alone, so that what failed is one message's.
-                if let Ok(d) = self.factory.build(self.id, &group.schema.schema) {
-                    group.decoder = d;
-                }
-                self.flush_one_by_one(group, chunk, out);
-            }
+            // Each message alone, so that what failed is one message's.
+            None => self.flush_one_by_one(group, chunk, out),
         }
     }
 
-    fn flush_one_by_one(&self, group: &Ready, chunk: Vec<KafkaMessage>, out: &mut Out) {
+    /// Each message of `chunk` decoded and flushed alone, into one new decoder: a message whose
+    /// row cannot be flushed is rejected, the others keep theirs. The decoder is replaced again
+    /// only after a message failed, since it may then hold part of that row; building one per
+    /// message would parse the schema and size fresh builders for every row of the chunk.
+    fn flush_one_by_one(&self, group: &mut Ready, chunk: Vec<KafkaMessage>, out: &mut Out) {
         let mut rows = Vec::new();
         let mut kept = Vec::new();
+        // The decoder whose flush of the whole chunk failed may hold anything.
+        let mut clean = false;
         for m in chunk {
-            let one = self
-                .factory
-                .build(self.id, &group.schema.schema)
-                .and_then(|mut d| {
-                    d.decode_one(m.value.as_deref().unwrap_or_default())?;
-                    match d.flush()? {
-                        Some(b) if b.num_rows() == 1 => {
-                            normalise(b, &group.fixed_uuids).map_err(|e| e.to_string())
-                        }
-                        _ => Err("decoded, but no row came out".to_string()),
+            let one = match clean {
+                true => Ok(()),
+                false => self
+                    .factory
+                    .build(self.id, &group.schema.schema)
+                    .map(|d| group.decoder = d),
+            }
+            .and_then(|()| {
+                clean = false;
+                let d = &mut group.decoder;
+                d.decode_one(m.value.as_deref().unwrap_or_default())?;
+                match d.flush()? {
+                    Some(b) if b.num_rows() == 1 => {
+                        clean = true;
+                        normalise(b, &group.fixed_uuids).map_err(|e| e.to_string())
                     }
-                });
+                    _ => Err("decoded, but no row came out".to_string()),
+                }
+            });
             match one {
                 Ok(b) => {
                     rows.push(b);
@@ -742,6 +750,12 @@ impl Ctx<'_> {
                     let reason = format!("cannot turn the decoded record into Arrow: {e}");
                     out.reject(m, Some(self.id), reason, true)
                 }
+            }
+        }
+        if !clean {
+            // It built before; should it not now, the next message fails and is isolated.
+            if let Ok(d) = self.factory.build(self.id, &group.schema.schema) {
+                group.decoder = d;
             }
         }
         if rows.is_empty() {
