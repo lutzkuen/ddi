@@ -23,9 +23,13 @@
 //! Arrow's cast of a struct into a struct pairs the fields by name only when every target field
 //! is in the source, and otherwise by position (arrow-cast cast/mod.rs:2223-2252, reached from
 //! the coercer through cast/mod.rs:1183): a record that gained or lost a field would have its
-//! values written into its neighbours' columns, silently. So nothing nested reaches that cast.
-//! A conformed column already has the target's type wherever it is nested, and the coercer
-//! passes it through as it is.
+//! values written into its neighbours' columns, silently. Its `(_, List)` arm wraps any value in
+//! a one-element list, so a record going into an ARRAY of records reached that pairing too, and
+//! a text going into an ARRAY of numbers became `[null]` in a list that stays valid. So nothing
+//! nested reaches that cast: a struct, a list or a map is fitted by name (a large or fixed-size
+//! list made a list first, its elements untouched), and a value of another shape going into one
+//! is rejected. A conformed column already has the target's type wherever it is nested, and
+//! the coercer passes it through as it is.
 //!
 //! # What is left to the coercer
 //!
@@ -184,6 +188,20 @@ impl Fitter<'_> {
                 self.structs(array, to_fields, path, kdi)
             }
             (DataType::List(_), DataType::List(item)) => self.list(array, item, path, kdi),
+            (
+                DataType::LargeList(element)
+                | DataType::FixedSizeList(element, _)
+                | DataType::ListView(element)
+                | DataType::LargeListView(element),
+                DataType::List(item),
+            ) => {
+                // The container alone made a `List`, its elements untouched; then by name.
+                let as_list = DataType::List(element.clone());
+                match crate::transform::decimal::cast(array, &as_list) {
+                    Ok(list) => self.list(&list, item, path, kdi),
+                    Err(_) => Ok(self.refused(array, to, path)),
+                }
+            }
             (DataType::Map(..), DataType::Map(entries, sorted)) => {
                 self.map(array, entries, *sorted, path, kdi)
             }
@@ -191,9 +209,36 @@ impl Fitter<'_> {
                 DataType::Float16 | DataType::Float32 | DataType::Float64,
                 DataType::Decimal128(..) | DataType::Decimal256(..),
             ) => self.float_to_decimal(array, to, path),
+            // Anything else into a struct, a list or a map (a record or a text into an ARRAY):
+            // Arrow's cast would wrap it in a one-element list and pair a struct's fields by
+            // position, or null an element inside a list that stays valid, and so would the
+            // coercer's at the top level. kdi's arrow-json refused such a value too.
+            (_, to) if to.is_nested() => Ok(self.refused(array, to, path)),
             _ if top => Ok(Fitted::clean(array.clone())),
             _ => self.cast(array, to, path),
         }
+    }
+
+    /// `array` into `to`, which has no place for its values: every one that is not null is
+    /// rejected, and a null stays null.
+    fn refused(&self, array: &ArrayRef, to: &DataType, path: &str) -> Fitted {
+        Fitted {
+            array: new_null_array(to, array.len()),
+            bad: self.refusals(array, to, path),
+        }
+    }
+
+    /// A reason for each value of `array` that is not null, which `to` has no place for.
+    fn refusals(&self, array: &ArrayRef, to: &DataType, path: &str) -> Vec<Option<String>> {
+        let from = array.data_type();
+        let mut bad = Reasons::default();
+        let valid = array.logical_nulls();
+        for i in 0..array.len() {
+            if valid.as_ref().is_none_or(|v| v.is_valid(i)) {
+                bad.set(array.len(), i, || self.not_converted(path, from, to));
+            }
+        }
+        bad.0
     }
 
     /// A value going into a STRING where kafka-delta-ingest's text is written (§5.6 steps 5 and
@@ -825,18 +870,11 @@ impl Fitter<'_> {
             .or_else(|| fields.iter().next())
             .ok_or_else(|| Error::Schema(format!("{path}: a union without branches")))?;
         let to = DataType::Union(fields.clone(), UnionMode::Dense);
-        let mut bad = Reasons::default();
-        let valid = array.logical_nulls();
-        for i in 0..array.len() {
-            if valid.as_ref().is_none_or(|v| v.is_valid(i)) {
-                bad.set(array.len(), i, || self.not_converted(path, from, &to));
-            }
-        }
         Ok((
             type_id,
             Fitted {
                 array: new_null_array(field.data_type(), array.len()),
-                bad: bad.0,
+                bad: self.refusals(array, &to, path),
             },
         ))
     }

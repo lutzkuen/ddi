@@ -1369,6 +1369,192 @@ async fn union_widening_wraps_branch() {
     assert_eq!(good.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
 }
 
+/// Nothing nested reaches Arrow's cast, whose `(_, List)` arm wraps a value in a one-element list
+/// and casts a struct into a struct by position once a field name is missing, and nulls a value
+/// that does not convert inside a list that stays valid. A record or a string going into an
+/// ARRAY (into the target, at the top level or nested, or into `U` after a newer writer schema
+/// made the field an array) is rejected, as kafka-delta-ingest's arrow-json refused it; it was
+/// written with `sku` in `note`, or as `[null]`. A null stays null, and a record into a struct
+/// still goes by name.
+#[tokio::test]
+async fn nothing_nested_is_cast_by_position() {
+    const ITEM: &str = r#"{"type":"record","name":"Msg","fields":[
+        {"name":"id","type":"long"},
+        {"name":"item","type":{"type":"record","name":"Item","fields":[
+            {"name":"sku","type":"string"},{"name":"note","type":"string"}]}},
+        {"name":"order","type":{"type":"record","name":"Order","fields":[
+            {"name":"item","type":"Item"},
+            {"name":"qty","type":["null","string"]}]}}]}"#;
+    let row = |id: i64, qty: Option<&str>| {
+        let item = || record(vec![("sku", s("SKU-1")), ("note", s("gift"))]);
+        record(vec![
+            ("id", Avro::Long(id)),
+            ("item", item()),
+            (
+                "order",
+                record(vec![
+                    ("item", item()),
+                    (
+                        "qty",
+                        match qty {
+                            Some(q) => Avro::Union(1, Box::new(s(q))),
+                            None => Avro::Union(0, Box::new(Avro::Null)),
+                        },
+                    ),
+                ]),
+            ),
+        ])
+    };
+    let notes = || {
+        Delta::from(ArrayType::new(
+            strct(vec![
+                field("note", Delta::STRING, true),
+                field("comment", Delta::STRING, true),
+            ]),
+            true,
+        ))
+    };
+    let rows = || async {
+        decoded(
+            &[(1, ITEM)],
+            vec![
+                (1, row(0, Some("abc"))),
+                (1, row(1, Some("7"))),
+                (1, row(2, None)),
+            ],
+        )
+        .await
+    };
+    let into = |fields: Vec<StructField>| {
+        let mut all = vec![field("id", Delta::LONG, false)];
+        all.extend(fields);
+        target(all)
+    };
+
+    // A top-level record into an ARRAY<STRUCT>, and a nested one.
+    for t in [
+        into(vec![field("item", notes(), true)]),
+        into(vec![field(
+            "order",
+            strct(vec![field("item", notes(), true)]),
+            true,
+        )]),
+    ] {
+        let (good, rejects) = through(&mut conformer(t), rows().await);
+        assert_eq!(rejected_offsets(&rejects), [0, 1, 2], "{good:?}");
+        assert!(
+            reasons(&rejects)[0].contains("does not convert"),
+            "{:?}",
+            reasons(&rejects)
+        );
+    }
+    // A string into an ARRAY<INT>: rejected, never `[null]` or `[7]`; a null stays null.
+    let t = into(vec![field(
+        "order",
+        strct(vec![field(
+            "qty",
+            ArrayType::new(Delta::INTEGER, true),
+            true,
+        )]),
+        true,
+    )]);
+    let (good, rejects) = through(&mut conformer(t), rows().await);
+    assert_eq!(rejected_offsets(&rejects), [0, 1]);
+    assert_eq!(
+        json(&good),
+        [serde_json::json!({"id": 2, "order": {"qty": null}})]
+    );
+    // Control: a record into a struct goes by name.
+    let t = into(vec![field(
+        "order",
+        strct(vec![field(
+            "item",
+            strct(vec![
+                field("note", Delta::STRING, true),
+                field("comment", Delta::STRING, true),
+            ]),
+            true,
+        )]),
+        true,
+    )]);
+    let (good, rejects) = through(&mut conformer(t), rows().await);
+    assert!(rejects.is_empty());
+    assert_eq!(
+        json(&good)[0]["order"]["item"],
+        serde_json::json!({"note": "gift", "comment": null})
+    );
+
+    // A large list of records (a shape only SQL makes) goes into an ARRAY by name as well.
+    let items = Fields::from(vec![
+        Field::new("sku", DataType::Utf8, true),
+        Field::new("note", DataType::Utf8, true),
+    ]);
+    let values = StructArray::new(
+        items.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["SKU-1"])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["gift"])),
+        ],
+        None,
+    );
+    let large = deltalake::arrow::array::LargeListArray::new(
+        Arc::new(Field::new("item", DataType::Struct(items), true)),
+        deltalake::arrow::buffer::OffsetBuffer::new(vec![0i64, 1].into()),
+        Arc::new(values),
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("item", large.data_type().clone(), true),
+        ])),
+        vec![Arc::new(Int64Array::from(vec![0])), Arc::new(large)],
+    )
+    .unwrap();
+    let (good, rejects) = through(
+        &mut conformer(into(vec![field("item", notes(), true)])),
+        vec![batch],
+    );
+    assert!(rejects.is_empty());
+    assert_eq!(
+        json(&good)[0]["item"],
+        serde_json::json!([{"note": "gift", "comment": null}])
+    );
+
+    // Into `U`, after a newer writer schema made both fields arrays.
+    const OLD: &str = r#"{"type":"record","name":"Msg","fields":[
+        {"name":"item","type":{"type":"record","name":"Item","fields":[
+            {"name":"sku","type":"string"},{"name":"note","type":"string"}]}},
+        {"name":"qty","type":"string"}]}"#;
+    const NEW: &str = r#"{"type":"record","name":"Msg","fields":[
+        {"name":"item","type":{"type":"array","items":{"type":"record","name":"Item","fields":[
+            {"name":"note","type":"string"},{"name":"comment","type":"string"}]}}},
+        {"name":"qty","type":{"type":"array","items":"int"}}]}"#;
+    let batches = decoded(
+        &[(1, OLD), (2, NEW)],
+        vec![(
+            1,
+            record(vec![
+                (
+                    "item",
+                    record(vec![("sku", s("SKU-1")), ("note", s("gift"))]),
+                ),
+                ("qty", s("abc")),
+            ]),
+        )],
+    )
+    .await;
+    let u = UnionSchema::build(&[registered(1, OLD), registered(2, NEW)], "kafka_");
+    let mut rejects = Vec::new();
+    let aligned = u.align_all(batches, &mut rejects).unwrap();
+    assert!(aligned.is_empty(), "{:?}", json(&aligned));
+    assert!(
+        reasons(&rejects)[0].starts_with("writer schema 1 field item: Struct"),
+        "{:?}",
+        reasons(&rejects)
+    );
+}
+
 /// An older plain value widened into a union that lacks its own type goes into the branch Avro's
 /// resolution promotes it to (int to long, float to double, bytes to string), the first such in
 /// the union's order, as apache-avro reads the older message with the newer schema: never into
