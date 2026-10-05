@@ -152,6 +152,11 @@ struct Fitter<'n> {
     /// writer schema, by the path that names its values ([`named_types`]), which the decoded
     /// rows no longer carry. A plain value going into a union takes the branch of its name.
     names: Option<&'n HashMap<String, String>>,
+    /// Into the target: each nullable field of a struct no field of the rows' struct matches,
+    /// by its path (`customer.customerid`), with the name the rows have for it in another case
+    /// where they have one. Its values are null; the conformer warns about it, as about a
+    /// top-level column (§5.6 step 1). A union's branches are left out: one fills only its own.
+    missing: std::cell::RefCell<Vec<(String, Option<String>)>>,
 }
 
 impl Fitter<'_> {
@@ -418,6 +423,13 @@ impl Fitter<'_> {
                         for i in (0..n).filter(|i| parent_valid(*i)) {
                             bad.set(n, i, || self.missing_not_null(&child_path));
                         }
+                    } else if matches!(self.into, Dest::Target) {
+                        let near = s
+                            .fields()
+                            .iter()
+                            .find(|f| f.name().eq_ignore_ascii_case(field.name()))
+                            .map(|f| format!("{path}.{}", f.name()));
+                        self.missing.borrow_mut().push((child_path.clone(), near));
                     }
                     Fitted::clean(new_null_array(field.data_type(), n))
                 }
@@ -663,6 +675,8 @@ impl Fitter<'_> {
         }
         let mut branches: HashMap<i8, usize> = HashMap::new();
         let mut fitted = Vec::with_capacity(fields.len());
+        // A branch fills only its own fields of the target: none is missing for it.
+        let missing = self.missing.borrow().len();
         for (type_id, field) in fields.iter() {
             let branch_path = format!("{path} (union branch {})", field.name());
             branches.insert(type_id, fitted.len());
@@ -680,6 +694,7 @@ impl Fitter<'_> {
                 .map(|(at, k)| Kdi { at, reach: k.reach });
             fitted.push(self.fit(u.child(type_id), to, &branch_path, false, kdi)?);
         }
+        self.missing.borrow_mut().truncate(missing);
         let indices: Vec<(usize, usize)> = (0..n)
             .map(|i| (branches[&u.type_id(i)], u.value_offset(i)))
             .collect();
@@ -1406,8 +1421,9 @@ impl Conformer {
         self.approximate
     }
 
-    /// The nullable target columns the last batch did not produce: they were written null
-    /// (`ddi_kafka_target_columns_unmatched`, §5.6 step 1).
+    /// The nullable target columns the last batch did not produce, and the nullable fields of
+    /// its struct columns (by path, `customer.customerid`) that the rows' structs do not have:
+    /// they were written null (`ddi_kafka_target_columns_unmatched`, §5.6 steps 1 and 2).
     pub fn unmatched_target_columns(&self) -> &[String] {
         &self.unmatched
     }
@@ -1457,7 +1473,9 @@ impl Conformer {
             into: Dest::Target,
             text: self.text,
             names: None,
+            missing: Default::default(),
         };
+        let mut near = Vec::new();
         let ids = (self.text.any() && n > 0).then(|| self.writer_ids(batch));
         let writers = ids.map(|ids| self.writers(ids)).transpose()?;
         // kdi had no key or headers: those take Arrow's cast, as without the options (§5.6 step 5).
@@ -1487,6 +1505,12 @@ impl Conformer {
                 });
             let kdi = at.as_deref().map(|at| Kdi { at, reach: true });
             let fitted = fitter.fit(&columns[index], field.data_type(), field.name(), true, kdi)?;
+            for (path, theirs) in fitter.missing.borrow_mut().drain(..) {
+                if let Some(theirs) = theirs {
+                    near.push(format!("{path} (the rows have {theirs})"));
+                }
+                unmatched.push(path);
+            }
             for (i, reason) in fitted.bad.iter().enumerate() {
                 if let (Some(reason), None) = (reason, &bad[i]) {
                     bad[i] = Some((field.name().clone(), reason.clone()));
@@ -1502,7 +1526,7 @@ impl Conformer {
             ));
             columns[index] = fitted.array;
         }
-        self.note_unmatched(batch, unmatched);
+        self.note_unmatched(batch, unmatched, near);
         let out = RecordBatch::try_new(
             Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
             columns,
@@ -1560,10 +1584,17 @@ impl Conformer {
             .collect()
     }
 
-    /// Warns once per writer schema id about target columns its rows do not have, which are
+    /// Warns once per writer schema id about target columns its rows do not have, and nullable
+    /// fields of target structs their structs do not have (`nested`, by path), which are
     /// written null: usually a field named in another case (`customerId` against
-    /// `customerid`), since names match exactly.
-    fn note_unmatched(&mut self, batch: &RecordBatch, unmatched: Vec<String>) {
+    /// `customerid`), since names match exactly. `nested_near` names those of `unmatched` that
+    /// are nested and that the rows have in another case.
+    fn note_unmatched(
+        &mut self,
+        batch: &RecordBatch,
+        unmatched: Vec<String>,
+        nested_near: Vec<String>,
+    ) {
         if !unmatched.is_empty() {
             let ids = schema_ids(batch, &self.prefix);
             let new: Vec<Option<i32>> = ids
@@ -1571,13 +1602,14 @@ impl Conformer {
                 .filter(|id| !self.warned.contains(id))
                 .collect();
             if !new.is_empty() {
-                let near = case_only(&batch.schema(), &unmatched);
+                let mut near = case_only(&batch.schema(), &unmatched);
+                near.extend(nested_near);
                 warn!(
                     writer_schema_ids = ?new,
                     columns = ?unmatched,
                     differ_in_case_only = ?near,
-                    "target columns these rows do not have are written as null; names are \
-                     matched exactly, case included"
+                    "target columns, and fields of target structs, that these rows do not \
+                     have are written as null; names are matched exactly, case included"
                 );
                 self.warned.extend(new);
             }
@@ -1829,6 +1861,7 @@ impl UnionSchema {
                 into: Dest::Union { writer, newest },
                 text: KdiText::default(),
                 names: writer.and_then(|w| self.names.get(&(w as u32))),
+                missing: Default::default(),
             };
             let fitted = fitter.fit(column, field.data_type(), field.name(), false, None)?;
             for (i, reason) in fitted.bad.iter().enumerate() {

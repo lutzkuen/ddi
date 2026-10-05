@@ -680,7 +680,7 @@ async fn unmatched_target_column_warns() {
 
 /// Names match exactly, case included, at the top and inside a struct, as kafka-delta-ingest's
 /// arrow-json and ddi's coercer match them: `customerId` does not fill `customerid`, nor `Zip`
-/// `zip`. The warning names the near miss.
+/// `zip`. Both are counted, and the warning names the near miss.
 #[tokio::test]
 async fn case_mismatch_not_matched() {
     let batches = decoded(
@@ -711,10 +711,106 @@ async fn case_mismatch_not_matched() {
         json(&good),
         vec![serde_json::json!({"id": 1, "customerid": null, "address": {"zip": null}})]
     );
-    assert_eq!(c.unmatched_target_columns(), ["customerid"]);
+    assert_eq!(c.unmatched_target_columns(), ["customerid", "address.zip"]);
     assert_eq!(
         case_only(&batches[0].schema(), c.unmatched_target_columns()),
         ["customerid (the rows have customerId)"]
+    );
+}
+
+/// A nullable field of a target struct that no field of the rows' struct fills is written null,
+/// and said so as for a top-level column: in the warning, with the name the rows have for it in
+/// another case, once per writer schema, and in the gauge's count, by its path. Before, a nested
+/// case mismatch nulled that field on every row with no word. A union's record branch fills only
+/// its own fields, and is not counted for the others.
+#[tokio::test]
+async fn an_unmatched_nested_field_warns() {
+    use std::sync::Mutex;
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Logs {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    const NESTED: &str = r#"{"type":"record","name":"Order","fields":[
+        {"name":"id","type":"long"},
+        {"name":"customer","type":{"type":"record","name":"C","fields":[
+            {"name":"customerId","type":"string"}]}},
+        {"name":"items","type":{"type":"array","items":{"type":"record","name":"I","fields":[
+            {"name":"sku","type":"string"}]}}},
+        {"name":"payment","type":["null",
+            {"type":"record","name":"Card","fields":[{"name":"last4","type":"string"}]},
+            {"type":"record","name":"Bank","fields":[{"name":"iban","type":"string"}]}]}]}"#;
+    let row = record(vec![
+        ("id", Avro::Long(1)),
+        ("customer", record(vec![("customerId", s("c-1"))])),
+        ("items", Avro::Array(vec![record(vec![("sku", s("S"))])])),
+        (
+            "payment",
+            Avro::Union(1, Box::new(record(vec![("last4", s("1234"))]))),
+        ),
+    ]);
+    let batches = decoded(&[(1, NESTED)], vec![(1, row)]).await;
+    let t = target(vec![
+        field("id", Delta::LONG, false),
+        field(
+            "customer",
+            strct(vec![field("customerid", Delta::STRING, true)]),
+            true,
+        ),
+        field(
+            "items",
+            ArrayType::new(
+                strct(vec![
+                    field("sku", Delta::STRING, true),
+                    field("qty", Delta::INTEGER, true),
+                ]),
+                true,
+            ),
+            true,
+        ),
+        field(
+            "payment",
+            strct(vec![
+                field("last4", Delta::STRING, true),
+                field("iban", Delta::STRING, true),
+            ]),
+            true,
+        ),
+    ]);
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let mut c = conformer(t);
+    let (good, rejects) =
+        tracing::subscriber::with_default(subscriber, || through(&mut c, batches.clone()));
+    assert!(rejects.is_empty());
+    assert_eq!(
+        json(&good)[0],
+        serde_json::json!({
+            "id": 1,
+            "customer": {"customerid": null},
+            "items": [{"sku": "S", "qty": null}],
+            "payment": {"last4": "1234", "iban": null}
+        })
+    );
+    assert_eq!(
+        c.unmatched_target_columns(),
+        ["customer.customerid", "items[].qty"]
+    );
+    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(logs.matches("WARN").count(), 1, "{logs}");
+    assert!(
+        logs.contains("customer.customerid (the rows have customer.customerId)"),
+        "{logs}"
     );
 }
 
