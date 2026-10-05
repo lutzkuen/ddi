@@ -99,6 +99,14 @@ arrow-avro = { version = "=58.4.0", default-features = false, optional = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "io-util"] }
+# The parity reference for the `kafka` feature's decoder (docs/kafka-design.md §5.3, §9.1): the
+# apache-avro that kafka-delta-ingest decodes Schema Registry Avro with, through
+# schema_registry_converter 4.10.0. Its tests write fixtures with it, an Avro implementation
+# independent of the arrow-avro under test, and compare against what it reads. 0.21.0 is the
+# version that converter locks; production kdi's own is an open inventory item (M-1), and
+# moving to it is this one line. No default features: they are codecs for container files,
+# and `xz` would bring back the `links = "lzma"` collision.
+apache-avro = { version = "=0.21.0", default-features = false }
 
 # Debug builds link deltalake + datafusion + arrow into every test binary, and their
 # debug info — not their code — is what makes those binaries enormous. Keeping full

@@ -2,6 +2,8 @@
 //!
 //! The consumer itself lands in M3. What is here now:
 //! - [`registry`]: the Schema Registry client (§5.2);
+//! - [`decode`]: Confluent-framed Avro into Arrow, one decoder per writer schema, with every
+//!   message checked to be exactly one row and a malformed one isolated (§5.1, §5.4, §6.1);
 //! - what the build has to prove: that librdkafka is the version the design was checked
 //!   against, and that it was built with what ddi's clusters need (TLS, SCRAM, zstd).
 //!
@@ -9,6 +11,7 @@
 //! compiled, in `config::kafka`, so a build without this feature can still read and validate
 //! it, and hold its pipelines back by name.
 
+pub mod decode;
 pub mod registry;
 
 /// The librdkafka this binary was linked against, as librdkafka spells it (`"2.12.1"`).

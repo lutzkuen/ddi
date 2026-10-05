@@ -461,6 +461,25 @@ pub enum Error {
         subjects: Vec<String>,
     },
 
+    /// A writer schema has a top-level field named like a Kafka metadata column
+    /// (docs/kafka-design.md §6.1).
+    ///
+    /// Letting the payload win would silently turn the offset columns the partition watermark
+    /// relies on into payload data, and dropping the field would lose it, so the pipeline holds
+    /// until the prefix changes.
+    #[error(
+        "writer schema {schema_id} has the top-level field {field:?}, which starts with \
+         metadata_prefix {prefix:?}: it would collide with the Kafka metadata columns \
+         ({prefix}topic, {prefix}partition, {prefix}offset, ...). Set another metadata_prefix \
+         for this pipeline, and map names in transform_sql if the target needs them. Nothing \
+         was written."
+    )]
+    KafkaMetadataCollision {
+        schema_id: u32,
+        field: String,
+        prefix: String,
+    },
+
     #[error("transform error: {0}")]
     Transform(String),
 
@@ -615,7 +634,9 @@ impl Error {
             },
             // Every message of the writer schema needs the same thing: the pipeline holds
             // rather than quarantining them one by one.
-            Error::KafkaSchemaReferences { .. } => KafkaClass::BlockingPipeline,
+            Error::KafkaSchemaReferences { .. } | Error::KafkaMetadataCollision { .. } => {
+                KafkaClass::BlockingPipeline
+            }
             // An internal invariant, and the errors of a Delta source, which a Kafka pipeline
             // has none of.
             Error::Other(_)
@@ -949,8 +970,9 @@ mod tests {
                 BlockingPipeline,
             ),
             // The Schema Registry (§5.2): an outage after the client's own retries, wrong
-            // credentials, a refusal or an answer that is not its API's; and a writer schema
-            // whose references hold every message of it.
+            // credentials, a refusal or an answer that is not its API's; and the two facts
+            // about a writer schema that hold every message of it: references, and a field
+            // named like a metadata column (§6.1).
             (
                 Error::SchemaRegistry {
                     url: "https://sr.internal:8081".into(),
@@ -980,6 +1002,14 @@ mod tests {
                     url: "https://sr.internal:8081".into(),
                     id: 7,
                     subjects: vec!["address-value".into()],
+                },
+                BlockingPipeline,
+            ),
+            (
+                Error::KafkaMetadataCollision {
+                    schema_id: 7,
+                    field: "kafka_offset".into(),
+                    prefix: "kafka_".into(),
                 },
                 BlockingPipeline,
             ),
