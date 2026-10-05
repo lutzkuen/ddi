@@ -1190,14 +1190,25 @@ pub struct Fence {
 impl Fence {
     /// A fence for `app_id` that owns nothing yet.
     pub fn new(app_id: impl Into<String>) -> Self {
+        Self::with_lookups(app_id, Arc::new(LookupCounters::default()))
+    }
+
+    /// As [`Self::new`], adding what its reads cost to `lookups`: counters that outlive it,
+    /// such as a pipeline's metrics, which a reopened consumer's new fence keeps adding to.
+    pub fn with_lookups(app_id: impl Into<String>, lookups: Arc<LookupCounters>) -> Self {
         Self {
             app_id: app_id.into(),
             base: BTreeMap::new(),
             carried: BTreeSet::new(),
             marker: None,
             below: BelowCheckpoint::default(),
-            lookups: Arc::new(LookupCounters::default()),
+            lookups,
         }
+    }
+
+    /// The partitions this fence owns.
+    pub fn owned(&self) -> Vec<i32> {
+        self.base.keys().copied().collect()
     }
 
     /// Whether the next commit writes the takeover marker: it was not in the table at the
@@ -1444,6 +1455,56 @@ impl Fence {
         self.base.remove(&partition);
         self.carried.remove(&partition);
     }
+}
+
+/// The appIds of every `txn` in `table`'s newest `max_commits` commits and in its newest
+/// checkpoint: what the typo guard compares a fresh app_id against (docs/kafka-design.md §4.4
+/// step 7).
+///
+/// Evidence for a refusal and its message, not an offset, so it is lenient where
+/// [`read_txns`] is strict: the walk stops at the first commit log cleanup removed, a line
+/// that does not parse is skipped, and a checkpoint that cannot be read here is left out with
+/// a warning. Leaving an appId out can only make the guard refuse where it might not have,
+/// never let a typo through.
+pub async fn recent_txn_app_ids(table: &DeltaTable, max_commits: u64) -> Result<BTreeSet<String>> {
+    let head = table.version().ok_or_else(|| not_loaded(table))?;
+    let log_store = table.log_store();
+    let mut ids = BTreeSet::new();
+    let bottom = head.saturating_sub(max_commits.max(1) - 1);
+    let mut commits = futures::stream::iter((bottom..=head).rev())
+        .map(|v| {
+            let log_store = log_store.clone();
+            async move { log_store.read_commit_entry(v).await }
+        })
+        .buffered(IN_FLIGHT);
+    while let Some(read) = commits.next().await {
+        let Some(bytes) = read? else { break };
+        for line in serde_json::Deserializer::from_slice(&bytes).into_iter::<LogLine>() {
+            if let Ok(LogLine { txn: Some(txn), .. }) = line {
+                ids.insert(txn.app_id);
+            }
+        }
+    }
+    let store = crate::storage::with_every_checkpoint(log_store.as_ref());
+    if let Some(checkpoint) = newest_checkpoint(store.as_ref(), log_store.log_path(), head).await? {
+        for file in &checkpoint.files {
+            let in_file = if file.location.as_ref().ends_with(".json") {
+                json_txns(store.as_ref(), file).await
+            } else {
+                parquet_txns(store.clone(), file).await
+            };
+            match in_file {
+                Ok(txns) => ids.extend(txns.into_iter().map(|(id, _)| id)),
+                Err(why) => warn!(
+                    table = %table.table_url(),
+                    checkpoint = %file.location,
+                    "cannot read the txn column of this checkpoint ({why}); the appIds it holds \
+                     are left out of the typo guard's evidence"
+                ),
+            }
+        }
+    }
+    Ok(ids)
 }
 
 /// Refuse a target that sets `delta.setTransactionRetentionDuration`.

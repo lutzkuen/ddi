@@ -532,6 +532,145 @@ pub enum Error {
         detail: String,
     },
 
+    /// A partition's next offset is no longer in its topic: retention trimmed it, so the
+    /// messages from `wanted` up to `low` were never read (docs/kafka-design.md §4.4, I4).
+    ///
+    /// Only that partition is paused; the others go on. Nothing is skipped without an
+    /// operator saying so.
+    #[error(
+        "partition {partition} of topic {topic:?}: the next offset to read is {wanted}, and \
+         the topic now starts at {low}. Retention removed {} message(s) this pipeline never \
+         read. The partition is paused and the others go on. To skip them, acknowledge it: \
+         `ddi kafka set-offsets --partition {partition} --next {low} --acknowledge-skip \
+         \"<reason>\"`; the pipeline notices within blocked_recheck_secs.",
+        low - wanted
+    )]
+    KafkaOffsetsUnavailable {
+        topic: String,
+        partition: i32,
+        wanted: i64,
+        low: i64,
+    },
+
+    /// A partition's stored offset is at or past the end of its topic: the topic was
+    /// recreated, or this is another cluster (docs/kafka-design.md §4.4, §4.7 row 12).
+    #[error(
+        "partition {partition} of topic {topic:?}: the target says offset {stored} was read, \
+         and the topic ends before it (its next offset is {high}). The topic was recreated, \
+         or the brokers are another cluster's. The partition is paused and the others go on. \
+         Use a new app_id, or move the offset back with `ddi kafka set-offsets --allow-replay`."
+    )]
+    KafkaOffsetsRegressed {
+        topic: String,
+        partition: i32,
+        stored: i64,
+        high: i64,
+    },
+
+    /// The message at a partition's stored offset is not the one ddi recorded when it wrote
+    /// that offset: the topic was recreated and refilled past it (docs/kafka-design.md §4.4,
+    /// I19).
+    #[error(
+        "partition {partition} of topic {topic:?}: the message at the stored offset {offset} \
+         is not the one this pipeline read there (it recorded {recorded}, the topic holds \
+         {found}). The topic was recreated and has as many messages again. The partition is \
+         paused and the others go on. Use a new app_id, or move the offset with `ddi kafka \
+         set-offsets --allow-replay`."
+    )]
+    KafkaTopicReplaced {
+        topic: String,
+        partition: i32,
+        offset: i64,
+        /// The timestamp and length ddi recorded, as text.
+        recorded: String,
+        /// What the topic holds there now.
+        found: String,
+    },
+
+    /// A message could not be decoded and there is no data-quality table to put it in
+    /// (docs/kafka-design.md §5.7). kafka-delta-ingest dropped such messages silently.
+    #[error(
+        "partition {partition} offset {offset} of topic {topic:?} cannot be decoded \
+         ({reason}), and there is no data-quality table at {dq_uri} to set it aside in. The \
+         pipeline holds, in its group, until the table exists; create it and it goes on \
+         within blocked_recheck_secs."
+    )]
+    KafkaUndecodable {
+        topic: String,
+        partition: i32,
+        offset: i64,
+        reason: String,
+        dq_uri: String,
+    },
+
+    /// More messages of one batch could not be decoded than `max_evaluation_rejects_per_batch`
+    /// allows (docs/kafka-design.md §5.7, "Cap").
+    #[error(
+        "{count} messages of one batch cannot be decoded, more than \
+         max_evaluation_rejects_per_batch = {cap}; the first: {reason}. This looks like a \
+         format or registry misconfiguration rather than bad data, so nothing is written and \
+         the pipeline holds. Fix the producer or the registry, or raise the cap and restart."
+    )]
+    KafkaTooManyUndecodable {
+        count: usize,
+        cap: usize,
+        reason: String,
+    },
+
+    /// A fresh app_id on a target that already holds data, with no explicit
+    /// `starting_offsets`: probably a mistyped app_id (docs/kafka-design.md §4.4 step 7).
+    #[error(
+        "app_id {app_id:?} has no offsets in {target_uri}, which already holds data{}. A \
+         mistyped app_id would read the topic into it a second time, so nothing is read until \
+         either the app_id is corrected or this pipeline sets starting_offsets itself.",
+        if seen.is_empty() {
+            " and no offsets of any app_id".to_string()
+        } else {
+            format!(" and offsets under {} (did you mean {:?}?)", seen.join(", "), seen[0])
+        }
+    )]
+    KafkaAppIdUnknown {
+        app_id: String,
+        target_uri: String,
+        /// The app_ids whose offsets the target holds, most likely first.
+        seen: Vec<String>,
+    },
+
+    /// `kdi_compat` is unset on a table kafka-delta-ingest may have written
+    /// (docs/kafka-design.md §4.4 step 6).
+    #[error(
+        "{target_uri} may have been written by kafka-delta-ingest ({}). Set kdi_compat = true \
+         to keep its STRING rendering (\"null\" text, raw-number timestamps, sorted-key JSON), \
+         or kdi_compat = false to accept the documented break; it is not guessed.",
+        if *fresh {
+            "it holds rows and no offsets of this app_id"
+        } else {
+            "it holds kafka-delta-ingest's offsets for this app_id"
+        }
+    )]
+    KafkaCompatUnset {
+        app_id: String,
+        target_uri: String,
+        /// The app_id is fresh on a target with rows, rather than in kafka-delta-ingest's era.
+        fresh: bool,
+    },
+
+    /// A `starting_offsets` map without `"*"` does not list every partition of the topic
+    /// (docs/kafka-design.md §4.4 step 8).
+    #[error(
+        "starting_offsets lists some partitions of topic {topic:?} but not {missing:?}, and has \
+         no \"*\" for the rest. Add an entry for each, or a \"*\" = \"earliest\" or \"latest\"."
+    )]
+    KafkaStartingOffsetsIncomplete { topic: String, missing: Vec<i32> },
+
+    /// librdkafka reported an error the consumer cannot read past by itself
+    /// (docs/kafka-design.md §3.6).
+    #[error("kafka: {detail}")]
+    KafkaClient {
+        failure: KafkaClientFailure,
+        detail: String,
+    },
+
     #[error("transform error: {0}")]
     Transform(String),
 
@@ -597,12 +736,26 @@ pub enum SchemaRegistryFailure {
     Refused,
 }
 
+/// What kind of librdkafka error stopped a Kafka consumer (docs/kafka-design.md §3.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KafkaClientFailure {
+    /// The brokers could not be reached, or a request timed out: librdkafka retries by itself.
+    /// Transient.
+    Transport,
+    /// librdkafka's own fatal error, a static member fenced by another with its
+    /// `group.instance.id`, cooperative rebalancing, or a consumer that cannot be built:
+    /// consumer-fatal. The supervisor drops the consumer and opens a new one.
+    Fatal,
+    /// Authentication failed, the group or topic is not authorised, or the topic does not
+    /// exist: consumer-fatal and config-class. Retrying in a second cannot help, so the
+    /// supervisor waits the full backoff, as for an open-time refusal.
+    Config,
+}
+
 /// How a Kafka pipeline handles an error its step raises (docs/kafka-design.md §3.6).
 ///
 /// Only consumer-fatal errors make a member leave its group; everything else is held, paused
-/// and retried in place, so that one member's trouble never rebalances the others. M3 adds a
-/// `BlockingPartition` class with the errors that pause one partition, which no error of this
-/// build is yet.
+/// and retried in place, so that one member's trouble never rebalances the others.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KafkaClass {
     /// Another writer got there first, or the handle fell behind log cleanup: reset in place,
@@ -619,6 +772,9 @@ pub enum KafkaClass {
     /// Needs an operator, and holds the whole pipeline: pause every owned partition, set the
     /// gauge, stay in the group, re-check every `blocked_recheck_secs`.
     BlockingPipeline,
+    /// Needs an operator, and holds one partition: pause it, keep re-asserting it at its
+    /// unchanged offset while the others go on, re-check it every `blocked_recheck_secs`.
+    BlockingPartition,
     /// Refused when the pipeline opens, before it joins its group: `RETRY_MAX` backoff.
     OpenRefusal,
     /// The consumer cannot go on: the supervisor drops it, backs off and reopens.
@@ -678,7 +834,23 @@ impl Error {
             Error::Transform(_) | Error::Evaluation(_) | Error::Schema(_) => {
                 KafkaClass::BlockingPipeline
             }
-            Error::KafkaOffsetMissing { .. } => KafkaClass::OpenRefusal,
+            Error::KafkaOffsetMissing { .. }
+            | Error::KafkaAppIdUnknown { .. }
+            | Error::KafkaCompatUnset { .. }
+            | Error::KafkaStartingOffsetsIncomplete { .. } => KafkaClass::OpenRefusal,
+            // One partition's offsets, which an operator has to settle; the others go on.
+            Error::KafkaOffsetsUnavailable { .. }
+            | Error::KafkaOffsetsRegressed { .. }
+            | Error::KafkaTopicReplaced { .. } => KafkaClass::BlockingPartition,
+            // Messages that cannot be set aside: no data-quality table, or more of them than
+            // the cap. The recheck reopens the table.
+            Error::KafkaUndecodable { .. } | Error::KafkaTooManyUndecodable { .. } => {
+                KafkaClass::BlockingPipeline
+            }
+            Error::KafkaClient { failure, .. } => match failure {
+                KafkaClientFailure::Transport => KafkaClass::Transient,
+                KafkaClientFailure::Fatal | KafkaClientFailure::Config => KafkaClass::ConsumerFatal,
+            },
             Error::SchemaRegistry { failure, .. } => match failure {
                 SchemaRegistryFailure::Unavailable => KafkaClass::Transient,
                 SchemaRegistryFailure::Unauthorized => KafkaClass::ConsumerFatal,
@@ -732,6 +904,35 @@ impl Error {
             }
             Error::Other(_) => KafkaClass::ConsumerFatal,
             _ => KafkaClass::Transient,
+        }
+    }
+
+    /// Whether a Kafka pipeline's supervisor waits the full `RETRY_MAX` before opening it
+    /// again after this error (docs/kafka-design.md §3.9).
+    ///
+    /// Only open and consumer-fatal errors reach the supervisor: a step handles the rest in
+    /// place. At open, everything that needs an operator refuses whatever its class in a step
+    /// (§3.6, open-time refusal), and so does a consumer-fatal error that is a fact about the
+    /// configuration (credentials, an authorisation, a topic that does not exist): retried a
+    /// second later each would only open the target, read its offsets and fail the same way.
+    /// A store or broker outage at open, and an internal fault, retry from a second, doubling.
+    pub fn kafka_waits_for_an_operator(&self) -> bool {
+        match self.kafka_class() {
+            KafkaClass::OpenRefusal
+            | KafkaClass::BlockingPipeline
+            | KafkaClass::BlockingPartition
+            | KafkaClass::Capacity => true,
+            KafkaClass::ConsumerFatal => matches!(
+                self,
+                Error::KafkaClient {
+                    failure: KafkaClientFailure::Config,
+                    ..
+                } | Error::SchemaRegistry {
+                    failure: SchemaRegistryFailure::Unauthorized,
+                    ..
+                }
+            ),
+            KafkaClass::Replan | KafkaClass::Transient => false,
         }
     }
 
@@ -1091,6 +1292,98 @@ mod tests {
                 },
                 BlockingPipeline,
             ),
+            // M3's: start resolution at open (§4.4), one partition's offsets (§4.4 table), the
+            // messages that cannot be set aside (§5.7), and librdkafka's own (§3.6).
+            (
+                Error::KafkaAppIdUnknown {
+                    app_id: "kafka_delta_ingset".into(),
+                    target_uri: "/lake/orders".into(),
+                    seen: vec!["kafka_delta_ingest".into()],
+                },
+                OpenRefusal,
+            ),
+            (
+                Error::KafkaCompatUnset {
+                    app_id: "orders".into(),
+                    target_uri: "/lake/orders".into(),
+                    fresh: false,
+                },
+                OpenRefusal,
+            ),
+            (
+                Error::KafkaStartingOffsetsIncomplete {
+                    topic: "orders".into(),
+                    missing: vec![2],
+                },
+                OpenRefusal,
+            ),
+            (
+                Error::KafkaOffsetsUnavailable {
+                    topic: "orders".into(),
+                    partition: 1,
+                    wanted: 42,
+                    low: 900,
+                },
+                BlockingPartition,
+            ),
+            (
+                Error::KafkaOffsetsRegressed {
+                    topic: "orders".into(),
+                    partition: 1,
+                    stored: 41,
+                    high: 7,
+                },
+                BlockingPartition,
+            ),
+            (
+                Error::KafkaTopicReplaced {
+                    topic: "orders".into(),
+                    partition: 1,
+                    offset: 41,
+                    recorded: "a".into(),
+                    found: "b".into(),
+                },
+                BlockingPartition,
+            ),
+            (
+                Error::KafkaUndecodable {
+                    topic: "orders".into(),
+                    partition: 1,
+                    offset: 41,
+                    reason: "not Confluent-framed".into(),
+                    dq_uri: "/lake/orders__ddi_dq".into(),
+                },
+                BlockingPipeline,
+            ),
+            (
+                Error::KafkaTooManyUndecodable {
+                    count: 101,
+                    cap: 100,
+                    reason: "not Confluent-framed".into(),
+                },
+                BlockingPipeline,
+            ),
+            (
+                Error::KafkaClient {
+                    failure: KafkaClientFailure::Transport,
+                    detail: "all brokers down".into(),
+                },
+                Transient,
+            ),
+            (
+                Error::KafkaClient {
+                    failure: KafkaClientFailure::Fatal,
+                    detail: "fenced by another static member".into(),
+                },
+                ConsumerFatal,
+            ),
+            (
+                Error::KafkaClient {
+                    failure: KafkaClientFailure::Config,
+                    detail: "SASL authentication failed".into(),
+                },
+                ConsumerFatal,
+            ),
             (
                 Error::Other("internal: a broken invariant".into()),
                 ConsumerFatal,
@@ -1146,6 +1439,42 @@ mod tests {
         for (e, class) in rows {
             assert_eq!(e.kafka_class(), class, "{e:?}");
         }
+    }
+
+    /// §9.1 M3's name for the table above, with every Kafka-only variant M3 adds and the
+    /// one-partition class: which of them the supervisor waits the full backoff for (§3.9).
+    #[test]
+    fn error_classification_table() {
+        let waits = |e: Error| e.kafka_waits_for_an_operator();
+        assert!(waits(Error::KafkaOffsetMissing {
+            app_id: "a".into(),
+            partitions: vec![0],
+            fresh: false,
+        }));
+        assert!(waits(Error::KafkaTxnRetention {
+            target_uri: "/t".into(),
+            retention: "interval 1 days".into(),
+        }));
+        assert!(waits(Error::KafkaClient {
+            failure: KafkaClientFailure::Config,
+            detail: "unknown topic".into(),
+        }));
+        assert!(waits(Error::SchemaRegistry {
+            url: "https://sr".into(),
+            failure: SchemaRegistryFailure::Unauthorized,
+            detail: "401".into(),
+        }));
+        assert!(waits(Error::Capacity("full".into())));
+        assert!(!waits(Error::KafkaClient {
+            failure: KafkaClientFailure::Fatal,
+            detail: "fatal".into(),
+        }));
+        assert!(!waits(Error::KafkaClient {
+            failure: KafkaClientFailure::Transport,
+            detail: "all brokers down".into(),
+        }));
+        assert!(!waits(Error::Config("cannot open: 503".into())));
+        assert!(!waits(Error::Other("internal".into())));
     }
 
     #[test]

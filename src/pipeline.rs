@@ -72,6 +72,12 @@ pub enum StepOutcome {
         /// lost.
         published: Option<crate::publish::PublishStats>,
     },
+
+    /// A Kafka pipeline polled for a while and has nothing to commit yet: its batch has not
+    /// closed, or one is held and waits to be tried again (docs/kafka-design.md §3.3). Never
+    /// produced by a Delta source. Whether it counts as progress is the pipeline's to say
+    /// ([`Pipeline::kafka_progress`]).
+    Waiting,
 }
 
 impl StepOutcome {
@@ -84,7 +90,7 @@ impl StepOutcome {
     /// `ddi_batches_fully_rejected_total`.
     pub fn fully_rejected(&self) -> bool {
         match *self {
-            Self::CaughtUp => false,
+            Self::CaughtUp | Self::Waiting => false,
             Self::Progressed {
                 rows,
                 rejected,
@@ -109,8 +115,9 @@ pub(crate) struct LookupBatch {
 }
 
 impl LookupBatch {
-    /// No lookups, and so nothing to acknowledge once the batch commits.
-    #[allow(dead_code)] // used from M3: a Kafka batch has no source commit to pin lookups by
+    /// No lookups, and so nothing to acknowledge once the batch commits: a Kafka batch has
+    /// no source commit to pin lookups by.
+    #[cfg_attr(not(feature = "kafka"), allow(dead_code))] // built by the Kafka step
     pub(crate) fn none() -> Self {
         Self {
             snapshots: Vec::new(),
@@ -238,10 +245,9 @@ pub struct Pipeline {
 #[cfg_attr(feature = "kafka", allow(clippy::large_enum_variant))]
 pub(crate) enum Source {
     Delta(DeltaSource),
-    /// A Kafka topic (docs/kafka-design.md). Nothing opens one until M3 brings the consumer;
-    /// what a Kafka batch needs of it in [`Pipeline::process`], the conform step, is here now.
+    /// A Kafka topic (docs/kafka-design.md): the consumer, the partitions' state, the buffer
+    /// and the conform step its rows go through ([`Pipeline::process`]).
     #[cfg(feature = "kafka")]
-    #[allow(dead_code)] // constructed from M3, by the Kafka open
     Kafka(Box<crate::kafka::KafkaSource>),
 }
 
@@ -303,7 +309,7 @@ pub(crate) enum Position {
         end: StreamCursor,
     },
     /// The offsets a Kafka batch read, and the ones its commit re-asserts.
-    #[allow(dead_code)] // used from M3: built by the Kafka step
+    #[cfg_attr(not(feature = "kafka"), allow(dead_code))] // built by the Kafka step
     Kafka(KafkaOffsets),
 }
 
@@ -327,16 +333,39 @@ impl Position {
 
 impl Pipeline {
     /// Open both tables, resolve the resume point, and prepare the loop.
+    ///
+    /// A Kafka pipeline opens its consumer instead of a source table, with metrics of its own
+    /// that last as long as this pipeline does; [`Self::open_with`] hands it ones that outlive
+    /// it, as the supervisor does.
     pub async fn open(cfg: ResolvedPipeline) -> Result<Self> {
-        // `kafka://<topic>` is not a table. The Kafka source arrives in M3 of
-        // docs/kafka-design.md; until then nothing opens one, and `ddi` holds them back first.
+        Self::open_with(cfg, None).await
+    }
+
+    /// As [`Self::open`], a Kafka pipeline counting into `kafka`, which the supervisor keeps
+    /// across reopens. Ignored for a Delta pipeline.
+    pub async fn open_with(
+        cfg: ResolvedPipeline,
+        kafka: Option<Arc<crate::metrics::KafkaMetrics>>,
+    ) -> Result<Self> {
+        // `kafka://<topic>` is not a table: a Kafka pipeline reads a consumer (docs/kafka-design.md).
         if cfg.kafka.is_some() {
-            return Err(Error::Config(format!(
-                "pipeline {:?} reads a Kafka topic, and this version of ddi cannot run a Kafka \
-                 source yet",
-                cfg.name
-            )));
+            #[cfg(feature = "kafka")]
+            {
+                let metrics = kafka
+                    .unwrap_or_else(|| crate::metrics::Metrics::new().pipeline(&cfg.name).kafka());
+                return Self::open_kafka(cfg, metrics).await;
+            }
+            #[cfg(not(feature = "kafka"))]
+            {
+                let _ = kafka;
+                return Err(Error::Config(format!(
+                    "pipeline {:?}: {}",
+                    cfg.name,
+                    crate::config::kafka::NOT_BUILT
+                )));
+            }
         }
+        let _ = kafka;
         let source = cfg
             .storage
             .open(&cfg.source_uri)
@@ -664,13 +693,36 @@ impl Pipeline {
         self.grain_check_passes
     }
 
+    /// Where a Delta pipeline reads next. A Kafka pipeline has no single cursor: it answers
+    /// version 0, and says where each partition is through [`Self::kafka_progress`] and its
+    /// metrics instead ([`Self::is_kafka`]).
     pub fn cursor(&self) -> StreamCursor {
         match &self.source {
             Source::Delta(src) => src.stream.cursor(),
-            // No Kafka source is opened before M3, which makes this an `Option`.
             #[cfg(feature = "kafka")]
             Source::Kafka(_) => StreamCursor::at_version(0),
         }
+    }
+
+    /// Whether this pipeline reads a Kafka topic.
+    pub fn is_kafka(&self) -> bool {
+        !matches!(self.source, Source::Delta(_))
+    }
+
+    /// Stop between steps (docs/kafka-design.md §3.9): a Kafka pipeline commits what it has
+    /// buffered, within its revoke time box, before its consumer closes and the group takes
+    /// its partitions back. A Delta pipeline has nothing buffered: a step is atomic.
+    pub async fn shutdown(&mut self) {
+        #[cfg(feature = "kafka")]
+        if self.is_kafka() {
+            self.kafka_shutdown().await;
+        }
+    }
+
+    /// A Kafka pipeline's progress (§3.9); `None` without the feature.
+    #[cfg(not(feature = "kafka"))]
+    pub fn kafka_progress(&self) -> Option<std::convert::Infallible> {
+        None
     }
 
     /// Source head as of the last step. `None` before the first step.
@@ -693,13 +745,8 @@ impl Pipeline {
     pub async fn step(&mut self) -> Result<StepOutcome> {
         match &self.source {
             Source::Delta(_) => self.step_delta().await,
-            // `Pipeline::open` refuses a Kafka pipeline until M3 brings the consumer.
             #[cfg(feature = "kafka")]
-            Source::Kafka(_) => Err(Error::Config(format!(
-                "pipeline {:?} reads a Kafka topic, and this version of ddi cannot run a Kafka \
-                 source yet",
-                self.cfg.name
-            ))),
+            Source::Kafka(_) => self.step_kafka().await,
         }
     }
 
@@ -761,7 +808,7 @@ impl Pipeline {
     }
 
     /// Transform, coerce and commit one batch: the part of a step every source shares.
-    async fn process(&mut self, batch: Batch) -> Result<StepOutcome> {
+    pub(crate) async fn process(&mut self, batch: Batch) -> Result<StepOutcome> {
         let Batch {
             started,
             through,
@@ -1137,9 +1184,25 @@ impl Pipeline {
             // Without a data-quality table a row that does not fit fails the batch, as the
             // coercer's strict cast does.
             #[cfg(feature = "kafka")]
-            Source::Kafka(src) => src
-                .conformer
-                .conform_all(output, rejects, self.dq.is_some()),
+            Source::Kafka(src) => {
+                let out = src
+                    .conformer
+                    .conform_all(output, rejects, self.dq.is_some())?;
+                // A row with a null partition value lands in __HIVE_DEFAULT_PARTITION__, which
+                // kafka-delta-ingest allowed too; it is counted (docs/kafka-design.md §5.6).
+                let nulls: usize = out
+                    .iter()
+                    .flat_map(|b| {
+                        src.partition_columns
+                            .iter()
+                            .filter_map(move |c| b.column_by_name(c).map(|a| a.null_count()))
+                    })
+                    .sum();
+                src.metrics
+                    .null_partition_values
+                    .fetch_add(nulls as u64, std::sync::atomic::Ordering::Relaxed);
+                Ok(out)
+            }
         }
     }
 
@@ -1220,7 +1283,12 @@ impl Pipeline {
         let now = chrono::Utc::now().naive_utc().and_utc().timestamp_micros();
         match offsets {
             Offsets::Version(txn_version) => dq.write(rejects, *txn_version, now).await,
-            Offsets::Kafka(offsets) => dq.write_kafka(rejects, offsets, now).await,
+            Offsets::Kafka(offsets) => {
+                let written = dq.write_kafka(rejects, offsets, now).await?;
+                #[cfg(feature = "kafka")]
+                crate::kafka::fault::after_dq();
+                Ok(written)
+            }
         }
     }
 
@@ -1556,8 +1624,23 @@ impl Pipeline {
         batches: Vec<RecordBatch>,
         offsets: &KafkaOffsets,
     ) -> Result<()> {
+        #[cfg(feature = "kafka")]
+        crate::kafka::fault::before_commit().await;
         let table = self.target.clone();
-        self.target = self.sink.commit_kafka(table, batches, offsets).await?;
+        let committed = self.sink.commit_kafka(table, batches, offsets).await?;
+        #[cfg(feature = "kafka")]
+        if crate::kafka::fault::fail_after_commit() {
+            // The commit landed and its acknowledgement is lost: the handle stays where it
+            // was, as it would after a PUT whose response never came (I17).
+            drop(committed);
+            return Err(Error::Delta(deltalake::DeltaTableError::from(
+                deltalake::logstore::object_store::Error::Generic {
+                    store: "fault",
+                    source: "fail_after_commit: the commit landed, its response was lost".into(),
+                },
+            )));
+        }
+        self.target = committed;
         Ok(())
     }
 
@@ -1589,6 +1672,7 @@ impl Pipeline {
         loop {
             match self.step().await? {
                 StepOutcome::CaughtUp => return Ok(n),
+                StepOutcome::Waiting => {}
                 _ => n += 1,
             }
         }
@@ -2786,7 +2870,7 @@ mod kafka_tests {
 
         let mut p = Pipeline::open(cfg(&source, &target, &dq)).await.unwrap();
         let conformer = Conformer::new(p.coercer.target(), "kafka_", KdiText::default()).unwrap();
-        p.source = Source::Kafka(Box::new(KafkaSource { conformer }));
+        p.source = Source::Kafka(Box::new(KafkaSource::for_tests(conformer)));
 
         // As the decoder hands rows on: the writer's own field order, then the metadata.
         let address_fields = Fields::from(vec![

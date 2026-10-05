@@ -183,7 +183,13 @@ pub struct SchemaRegistry {
     auth: Option<(String, Option<String>)>,
     retry_delays: Vec<Duration>,
     cache: Arc<SchemaCache>,
+    /// Told the outcome of every request, for `ddi_kafka_schema_registry_requests_total`.
+    count: Option<RequestCounter>,
 }
+
+/// Told how each request to the registry ended: `found`, `not_found`, `unauthorized`,
+/// `refused` or `unavailable` (one per try, so a retried outage counts each).
+pub type RequestCounter = Arc<dyn Fn(&'static str) + Send + Sync>;
 
 impl std::fmt::Debug for SchemaRegistry {
     /// The URL and whether credentials are set, never the credentials or the proxy (whose URL
@@ -265,7 +271,20 @@ impl SchemaRegistry {
             auth,
             retry_delays: RETRY_DELAYS.to_vec(),
             cache,
+            count: None,
         })
+    }
+
+    /// Tells `count` how every request ends, from now on.
+    pub fn with_request_counter(mut self, count: RequestCounter) -> Self {
+        self.count = Some(count);
+        self
+    }
+
+    fn counted(&self, outcome: &'static str) {
+        if let Some(count) = &self.count {
+            count(outcome);
+        }
     }
 
     /// The URL, as errors print it.
@@ -423,13 +442,26 @@ impl SchemaRegistry {
         }
         let response = match request.send().await {
             Ok(r) => r,
-            Err(e) => return Attempt::Retry(describe(&e)),
+            Err(e) => {
+                self.counted("unavailable");
+                return Attempt::Retry(describe(&e));
+            }
         };
         let status = response.status();
         let body = match response.bytes().await {
             Ok(b) => b,
-            Err(e) => return Attempt::Retry(describe(&e)),
+            Err(e) => {
+                self.counted("unavailable");
+                return Attempt::Retry(describe(&e));
+            }
         };
+        self.counted(match status.as_u16() {
+            200..=299 => "found",
+            401 | 403 => "unauthorized",
+            404 if registry_error_code(&body).is_some() => "not_found",
+            408 | 429 | 500..=599 => "unavailable",
+            _ => "refused",
+        });
         let what = || format!("GET {path}: HTTP {status}{}", registry_error(&body));
         match status.as_u16() {
             200..=299 => Attempt::Done(Ok(Answer::Found(body.to_vec()))),

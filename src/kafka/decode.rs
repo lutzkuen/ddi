@@ -913,6 +913,34 @@ fn metadata_columns(topic: &str, chunk: &[KafkaMessage], schema_id: u32) -> Vec<
     ]
 }
 
+/// The columns of `value_format = "raw"`: the value's bytes as `<prefix>value`, then the
+/// metadata columns but the schema id, which a raw value has none of.
+pub fn raw_fields(prefix: &str) -> Vec<Field> {
+    let mut fields = vec![Field::new(format!("{prefix}value"), DataType::Binary, true)];
+    let mut metadata = metadata_fields(prefix);
+    metadata.pop();
+    fields.extend(metadata);
+    fields
+}
+
+/// `messages` as one `value_format = "raw"` batch ([`raw_fields`]): diagnostics, and tests
+/// that need no registry. Tombstones are not among them (§5.7).
+pub fn raw_batch(topic: &str, prefix: &str, messages: &[KafkaMessage]) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = vec![Arc::new(BinaryArray::from_iter(
+        messages.iter().map(|m| m.value.as_deref()),
+    ))];
+    let mut metadata = metadata_columns(topic, messages, 0);
+    metadata.pop();
+    columns.extend(metadata);
+    RecordBatch::try_new(Arc::new(Schema::new(raw_fields(prefix))), columns)
+        .map_err(|e| Error::Other(format!("internal: cannot assemble raw rows: {e}")))
+}
+
+/// What a message took on the wire: its key, value and headers.
+pub fn raw_len(message: &KafkaMessage) -> u64 {
+    message.raw_len()
+}
+
 /// Undecodable messages as rows for the data-quality table (§5.7): `<prefix>topic`,
 /// `<prefix>partition`, `<prefix>offset`, `<prefix>timestamp`, `<prefix>key_b64`,
 /// `<prefix>value_b64`, `<prefix>value_schema_id`, each with the reason `avro: <reason>`.

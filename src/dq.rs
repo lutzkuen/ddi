@@ -238,6 +238,12 @@ impl DataQuality {
         &self.kafka
     }
 
+    /// Add to `counters` from now on: a pipeline's metrics, which outlive this table's handle
+    /// when it is opened again.
+    pub fn set_kafka_counters(&mut self, counters: Arc<KafkaCounters>) {
+        self.kafka = counters;
+    }
+
     /// Write every reject in this batch for `source_version`, unless they are already there.
     ///
     /// Returns how many rows were written — zero when a replay found them already recorded.

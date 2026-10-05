@@ -25,6 +25,10 @@ default = []
 # links the system's OpenSSL 3, which a Delta-only build has no use for. Its config is parsed
 # and validated either way; a build without it holds every [[kafka.pipeline]] back by name.
 kafka = ["dep:rdkafka", "dep:arrow-avro"]
+# Faults the Kafka integration tests inject into a running `ddi` through DDI_TEST_FAULT
+# (docs/kafka-design.md §9.2, src/kafka/fault.rs). Never in a release: without it every hook is
+# an empty function.
+fault-injection = ["kafka"]
 
 [dependencies]
 # Pinned exactly: delta-rs is 0.x and churns. All calls are isolated behind

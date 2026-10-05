@@ -163,6 +163,15 @@ impl Budget {
         }
     }
 
+    /// How many bytes a batch may decode to: the batch's share of this pipeline's budget.
+    ///
+    /// What a Kafka batch closes at, measured on its decoded rows (docs/kafka-design.md §3.3):
+    /// unlike a Delta batch it is not sized by a ratio, so it never shrinks after one small
+    /// batch. `None` when nothing bounds the process.
+    pub fn batch_bytes(&self) -> Option<u64> {
+        Some(((self.per_pipeline? as f64) * BATCH_SHARE) as u64)
+    }
+
     /// How many bytes of parquet a batch may name, given what decoding it last cost.
     ///
     /// `None` when nothing bounds the process, in which case the configured

@@ -558,6 +558,9 @@ pub struct ResolvedKafka {
     /// Manual assignment, stopping at the end of the topic. Set by `ddi once`, never by the
     /// file (§3.8).
     pub once: bool,
+    /// The app_ids of the other Kafka pipelines in this config that write the same target:
+    /// offsets of theirs in it are no sign of a mistyped app_id (§4.4 step 7, EO-m15).
+    pub neighbours: Vec<String>,
 }
 
 /// librdkafka keys ddi sets itself, each with the config key that owns it, or why nobody may
@@ -1622,6 +1625,7 @@ impl Config {
             revoke_flush_timeout_secs,
             blocked_recheck_secs,
             once: false,
+            neighbours: Vec::new(),
         };
 
         let resolved = ResolvedPipeline {
@@ -1708,7 +1712,22 @@ pub(super) fn resolve_entries(
             }),
         };
         match outcome {
-            Ok((r, warnings)) => {
+            Ok((mut r, warnings)) => {
+                // Every other entry on this table, whether it runs or not: what the file says
+                // shares the table is what the typo guard may take an offset of for.
+                let target = table_key(&p.target_uri);
+                let neighbours: Vec<String> = cfg
+                    .kafka
+                    .pipelines
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, q)| *j != i && table_key(&q.target_uri) == target)
+                    .map(|(_, q)| q.app_id.trim().to_string())
+                    .filter(|a| a != p.app_id.trim())
+                    .collect();
+                if let Some(k) = r.kafka.as_mut().and_then(Arc::get_mut) {
+                    k.neighbours = neighbours;
+                }
                 for w in warnings {
                     tracing::warn!(pipeline = %name, "{w}");
                 }
