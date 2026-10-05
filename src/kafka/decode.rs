@@ -939,6 +939,20 @@ pub fn decoded_schema(schema: &RegisteredSchema) -> std::result::Result<SchemaRe
         .map_err(|e| e.to_string())
 }
 
+/// The decoder's own Arrow schema for `schema`'s messages, before normalisation: with the
+/// metadata arrow-avro puts on its fields (the `avro.name` and `avro.namespace` of a named
+/// type, codec.rs:1534-1554). kafka-delta-ingest's text reads a writer schema's shape from it
+/// (crate::kafka::kdi_text), which needs to tell a decimal on `fixed` from one on `bytes`.
+pub(crate) fn raw_schema(schema: &RegisteredSchema) -> std::result::Result<SchemaRef, String> {
+    top_level_record(&schema.schema).map_err(|kind| {
+        format!(
+            "writer schema {} is not a record at the top level but {kind}",
+            schema.id
+        )
+    })?;
+    Ok(ArrowAvro.build(schema.id, &schema.schema)?.schema())
+}
+
 // ------------------------------------------------------------------------- normalisation
 
 /// The decoder's batch in the form the target reads (§5.4), recursively through structs,
@@ -1130,7 +1144,31 @@ fn top_level_record(schema: &str) -> std::result::Result<(), String> {
 /// arrow-avro reads such a field as the 16 bytes it is (it knows the uuid logical type on
 /// `string` only), so the field is told by that metadata.
 fn fixed_uuids(schema: &str) -> HashSet<(String, Option<String>)> {
-    fn walk(v: &serde_json::Value, ns: Option<&str>, out: &mut HashSet<(String, Option<String>)>) {
+    named_fixed(schema)
+        .into_iter()
+        .filter(|(_, (size, logical))| *size == 16 && logical.as_deref() == Some("uuid"))
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// `(name, namespace)` of every `fixed` type with logicalType decimal, and its size: the bytes
+/// a decimal written on it takes, which kafka-delta-ingest's text of it keeps (§5.6 step 5).
+/// arrow-avro reads the value into a `Decimal128` like a decimal on `bytes`, and keeps the
+/// `fixed` only as the field's `avro.name` and `avro.namespace` metadata (codec.rs:1534-1554),
+/// resolved as in [`fixed_uuids`].
+pub(crate) fn fixed_decimals(schema: &str) -> HashMap<(String, Option<String>), usize> {
+    named_fixed(schema)
+        .into_iter()
+        .filter(|(_, (_, logical))| logical.as_deref() == Some("decimal"))
+        .map(|(name, (size, _))| (name, size as usize))
+        .collect()
+}
+
+/// Every `fixed` type the schema defines: `(name, namespace)`, the namespace resolved as
+/// arrow-avro resolves it (see [`fixed_uuids`]), to its size and logicalType.
+fn named_fixed(schema: &str) -> HashMap<(String, Option<String>), (u64, Option<String>)> {
+    type Found = HashMap<(String, Option<String>), (u64, Option<String>)>;
+    fn walk(v: &serde_json::Value, ns: Option<&str>, out: &mut Found) {
         use serde_json::Value;
         match v {
             Value::Array(branches) => branches.iter().for_each(|b| walk(b, ns, out)),
@@ -1160,10 +1198,18 @@ fn fixed_uuids(schema: &str) -> HashSet<(String, Option<String>)> {
                         }
                     }
                     Some(Value::String(t)) if t == "fixed" => {
-                        let uuid = o.get("logicalType").and_then(Value::as_str) == Some("uuid")
-                            && o.get("size").and_then(Value::as_u64) == Some(16);
-                        if let (true, Some(name)) = (uuid, o.get("name").and_then(Value::as_str)) {
-                            out.insert((name.to_string(), own_ns.map(str::to_string)));
+                        let size = o.get("size").and_then(Value::as_u64);
+                        if let (Some(size), Some(name)) =
+                            (size, o.get("name").and_then(Value::as_str))
+                        {
+                            let logical = o
+                                .get("logicalType")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            out.insert(
+                                (name.to_string(), own_ns.map(str::to_string)),
+                                (size, logical),
+                            );
                         }
                     }
                     Some(t @ (Value::Object(_) | Value::Array(_))) => walk(t, ns, out),
@@ -1173,7 +1219,7 @@ fn fixed_uuids(schema: &str) -> HashSet<(String, Option<String>)> {
             _ => {}
         }
     }
-    let mut out = HashSet::new();
+    let mut out = HashMap::new();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(schema) {
         walk(&v, None, &mut out);
     }

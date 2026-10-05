@@ -6,6 +6,8 @@
 //!   message checked to be exactly one row and a malformed one isolated (§5.1, §5.4, §6.1);
 //! - [`conform`]: the union `U` the SQL path aligns its batches to (§5.5), and the conform
 //!   step that fits a batch to the target by name before the coercer (§5.6);
+//! - `kdi_text`: kafka-delta-ingest's text for values going into STRING columns, which the
+//!   conform step writes under `kdi_compat` and `kdi_null_text` (§5.6 steps 5 and 6);
 //! - [`KafkaSource`], what a Kafka pipeline's `process` needs of its source: so far the
 //!   conform step;
 //! - what the build has to prove: that librdkafka is the version the design was checked
@@ -17,6 +19,7 @@
 
 pub mod conform;
 pub mod decode;
+pub(crate) mod kdi_text;
 pub mod registry;
 #[cfg(test)]
 pub(crate) mod sr_stub;

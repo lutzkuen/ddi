@@ -22,7 +22,7 @@ use deltalake::kernel::{ArrayType, DataType as Delta, MapType, StructField, Stru
 // ------------------------------------------------------------------------------ fixtures
 
 /// Writer schemas by id, for the decoder.
-struct Schemas(HashMap<u32, Arc<RegisteredSchema>>);
+pub(super) struct Schemas(pub(super) HashMap<u32, Arc<RegisteredSchema>>);
 
 #[async_trait]
 impl WriterSchemas for Schemas {
@@ -37,7 +37,7 @@ impl WriterSchemas for Schemas {
     }
 }
 
-fn registered(id: u32, json: &str) -> Arc<RegisteredSchema> {
+pub(super) fn registered(id: u32, json: &str) -> Arc<RegisteredSchema> {
     Arc::new(RegisteredSchema {
         id,
         schema: json.to_string(),
@@ -50,7 +50,7 @@ fn registered(id: u32, json: &str) -> Arc<RegisteredSchema> {
 
 /// `rows` as messages at offsets 0.. of partition 0, each `(writer schema id, value)` written by
 /// apache-avro behind the Confluent header, and decoded: one batch per writer schema.
-async fn decoded(schemas: &[(u32, &str)], rows: Vec<(u32, Avro)>) -> Vec<RecordBatch> {
+pub(super) async fn decoded(schemas: &[(u32, &str)], rows: Vec<(u32, Avro)>) -> Vec<RecordBatch> {
     let map = schemas
         .iter()
         .map(|(id, json)| (*id, registered(*id, json)))
@@ -78,7 +78,7 @@ async fn decoded(schemas: &[(u32, &str)], rows: Vec<(u32, Avro)>) -> Vec<RecordB
     out.batches
 }
 
-fn record(fields: Vec<(&str, Avro)>) -> Avro {
+pub(super) fn record(fields: Vec<(&str, Avro)>) -> Avro {
     Avro::Record(
         fields
             .into_iter()
@@ -87,24 +87,24 @@ fn record(fields: Vec<(&str, Avro)>) -> Avro {
     )
 }
 
-fn s(v: &str) -> Avro {
+pub(super) fn s(v: &str) -> Avro {
     Avro::String(v.to_string())
 }
 
 /// A Delta table's schema as the kernel gives it to Arrow, which is what `Pipeline::open` reads
 /// a target's as.
-fn target(fields: Vec<StructField>) -> SchemaRef {
+pub(super) fn target(fields: Vec<StructField>) -> SchemaRef {
     let schema: Schema = (&StructType::try_new(fields).unwrap())
         .try_into_arrow()
         .unwrap();
     Arc::new(schema)
 }
 
-fn field(name: &str, t: impl std::convert::Into<Delta>, nullable: bool) -> StructField {
+pub(super) fn field(name: &str, t: impl std::convert::Into<Delta>, nullable: bool) -> StructField {
     StructField::new(name, t, nullable)
 }
 
-fn strct(fields: Vec<StructField>) -> Delta {
+pub(super) fn strct(fields: Vec<StructField>) -> Delta {
     Delta::try_struct_type(fields).unwrap()
 }
 
@@ -114,7 +114,10 @@ fn conformer(target: SchemaRef) -> Conformer {
 
 /// What `Pipeline::process` does with a Kafka batch on its way to the target: conform, then the
 /// coercer, rows that do not fit to the data-quality table.
-fn through(c: &mut Conformer, batches: Vec<RecordBatch>) -> (Vec<RecordBatch>, Vec<Rejected>) {
+pub(super) fn through(
+    c: &mut Conformer,
+    batches: Vec<RecordBatch>,
+) -> (Vec<RecordBatch>, Vec<Rejected>) {
     let mut rejects = Vec::new();
     let conformed = c.conform_all(batches, &mut rejects, true).unwrap();
     let coercer = SchemaCoercer::new(c.target.clone());
@@ -128,7 +131,7 @@ fn through(c: &mut Conformer, batches: Vec<RecordBatch>) -> (Vec<RecordBatch>, V
 }
 
 /// Rows as JSON objects, nulls written out.
-fn json(batches: &[RecordBatch]) -> Vec<serde_json::Value> {
+pub(super) fn json(batches: &[RecordBatch]) -> Vec<serde_json::Value> {
     use deltalake::arrow::json::writer::{ArrayWriter, WriterBuilder};
     let mut out = Vec::new();
     for b in batches {
@@ -146,12 +149,12 @@ fn json(batches: &[RecordBatch]) -> Vec<serde_json::Value> {
     out
 }
 
-fn reasons(rejects: &[Rejected]) -> Vec<String> {
+pub(super) fn reasons(rejects: &[Rejected]) -> Vec<String> {
     rejects.iter().flat_map(|r| r.reasons.clone()).collect()
 }
 
 /// The `kafka_offset` of every rejected row, in order.
-fn rejected_offsets(rejects: &[Rejected]) -> Vec<i64> {
+pub(super) fn rejected_offsets(rejects: &[Rejected]) -> Vec<i64> {
     rejects
         .iter()
         .flat_map(|r| {
@@ -885,26 +888,6 @@ async fn local_timestamp_read_as_utc() {
     );
     let inner = good[0].column_by_name("inner").unwrap().as_struct();
     assert_eq!(micros(inner.column(0)), 1_700_000_000_123_000);
-}
-
-/// kafka-delta-ingest's rendering is not built yet (M2c): asked for, the conformer refuses rather
-/// than writing other text than kdi did.
-#[test]
-fn kdi_text_is_refused_until_it_is_built() {
-    let t = target(vec![field("id", Delta::LONG, false)]);
-    for text in [
-        KdiText {
-            compat: true,
-            null_text: false,
-        },
-        KdiText {
-            compat: false,
-            null_text: true,
-        },
-    ] {
-        let err = Conformer::new(t.clone(), "kafka_", text).unwrap_err();
-        assert!(err.to_string().contains("not built yet"), "{err}");
-    }
 }
 
 /// Without a data-quality table, a row that does not fit fails the batch, as the coercer's strict

@@ -42,16 +42,19 @@
 //!
 //! # kafka-delta-ingest's text
 //!
-//! `kdi_compat` and `kdi_null_text` (§5.6 steps 5 and 6) render values going into a STRING
-//! column the way kafka-delta-ingest wrote them. That rendering is not built yet (M2c); until it
-//! is, [`Conformer::new`] refuses either setting rather than writing other text than it says.
+//! `kdi_compat` and `kdi_null_text` (§5.6 steps 5 and 6) write values going into a STRING
+//! column the way kafka-delta-ingest wrote them: a value that is not text as its JSON, by its
+//! Arrow type at every depth, and a null as the text `"null"` exactly where kdi's JSON had the
+//! key, which the row's own writer schema says ([`crate::kafka::kdi_text`]). So a conformer that
+//! writes either is told every writer schema its rows can come from ([`Conformer::observe`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use deltalake::arrow::array::{
     new_empty_array, new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array,
-    Decimal256Array, ListArray, MapArray, NullArray, RecordBatch, StructArray, UnionArray,
+    Decimal256Array, ListArray, MapArray, NullArray, RecordBatch, StringArray, StringBuilder,
+    StructArray, UnionArray,
 };
 use deltalake::arrow::buffer::OffsetBuffer;
 use deltalake::arrow::compute::kernels::cast_utils::parse_decimal;
@@ -68,6 +71,7 @@ use tracing::warn;
 
 use crate::error::{Error, Result};
 use crate::kafka::decode::{decoded_schema, metadata_fields};
+use crate::kafka::kdi_text::{self, At, Shape};
 use crate::kafka::registry::RegisteredSchema;
 use crate::schema::Rejected;
 use crate::transform::SqlTransform;
@@ -122,41 +126,124 @@ enum Dest {
     Union { writer: Option<i32>, newest: u32 },
 }
 
+/// Where each value of an array stood in kafka-delta-ingest's JSON (§5.6 step 6), and whether
+/// kdi's coercion reached that place: given when the conformer writes kdi's text.
+#[derive(Clone, Copy)]
+struct Kdi<'a, 's> {
+    /// One per value of the array being fitted.
+    at: &'a [At<'s>],
+    /// kdi's coercion reached here: not inside a map, nor an array of arrays or maps.
+    reach: bool,
+}
+
 /// Fits arrays to types, by name at every depth.
 struct Fitter {
     into: Dest,
+    /// kafka-delta-ingest's text, for values going into a STRING (§5.6 steps 5 and 6). Off
+    /// when fitting to `U`: only the target's STRING columns take it.
+    text: KdiText,
 }
 
 impl Fitter {
     /// `array` in type `to`, its values matched to `to`'s by name at every depth. `path` names
     /// the value in a rejection (`customer.address.zip`). `top` is set for a top-level column of
-    /// the target, whose plain values are left as they are, for the coercer to cast.
-    fn fit(&self, array: &ArrayRef, to: &DataType, path: &str, top: bool) -> Result<Fitted> {
+    /// the target, whose plain values are left as they are, for the coercer to cast. `kdi` is
+    /// where each value stood in kdi's JSON, given when kdi's text is written.
+    fn fit(
+        &self,
+        array: &ArrayRef,
+        to: &DataType,
+        path: &str,
+        top: bool,
+        kdi: Option<Kdi<'_, '_>>,
+    ) -> Result<Fitted> {
         let from = array.data_type();
-        if from == to {
+        // Equal types need nothing, unless a null in them may become "null", or a map's
+        // entries be put in kdi's order.
+        let kdi_work = kdi.is_some_and(|k| {
+            (self.text.null_text && kdi_text::takes_null_text(to, k.reach))
+                || (self.text.compat && kdi_text::has_map(to))
+        });
+        if from == to && !kdi_work {
             return Ok(Fitted::clean(array.clone()));
         }
         match (from, to) {
             (DataType::Union(..), DataType::Union(..)) => self.union_to_union(array, to, path),
-            (DataType::Union(..), _) => self.union_to(array, to, path),
+            (DataType::Union(..), _) => self.union_to(array, to, path, kdi),
             (_, DataType::Union(..)) => self.wrap_in_union(array, to, path),
+            // §5.6 steps 5 and 6: kafka-delta-ingest's text, by the value's Arrow type.
+            (_, DataType::Utf8) if kdi.is_some() => {
+                self.kdi_text(array, path, top, kdi.expect("matched as some"))
+            }
             (DataType::Null, _) => Ok(Fitted::clean(new_null_array(to, array.len()))),
             (DataType::Struct(_), DataType::Struct(to_fields)) => {
-                self.structs(array, to_fields, path)
+                self.structs(array, to_fields, path, kdi)
             }
-            (DataType::List(_), DataType::List(item)) => self.list(array, item, path),
+            (DataType::List(_), DataType::List(item)) => self.list(array, item, path, kdi),
             (DataType::Map(..), DataType::Map(entries, sorted)) => {
-                self.map(array, entries, *sorted, path)
+                self.map(array, entries, *sorted, path, kdi)
             }
             (
                 DataType::Float16 | DataType::Float32 | DataType::Float64,
                 DataType::Decimal128(..) | DataType::Decimal256(..),
             ) => self.float_to_decimal(array, to, path),
-            // §5.6 steps 5 and 6, kafka-delta-ingest's text for a value going into a STRING
-            // column, render here, by the value's Arrow type: M2c.
             _ if top => Ok(Fitted::clean(array.clone())),
             _ => self.cast(array, to, path),
         }
+    }
+
+    /// A value going into a STRING where kafka-delta-ingest's text is written (§5.6 steps 5 and
+    /// 6). Text stays as it is. Under `kdi_compat` anything else is its kdi text, by its Arrow
+    /// type ([`kdi_text::text`]), and a value that has none (NaN, the infinities) rejects its
+    /// row; without it, Arrow's cast as anywhere else. Under `kdi_null_text` a null becomes
+    /// `"null"` where kdi's JSON had the key and its coercion reached.
+    fn kdi_text(
+        &self,
+        array: &ArrayRef,
+        path: &str,
+        top: bool,
+        kdi: Kdi<'_, '_>,
+    ) -> Result<Fitted> {
+        let n = array.len();
+        let null_word = |i: usize| self.text.null_text && kdi.reach && kdi.at[i].key;
+        let textual =
+            |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+        let from = array.data_type();
+        let is_text = textual(from) || matches!(from, DataType::Dictionary(_, v) if textual(v));
+        if is_text || !self.text.compat {
+            let fitted = if from == &DataType::Utf8 {
+                Fitted::clean(array.clone())
+            } else if top && !(0..n).any(|i| null_word(i) && kdi_text::is_null(array.as_ref(), i)) {
+                // Nothing to write "null" into: the coercer casts it, as without the options.
+                return Ok(Fitted::clean(array.clone()));
+            } else {
+                self.cast(array, &DataType::Utf8, path)?
+            };
+            return Ok(with_null_word(fitted, null_word));
+        }
+        let mut out = StringBuilder::with_capacity(n, n * 8);
+        let mut bad = Reasons::default();
+        for i in 0..n {
+            if kdi_text::is_null(array.as_ref(), i) {
+                if null_word(i) {
+                    out.append_value("null");
+                } else {
+                    out.append_null();
+                }
+                continue;
+            }
+            match kdi_text::text(array.as_ref(), i, kdi.at[i].shape) {
+                Ok(text) => out.append_value(text),
+                Err(why) => {
+                    out.append_null();
+                    bad.set(n, i, || format!("{path}: {why}"));
+                }
+            }
+        }
+        Ok(Fitted {
+            array: Arc::new(out.finish()),
+            bad: bad.0,
+        })
     }
 
     /// A plain value cast to `to`, leniently: a value the cast turns into a null is rejected.
@@ -192,7 +279,13 @@ impl Fitter {
 
     /// A struct into a struct, child by child of the target, each found by its exact name. A
     /// child the source lacks is null, and one only the source has is dropped.
-    fn structs(&self, array: &ArrayRef, to_fields: &Fields, path: &str) -> Result<Fitted> {
+    fn structs(
+        &self,
+        array: &ArrayRef,
+        to_fields: &Fields,
+        path: &str,
+        kdi: Option<Kdi<'_, '_>>,
+    ) -> Result<Fitted> {
         let s = array.as_struct();
         let n = s.len();
         let parent = s.logical_nulls();
@@ -202,7 +295,21 @@ impl Fitter {
         for field in to_fields {
             let child_path = format!("{path}.{}", field.name());
             let fitted = match s.column_by_name(field.name()) {
-                Some(child) => self.fit(child, field.data_type(), &child_path, false)?,
+                Some(child) => {
+                    let at: Option<Vec<At>> = kdi.map(|k| {
+                        (0..n)
+                            .map(|i| match parent_valid(i) {
+                                true => k.at[i].child(field.name()),
+                                false => At::ABSENT,
+                            })
+                            .collect()
+                    });
+                    let kdi = at
+                        .as_deref()
+                        .zip(kdi)
+                        .map(|(at, k)| Kdi { at, reach: k.reach });
+                    self.fit(child, field.data_type(), &child_path, false, kdi)?
+                }
                 None => {
                     if !field.is_nullable() {
                         for i in (0..n).filter(|i| parent_valid(*i)) {
@@ -246,10 +353,21 @@ impl Fitter {
     }
 
     /// A list into a list: its elements fitted in place, under the target's element field.
-    fn list(&self, array: &ArrayRef, item: &FieldRef, path: &str) -> Result<Fitted> {
+    fn list(
+        &self,
+        array: &ArrayRef,
+        item: &FieldRef,
+        path: &str,
+        kdi: Option<Kdi<'_, '_>>,
+    ) -> Result<Fitted> {
         let l = array.as_list::<i32>();
         let item_path = format!("{path}[]");
-        let fitted = self.fit(l.values(), item.data_type(), &item_path, false)?;
+        let at = kdi.map(|k| per_element(l, l.offsets(), l.values().len(), k, At::element));
+        let kdi = at.as_deref().zip(kdi).map(|(at, k)| Kdi {
+            at,
+            reach: k.reach && kdi_text::reaches_elements(item.data_type()),
+        });
+        let fitted = self.fit(l.values(), item.data_type(), &item_path, false, kdi)?;
         let (values, bad) = self.elements(
             l.len(),
             l.offsets(),
@@ -278,6 +396,7 @@ impl Fitter {
         entries: &FieldRef,
         sorted: bool,
         path: &str,
+        kdi: Option<Kdi<'_, '_>>,
     ) -> Result<Fitted> {
         let m = array.as_map();
         let DataType::Struct(entry_fields) = entries.data_type() else {
@@ -290,8 +409,24 @@ impl Fitter {
         let n = m.len();
         let key_path = format!("{path}{{key}}");
         let value_path = format!("{path}{{}}");
-        let keys = self.fit(m.keys(), key_field.data_type(), &key_path, false)?;
-        let values = self.fit(m.values(), value_field.data_type(), &value_path, false)?;
+        // kdi's coercion never reached inside a map (coercions.rs:64): no "null" there, and
+        // its values are written by type only under `kdi_compat`.
+        let value_at = kdi.map(|k| per_element(m, m.offsets(), m.values().len(), k, At::value));
+        let key_at = kdi.map(|_| vec![At::ABSENT; m.keys().len()]);
+        let keys = self.fit(
+            m.keys(),
+            key_field.data_type(),
+            &key_path,
+            false,
+            key_at.as_deref().map(|at| Kdi { at, reach: false }),
+        )?;
+        let values = self.fit(
+            m.values(),
+            value_field.data_type(),
+            &value_path,
+            false,
+            value_at.as_deref().map(|at| Kdi { at, reach: false }),
+        )?;
         let (keys, key_bad) = self.elements(
             n,
             m.offsets(),
@@ -317,11 +452,26 @@ impl Fitter {
                 .map(|(k, v)| k.or(v))
                 .collect(),
         };
+        let mut offsets = m.offsets().clone();
+        let (keys, values) = match kdi.is_some() && self.text.compat {
+            true => match kdi_order(&keys, &offsets) {
+                Some((indices, ordered)) => {
+                    offsets = ordered;
+                    let take = |a: &ArrayRef| {
+                        deltalake::arrow::compute::take(a.as_ref(), &indices, None)
+                            .map_err(|e| assembly(path, e))
+                    };
+                    (take(&keys)?, take(&values)?)
+                }
+                None => (keys, values),
+            },
+            false => (keys, values),
+        };
         let entries_array = StructArray::try_new(entry_fields.clone(), vec![keys, values], None)
             .map_err(|e| assembly(path, e))?;
         let out = MapArray::try_new(
             entries.clone(),
-            m.offsets().clone(),
+            offsets,
             entries_array,
             m.nulls().cloned(),
             sorted,
@@ -377,7 +527,13 @@ impl Fitter {
 
     /// A general union into a plain type: each row's value is its own branch's, fitted to `to`.
     /// A branch that does not convert rejects the rows that hold it.
-    fn union_to(&self, array: &ArrayRef, to: &DataType, path: &str) -> Result<Fitted> {
+    fn union_to(
+        &self,
+        array: &ArrayRef,
+        to: &DataType,
+        path: &str,
+        kdi: Option<Kdi<'_, '_>>,
+    ) -> Result<Fitted> {
         let u = as_union(array, path)?;
         let DataType::Union(fields, _) = array.data_type() else {
             unreachable!("matched as a union")
@@ -391,7 +547,19 @@ impl Fitter {
         for (type_id, field) in fields.iter() {
             let branch_path = format!("{path} (union branch {})", field.name());
             branches.insert(type_id, fitted.len());
-            fitted.push(self.fit(u.child(type_id), to, &branch_path, false)?);
+            // Each value of the branch stood where its row's union did.
+            let at: Option<Vec<At>> = kdi.map(|k| {
+                let mut at = vec![At::ABSENT; u.child(type_id).len()];
+                for i in (0..n).filter(|i| u.type_id(*i) == type_id) {
+                    at[u.value_offset(i)] = k.at[i].branch(field.name());
+                }
+                at
+            });
+            let kdi = at
+                .as_deref()
+                .zip(kdi)
+                .map(|(at, k)| Kdi { at, reach: k.reach });
+            fitted.push(self.fit(u.child(type_id), to, &branch_path, false, kdi)?);
         }
         let indices: Vec<(usize, usize)> = (0..n)
             .map(|i| (branches[&u.type_id(i)], u.value_offset(i)))
@@ -546,7 +714,10 @@ impl Fitter {
             )
         };
         if let Some((type_id, field)) = fields.iter().find(|(_, f)| same_kind(f.data_type())) {
-            return Ok((type_id, self.fit(array, field.data_type(), path, false)?));
+            return Ok((
+                type_id,
+                self.fit(array, field.data_type(), path, false, None)?,
+            ));
         }
         let mut partly = None;
         for (type_id, field) in fields.iter() {
@@ -697,6 +868,73 @@ fn decimal_text(v: f64, precision: u8, scale: i8) -> Option<String> {
     Some(v.to_string())
 }
 
+/// Where each of `len` elements of `n` lists (or maps) stood in kafka-delta-ingest's JSON:
+/// `step` of its list's, for the elements of a list that is not null; nowhere for the others.
+fn per_element<'s>(
+    lists: &dyn Array,
+    offsets: &OffsetBuffer<i32>,
+    len: usize,
+    kdi: Kdi<'_, 's>,
+    step: impl Fn(At<'s>) -> At<'s>,
+) -> Vec<At<'s>> {
+    let mut at = vec![At::ABSENT; len];
+    for row in 0..lists.len() {
+        if lists.is_valid(row) {
+            let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+            for slot in &mut at[start..end] {
+                *slot = step(kdi.at[row]);
+            }
+        }
+    }
+    at
+}
+
+/// Each map's entries as kafka-delta-ingest wrote them, where they differ from `keys`' order:
+/// one per key, the last one read (apache-avro held a map in a `HashMap`), in the keys' byte
+/// order (serde_json's `BTreeMap`, which arrow-json read the object from). The entries to take,
+/// and the maps' new offsets; `None` when every map already is so, or a key is not text.
+fn kdi_order(
+    keys: &ArrayRef,
+    offsets: &OffsetBuffer<i32>,
+) -> Option<(deltalake::arrow::array::UInt32Array, OffsetBuffer<i32>)> {
+    let keys = keys.as_string_opt::<i32>()?;
+    let mut indices: Vec<u32> = Vec::with_capacity(keys.len());
+    let mut lengths = Vec::with_capacity(offsets.len().saturating_sub(1));
+    let mut changed = false;
+    for w in offsets.windows(2) {
+        let (start, end) = (w[0] as usize, w[1] as usize);
+        let mut entries: BTreeMap<&str, usize> = BTreeMap::new();
+        for j in start..end {
+            entries.insert(keys.value(j), j);
+        }
+        changed |= entries.len() != end - start || entries.values().copied().ne(start..end);
+        lengths.push(entries.len());
+        indices.extend(entries.into_values().map(|j| j as u32));
+    }
+    changed.then(|| (indices.into(), OffsetBuffer::from_lengths(lengths)))
+}
+
+/// `fitted`, a STRING array, with the text `"null"` in place of each null `null_word` asks for
+/// (§5.6 step 6); a value whose row is rejected stays null.
+fn with_null_word(fitted: Fitted, null_word: impl Fn(usize) -> bool) -> Fitted {
+    let strings = fitted.array.as_string::<i32>();
+    let n = strings.len();
+    if !(0..n).any(|i| strings.is_null(i) && null_word(i) && fitted.reason(i).is_none()) {
+        return fitted;
+    }
+    let array: StringArray = (0..n)
+        .map(|i| match strings.is_null(i) {
+            false => Some(strings.value(i)),
+            true if null_word(i) && fitted.reason(i).is_none() => Some("null"),
+            true => None,
+        })
+        .collect();
+    Fitted {
+        array: Arc::new(array),
+        bad: fitted.bad,
+    }
+}
+
 /// `array` with every null replaced by a placeholder value, so that it can stand in a field
 /// that is NOT NULL. Only for values whose rows are rejected: the placeholder is never
 /// written.
@@ -809,13 +1047,18 @@ fn split(
 // ======================================================================= the target (§5.6)
 
 /// How a value going into a STRING column is written where kafka-delta-ingest wrote text of
-/// its own (§5.6 steps 5 and 6): `kdi_compat` renders a non-string value by its Arrow type, and
-/// `kdi_null_text` writes `"null"` where kdi's JSON had the key. Both are M2c; until then a
-/// conformer refuses them.
+/// its own (§5.6 steps 5 and 6): `kdi_compat` writes a value that is not text by its Arrow type,
+/// as kdi's JSON had it, and `kdi_null_text` writes `"null"` where kdi's JSON had the key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KdiText {
     pub compat: bool,
     pub null_text: bool,
+}
+
+impl KdiText {
+    fn any(self) -> bool {
+        self.compat || self.null_text
+    }
 }
 
 /// Fits a Kafka pipeline's rows to its target, by name at every depth, before the coercer
@@ -824,31 +1067,85 @@ pub struct KdiText {
 pub struct Conformer {
     target: SchemaRef,
     prefix: String,
+    text: KdiText,
     /// The writer schema ids a missing target column has been warned about, `None` for rows
     /// that do not say which (SQL that dropped `<prefix>value_schema_id`).
     warned: BTreeSet<Option<i32>>,
     /// The nullable target columns the last batch did not produce.
     unmatched: Vec<String>,
+    /// For kdi's text: each writer schema's shape, by id ([`Conformer::observe`]).
+    shapes: BTreeMap<u32, Shape>,
+    /// Every observed writer schema's shape merged, newest first: what a row that does not say
+    /// its writer schema is read with (§5.6 step 6, "approximate").
+    merged: Option<Shape>,
+    /// A batch whose rows did not say their writer schema was written with `merged`
+    /// (`ddi_kafka_null_text_approximate`); warned about once.
+    approximate: bool,
 }
 
 impl Conformer {
-    /// A conformer into `target`, the Kafka metadata columns named with `prefix`.
+    /// A conformer into `target`, the Kafka metadata columns named with `prefix`. With either
+    /// of kafka-delta-ingest's texts (`text`), it must be told every writer schema its rows can
+    /// come from ([`Conformer::observe`]) before it conforms them.
     pub fn new(target: SchemaRef, prefix: impl Into<String>, text: KdiText) -> Result<Self> {
-        if text.compat || text.null_text {
-            return Err(Error::Config(format!(
-                "kdi_compat = {} and kdi_null_text = {}: writing kafka-delta-ingest's text into \
-                 STRING columns is not built yet (docs/kafka-design.md §5.6 steps 5 and 6), so \
-                 this build cannot keep a kafka-delta-ingest table's rendering. Nothing was \
-                 written.",
-                text.compat, text.null_text
-            )));
-        }
         Ok(Self {
             target,
             prefix: prefix.into(),
+            text,
             warned: BTreeSet::new(),
             unmatched: Vec::new(),
+            shapes: BTreeMap::new(),
+            merged: None,
+            approximate: false,
         })
+    }
+
+    /// Takes note of writer schemas the rows can come from: kafka-delta-ingest's text reads where
+    /// its JSON had a key, and the bytes a decimal was written with, off the row's own writer
+    /// schema (§5.6 steps 5 and 6). The members of `U` on the SQL path, and every writer schema
+    /// the decoder met on either path. Nothing to do without kdi's text.
+    ///
+    /// A writer schema the decoder cannot use either is left out: none of its messages becomes
+    /// a row.
+    pub fn observe(&mut self, schemas: &[Arc<RegisteredSchema>]) {
+        if !self.text.any() {
+            return;
+        }
+        let mut grew = false;
+        for schema in schemas {
+            if self.shapes.contains_key(&schema.id) {
+                continue;
+            }
+            match Shape::of(schema) {
+                Ok(shape) => {
+                    self.shapes.insert(schema.id, shape);
+                    grew = true;
+                }
+                Err(reason) => warn!(
+                    writer_schema = schema.id,
+                    "no kafka-delta-ingest text for this writer schema's rows, which it has \
+                     none of: {reason}"
+                ),
+            }
+        }
+        if grew {
+            let mut merged: Option<Shape> = None;
+            for shape in self.shapes.values().rev() {
+                match &mut merged {
+                    Some(m) => m.merge(shape),
+                    None => merged = Some(shape.clone()),
+                }
+            }
+            self.merged = merged;
+        }
+    }
+
+    /// Whether a batch's rows did not say their writer schema, so that where kdi's JSON had a
+    /// key was read off every writer schema observed instead (`ddi_kafka_null_text_approximate`,
+    /// §5.6 step 6). The only rows written otherwise than kdi wrote them are those whose writer
+    /// schema lacks a field another has.
+    pub fn null_text_approximate(&self) -> bool {
+        self.approximate
     }
 
     /// The nullable target columns the last batch did not produce: they were written null
@@ -898,7 +1195,17 @@ impl Conformer {
         let mut columns = batch.columns().to_vec();
         let mut bad: Vec<Option<(String, String)>> = vec![None; n];
         let mut unmatched = Vec::new();
-        let fitter = Fitter { into: Dest::Target };
+        let fitter = Fitter {
+            into: Dest::Target,
+            text: self.text,
+        };
+        let ids = (self.text.any() && n > 0).then(|| self.writer_ids(batch));
+        let writers = ids.map(|ids| self.writers(ids)).transpose()?;
+        // kdi had no key or headers: those take Arrow's cast, as without the options (§5.6 step 5).
+        let plain = [
+            format!("{}key", self.prefix),
+            format!("{}headers", self.prefix),
+        ];
         for field in self.target.fields() {
             let Ok(index) = schema.index_of(field.name()) else {
                 // NOT NULL: the coercer refuses the batch, naming what there is instead.
@@ -907,7 +1214,12 @@ impl Conformer {
                 }
                 continue;
             };
-            let fitted = fitter.fit(&columns[index], field.data_type(), field.name(), true)?;
+            let at: Option<Vec<At>> = writers
+                .as_ref()
+                .filter(|_| !plain.contains(field.name()))
+                .map(|w| w.iter().map(|s| At::column(s, field.name())).collect());
+            let kdi = at.as_deref().map(|at| Kdi { at, reach: true });
+            let fitted = fitter.fit(&columns[index], field.data_type(), field.name(), true, kdi)?;
             for (i, reason) in fitted.bad.iter().enumerate() {
                 if let (Some(reason), None) = (reason, &bad[i]) {
                     bad[i] = Some((field.name().clone(), reason.clone()));
@@ -930,6 +1242,55 @@ impl Conformer {
         )
         .map_err(|e| assembly("the conformed batch", e))?;
         split(batch, out, bad)
+    }
+
+    /// Each row's writer schema id, from `<prefix>value_schema_id`, as kafka-delta-ingest's
+    /// text reads where its JSON had keys (§5.6 step 6). Rows that do not say theirs (SQL that
+    /// dropped the column) are read with every observed writer schema merged: a warning once,
+    /// and the gauge set.
+    fn writer_ids(&mut self, batch: &RecordBatch) -> Vec<Option<i32>> {
+        let column = format!("{}value_schema_id", self.prefix);
+        let ids: Vec<Option<i32>> = match batch.column_by_name(&column) {
+            Some(c) if c.data_type() == &DataType::Int32 => {
+                c.as_primitive::<Int32Type>().iter().collect()
+            }
+            _ => vec![None; batch.num_rows()],
+        };
+        if ids.iter().any(Option::is_none) && !self.approximate {
+            warn!(
+                column = %column,
+                "rows that do not say their writer schema: where kafka-delta-ingest wrote \
+                 \"null\" is read off every writer schema seen instead of the row's own, so a \
+                 row whose writer schema lacks a field another has gets \"null\" there where kdi \
+                 had nothing. Keep the column in the SQL's output (SELECT *, ...) for kdi's exact \
+                 text"
+            );
+            self.approximate = true;
+        }
+        ids
+    }
+
+    /// The shape of each row's writer schema, by id; for a row without one, every observed
+    /// writer schema's merged.
+    fn writers(&self, ids: Vec<Option<i32>>) -> Result<Vec<&Shape>> {
+        let missing = |what: String| {
+            Error::Other(format!(
+                "internal: kafka-delta-ingest's text needs {what}, which the conformer was not \
+                 told of (Conformer::observe)"
+            ))
+        };
+        ids.into_iter()
+            .map(|id| match id {
+                Some(id) => self
+                    .shapes
+                    .get(&(id as u32))
+                    .ok_or_else(|| missing(format!("writer schema {id}"))),
+                None => self
+                    .merged
+                    .as_ref()
+                    .ok_or_else(|| missing("a writer schema".to_string())),
+            })
+            .collect()
     }
 
     /// Warns once per writer schema id about target columns its rows do not have, which are
@@ -1177,8 +1538,9 @@ impl UnionSchema {
                 .unwrap_or_default();
             let fitter = Fitter {
                 into: Dest::Union { writer, newest },
+                text: KdiText::default(),
             };
-            let fitted = fitter.fit(column, field.data_type(), field.name(), false)?;
+            let fitted = fitter.fit(column, field.data_type(), field.name(), false, None)?;
             for (i, reason) in fitted.bad.iter().enumerate() {
                 if let (Some(reason), None) = (reason, &bad[i]) {
                     bad[i] = Some((field.name().clone(), reason.clone()));
