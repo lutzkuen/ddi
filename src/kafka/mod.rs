@@ -1,10 +1,15 @@
 //! The Kafka source, compiled only with the `kafka` feature (docs/kafka-design.md).
 //!
-//! The source itself lands in M3. What is here now is what the build has to prove: that
-//! librdkafka is the version the design was checked against, and that it was built with what
-//! ddi's clusters need (TLS, SCRAM, zstd). Configuration is not here: it is always compiled,
-//! in `config::kafka`, so a build without this feature can still read and validate it, and
-//! hold its pipelines back by name.
+//! The consumer itself lands in M3. What is here now:
+//! - [`registry`]: the Schema Registry client (§5.2);
+//! - what the build has to prove: that librdkafka is the version the design was checked
+//!   against, and that it was built with what ddi's clusters need (TLS, SCRAM, zstd).
+//!
+//! All of it is pure: no consumer, no Delta commit. Configuration is not here: it is always
+//! compiled, in `config::kafka`, so a build without this feature can still read and validate
+//! it, and hold its pipelines back by name.
+
+pub mod registry;
 
 /// The librdkafka this binary was linked against, as librdkafka spells it (`"2.12.1"`).
 pub fn librdkafka_version() -> String {

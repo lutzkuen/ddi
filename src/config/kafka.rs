@@ -493,7 +493,11 @@ impl EnvRef {
 
     /// The variable's value, `None` where an optional one is unset, and an error where a
     /// required one is.
-    fn read(&self, what: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<Option<String>> {
+    pub(crate) fn read(
+        &self,
+        what: &str,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Option<String>> {
         let Some(name) = self.name() else {
             return Ok(None);
         };

@@ -429,6 +429,38 @@ pub enum Error {
         partitions: Vec<(i32, i64)>,
     },
 
+    /// The Schema Registry did not give a Kafka pipeline the writer schema it asked for, for a
+    /// reason that is not the message's (docs/kafka-design.md §5.2).
+    ///
+    /// A schema id the registry does not know is the message's, and makes that message
+    /// undecodable instead; this is the registry itself failing, which no message can be blamed
+    /// for, so the batch waits for it. How long, and whether the pipeline stays in its group
+    /// meanwhile, is the failure's to say: see [`SchemaRegistryFailure`].
+    #[error("Schema Registry {url}: {detail}")]
+    SchemaRegistry {
+        url: String,
+        failure: SchemaRegistryFailure,
+        detail: String,
+    },
+
+    /// A writer schema refers to schemas under other subjects, which ddi does not resolve yet
+    /// (docs/kafka-design.md §5.2, open question 10).
+    ///
+    /// Not a fact about one message: every message written with this schema needs the same
+    /// references, so it holds the pipeline rather than sending each one to the data-quality
+    /// table.
+    #[error(
+        "writer schema {id} in the Schema Registry {url} refers to other subjects ({}), and \
+         schema references are not supported yet. Nothing was written; the pipeline holds \
+         until a build that resolves them, or a writer schema without references.",
+        subjects.join(", ")
+    )]
+    KafkaSchemaReferences {
+        url: String,
+        id: u32,
+        subjects: Vec<String>,
+    },
+
     #[error("transform error: {0}")]
     Transform(String),
 
@@ -476,6 +508,22 @@ pub enum Error {
 
     #[error("{0}")]
     Other(String),
+}
+
+/// Why the Schema Registry did not answer, which decides how a Kafka pipeline waits for it
+/// (docs/kafka-design.md §5.2, §3.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaRegistryFailure {
+    /// A 5xx, 429 or 408, a timeout or a failed connection, still so after the client's own
+    /// retries: Transient. An outage that ends by itself.
+    Unavailable,
+    /// 401 or 403: the credentials are wrong or lack a permission. Consumer-fatal and
+    /// config-class: no message is to blame, so none is ever quarantined for it.
+    Unauthorized,
+    /// Any other refusal, or an answer that is not the Schema Registry API's (a reverse proxy's
+    /// page, a URL that points elsewhere): Blocking, pipeline. Retrying the same request cannot
+    /// help until someone changes the registry or the URL.
+    Refused,
 }
 
 /// How a Kafka pipeline handles an error its step raises (docs/kafka-design.md §3.6).
@@ -560,6 +608,14 @@ impl Error {
                 KafkaClass::BlockingPipeline
             }
             Error::KafkaOffsetMissing { .. } => KafkaClass::OpenRefusal,
+            Error::SchemaRegistry { failure, .. } => match failure {
+                SchemaRegistryFailure::Unavailable => KafkaClass::Transient,
+                SchemaRegistryFailure::Unauthorized => KafkaClass::ConsumerFatal,
+                SchemaRegistryFailure::Refused => KafkaClass::BlockingPipeline,
+            },
+            // Every message of the writer schema needs the same thing: the pipeline holds
+            // rather than quarantining them one by one.
+            Error::KafkaSchemaReferences { .. } => KafkaClass::BlockingPipeline,
             // An internal invariant, and the errors of a Delta source, which a Kafka pipeline
             // has none of.
             Error::Other(_)
@@ -889,6 +945,41 @@ mod tests {
                     target_uri: "/lake/orders".into(),
                     app_id: "orders".into(),
                     partitions: vec![(1, 41)],
+                },
+                BlockingPipeline,
+            ),
+            // The Schema Registry (§5.2): an outage after the client's own retries, wrong
+            // credentials, a refusal or an answer that is not its API's; and a writer schema
+            // whose references hold every message of it.
+            (
+                Error::SchemaRegistry {
+                    url: "https://sr.internal:8081".into(),
+                    failure: SchemaRegistryFailure::Unavailable,
+                    detail: "HTTP 503".into(),
+                },
+                Transient,
+            ),
+            (
+                Error::SchemaRegistry {
+                    url: "https://sr.internal:8081".into(),
+                    failure: SchemaRegistryFailure::Unauthorized,
+                    detail: "HTTP 401".into(),
+                },
+                ConsumerFatal,
+            ),
+            (
+                Error::SchemaRegistry {
+                    url: "https://sr.internal:8081".into(),
+                    failure: SchemaRegistryFailure::Refused,
+                    detail: "HTTP 400".into(),
+                },
+                BlockingPipeline,
+            ),
+            (
+                Error::KafkaSchemaReferences {
+                    url: "https://sr.internal:8081".into(),
+                    id: 7,
+                    subjects: vec!["address-value".into()],
                 },
                 BlockingPipeline,
             ),
