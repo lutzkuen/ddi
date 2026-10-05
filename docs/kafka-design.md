@@ -318,8 +318,8 @@ There is no `ddi.sourceVersion` on Kafka commits: it is written but never read (
 | src/kafka/partitions.rs | kafka | Per-partition state, gate, duplicate/gap accounting, re-read verification, buffer, close policy, ranges | 350 |
 | src/kafka/rebalance.rs | kafka | `assign_with_delta_offsets`, `flush_then_unassign`, blocked recheck | 250 |
 | src/kafka/start.rs | kafka | Start resolution, baseline, typo guard, kdi-era checks | 260 |
-| src/kafka/registry.rs | kafka | SR client, process-wide cache, latest subject version | 230 |
-| src/kafka/decode.rs | kafka | Framing, per-id decoders, strict check, chunk isolation, normalisation, metadata builders, measured sizes | 480 |
+| src/kafka/registry.rs | kafka | SR client, process-wide cache, latest subject version | 230 (as built: 700, + 580 of tests) |
+| src/kafka/decode.rs | kafka | Framing, per-id decoders, strict check, chunk isolation, normalisation, metadata builders, measured sizes | 480 (as built: 1190, + 1900 of tests) |
 | src/kafka/conform.rs | kafka | `U`, `align_to_union`, by-name nested conform, kdi rendering by type, null text by presence, float→decimal, unmatched-column guard | 800 |
 | src/kafka/step.rs | kafka | `impl Pipeline { open_kafka, step_kafka, commit_batch, reset_in_place, kafka_progress }`, error classification, pending batch | 380 |
 | src/kafka/tools.rs | kafka | `ddi kafka plan`, `clone-table`, `set-offsets`, `status` (group-less client) | 450 |
@@ -537,8 +537,10 @@ rdkafka    = { version = "0.39", default-features = false, features = ["tokio", 
 arrow-avro = { version = "=58.4.0", default-features = false, optional = true }
 
 [dev-dependencies]
-apache-avro = "=<version in the production kdi binary>"   # parity tests only; set in M-1 (0.21.0 if the fork is what runs)
+apache-avro = { version = "=0.21.0", default-features = false }   # parity tests only (M2a: see below)
 ```
+
+- **apache-avro `=0.21.0`** is an assumption M-1 must confirm: it is the version schema_registry_converter 4.10.0 locks in kdi's Cargo.lock, and the converter is what decodes Schema Registry Avro in kdi (kdi's own `apache-avro = "0.22"` serves its single-object and container paths, serialization.rs:11, 285-288). Changing it is one line in Cargo.toml. No default features: they are container-file codecs, and `xz` would bring back the `links = "lzma"` collision. The lockfile gains apache-avro and six small crates (bon, bon-macros, prettyplease, quad-rand, regex-lite, serde_bytes), and bigdecimal and num-bigint gain their `serde` edge; no locked version moves, and `cargo tree -e normal` is unchanged, since a dev-dependency never reaches the binary.
 
 - **`ssl`** runs mklove with `--enable-ssl` against system OpenSSL 3. SASL PLAIN and SCRAM-SHA-256/512 come with it; no libsasl2 is needed. This is settled by the probe build (§0.3.21); M1 keeps it as a regression check: `builtin.features ⊇ ssl,sasl_scram,zstd`.
 - **`sasl` is not enabled.** It maps to `gssapi`, i.e. Kerberos only (rdkafka-sys Cargo.toml:48-61).
@@ -1107,6 +1109,15 @@ It exits non-zero on blocking findings.
 
 **Not `schema_registry_converter`:** it defaults to native-tls, pulls reqwest 0.13 and apache-avro, and brings a JSON-schema validator.
 
+**As built (M2a).** `SchemaRegistry::lookup` and `SubjectSchemas`; every answer is classified by status and body, never by text:
+- **Outages:** the first try and three retries, after 100 ms, 500 ms and 2 s (four requests), then `SchemaRegistry { failure: Unavailable }`, Transient. 408 counts as an outage beside 5xx and 429; so do a timeout, a refused connection and a body cut off.
+- **404** is "not found" only with the registry's own error body (`error_code`: 40403 for an id, 40401 for a subject). A 404 without one is a reverse proxy's or another server's page: `SchemaRegistry { failure: Refused }`, Blocking (pipeline), because taken for "not found" a wrong URL would send every message to the DQ table. Any other status, a 2xx that is not the API's JSON, and one without `schema` are `Refused` too. 401/403 is `Unauthorized`, consumer-fatal.
+- **Not found** is remembered for 10 s per `(url, id)`, so a topic full of one unknown id costs one request per 10 s, not one per message; its messages are undecodable (not deterministic) either way.
+- **Cache:** `SchemaCache::global()`, keyed by the trimmed URL and the id. One request per id, also for callers that ask at once (they wait on one `tokio::sync::OnceCell`); a failed fetch keeps nothing.
+- **References** are `KafkaSchemaReferences { url, id, subjects }`, Blocking (pipeline), for every message of that id. **`schemaType`** other than AVRO is undecodable, deterministic.
+- **Latest version:** `SubjectSchemas::open` asks once, `observe` asks again for an id not in `U` yet, never for one it holds; the subject is one escaped path segment. A latest version that is not Avro or has references is left out of `U` with a warning; its own messages say why when they come.
+- **Network:** a proxy URL reqwest cannot use, a CA that is not PEM, and an explicitly named variable that is unset are `Config` errors at open, and none prints the proxy URL. Without `proxy_env` set, reqwest's own `HTTP(S)_PROXY` handling stays, as in kdi.
+
 ### 5.3 arrow-avro versus apache-avro
 
 | | arrow-avro 58.4.0 | apache-avro (+ serde_json + arrow-json) |
@@ -1118,6 +1129,19 @@ It exits non-zero on blocking findings.
 | kdi parity | Needs the conform layer (§5.6) | Exact by construction |
 
 **Decision:** arrow-avro in production, behind a small `trait Decode` so apache-avro could be swapped in if M2's matrix finds a blocking bug. apache-avro, pinned to the **production** kdi version, is a dev-dependency for the parity tests only. Pin arrow-avro `=58.4.0` and bump it with deltalake; a mismatch is a compile error.
+
+**Go/no-go (M2a): go.** The evidence, all in src/kafka/decode/tests.rs, with fixtures written by apache-avro 0.21.0 and by arrow-avro's own writer:
+- `logical_type_matrix`: every type and logical type a Confluent producer writes decodes to the Arrow type of §5.6's table, and to the values apache-avro 0.21.0 reads from the same bytes (timestamps, dates, uuids, enums, decimals as minimal `bytes` and as sign-extended `fixed`, NaN and infinities, both spellings of a nullable union, a general union).
+- `writer_schema_switch_mid_batch`: messages from arrow-avro's writer (`AvroSoeFormat`, `FingerprintStrategy::Id`, reader/mod.rs:615-639) decode, two writer versions interleaved. `java_and_connect_schemas_decode`: the attributes Java and Kafka Connect add (`avro.java.string`, `connect.*`, docs, defaults, aliases, a named type used again).
+- The two defects that shape §5.4 are confirmed and contained. `arrow_avro_swallows_a_truncated_body`: `decode` returns `Ok(5)` for a truncated body and then takes the next message's bytes for its rest (§0.3 fact 2). `arrow_avro_keeps_part_of_a_failed_row`: a row that fails half-way leaves the fields it decoded in the builders, so a decoder that failed is replaced, never reused.
+- Hostile inputs: `get_bytes` checks a length against the bytes that are there before taking them (reader/cursor.rs:83-95), and `process_blockwise` reads an item per count until the bytes run out (reader/record.rs:2268-2310). So hostile lengths and counts are undecodable messages with no large allocation (`huge_length_prefix_errors_without_allocation`, with a per-thread allocation probe). A block count of `i64::MIN` overflows the negation at record.rs:2283 and panics in a debug build; `decode_one` catches the panic as that message's failure. ddi has no panic hook and does not build with `panic = "abort"`.
+- Limits found, none blocking:
+  1. A `fixed(16)` with logicalType uuid is read as its 16 bytes: arrow-avro knows that logical type on `string` only (codec.rs:1677-1682). ddi tells it by the `avro.name` arrow-avro keeps on the field and renders it as text (`fixed_uuid_is_text_as_well`). apache-avro 0.21.0 cannot read such a field at all (decode.rs:123-136 reads a length first), so kdi never ingested one.
+  2. A record that encodes to zero bytes (no field, or only `null` ones) cannot be decoded from a message alone: `decode` loops only while bytes remain (reader/mod.rs:708), so a header alone leaves it waiting. Such a writer schema is undecodable, deterministic, with that reason (`a_record_of_zero_bytes_is_undecodable_with_its_reason`); kdi would have written its nulls.
+  3. An array whose items take no bytes (`null`, `fixed(0)`, records of those) lets a hostile count keep the decoder looping without reading; such a writer schema is undecodable (`an_array_of_zero_width_items_is_refused`).
+  4. A recursive record is refused when the decoder is built (its name is registered only after its fields, codec.rs:1499-1522), so its messages are undecodable with the reason (`a_recursive_schema_is_undecodable`). Arrow has no recursive type; kdi wrote nested JSON.
+  5. A body cut inside a varint is a parse error ("bad varint"), not incomplete data: it fails loudly, and the strict check needs to catch only the cuts inside strings, bytes and fixed.
+- The fallback seam is real: `trait Decode` and `DecodeFactory`, with `ArrowAvro` the production factory; `a_chunk_that_cannot_be_flushed_is_isolated` drives a second implementation through it.
 
 ### 5.4 Decoder lifecycle (src/kafka/decode.rs)
 
@@ -1159,7 +1183,16 @@ flush(G): rb = dec.flush()?; normalize(rb); append metadata columns from meta; b
 - enum `Dictionary(Int32, Utf8)` → `Utf8`;
 - uuid `FixedSizeBinary(16)` with `logicalType = uuid` (codec.rs:1676-1682) → lowercase hyphenated `Utf8`, as apache-avro produces (types.rs:353).
 
-**Hostile inputs** (huge length prefixes, fuzzed lengths) must produce an error, not a large allocation **(verify M2 with a fuzz-style test)**.
+**Hostile inputs** (huge length prefixes, fuzzed lengths) must produce an error, not a large allocation. **Verified in M2a** (§5.3, `huge_length_prefix_errors_without_allocation`).
+
+**As built (M2a),** where it differs from the sketch above:
+- **Isolation re-decodes the chunk together.** The messages before the bad one are decoded again into one fresh decoder and flushed at once, so isolation decodes each good message again at most once however many bad ones follow it, and it comes out in one batch rather than one per row. Only a flush that fails as a whole, returns the wrong row count or cannot be normalised falls back to one decoder per message (`a_chunk_that_cannot_be_flushed_is_isolated`).
+- **Metadata columns are built at flush from the chunk** of messages kept beside the decoder, not in parallel builders, so a row's metadata can only be its own message's.
+- **The strict check** is `decode` consumed every byte and `capacity()` fell by exactly one. Its reasons: a truncated body, a header with no body, bytes after the record, a second record, a malformed body, a panic inside arrow-avro.
+- **What a message cannot be blamed for** (a registry outage, references, a metadata collision) hands the message back untouched (`NotFed`); fed again, it decodes as if new (`a_registry_outage_hands_the_message_back`).
+- **Tombstones** are counted by the decoder, so M3's loop hands every message to `feed`. `discard()` drops a batch for a revoke that does not commit it, keeping the writer schemas.
+- **Undecodable rows** for DQ carry `<prefix>topic, partition, offset, timestamp, key_b64, value_b64, value_schema_id` and the reason `avro: …` (§5.7). `Undecodable.deterministic` is kept for the operator (false where decoding again could succeed: an unknown id, a message that failed only when decoded again, an internal fault), though §5.7 no longer uses it.
+- **`decoded_bytes()`** is the flushed batches' `get_slice_memory_size`, plus the rows still inside decoders at the batch's flushed ratio, 4× before anything flushed (`decoded_bytes_measured_by_slice_not_capacity`: three rows use under a tenth of the 1024-row builders).
 
 ### 5.5 Schema evolution: making the input usable
 
@@ -1474,7 +1507,7 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
 **CI** (.github/workflows/ci.yml):
 - **`check`** (15-28): unchanged. This is the feature-off proof of I13 and I16.
 - **New `check-kafka`:** `cargo clippy --all-targets --features kafka -- -D warnings` and `cargo test --all-targets --features kafka`. The unit tests cover decode, SR, conform, fence and DQ; no broker is needed.
-  - Until M3 wires them up, the M2 modules carry `#![cfg_attr(not(test), allow(dead_code))]`, removed in M3 (PO-minor 10).
+  - Until M3 wires them up, the M2 modules carry `#![cfg_attr(not(test), allow(dead_code))]`, removed in M3 (PO-minor 10). **As built (M2a):** not needed; `registry` and `decode` are `pub` in the library, which the binary uses, so nothing is dead code.
 - **New `kafka-integration`,** in the style of the Azurite job (155-185):
 
   ```yaml
@@ -1543,6 +1576,7 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
 - `deleted_true_query_sent`, `absent_schema_type_is_avro`;
 - `404_40403_is_undecodable_nondeterministic`, `401_is_consumer_fatal`, `retry_on_5xx_then_transient`;
 - `cache_one_request_per_id`, `references_block`, `latest_version_fetched_on_unseen_id`.
+- As built (M2a): the two names that start with a digit are `sr_404_40403_is_undecodable_nondeterministic` and `sr_401_is_consumer_fatal`, since a Rust name cannot; added `latest_version_of_an_unknown_subject_is_none` and `a_private_ca_is_read_from_pem`.
 
 **M2, decode** (fixtures written with arrow-avro's own writer, `AvroSoeFormat` + `FingerprintStrategy::Id`, as in reader/mod.rs:615-639, plus messages from the M-1 production corpus):
 - `logical_type_matrix`;
@@ -1552,6 +1586,7 @@ RUN /usr/local/bin/ddi --version     # line 42: proves libssl.so.3 resolves and 
 - `uuid_and_enum_normalised`, `timestamps_are_utc`;
 - `decoded_bytes_measured_by_slice_not_capacity`;
 - `metadata_prefix_collision_blocks`.
+- As built (M2a), added: `framing_reads_the_confluent_header`, `tombstones_are_counted_and_nothing_else`, `chunks_flush_at_8192_rows`, `fixed_uuid_is_text_as_well`, `a_chunk_that_cannot_be_flushed_is_isolated`, `a_registry_outage_hands_the_message_back`, `discard_drops_rows_inside_decoders`, `java_and_connect_schemas_decode`, `a_recursive_schema_is_undecodable`, `an_array_of_zero_width_items_is_refused`, `a_record_of_zero_bytes_is_undecodable_with_its_reason`, and the go/no-go evidence `arrow_avro_swallows_a_truncated_body` and `arrow_avro_keeps_part_of_a_failed_row`. The fixtures are synthetic (apache-avro 0.21.0 and arrow-avro's writer); messages from the M-1 production corpus join them when it exists.
 
 **M2, conform:**
 - **Parity:**
@@ -1744,7 +1779,7 @@ Optional zero-pause variant: start ddi in kdi's group first (both eager, `range,
 
 **Not verified, flagged in the text:**
 - **M-1:** the converter version and `?deleted=true` in production; decimal byte lengths of real producers.
-- **M2:** hostile-length Avro inputs, nested NOT NULL fill, local-timestamp cast.
+- **M2:** nested NOT NULL fill, local-timestamp cast through conform (arrow's own cast reads a naive timestamp as UTC: `timestamps_are_utc`). Hostile-length Avro inputs: verified in M2a (§5.3).
 - **M3:** the snapshot file-count accessor; exposure of delta-rs's write metrics.
 - **M4:**
   - `* REPLACE`/`* EXCEPT` and quoted multi-level access through ddi's validator and planner;
@@ -1835,6 +1870,8 @@ Each milestone can be reviewed and merged on its own. Days are dev-days at ddi's
 | **M6** | **Pilot cutover.** Comparison SQL recipes; runbook executed on one low-traffic topic (shadow → compare → switch); rollback rehearsal | The §10.3 gates pass on the pilot and stay green for 3 days after the switch; `kdi_ddi_alternate` green | 1.5 + soak |
 
 **M1 as built.** Until M3, a build with the feature resolves a Kafka pipeline and `ddi validate` shows it (with a "not run by this build yet" line), while `run`, `once` and `status` hold it back by name (`config_valid = 0`) and `Pipeline::open` refuses one; M3 removes both. With every Kafka pipeline held back, the budget reserves nothing yet. User documentation stays in M5. The apache-avro dev-dependency waits for M-1's version.
+
+**M2a as built** (the registry and the decoder; M2b is `U`, conform and the parity matrices). src/kafka/registry.rs (§5.2) and src/kafka/decode.rs (§5.1, §5.4, §6.1), pure: messages come in as `KafkaMessage { partition, offset, timestamp, key, value, headers }`, and nothing touches a consumer or a Delta table. New error variants: `SchemaRegistry { url, failure, detail }` with `SchemaRegistryFailure::{Unavailable, Unauthorized, Refused}` (Transient, consumer-fatal, Blocking), `KafkaSchemaReferences` and `KafkaMetadataCollision` (both Blocking, pipeline), pinned in `every_error_has_its_kafka_class`. arrow-avro is a go (§5.3). apache-avro is pinned `=0.21.0` as the assumption of §3.1 until M-1 reads production's version. Deviations, each recorded where it applies: §5.2's 404 rule, 408 and retry count; §5.4's isolation by chunk and the zero-width refusals; §9.1's `sr_` test names.
 
 **Total: about 38 dev-days** (range 33-43), plus soak and roughly 0.25 day per further table. This is above the critique's 30-35 because their findings added scope: deferred revoke flush, stay-in-group error handling, the txn walker in M0, and null-text presence.
 
