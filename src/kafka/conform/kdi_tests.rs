@@ -1470,6 +1470,76 @@ async fn null_text_presence_by_schema_id() {
     assert!(!c.null_text_approximate() && !c_sql.null_text_approximate());
 }
 
+/// On the SQL path an older row is aligned to `U`'s newer types: an int to a double, bytes to a
+/// string, milliseconds to microseconds. kdi decoded each message with its own writer schema, so
+/// its text is the older type's: "5", not "5.0"; `[104,105]`, not "hi"; the milliseconds. Since a
+/// value goes into `U` only where it comes back unchanged, it is written as its own writer
+/// schema's type, at the top level and inside a record, as kdi wrote it.
+#[tokio::test]
+async fn older_rows_keep_their_writer_types_text() {
+    const W1: &str = r#"{"type":"record","name":"R","fields":[
+        {"name":"id","type":"int"},{"name":"amt","type":"int"},{"name":"big","type":"long"},
+        {"name":"b","type":"bytes"},{"name":"t","type":{"type":"long","logicalType":"timestamp-millis"}},
+        {"name":"f","type":"float"},
+        {"name":"r","type":{"type":"record","name":"In","fields":[{"name":"n","type":"int"}]}}]}"#;
+    const W2: &str = r#"{"type":"record","name":"R","fields":[
+        {"name":"id","type":"int"},{"name":"amt","type":"double"},{"name":"big","type":"double"},
+        {"name":"b","type":"string"},{"name":"t","type":{"type":"long","logicalType":"timestamp-micros"}},
+        {"name":"f","type":"double"},
+        {"name":"r","type":{"type":"record","name":"In","fields":[{"name":"n","type":"double"}]}}]}"#;
+    let b0 = body(
+        W1,
+        record(vec![
+            ("id", Avro::Int(0)),
+            ("amt", Avro::Int(5)),
+            ("big", Avro::Long(1 << 53)),
+            ("b", Avro::Bytes(b"hi".to_vec())),
+            ("t", Avro::TimestampMillis(1_636_668_718_123)),
+            ("f", Avro::Float(0.1)),
+            ("r", record(vec![("n", Avro::Int(7))])),
+        ]),
+    );
+    let b1 = body(
+        W2,
+        record(vec![
+            ("id", Avro::Int(1)),
+            ("amt", Avro::Double(5.0)),
+            ("big", Avro::Double(2.5)),
+            ("b", s("ho")),
+            ("t", Avro::TimestampMicros(1_636_668_718_123_456)),
+            ("f", Avro::Double(0.1)),
+            ("r", record(vec![("n", Avro::Double(7.0))])),
+        ]),
+    );
+    let members = [(1, W1), (2, W2)];
+    let columns = ["amt", "big", "b", "t", "f", "r"];
+    let mut fields = vec![field("id", Delta::INTEGER, true)];
+    fields.extend(columns.iter().map(|c| field(c, Delta::STRING, true)));
+    let delta = StructType::try_new(fields).unwrap();
+    let (_, good, rejects) = through_sql(
+        "SELECT * FROM source",
+        &members,
+        decode(&members, vec![(1, b0.clone()), (2, b1.clone())]).await,
+        arrow_of(&delta),
+        TEXT,
+    )
+    .await;
+    assert!(rejects.is_empty(), "{:?}", reasons(&rejects));
+    let kdi = kdi_wrote(
+        &[
+            (W1, b0.as_slice(), Some(timestamp_ms(0))),
+            (W2, b1.as_slice(), Some(timestamp_ms(1))),
+        ],
+        &delta,
+    );
+    for c in columns {
+        assert_eq!(shown(&good, c), shown(std::slice::from_ref(&kdi), c), "{c}");
+    }
+    assert_eq!(shown(&good, "amt"), ["5", "5.0"]);
+    assert_eq!(shown(&good, "b"), ["[104,105]", "ho"]);
+    assert_eq!(shown(&good, "r"), [r#"{"n":7}"#, r#"{"n":7.0}"#]);
+}
+
 /// SQL that drops `kafka_value_schema_id` leaves no row saying its writer schema: where kdi had
 /// a key is then read off every writer schema seen (`U`'s fields), with a warning once and the
 /// gauge's flag set. The rows that differ from kdi are exactly the v1 rows' `b` and `r.y`,

@@ -249,8 +249,9 @@ impl Fitter<'_> {
 
     /// A value going into a STRING where kafka-delta-ingest's text is written (§5.6 steps 5 and
     /// 6). Text stays as it is. Under `kdi_compat` anything else is its kdi text, by its Arrow
-    /// type ([`kdi_text::text`]), and a value that has none (NaN, the infinities) rejects its
-    /// row; without it, Arrow's cast as anywhere else. Under `kdi_null_text` a null becomes
+    /// type, or by the type its row's writer schema gave it where `U` converted it
+    /// ([`kdi_text::text`]), and a value that has none (NaN, the infinities) rejects its row;
+    /// without it, Arrow's cast as anywhere else. Under `kdi_null_text` a null becomes
     /// `"null"` where kdi's JSON had the key and its coercion reached.
     fn kdi_text(
         &self,
@@ -265,7 +266,11 @@ impl Fitter<'_> {
             |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
         let from = array.data_type();
         let is_text = textual(from) || matches!(from, DataType::Dictionary(_, v) if textual(v));
-        if is_text || !self.text.compat {
+        // Text is written as it is, unless a row's writer schema had bytes there, which `U`
+        // made text and kdi wrote as an array of numbers.
+        let converted =
+            self.text.compat && (0..n).any(|i| kdi_text::converted(from, kdi.at[i].shape));
+        if (is_text && !converted) || !self.text.compat {
             let fitted = if from == &DataType::Utf8 {
                 Fitted::clean(array.clone())
             } else if top && !(0..n).any(|i| null_word(i) && kdi_text::is_null(array.as_ref(), i)) {

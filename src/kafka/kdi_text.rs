@@ -35,11 +35,17 @@
 //! Decimals need the writer schema too: kdi wrote a decimal's bytes as they were on the wire
 //! (decimal.rs:87-104 sign-extends the value back to the length it was read with), and the
 //! `fixed` a decimal is written on has a size its Arrow type does not keep.
+//!
+//! So does every value `U` converted: kdi wrote an older row's int as `5` where `U` holds the
+//! double `5.0`, its bytes as an array where `U` holds a string. A value goes into `U` only where
+//! it comes back unchanged (crate::kafka::conform), so it is written as the row's own writer
+//! schema typed it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
-use deltalake::arrow::array::{Array, AsArray, UnionArray};
+use deltalake::arrow::array::{Array, ArrayRef, AsArray, UnionArray};
+use deltalake::arrow::compute::CastOptions;
 use deltalake::arrow::datatypes::{
     i256, DataType, Date32Type, Date64Type, Decimal128Type, Decimal256Type, Decimal32Type,
     Decimal64Type, DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType,
@@ -50,7 +56,7 @@ use deltalake::arrow::datatypes::{
     TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 
-use crate::kafka::decode::{fixed_decimals, raw_schema};
+use crate::kafka::decode::{decoded_schema, fixed_decimals, raw_schema};
 use crate::kafka::registry::RegisteredSchema;
 
 // ======================================================================== the writer's shape
@@ -68,8 +74,12 @@ pub(crate) enum Shape {
     Map(Box<Shape>),
     /// A general union, its branches by the name arrow-avro gives them (codec.rs:1201-1213).
     Union(BTreeMap<String, Shape>),
-    /// Any other value. `fixed` is the size of the `fixed` a decimal is written on.
-    Leaf { fixed: Option<usize> },
+    /// Any other value: its Arrow type as decoded from this writer schema, and the size of the
+    /// `fixed` a decimal is written on.
+    Leaf {
+        arrow: DataType,
+        fixed: Option<usize>,
+    },
 }
 
 impl Shape {
@@ -77,43 +87,67 @@ impl Shape {
     /// the decoder would refuse the writer schema; such a writer schema has no rows.
     pub(crate) fn of(schema: &RegisteredSchema) -> Result<Self, String> {
         let raw = raw_schema(schema)?;
+        let decoded = decoded_schema(schema)?;
         let fixed = fixed_decimals(&schema.schema);
         Ok(Shape::Record(
             raw.fields()
                 .iter()
-                .map(|f| (f.name().clone(), Shape::field(f, &fixed)))
+                .zip(decoded.fields())
+                .map(|(f, d)| (f.name().clone(), Shape::field(f, d.data_type(), &fixed)))
                 .collect(),
         ))
     }
 
-    fn field(field: &Field, fixed: &HashMap<(String, Option<String>), usize>) -> Self {
+    /// The shape of `field`, of the decoder's own schema, whose rows are of type `decoded` once
+    /// normalised (the same fields, in the same order, at every depth).
+    fn field(
+        field: &Field,
+        decoded: &DataType,
+        fixed: &HashMap<(String, Option<String>), usize>,
+    ) -> Self {
         use arrow_avro::schema::{AVRO_NAMESPACE_METADATA_KEY, AVRO_NAME_METADATA_KEY};
-        match field.data_type() {
-            DataType::Struct(fields) => Shape::Record(
+        let leaf = |fixed: Option<usize>| Shape::Leaf {
+            arrow: decoded.clone(),
+            fixed,
+        };
+        match (field.data_type(), decoded) {
+            (DataType::Struct(fields), DataType::Struct(normalised)) => Shape::Record(
                 fields
                     .iter()
-                    .map(|f| (f.name().clone(), Shape::field(f, fixed)))
+                    .zip(normalised)
+                    .map(|(f, d)| (f.name().clone(), Shape::field(f, d.data_type(), fixed)))
                     .collect(),
             ),
-            DataType::List(item) | DataType::LargeList(item) => {
-                Shape::List(Box::new(Shape::field(item, fixed)))
-            }
-            DataType::Map(entries, _) => match entries.data_type() {
-                DataType::Struct(kv) if kv.len() == 2 => {
-                    Shape::Map(Box::new(Shape::field(&kv[1], fixed)))
+            (
+                DataType::List(item) | DataType::LargeList(item),
+                DataType::List(normalised) | DataType::LargeList(normalised),
+            ) => Shape::List(Box::new(Shape::field(item, normalised.data_type(), fixed))),
+            (DataType::Map(entries, _), DataType::Map(normalised, _)) => {
+                match (entries.data_type(), normalised.data_type()) {
+                    (DataType::Struct(kv), DataType::Struct(nkv))
+                        if kv.len() == 2 && nkv.len() == 2 =>
+                    {
+                        Shape::Map(Box::new(Shape::field(&kv[1], nkv[1].data_type(), fixed)))
+                    }
+                    _ => leaf(None),
                 }
-                _ => Shape::Leaf { fixed: None },
-            },
-            DataType::Union(fields, _) => Shape::Union(
+            }
+            (DataType::Union(fields, _), DataType::Union(normalised, _)) => Shape::Union(
                 fields
                     .iter()
-                    .map(|(_, f)| (f.name().clone(), Shape::field(f, fixed)))
+                    .zip(normalised.iter())
+                    .map(|((_, f), (_, d))| {
+                        (f.name().clone(), Shape::field(f, d.data_type(), fixed))
+                    })
                     .collect(),
             ),
-            DataType::Decimal32(..)
-            | DataType::Decimal64(..)
-            | DataType::Decimal128(..)
-            | DataType::Decimal256(..) => {
+            (
+                DataType::Decimal32(..)
+                | DataType::Decimal64(..)
+                | DataType::Decimal128(..)
+                | DataType::Decimal256(..),
+                _,
+            ) => {
                 let metadata = field.metadata();
                 let size = metadata.get(AVRO_NAME_METADATA_KEY).and_then(|name| {
                     fixed
@@ -123,9 +157,9 @@ impl Shape {
                         ))
                         .copied()
                 });
-                Shape::Leaf { fixed: size }
+                leaf(size)
             }
-            _ => Shape::Leaf { fixed: None },
+            _ => leaf(None),
         }
     }
 
@@ -162,7 +196,7 @@ impl Shape {
 
     fn fixed(&self) -> Option<usize> {
         match self {
-            Shape::Leaf { fixed } => *fixed,
+            Shape::Leaf { fixed, .. } => *fixed,
             _ => None,
         }
     }
@@ -294,6 +328,9 @@ pub(crate) fn has_map(t: &DataType) -> bool {
 /// it is, anything else its JSON text. `shape` is the writer schema's type of it, if any. An
 /// error says why the value has none; its row is set aside.
 pub(crate) fn text(array: &dyn Array, i: usize, shape: Option<&Shape>) -> Result<String, String> {
+    if let Some(written) = as_written(array, i, shape) {
+        return text(written.as_ref(), 0, shape);
+    }
     match array.data_type() {
         DataType::Utf8 => Ok(array.as_string::<i32>().value(i).to_string()),
         DataType::LargeUtf8 => Ok(array.as_string::<i64>().value(i).to_string()),
@@ -337,6 +374,9 @@ fn json(
     shape: Option<&Shape>,
     out: &mut String,
 ) -> Result<(), String> {
+    if let Some(written) = as_written(array, i, shape) {
+        return json(written.as_ref(), 0, shape, out);
+    }
     macro_rules! int {
         ($t:ty) => {{
             let _ = write!(out, "{}", array.as_primitive::<$t>().value(i));
@@ -512,6 +552,43 @@ fn json(
     Ok(())
 }
 
+/// Whether a value of type `t` standing where `shape` is was converted from the type its row's
+/// writer schema gave it: on the SQL path, an older row aligned to a newer writer schema's type
+/// in `U` (§5.5).
+pub(crate) fn converted(t: &DataType, shape: Option<&Shape>) -> bool {
+    match shape {
+        Some(Shape::Leaf { arrow, .. }) => arrow != t && plain(arrow) && plain(t),
+        _ => false,
+    }
+}
+
+/// A type that holds one value, not values of other types.
+fn plain(t: &DataType) -> bool {
+    !t.is_nested() && !matches!(t, DataType::Dictionary(..) | DataType::Null)
+}
+
+/// Value `i` of `array` in the type its row's writer schema gave it, as a one-value array, where
+/// it was converted from that type ([`converted`]) and is exactly a value of it: kdi wrote the
+/// value its own writer schema decoded. `None` otherwise, a value the SQL computed under a
+/// writer field's name among them, which is written by its own type.
+fn as_written(array: &dyn Array, i: usize, shape: Option<&Shape>) -> Option<ArrayRef> {
+    let t = array.data_type();
+    if !converted(t, shape) {
+        return None;
+    }
+    let Some(Shape::Leaf { arrow: writer, .. }) = shape else {
+        return None;
+    };
+    let options = CastOptions {
+        safe: true,
+        ..Default::default()
+    };
+    let one = array.slice(i, 1);
+    let written = crate::transform::decimal::cast_with_options(&one, writer, &options).ok()?;
+    let back = crate::transform::decimal::cast_with_options(&written, t, &options).ok()?;
+    (written.is_valid(0) && back.to_data() == one.to_data()).then_some(written)
+}
+
 /// A double as serde_json writes it (ser.rs:169-180, 1716-1723), which is what kdi's
 /// `value.to_string()` gave. NaN and the infinities are no JSON number: apache-avro refused to
 /// convert them (types.rs:307-312), and kdi dropped the message.
@@ -654,7 +731,10 @@ mod tests {
         assert_eq!(minimal(-129), [0xFF, 0x7F]);
         assert_eq!(minimal(1234), [0x04, 0xD2]);
         assert_eq!(minimal(i128::MIN), i128::MIN.to_be_bytes());
-        let fixed = Shape::Leaf { fixed: Some(4) };
+        let fixed = Shape::Leaf {
+            arrow: DataType::Decimal128(10, 2),
+            fixed: Some(4),
+        };
         let extended = |v: i128| decimal_bytes(&v.to_be_bytes(), Some(&fixed));
         assert_eq!(extended(1234), [0, 0, 0x04, 0xD2]);
         assert_eq!(extended(-1234), [0xFF, 0xFF, 0xFB, 0x2E]);
