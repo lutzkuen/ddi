@@ -480,6 +480,58 @@ pub enum Error {
         prefix: String,
     },
 
+    /// A partition column of a Kafka pipeline's target is not among the columns it produces
+    /// (docs/kafka-design.md §5.6 step 0).
+    ///
+    /// Every row would land in the null partition, `__HIVE_DEFAULT_PARTITION__`, which the
+    /// table's readers would not look in. Checked when the pipeline opens, against
+    /// `transform_sql` planned over the union of its writer schemas, or against those schemas
+    /// and the metadata columns when it has no SQL; and on its first batch instead when no
+    /// writer schema was known at open. Names are matched exactly, case included.
+    #[error(
+        "target {target_uri} is partitioned by {columns:?}, and {} {}. Every row would land in \
+         the null partition. {}Nothing was read or written.",
+        if *sql { "transform_sql produces no such column" } else {
+            "neither the writer schemas nor the Kafka metadata columns have one (and there is no \
+             transform_sql to compute it)"
+        },
+        if produced.is_empty() { String::new() } else {
+            format!("(it produces: {})", produced.join(", "))
+        },
+        if *sql { "Produce each partition column in the SQL, under exactly its name. " } else {
+            "Add a transform_sql that produces each partition column under exactly its name. "
+        }
+    )]
+    KafkaPartitionColumnUnmapped {
+        target_uri: String,
+        /// The partition columns that are not produced.
+        columns: Vec<String>,
+        /// What is produced instead, for the message.
+        produced: Vec<String>,
+        /// Whether the columns come from `transform_sql`, or from the writer schemas as they
+        /// are.
+        sql: bool,
+    },
+
+    /// A field's type changed between writer schemas, and `transform_sql` no longer plans over
+    /// the union of them (docs/kafka-design.md §5.5).
+    ///
+    /// The union takes each field's type from the newest writer schema that has it, so a new
+    /// version that changes a type changes what the SQL reads. Retrying cannot help: the SQL
+    /// has to be adjusted to the new type, and the pipeline restarted.
+    #[error(
+        "transform_sql no longer plans over the writer schemas, whose types changed: {}. ({detail}) \
+         The newest writer schema's type is the one the SQL reads; adjust the SQL to it and \
+         restart. Nothing was written.",
+        fields.join("; ")
+    )]
+    KafkaSchemaConflict {
+        /// Each changed field, with its type in both writer schemas and their ids.
+        fields: Vec<String>,
+        /// Why planning failed.
+        detail: String,
+    },
+
     #[error("transform error: {0}")]
     Transform(String),
 
@@ -635,6 +687,13 @@ impl Error {
             // Every message of the writer schema needs the same thing: the pipeline holds
             // rather than quarantining them one by one.
             Error::KafkaSchemaReferences { .. } | Error::KafkaMetadataCollision { .. } => {
+                KafkaClass::BlockingPipeline
+            }
+            // The SQL, or what the target needs of it, until someone changes one or the other.
+            // Raised at open (where every refusal is OpenRefusal), or by a batch: the first one
+            // when no writer schema was known at open, or one whose writer schema changed a
+            // type the SQL reads.
+            Error::KafkaPartitionColumnUnmapped { .. } | Error::KafkaSchemaConflict { .. } => {
                 KafkaClass::BlockingPipeline
             }
             // An internal invariant, and the errors of a Delta source, which a Kafka pipeline
@@ -1010,6 +1069,25 @@ mod tests {
                     schema_id: 7,
                     field: "kafka_offset".into(),
                     prefix: "kafka_".into(),
+                },
+                BlockingPipeline,
+            ),
+            // The conform step (§5.5, §5.6): partition columns nothing produces, raised at open
+            // or by the first batch when no writer schema was known then; and SQL that no
+            // longer plans after a writer schema changed a type it reads.
+            (
+                Error::KafkaPartitionColumnUnmapped {
+                    target_uri: "/lake/orders".into(),
+                    columns: vec!["ingest_date".into()],
+                    produced: vec!["id".into()],
+                    sql: true,
+                },
+                BlockingPipeline,
+            ),
+            (
+                Error::KafkaSchemaConflict {
+                    fields: vec!["amount (writer schema 2: Struct, writer schema 1: Int64)".into()],
+                    detail: "cannot add Struct and Int64".into(),
                 },
                 BlockingPipeline,
             ),

@@ -915,6 +915,30 @@ fn rejected_rows(
     }))
 }
 
+// ------------------------------------------------------------------- the decoded schema
+
+/// The Arrow schema of the rows decoded from `schema`'s messages, before the metadata columns:
+/// the decoder's own schema, normalised as every flushed batch is. The union `U` of the SQL
+/// path is built from these (docs/kafka-design.md §5.5).
+///
+/// Fails, with the reason, where the decoder would refuse the writer schema: not a record at
+/// the top level, or nothing arrow-avro can build a decoder for.
+pub fn decoded_schema(schema: &RegisteredSchema) -> std::result::Result<SchemaRef, String> {
+    top_level_record(&schema.schema).map_err(|kind| {
+        format!(
+            "writer schema {} is not a record at the top level but {kind}",
+            schema.id
+        )
+    })?;
+    let raw = ArrowAvro.build(schema.id, &schema.schema)?.schema();
+    // The normalisation of a batch with no rows is the normalisation of its schema: the one
+    // code path for both, so the two cannot drift apart.
+    let empty = RecordBatch::new_empty(raw);
+    normalise(empty, &fixed_uuids(&schema.schema))
+        .map(|b| b.schema())
+        .map_err(|e| e.to_string())
+}
+
 // ------------------------------------------------------------------------- normalisation
 
 /// The decoder's batch in the form the target reads (§5.4), recursively through structs,

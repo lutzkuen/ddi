@@ -190,6 +190,23 @@ impl SqlTransform {
             .map_err(Failure::into_error)
     }
 
+    /// The schema the SQL's output has over a source of `schema`, planned exactly as a run
+    /// plans it, without a row to run on.
+    ///
+    /// A Kafka pipeline asks this at open, of the union of its writer schemas: whether the SQL
+    /// plans at all over a field whose type changed, and whether its output has the target's
+    /// partition columns (docs/kafka-design.md §5.5, §5.6). A failure is a planning failure,
+    /// never one a row could be blamed for.
+    pub async fn output_schema(&self, schema: SchemaRef) -> Result<SchemaRef> {
+        let ctx = self
+            .session(schema, Vec::new(), &[])
+            .map_err(Failure::into_error)?;
+        let planning = |e| crate::spill::classify(e, "transform_sql failed to plan");
+        let df = ctx.sql(&self.sql).await.map_err(planning)?;
+        let plan = df.create_physical_plan().await.map_err(planning)?;
+        Ok(plan.schema())
+    }
+
     /// One run over `batches`, telling a value it cannot evaluate from any other failure.
     async fn execute(
         &self,
@@ -197,6 +214,39 @@ impl SqlTransform {
         batches: Vec<RecordBatch>,
         lookups: &[Lookup],
     ) -> std::result::Result<Vec<RecordBatch>, Failure> {
+        let ctx = self.session(schema, batches, lookups)?;
+
+        // `DataFrame::collect`, in its two halves. Constant folding happens in the first, so
+        // a literal that cannot be cast fails there — a fault of the query, which evaluating
+        // the batch in parts would only reproduce, and would otherwise be blamed on a row.
+        let planning =
+            |e| Failure::Other(crate::spill::classify(e, "transform_sql failed to plan"));
+        let df = ctx.sql(&self.sql).await.map_err(planning)?;
+        let task = Arc::new(df.task_ctx());
+        let plan = df.create_physical_plan().await.map_err(planning)?;
+        // Through `classify` rather than straight to `Transform`, because a transform that
+        // sorts or groups spills, and a full spill directory is a fact about the machine that
+        // wants the opposite handling from a fact about the data. See `crate::spill`.
+        let out = physical_plan::collect(plan, task).await.map_err(|e| {
+            if attributable(&e) {
+                Failure::Evaluation(e)
+            } else {
+                Failure::Other(crate::spill::classify(e, EXECUTE))
+            }
+        })?;
+        // The JSON marker is how expressions inside this query know text from JSON. Outside
+        // it the rows are text like any other, and nothing downstream should have to know.
+        Ok(crate::transform::json::strip_json_marker(out))
+    }
+
+    /// A fresh session with `batches` registered as `source` under `schema`, and the lookups
+    /// beside it: what every run, and every plan, of this SQL starts from.
+    fn session(
+        &self,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        lookups: &[Lookup],
+    ) -> std::result::Result<SessionContext, Failure> {
         let config = crate::budget::session_config()
             // Grain-preserving transforms need no repartitioning, and keeping it off makes
             // output row order track input order, which makes tests deterministic.
@@ -242,28 +292,7 @@ impl SqlTransform {
                     )))
                 })?;
         }
-
-        // `DataFrame::collect`, in its two halves. Constant folding happens in the first, so
-        // a literal that cannot be cast fails there — a fault of the query, which evaluating
-        // the batch in parts would only reproduce, and would otherwise be blamed on a row.
-        let planning =
-            |e| Failure::Other(crate::spill::classify(e, "transform_sql failed to plan"));
-        let df = ctx.sql(&self.sql).await.map_err(planning)?;
-        let task = Arc::new(df.task_ctx());
-        let plan = df.create_physical_plan().await.map_err(planning)?;
-        // Through `classify` rather than straight to `Transform`, because a transform that
-        // sorts or groups spills, and a full spill directory is a fact about the machine that
-        // wants the opposite handling from a fact about the data. See `crate::spill`.
-        let out = physical_plan::collect(plan, task).await.map_err(|e| {
-            if attributable(&e) {
-                Failure::Evaluation(e)
-            } else {
-                Failure::Other(crate::spill::classify(e, EXECUTE))
-            }
-        })?;
-        // The JSON marker is how expressions inside this query know text from JSON. Outside
-        // it the rows are text like any other, and nothing downstream should have to know.
-        Ok(crate::transform::json::strip_json_marker(out))
+        Ok(ctx)
     }
 }
 
