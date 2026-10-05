@@ -7,8 +7,8 @@
 //!   every batch is aligned to `U` first: the fields of the newest writer schema, then those
 //!   only older ones have, newest first, each with the type of the newest writer schema that
 //!   has it, and the Kafka metadata columns after them. An older row is cast to that type, and
-//!   one that does not convert goes to the data-quality table; a field its writer schema lacks
-//!   is null. Without SQL nothing is aligned: batches of different writer schemas go through
+//!   one that does not convert, or would not be the same value, goes to the data-quality table;
+//!   a field its writer schema lacks is null. Without SQL nothing is aligned: batches of different writer schemas go through
 //!   `Identity` as they are, and are conformed to the target one by one.
 //! - **Into the target, after the transform and before the coercer** ([`Conformer`], §5.6). A
 //!   column goes to the target column of exactly its name, case included, and so on at every
@@ -247,7 +247,8 @@ impl Fitter {
     }
 
     /// A plain value cast to `to`, leniently: a value the cast turns into a null is rejected.
-    /// One with no cast at all is rejected wherever it is not null.
+    /// One with no cast at all is rejected wherever it is not null. Into `U`, so is one the cast
+    /// changes ([`Self::unchanged`]).
     fn cast(&self, array: &ArrayRef, to: &DataType, path: &str) -> Result<Fitted> {
         let from = array.data_type();
         let options = CastOptions {
@@ -271,10 +272,52 @@ impl Fitter {
                 bad.set(array.len(), i, || self.not_converted(path, from, to));
             }
         }
+        self.unchanged(array, &out, path, &mut bad);
         Ok(Fitted {
             array: out,
             bad: bad.0,
         })
+    }
+
+    /// Into `U` (§5.5), rejects each value of `array` that `out`, its conversion, does not hold
+    /// unchanged: one that, cast back to its own type, is not what it was. An older writer
+    /// schema's value is never written as another: a fraction truncated (a double into a newer
+    /// long), digits or a unit's precision dropped (a decimal's scale, a timestamp's unit
+    /// narrowed), a double rounded to a float. Avro's promotions (int to long to float to
+    /// double, string to bytes and back) keep every value they can hold, and a value they
+    /// cannot (a long past 2^53 into a double) is rejected too. Into the target nothing is
+    /// checked: there a value goes where the table says, as kdi's arrow-json put it.
+    fn unchanged(&self, array: &ArrayRef, out: &ArrayRef, path: &str, bad: &mut Reasons) {
+        if !matches!(self.into, Dest::Union { .. }) {
+            return;
+        }
+        let from = array.data_type();
+        let options = CastOptions {
+            safe: true,
+            ..Default::default()
+        };
+        let back = crate::transform::decimal::cast_with_options(out, from, &options).ok();
+        let same = back
+            .as_ref()
+            .and_then(|b| deltalake::arrow::compute::kernels::cmp::not_distinct(array, b).ok());
+        let (before, after) = (array.logical_nulls(), out.logical_nulls());
+        let n = array.len();
+        for i in 0..n {
+            // A null stays null; a value that became one is rejected already.
+            if before.as_ref().is_some_and(|b| b.is_null(i))
+                || after.as_ref().is_some_and(|a| a.is_null(i))
+            {
+                continue;
+            }
+            let kept = match (&back, &same) {
+                (Some(_), Some(same)) => same.value(i),
+                (Some(back), None) => array.slice(i, 1).to_data() == back.slice(i, 1).to_data(),
+                (None, _) => false,
+            };
+            if !kept {
+                bad.set(n, i, || self.changed(path, from, out.data_type()));
+            }
+        }
     }
 
     /// A struct into a struct, child by child of the target, each found by its exact name. A
@@ -824,6 +867,7 @@ impl Fitter {
             }
             _ => unreachable!("matched as a decimal"),
         };
+        self.unchanged(array, &out, path, &mut bad);
         Ok(Fitted {
             array: out,
             bad: bad.0,
@@ -839,6 +883,19 @@ impl Fitter {
                 writer.map_or("?".to_string(), |w| w.to_string())
             ),
         }
+    }
+
+    /// Into `U` only: the value converts, but not to the same value.
+    fn changed(&self, path: &str, from: &DataType, to: &DataType) -> String {
+        let (writer, newest) = match self.into {
+            Dest::Union { writer, newest } => (writer, newest),
+            Dest::Target => (None, 0),
+        };
+        format!(
+            "writer schema {} field {path}: {from} does not convert to {to} without changing the \
+             value (its type in writer schema {newest}, the newest that has it)",
+            writer.map_or("?".to_string(), |w| w.to_string())
+        )
     }
 
     fn null_into_not_null(&self, path: &str) -> String {

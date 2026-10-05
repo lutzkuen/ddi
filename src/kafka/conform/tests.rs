@@ -1152,6 +1152,125 @@ async fn union_u_newest_type_wins_old_rows_cast_or_rejected() {
     );
 }
 
+/// A newer writer schema may narrow a type (a double to a long, as FORWARD compatibility
+/// allows; a double to a float; a decimal's scale or a timestamp's unit under NONE), and `U`
+/// takes the newest type. An older row's value that the narrower type holds exactly is kept;
+/// one it would change (a fraction truncated, digits or precision dropped, a double rounded to a
+/// float) is rejected with its writer schema named, never written as another value, as was a
+/// value it cannot hold at all.
+#[tokio::test]
+async fn union_u_never_changes_an_older_value() {
+    const W1: &str = r#"{"type":"record","name":"N","fields":[
+        {"name":"id","type":"long"},
+        {"name":"qty","type":"double"},
+        {"name":"rate","type":"double"},
+        {"name":"amt","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":3}},
+        {"name":"ts","type":{"type":"long","logicalType":"timestamp-micros"}},
+        {"name":"big","type":"long"}]}"#;
+    const W2: &str = r#"{"type":"record","name":"N","fields":[
+        {"name":"id","type":"long"},
+        {"name":"qty","type":"long"},
+        {"name":"rate","type":"float"},
+        {"name":"amt","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}},
+        {"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},
+        {"name":"big","type":"int"}]}"#;
+    // FORWARD: a reader of W1 reads W2's longs and floats as doubles.
+    let narrowing = |t1: &str, t2: &str| {
+        let s = |t: &str| {
+            apache_avro::Schema::parse_str(&format!(
+                r#"{{"type":"record","name":"N","fields":[{{"name":"v","type":"{t}"}}]}}"#
+            ))
+            .unwrap()
+        };
+        apache_avro::schema_compatibility::SchemaCompatibility::can_read(&s(t2), &s(t1))
+    };
+    assert!(narrowing("double", "long").is_ok());
+    assert!(narrowing("double", "float").is_ok());
+
+    // A positive unscaled value in the fewest bytes of two's complement, as Java writes it.
+    let decimal = |unscaled: i64| {
+        let bytes = unscaled.to_be_bytes();
+        let mut start = 0;
+        while start < 7 && bytes[start] == 0 && bytes[start + 1] & 0x80 == 0 {
+            start += 1;
+        }
+        Avro::Decimal(apache_avro::Decimal::from(bytes[start..].to_vec()))
+    };
+    // Exact in every narrower type: 2.0, 1.5, 1.230, a whole millisecond, 7.
+    let v1 = |id: i64, change: &str| {
+        let v = |field: &str, exact: Avro, changed: Avro| match field == change {
+            true => (field.to_string(), changed),
+            false => (field.to_string(), exact),
+        };
+        Avro::Record(vec![
+            ("id".into(), Avro::Long(id)),
+            v("qty", Avro::Double(2.0), Avro::Double(1.5)),
+            v("rate", Avro::Double(1.5), Avro::Double(0.1)),
+            v("amt", decimal(1230), decimal(1235)),
+            v(
+                "ts",
+                Avro::TimestampMicros(1_700_000_000_123_000),
+                Avro::TimestampMicros(1_700_000_000_123_456),
+            ),
+            v("big", Avro::Long(7), Avro::Long(1 << 40)),
+        ])
+    };
+    let batches = decoded(
+        &[(1, W1), (2, W2)],
+        vec![
+            (1, v1(0, "")),
+            (1, v1(1, "qty")),
+            (1, v1(2, "rate")),
+            (1, v1(3, "amt")),
+            (1, v1(4, "ts")),
+            (1, v1(5, "big")),
+            (
+                2,
+                record(vec![
+                    ("id", Avro::Long(6)),
+                    ("qty", Avro::Long(3)),
+                    ("rate", Avro::Float(0.25)),
+                    ("amt", decimal(250)),
+                    ("ts", Avro::TimestampMillis(1_700_000_000_456)),
+                    ("big", Avro::Int(9)),
+                ]),
+            ),
+        ],
+    )
+    .await;
+    let u = UnionSchema::build(&[registered(1, W1), registered(2, W2)], "kafka_");
+    assert_eq!(
+        u.schema().field_with_name("qty").unwrap().data_type(),
+        &DataType::Int64
+    );
+    let mut rejects = Vec::new();
+    let aligned = u.align_all(batches, &mut rejects).unwrap();
+    assert_eq!(rejected_offsets(&rejects), [1, 2, 3, 4, 5]);
+    let why = reasons(&rejects);
+    for (reason, field) in why.iter().zip(["qty", "rate", "amt", "ts"]) {
+        assert!(
+            reason.starts_with(&format!("writer schema 1 field {field}: "))
+                && reason.contains("without changing the value"),
+            "{why:#?}"
+        );
+    }
+    assert!(
+        why[4].contains("field big: Int64 does not convert to Int32"),
+        "{why:#?}"
+    );
+
+    let sql = SqlTransform::new("SELECT id, qty, rate, CAST(amt AS VARCHAR) AS amt FROM source");
+    let mut rows = json(&sql.run(u.schema(), aligned).await.unwrap());
+    rows.sort_by_key(|r| r["id"].as_i64());
+    assert_eq!(
+        rows,
+        vec![
+            serde_json::json!({"id": 0, "qty": 2, "rate": 1.5, "amt": "1.23"}),
+            serde_json::json!({"id": 6, "qty": 3, "rate": 0.25, "amt": "2.50"}),
+        ]
+    );
+}
+
 /// A newer version widens a plain field into a general union that has the old type as a branch:
 /// an older row's value becomes that branch, its null the union's null branch. The union then
 /// goes into the target like any union, branch by branch.
