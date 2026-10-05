@@ -1152,6 +1152,35 @@ async fn union_u_newest_type_wins_old_rows_cast_or_rejected() {
     );
 }
 
+/// A batch whose writer schema is not a member of `U` was aligned before it joined: an ordering
+/// slip, refused as an internal error, whether the writer schema added a field or only changed a
+/// type. The latter was cast to `U`'s stale type, 1.5 aligned to 1.
+#[tokio::test]
+async fn aligning_a_writer_schema_not_in_u_is_an_internal_error() {
+    const L: &str = r#"{"type":"record","name":"O","fields":[
+        {"name":"id","type":"long"},{"name":"qty","type":"long"}]}"#;
+    const D: &str = r#"{"type":"record","name":"O","fields":[
+        {"name":"id","type":"long"},{"name":"qty","type":"double"}]}"#;
+    let batches = decoded(
+        &[(2, D)],
+        vec![(
+            2,
+            record(vec![("id", Avro::Long(0)), ("qty", Avro::Double(1.5))]),
+        )],
+    )
+    .await;
+    let stale = UnionSchema::build(&[registered(1, L)], "kafka_");
+    let err = stale.align(&batches[0]).unwrap_err().to_string();
+    assert!(
+        err.starts_with("internal: ") && err.contains("writer schema 2"),
+        "{err}"
+    );
+    let grown = UnionSchema::build(&[registered(1, L), registered(2, D)], "kafka_");
+    let (aligned, rejected) = grown.align(&batches[0]).unwrap();
+    assert!(rejected.is_none());
+    assert_eq!(json(&[aligned])[0]["qty"], 1.5);
+}
+
 /// A newer writer schema may narrow a type (a double to a long, as FORWARD compatibility
 /// allows; a double to a float; a decimal's scale or a timestamp's unit under NONE), and `U`
 /// takes the newest type. An older row's value that the narrower type holds exactly is kept;

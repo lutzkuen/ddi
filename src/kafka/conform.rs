@@ -1751,10 +1751,13 @@ impl UnionSchema {
     /// cast to `U`'s type (by name, at every depth), or null where the batch has none. A row
     /// whose value does not convert comes back apart, as it arrived, with the reason.
     ///
-    /// A batch with a field `U` lacks is refused: its writer schema was not observed into `U`
-    /// before aligning, and the field would be lost.
+    /// A batch whose writer schema is not a member, or with a field `U` lacks, is refused as an
+    /// internal error: its writer schema was not observed into `U` before aligning, and its
+    /// values would be cast to types it never had, or a field lost. Every writer schema whose
+    /// messages become rows is a member ([`Self::build`] leaves out only those that never do).
     pub fn align(&self, batch: &RecordBatch) -> Result<(RecordBatch, Option<Rejected>)> {
-        let writer = schema_ids(batch, &self.prefix).into_iter().next().flatten();
+        let ids = schema_ids(batch, &self.prefix);
+        let writer = ids.iter().next().copied().flatten();
         if let Some(lost) = batch
             .schema()
             .fields()
@@ -1766,6 +1769,16 @@ impl UnionSchema {
                  over does not: it was aligned before its writer schema joined the union",
                 writer.map_or("?".to_string(), |w| w.to_string()),
                 lost.name()
+            )));
+        }
+        if let Some(stranger) = ids
+            .iter()
+            .flatten()
+            .find(|id| !self.members.contains(&(**id as u32)))
+        {
+            return Err(Error::Other(format!(
+                "internal: writer schema {stranger} is not a member of the union the SQL runs \
+                 over: its batch was aligned before its writer schema joined the union"
             )));
         }
         let n = batch.num_rows();
