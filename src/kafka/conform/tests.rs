@@ -1369,6 +1369,100 @@ async fn union_widening_wraps_branch() {
     assert_eq!(good.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
 }
 
+/// An older plain value widened into a union that lacks its own type goes into the branch Avro's
+/// resolution promotes it to (int to long, float to double, bytes to string), the first such in
+/// the union's order, as apache-avro reads the older message with the newer schema: never into
+/// the first branch it merely converts to (an int as the text "5", a float 2.7 truncated into a
+/// long). So the SQL path writes what the identity path and kafka-delta-ingest wrote.
+#[tokio::test]
+async fn union_widening_takes_avros_promoted_branch() {
+    const W1: &str = r#"{"type":"record","name":"R","fields":[
+        {"name":"id","type":"long"},{"name":"code","type":"int"},{"name":"f","type":"float"},
+        {"name":"g","type":"float"},{"name":"b","type":"bytes"}]}"#;
+    const W2: &str = r#"{"type":"record","name":"R","fields":[
+        {"name":"id","type":"long"},
+        {"name":"code","type":["null","string","long"]},
+        {"name":"f","type":["null","string","double"]},
+        {"name":"g","type":["null","long","double"]},
+        {"name":"b","type":["null","long","string"]}]}"#;
+    let row = || {
+        record(vec![
+            ("id", Avro::Long(0)),
+            ("code", Avro::Int(5)),
+            ("f", Avro::Float(0.1)),
+            ("g", Avro::Float(2.7)),
+            ("b", Avro::Bytes(b"hi".to_vec())),
+        ])
+    };
+    // Avro's own resolution of the older message with the newer schema.
+    let (s1, s2) = (
+        apache_avro::Schema::parse_str(W1).unwrap(),
+        apache_avro::Schema::parse_str(W2).unwrap(),
+    );
+    let datum = apache_avro::to_avro_datum(&s1, row()).unwrap();
+    let Avro::Record(resolved) =
+        apache_avro::from_avro_datum(&s1, &mut &datum[..], Some(&s2)).unwrap()
+    else {
+        panic!("a record")
+    };
+    assert_eq!(resolved[1].1, Avro::Union(2, Box::new(Avro::Long(5))));
+    assert_eq!(
+        resolved[2].1,
+        Avro::Union(2, Box::new(Avro::Double(f64::from(0.1f32))))
+    );
+    assert_eq!(
+        resolved[3].1,
+        Avro::Union(2, Box::new(Avro::Double(f64::from(2.7f32))))
+    );
+    assert_eq!(
+        resolved[4].1,
+        Avro::Union(2, Box::new(Avro::String("hi".into())))
+    );
+
+    let u = UnionSchema::build(&[registered(1, W1), registered(2, W2)], "kafka_");
+    let mut rejects = Vec::new();
+    let aligned = u
+        .align_all(decoded(&[(1, W1)], vec![(1, row())]).await, &mut rejects)
+        .unwrap();
+    assert!(rejects.is_empty(), "{:?}", reasons(&rejects));
+    let branch = |name: &str| {
+        let col = aligned[0].column_by_name(name).unwrap();
+        union_row(col.as_ref(), 0).0
+    };
+    assert_eq!(
+        [branch("code"), branch("f"), branch("g"), branch("b")],
+        ["long", "double", "double", "string"]
+    );
+
+    // Into DOUBLE columns: what the identity path and kdi wrote, the float widened.
+    let t = target(vec![
+        field("id", Delta::LONG, false),
+        field("f", Delta::DOUBLE, true),
+        field("g", Delta::DOUBLE, true),
+    ]);
+    let sql =
+        SqlTransform::new("SELECT id, f, g, union_extract(code, 'long') AS code_long FROM source");
+    let out = sql.run(u.schema(), aligned).await.unwrap();
+    let code_long = out[0].column_by_name("code_long").unwrap();
+    assert_eq!(code_long.as_primitive::<Int64Type>().value(0), 5);
+    let (good, rejects) = through(&mut conformer(t.clone()), out);
+    assert!(rejects.is_empty());
+    let (identity, rejects) = through(
+        &mut conformer(t),
+        decoded(&[(1, W1)], vec![(1, row())]).await,
+    );
+    assert!(rejects.is_empty());
+    let kdi = serde_json::Value::try_from(
+        apache_avro::from_avro_datum(&s1, &mut &datum[..], None).unwrap(),
+    )
+    .unwrap();
+    for rows in [json(&good), json(&identity)] {
+        assert_eq!(rows[0]["f"], kdi["f"], "{rows:?}");
+        assert_eq!(rows[0]["g"], kdi["g"], "{rows:?}");
+    }
+    assert_eq!(kdi["f"].to_string(), "0.10000000149011612");
+}
+
 /// Row `i` of a union column: its branch's name, and the branch's struct as text fields.
 fn union_row(col: &dyn Array, i: usize) -> (String, Vec<(String, Option<String>)>) {
     let u = col.as_any().downcast_ref::<UnionArray>().unwrap();

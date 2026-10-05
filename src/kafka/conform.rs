@@ -767,10 +767,11 @@ impl Fitter<'_> {
     /// `ResolvingGrammarGenerator.bestBranch`): the branch of the values' `name` (a source
     /// union's branch, or the full name of a record, enum or fixed), or of their type; else, for
     /// a record, the record branch holding most of its fields, all of them where one does (the
-    /// one with the fewest others); else, for an array or a map, the branch of that kind.
-    /// Failing those, which Avro refuses, the first branch every value converts to unchanged,
-    /// or failing that the first any value converts to, its other values rejected; else none,
-    /// and every value is rejected.
+    /// one with the fewest others); else, for an array or a map, the branch of that kind; else
+    /// the first branch Avro promotes the value to ([`promotes`]). Failing those, which Avro
+    /// refuses, the first branch every value converts to unchanged, or failing that the first
+    /// any value converts to, its other values rejected; else none, and every value is
+    /// rejected.
     fn branch_for(
         &self,
         array: &ArrayRef,
@@ -796,7 +797,8 @@ impl Fitter<'_> {
                 .find(|(_, f)| matches!(f.data_type(), DataType::Map(..))),
             _ => None,
         };
-        if let Some((type_id, field)) = named.or_else(same).or_else(kind) {
+        let promoted = || fields.iter().find(|(_, f)| promotes(from, f.data_type()));
+        if let Some((type_id, field)) = named.or_else(same).or_else(kind).or_else(promoted) {
             return Ok((
                 type_id,
                 self.fit(array, field.data_type(), path, false, None)?,
@@ -976,6 +978,23 @@ fn decimal_text(v: f64, precision: u8, scale: i8) -> Option<String> {
         return None;
     }
     Some(v.to_string())
+}
+
+/// Whether Avro's schema resolution promotes a value of type `from` to `to` (the specification's
+/// "Schema Resolution": int to long, float or double; long to float or double; float to
+/// double; string to bytes and bytes to string), which is how it picks a union's branch for a
+/// value no branch has the type of. A logical type is not promoted.
+fn promotes(from: &DataType, to: &DataType) -> bool {
+    matches!(
+        (from, to),
+        (
+            DataType::Int32,
+            DataType::Int64 | DataType::Float32 | DataType::Float64
+        ) | (DataType::Int64, DataType::Float32 | DataType::Float64)
+            | (DataType::Float32, DataType::Float64)
+            | (DataType::Utf8, DataType::Binary)
+            | (DataType::Binary, DataType::Utf8)
+    )
 }
 
 /// The record branch of a union that a record of `children` goes into by its structure, as
