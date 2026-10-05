@@ -15,10 +15,13 @@
 //! arrow-avro's `Decoder` decodes a stream, not messages: given a truncated body it consumes
 //! the header, waits for more bytes and reports success (reader/mod.rs:706-735), and a message
 //! that fails half-way leaves the fields it did decode in the column builders. So every message
-//! is checked to have become exactly one row from exactly its own bytes, and one that did not
-//! is *isolated*: the decoder, which may hold part of its row, is replaced, the chunk's earlier
-//! messages are decoded again into the new one and flushed, and the message alone goes to the
-//! data-quality table. One malformed message cannot change or lose another's row (I10).
+//! is checked to have become exactly one row from exactly its own bytes, and its record is
+//! walked on the wire against the writer schema to end where the message does ([`wire`]: after
+//! a record, arrow-avro takes a copy of the message's own header for the next message's). One
+//! that did not is *isolated*: the decoder, which may hold part of its row, is replaced, the
+//! chunk's earlier messages are decoded again into the new one and flushed, and the message
+//! alone goes to the data-quality table. One malformed message cannot change or lose another's
+//! row (I10).
 //!
 //! # What comes out
 //!
@@ -56,6 +59,9 @@ use deltalake::arrow::record_batch::RecordBatch;
 use crate::error::{Error, Result};
 use crate::kafka::registry::{Lookup, RegisteredSchema, WriterSchemas};
 use crate::schema::Rejected;
+
+mod wire;
+use wire::Wire;
 
 /// Rows one writer schema's decoder holds before they are flushed into a batch. Also the most
 /// raw messages kept per writer schema (§3.7).
@@ -207,12 +213,38 @@ impl DecodeFactory for ArrowAvro {
             Ok(Err(e)) => return Err(e.to_string()),
             Err(panic) => return Err(format!("arrow-avro panicked: {}", panic_text(&panic))),
         };
-        Ok(Box::new(ArrowAvroDecoder { inner }))
+        Ok(Box::new(ArrowAvroDecoder {
+            inner,
+            wire: Wire::new(writer_schema).ok(),
+        }))
     }
 }
 
 struct ArrowAvroDecoder {
     inner: arrow_avro::reader::Decoder,
+    /// The writer schema's records on the wire, walked to check what arrow-avro let through
+    /// ([`wire`]). Read as arrow-avro reads the schema, so it is there for every schema arrow-avro
+    /// builds a decoder for; were it ever not, the check would be arrow-avro's alone, as before.
+    wire: Option<Wire>,
+}
+
+impl ArrowAvroDecoder {
+    /// A message arrow-avro decoded into one row from all its bytes, walked on the wire: the
+    /// record must end where the message does, and hold nothing apache-avro refuses.
+    fn walk(&self, framed: &[u8]) -> std::result::Result<(), String> {
+        let Some(wire) = &self.wire else {
+            return Ok(());
+        };
+        let body = &framed[HEADER_LEN..];
+        match wire.record_len(body) {
+            Ok(len) if len == body.len() => Ok(()),
+            Ok(len) => Err(format!(
+                "{} unexpected byte(s) after the record",
+                body.len() - len
+            )),
+            Err(e) => Err(format!("malformed Avro body: {e}")),
+        }
+    }
 }
 
 impl Decode for ArrowAvroDecoder {
@@ -220,10 +252,14 @@ impl Decode for ArrowAvroDecoder {
         self.inner.schema()
     }
 
-    /// The strict per-message check (§5.4): `decode` consumed every byte, and the decoder's
-    /// capacity fell by exactly one row. arrow-avro alone would accept a truncated body (it
-    /// waits for the rest), a second record after the first, or report an error after a row
-    /// it already kept.
+    /// The strict per-message check (§5.4): `decode` consumed every byte, the decoder's
+    /// capacity fell by exactly one row, and the record, walked on the wire against the writer
+    /// schema ([`wire`]), ends exactly where the message does and holds no union index or
+    /// boolean apache-avro would refuse. arrow-avro alone would accept a truncated body (it
+    /// waits for the rest), a second record after the first, a copy of the message's own header
+    /// after the record (it then waits for that "message's" body, and takes the next message
+    /// for it), a two-branch union's index out of range, or report an error after a row it
+    /// already kept.
     fn decode_one(&mut self, framed: &[u8]) -> std::result::Result<(), String> {
         let before = self.inner.capacity();
         if before == 0 {
@@ -241,7 +277,7 @@ impl Decode for ArrowAvroDecoder {
             Ok(Err(e)) if rows == 0 => Err(format!("malformed Avro body: {e}")),
             Ok(Err(e)) => Err(format!("unexpected bytes after the record: {e}")),
             Ok(Ok(read)) => match rows {
-                1 if read == framed.len() => Ok(()),
+                1 if read == framed.len() => self.walk(framed),
                 1 => Err(format!(
                     "{} unexpected byte(s) after the record",
                     framed.len() - read

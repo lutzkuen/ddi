@@ -1012,6 +1012,193 @@ async fn trailing_bytes_isolated() {
     }
 }
 
+/// A record followed by exactly its own 5-byte header: arrow-avro takes the copy for the next
+/// message's header, reports every byte read and one row, and then waits for a body. Unchecked,
+/// the malformed message was kept and the next good message of its writer schema, from any
+/// partition, was read as that body and rejected, or became a row of garbage; the poisoned
+/// decoder outlived `finish` and `discard`. Walking the record says where it ends, so the
+/// malformed message alone goes to the data-quality table, and every good one keeps its row
+/// (I10).
+#[tokio::test]
+async fn a_trailing_copy_of_the_header_is_isolated() {
+    let good = |o: i64| framed(1, V1, v1(o, "n"));
+    let with_header = |o: i64| {
+        let mut m = good(o);
+        let header = m[..HEADER_LEN].to_vec();
+        m.extend(header);
+        m
+    };
+    let rejected = |out: &Decoded| -> Vec<(i64, String)> {
+        out.undecodable
+            .iter()
+            .map(|u| (u.offset, u.reason.clone()))
+            .collect()
+    };
+
+    // In one batch; the messages after it are on other partitions (`message` spreads them).
+    let mut d = decoder(Schemas::with(&[(1, V1)]));
+    feed_all(
+        &mut d,
+        vec![
+            message(0, Some(good(0))),
+            message(1, Some(with_header(1))),
+            message(2, Some(good(2))),
+            message(3, Some(good(3))),
+            message(4, Some(good(4))),
+        ],
+    )
+    .await;
+    let out = d.finish().unwrap();
+    assert_eq!(
+        rows_by_offset(&out.batches),
+        [(0, 0), (2, 2), (3, 3), (4, 4)]
+    );
+    assert_rows_are_their_messages(&out.batches);
+    assert_eq!(
+        rejected(&out),
+        [(1, "5 unexpected byte(s) after the record".to_string())]
+    );
+    assert!(out.undecodable[0].deterministic);
+
+    // Last in a batch, and last before a revoke: the next batch's first message is unharmed.
+    let mut d = decoder(Schemas::with(&[(1, V1)]));
+    feed_all(
+        &mut d,
+        vec![message(0, Some(good(0))), message(1, Some(with_header(1)))],
+    )
+    .await;
+    let out = d.finish().unwrap();
+    assert_eq!(rows_by_offset(&out.batches), [(0, 0)]);
+    assert_eq!(rejected(&out).len(), 1);
+    feed_all(
+        &mut d,
+        vec![message(10, Some(good(10))), message(11, Some(good(11)))],
+    )
+    .await;
+    let out = d.finish().unwrap();
+    assert_eq!(rows_by_offset(&out.batches), [(10, 10), (11, 11)]);
+    assert!(out.undecodable.is_empty(), "{:?}", out.undecodable);
+    d.feed(message(12, Some(with_header(12)))).await.unwrap();
+    d.discard();
+    feed_all(
+        &mut d,
+        vec![message(20, Some(good(20))), message(21, Some(good(21)))],
+    )
+    .await;
+    let out = d.finish().unwrap();
+    assert_eq!(rows_by_offset(&out.batches), [(20, 20), (21, 21)]);
+    assert!(out.undecodable.is_empty(), "{:?}", out.undecodable);
+
+    // A good message whose own last bytes look like a header was kept as garbage: the copy's
+    // "body" was its header and the first bytes of its value.
+    const F: &str = r#"{"type":"record","name":"F","fields":[
+        {"name":"f","type":{"type":"fixed","name":"x9","size":9}}]}"#;
+    let header = [0u8, 0, 0, 0, 1];
+    let mut a = header.to_vec();
+    a.extend([9u8; 9]);
+    a.extend(header);
+    let mut b = header.to_vec();
+    b.extend([7u8, 7, 7, 7, 0, 0, 0, 0, 1]);
+    let mut d = decoder(Schemas::with(&[(1, F)]));
+    feed_all(&mut d, vec![message(1, Some(a)), message(2, Some(b))]).await;
+    let out = d.finish().unwrap();
+    assert_eq!(rejected(&out).iter().map(|r| r.0).collect::<Vec<_>>(), [1]);
+    let batch = &out.batches[0];
+    assert_eq!(i64s(batch, "kafka_offset"), [2]);
+    let f = column(batch, "f").as_fixed_size_binary();
+    assert_eq!(f.value(0), [7, 7, 7, 7, 0, 0, 0, 0, 1]);
+}
+
+/// A union's branch index outside its branches, and a boolean that is neither 0 nor 1: apache-
+/// avro 0.21.0 refuses the message, and kafka-delta-ingest wrote nothing of it. arrow-avro reads
+/// a two-branch nullable union's index as a raw varint and only compares it with 0, so index 5
+/// or -1 became the value's branch (or null), and any byte but 0 a true. Each is undecodable,
+/// as a union of three branches already was, and the good messages around it keep their rows.
+#[tokio::test]
+async fn a_union_index_or_boolean_out_of_range_is_undecodable() {
+    const OPT: &str = r#"{"type":"record","name":"O","fields":[
+        {"name":"id","type":"long"},
+        {"name":"first","type":["null","long"]},
+        {"name":"second","type":["long","null"]},
+        {"name":"three","type":["null","long","string"]},
+        {"name":"flag","type":"boolean"}]}"#;
+    let long = zigzag_varint;
+    // `id`, then each field's bytes: by default branch 1 of `first` (42), branch 0 of `second`
+    // (43), branch 1 of `three` (44), and true.
+    let body = |id: i64, first: Vec<u8>, second: Vec<u8>, three: Vec<u8>, flag: u8| {
+        [
+            vec![0, 0, 0, 0, 1],
+            long(id),
+            first,
+            second,
+            three,
+            vec![flag],
+        ]
+        .concat()
+    };
+    let first = || [long(1), long(42)].concat();
+    let second = || [long(0), long(43)].concat();
+    let three = || [long(1), long(44)].concat();
+    let hostile: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "[null, long] index 5",
+            body(1, [long(5), long(42)].concat(), second(), three(), 1),
+        ),
+        (
+            "[null, long] index -1",
+            body(3, [long(-1), long(42)].concat(), second(), three(), 1),
+        ),
+        (
+            "[long, null] index 5",
+            body(5, first(), long(5), three(), 1),
+        ),
+        (
+            "[null, long, string] index 5",
+            body(7, first(), second(), [long(5), long(44)].concat(), 1),
+        ),
+        (
+            "a boolean of byte 2",
+            body(9, first(), second(), three(), 2),
+        ),
+    ];
+    let schema = apache_avro::Schema::parse_str(OPT).unwrap();
+    let mut messages = vec![message(0, Some(body(0, first(), second(), three(), 1)))];
+    for (i, (what, payload)) in hostile.iter().enumerate() {
+        let o = 2 * i as i64 + 1;
+        // kafka-delta-ingest's decoder refused it.
+        let refused = apache_avro::from_avro_datum(&schema, &mut &payload[HEADER_LEN..], None);
+        assert!(refused.is_err(), "{what}: apache-avro read {refused:?}");
+        messages.push(message(o, Some(payload.clone())));
+        messages.push(message(
+            o + 1,
+            Some(body(o + 1, first(), second(), three(), 0)),
+        ));
+    }
+    let mut d = decoder(Schemas::with(&[(1, OPT)]));
+    feed_all(&mut d, messages).await;
+    let out = d.finish().unwrap();
+    let bad: Vec<(i64, &str)> = out
+        .undecodable
+        .iter()
+        .map(|u| (u.offset, u.reason.as_str()))
+        .collect();
+    assert_eq!(
+        bad.iter().map(|b| b.0).collect::<Vec<_>>(),
+        [1, 3, 5, 7, 9],
+        "{bad:?}"
+    );
+    for (_, reason) in &bad[..4] {
+        assert!(reason.contains("out of range"), "{bad:?}");
+    }
+    assert!(bad[4].1.contains("boolean"), "{bad:?}");
+    assert!(out.undecodable.iter().all(|u| u.deterministic));
+    assert_eq!(
+        rows_by_offset(&out.batches),
+        [(0, 0), (2, 2), (4, 4), (6, 6), (8, 8), (10, 10)]
+    );
+    assert_rows_are_their_messages(&out.batches);
+}
+
 #[tokio::test]
 async fn unknown_schema_id_isolated() {
     let schemas = Schemas::with(&[(1, V1)]);
