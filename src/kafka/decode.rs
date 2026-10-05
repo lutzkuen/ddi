@@ -16,7 +16,7 @@
 //! the header, waits for more bytes and reports success (reader/mod.rs:706-735), and a message
 //! that fails half-way leaves the fields it did decode in the column builders. So every message
 //! is checked to have become exactly one row from exactly its own bytes, and its record is
-//! walked on the wire against the writer schema to end where the message does ([`wire`]: after
+//! walked on the wire against the writer schema to end where the message does (`wire.rs`: after
 //! a record, arrow-avro takes a copy of the message's own header for the next message's). One
 //! that did not is *isolated*: the decoder, which may hold part of its row, is replaced, the
 //! chunk's earlier messages are decoded again into the new one and flushed, and the message
