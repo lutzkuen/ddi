@@ -1322,6 +1322,9 @@ pub struct Conformer {
     /// A batch whose rows did not say their writer schema was written with `merged`
     /// (`ddi_kafka_null_text_approximate`); warned about once.
     approximate: bool,
+    /// The SQL's output columns that copy a column of `U` unchanged under another name, by
+    /// that column's name ([`Conformer::observe_copies`]).
+    copies: BTreeMap<String, String>,
 }
 
 impl Conformer {
@@ -1338,6 +1341,7 @@ impl Conformer {
             shapes: BTreeMap::new(),
             merged: None,
             approximate: false,
+            copies: BTreeMap::new(),
         })
     }
 
@@ -1379,6 +1383,19 @@ impl Conformer {
             }
             self.merged = merged;
         }
+    }
+
+    /// Takes note of the SQL's output columns that copy a column of `U` unchanged, each with
+    /// that column's name ([`SqlTransform::column_sources`] over `U`'s schema, read whenever the
+    /// SQL is planned over a new `U`). kafka-delta-ingest's text of such a copy has what kdi's
+    /// `-t 'r2: r'` copied: the keys the row's writer schema gave the field, at every depth,
+    /// and the bytes a `fixed` decimal of it was written with; a column the SQL built has every
+    /// key of its own instead (§5.6 step 6). Nothing to do without kdi's text.
+    pub fn observe_copies(&mut self, sources: BTreeMap<String, String>) {
+        self.copies = sources
+            .into_iter()
+            .filter(|(column, source)| column != source)
+            .collect();
     }
 
     /// Whether a batch's rows did not say their writer schema, so that where kdi's JSON had a
@@ -1456,10 +1473,18 @@ impl Conformer {
                 }
                 continue;
             };
+            let copied = self.copies.get(field.name());
             let at: Option<Vec<At>> = writers
                 .as_ref()
                 .filter(|_| !plain.contains(field.name()))
-                .map(|w| w.iter().map(|s| At::column(s, field.name())).collect());
+                .map(|w| {
+                    w.iter()
+                        .map(|s| match copied {
+                            Some(source) => At::copy(s, source),
+                            None => At::column(s, field.name()),
+                        })
+                        .collect()
+                });
             let kdi = at.as_deref().map(|at| Kdi { at, reach: true });
             let fitted = fitter.fit(&columns[index], field.data_type(), field.name(), true, kdi)?;
             for (i, reason) in fitted.bad.iter().enumerate() {

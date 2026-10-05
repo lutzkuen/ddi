@@ -250,6 +250,16 @@ impl<'s> At<'s> {
         }
     }
 
+    /// A top-level column that copies the column `source` of a row written with `writer`, as
+    /// kdi's `-t 'name: source'` copied a field's JSON: the keys inside are the source field's,
+    /// but the column itself has none, since kdi set nothing for a null (transforms.rs:343-347).
+    pub(crate) fn copy(writer: &'s Shape, source: &str) -> Self {
+        At {
+            key: false,
+            shape: writer.field_named(source),
+        }
+    }
+
     /// The child `name` of this value, which is not null.
     pub(crate) fn child(self, name: &str) -> At<'s> {
         let shape = self.shape.and_then(|s| s.field_named(name));

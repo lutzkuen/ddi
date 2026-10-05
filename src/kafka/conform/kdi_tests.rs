@@ -300,6 +300,33 @@ fn kdi_wrote(messages: &[(&str, &[u8], Option<i64>)], delta: &StructType) -> Rec
     }
 }
 
+/// kdi's batch for `messages`, as [`kdi_wrote`], with its `-t 'to: from'` transforms too: each
+/// sets `to` to the value of the message's field `from` (a JMESPath field reference) unless
+/// that is null or missing (transforms.rs:343-347), before the coercions.
+fn kdi_wrote_copying(
+    messages: &[(&str, &[u8], Option<i64>)],
+    delta: &StructType,
+    copies: &[(&str, &str)],
+) -> RecordBatch {
+    let tree = kdi::create_coercion_tree(delta);
+    let values: Vec<serde_json::Value> = messages
+        .iter()
+        .enumerate()
+        .map(|(offset, (writer, body, timestamp))| {
+            let schema = apache_avro::Schema::parse_str(writer).unwrap();
+            let mut v = kdi::deserialize(&schema, body).unwrap();
+            kdi_metadata(&mut v, offset as i64, *timestamp);
+            for (to, from) in copies {
+                let value = v.get(*from).cloned().unwrap_or_default();
+                kdi::set_value(&mut v, to, value);
+            }
+            kdi::coerce(&mut v, &tree);
+            v
+        })
+        .collect();
+    kdi::record_batch(arrow_of(delta), &values).unwrap()
+}
+
 // ================================================================== ddi's side
 
 /// The timestamp of the message at `offset`, in milliseconds.
@@ -1130,7 +1157,7 @@ fn arrow_of(delta: &StructType) -> SchemaRef {
 }
 
 /// The SQL path: `batches` aligned to the `U` of `members`, `sql` run over them, and the output
-/// conformed into `t` and coerced.
+/// conformed into `t` and coerced, the conformer told which columns the SQL copies.
 async fn through_sql(
     sql: &str,
     members: &[(u32, &str)],
@@ -1143,11 +1170,11 @@ async fn through_sql(
     let mut rejects = Vec::new();
     let aligned = u.align_all(batches, &mut rejects).unwrap();
     assert!(rejects.is_empty(), "{:?}", reasons(&rejects));
-    let out = SqlTransform::new(sql)
-        .run(u.schema(), aligned)
-        .await
-        .unwrap();
+    let sql = SqlTransform::new(sql);
+    let copies = sql.column_sources(u.schema()).await.unwrap();
+    let out = sql.run(u.schema(), aligned).await.unwrap();
     let mut c = kdi_conformer(t, text, members);
+    c.observe_copies(copies);
     let (good, rejects) = through(&mut c, out);
     (c, good, rejects)
 }
@@ -1582,6 +1609,54 @@ async fn null_text_approximate_without_schema_id_column() {
     assert!(!c.null_text_approximate());
 }
 
+/// A struct the SQL copies under another name (`r AS r2`, kdi's `-t 'r2: r'`) has the keys its
+/// row's writer schema gave `r`, as kdi's copy of the JSON had: a v1 row, whose `r` lacks `y`,
+/// writes no `y`, into a STRING (`{"x":null}`) and into a STRUCT's STRING child (NULL, not
+/// "null"). A struct the SQL builds has every key of its own.
+#[tokio::test]
+async fn a_copied_struct_keeps_its_writers_keys() {
+    let members = [(1, P1), (2, P2)];
+    let delta = StructType::try_new(vec![
+        field("id", Delta::INTEGER, true),
+        field("r2", Delta::STRING, true),
+        field(
+            "r3",
+            strct(vec![
+                field("x", Delta::STRING, true),
+                field("y", Delta::STRING, true),
+            ]),
+            true,
+        ),
+        field("built", Delta::STRING, true),
+    ])
+    .unwrap();
+    let (_, good, rejects) = through_sql(
+        "SELECT *, r AS r2, r AS r3, named_struct('x', r.x, 'y', r.y) AS built FROM source",
+        &members,
+        p_decoded().await,
+        arrow_of(&delta),
+        TEXT,
+    )
+    .await;
+    assert!(rejects.is_empty());
+    let messages = p_messages();
+    let kdi = kdi_wrote_copying(
+        &messages
+            .iter()
+            .enumerate()
+            .map(|(o, (_, w, b))| (*w, b.as_slice(), Some(timestamp_ms(o))))
+            .collect::<Vec<_>>(),
+        &delta,
+        &[("r2", "r"), ("r3", "r")],
+    );
+    for c in ["r2", "r3"] {
+        assert_eq!(shown(&good, c), shown(std::slice::from_ref(&kdi), c), "{c}");
+    }
+    assert_eq!(shown(&good, "r2")[0], r#"{"x":null}"#);
+    assert_eq!(shown(&good, "r3")[0], "{x: null, y: NULL}");
+    assert_eq!(shown(&good, "built")[0], r#"{"x":null,"y":null}"#);
+}
+
 /// A conformer writing kdi's text must know the writer schema of every row: one it was not
 /// told of is an internal error, never a guess.
 #[tokio::test]
@@ -1985,21 +2060,37 @@ async fn decimal_bytes_minimal_and_fixed_sign_extended() {
     );
     assert_eq!(shown(&good, "df_typed"), ["12.34", "-12.34", "0.00"]);
 
-    // Renamed by the SQL, the fixed size is lost: the fewest bytes (kdi's `-t dfa: df` kept 8).
+    // Renamed by the SQL, as kdi's `-t dfa: df` copied it: the fixed's 8 bytes. Computed from
+    // it, the fewest.
     let renamed = StructType::try_new(vec![
         field("id", Delta::INTEGER, true),
         field("dfa", string(), true),
+        field("dfc", string(), true),
     ])
     .unwrap();
     let (_, good, _) = through_sql(
-        "SELECT id, df AS dfa FROM source",
+        "SELECT id, df AS dfa, CAST(df AS DECIMAL(10, 2)) AS dfc FROM source",
         &[(1, D)],
-        decode(&[(1, D)], bodies).await,
+        decode(&[(1, D)], bodies.clone()).await,
         arrow_of(&renamed),
         TEXT,
     )
     .await;
-    assert_eq!(shown(&good, "dfa"), ["[4,210]", "[251,46]", "[0]"]);
+    let kdi = kdi_wrote_copying(
+        &bodies
+            .iter()
+            .enumerate()
+            .map(|(o, (_, b))| (D, b.as_slice(), Some(timestamp_ms(o))))
+            .collect::<Vec<_>>(),
+        &renamed,
+        &[("dfa", "df")],
+    );
+    assert_eq!(
+        shown(&good, "dfa"),
+        shown(std::slice::from_ref(&kdi), "dfa")
+    );
+    assert_eq!(shown(&good, "dfa"), fixed);
+    assert_eq!(shown(&good, "dfc"), ["[4,210]", "[251,46]", "[0]"]);
 }
 
 /// The message key has no kdi equivalent, so `kafka_key` into a STRING is Arrow's cast, as

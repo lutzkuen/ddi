@@ -21,7 +21,7 @@
 //! put together. The SQL is checked for that once, when it is built — see
 //! [`crate::transform::validate::cross_row_construct`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -207,6 +207,30 @@ impl SqlTransform {
         Ok(plan.schema())
     }
 
+    /// The output columns that copy a column of `source` unchanged, renamed or not, each with
+    /// that column's name: `SELECT *, r AS r2` gives `r` and `r2`, both from `r`. Read off the
+    /// plan the SQL makes over a source of `schema`, through filters, sorts, limits, subquery
+    /// aliases, the source's side of a join and what an unnest passes through; a column
+    /// computed from one, or from anything else, copies none.
+    ///
+    /// A Kafka pipeline's conform step reads kafka-delta-ingest's text of such a copy off the
+    /// writer schema's field it copies, as kdi's `-t 'r2: r'` copied the field's JSON
+    /// (docs/kafka-design.md §5.6 step 6).
+    pub async fn column_sources(&self, schema: SchemaRef) -> Result<BTreeMap<String, String>> {
+        let ctx = self
+            .session(schema, Vec::new(), &[])
+            .map_err(Failure::into_error)?;
+        let planning = |e| crate::spill::classify(e, "transform_sql failed to plan");
+        let df = ctx.sql(&self.sql).await.map_err(planning)?;
+        let plan = df.logical_plan();
+        Ok((0..plan.schema().fields().len())
+            .filter_map(|i| {
+                let source = copied_column(plan, i)?;
+                Some((plan.schema().field(i).name().clone(), source))
+            })
+            .collect())
+    }
+
     /// One run over `batches`, telling a value it cannot evaluate from any other failure.
     async fn execute(
         &self,
@@ -293,6 +317,58 @@ impl SqlTransform {
                 })?;
         }
         Ok(ctx)
+    }
+}
+
+/// The column of `source` that output column `i` of `plan` is an unchanged copy of, if any.
+fn copied_column(
+    plan: &deltalake::datafusion::logical_expr::LogicalPlan,
+    i: usize,
+) -> Option<String> {
+    use deltalake::datafusion::logical_expr::{Distinct, Expr, LogicalPlan as Plan};
+    match plan {
+        Plan::TableScan(scan) => (scan.table_name.table() == SOURCE_TABLE)
+            .then(|| scan.projected_schema.field(i).name().clone()),
+        Plan::Projection(p) => {
+            let mut expr = p.expr.get(i)?;
+            while let Expr::Alias(alias) = expr {
+                expr = &alias.expr;
+            }
+            let Expr::Column(column) = expr else {
+                return None;
+            };
+            copied_column(&p.input, p.input.schema().index_of_column(column).ok()?)
+        }
+        Plan::Filter(f) => copied_column(&f.input, i),
+        Plan::Sort(s) => copied_column(&s.input, i),
+        Plan::Limit(l) => copied_column(&l.input, i),
+        Plan::Repartition(r) => copied_column(&r.input, i),
+        Plan::Distinct(Distinct::All(input)) => copied_column(input, i),
+        // The same fields in the same order, under another name.
+        Plan::SubqueryAlias(a) => copied_column(&a.input, i),
+        Plan::Join(j) => {
+            let (qualifier, field) = plan.schema().qualified_field(i);
+            match j
+                .left
+                .schema()
+                .index_of_column_by_name(qualifier, field.name())
+            {
+                Some(k) => copied_column(&j.left, k),
+                None => copied_column(
+                    &j.right,
+                    j.right
+                        .schema()
+                        .index_of_column_by_name(qualifier, field.name())?,
+                ),
+            }
+        }
+        Plan::Unnest(u) => {
+            let from = *u.dependency_indices.get(i)?;
+            let unnested = u.list_type_columns.iter().any(|(k, _)| *k == from)
+                || u.struct_type_columns.contains(&from);
+            (!unnested).then(|| copied_column(&u.input, from)).flatten()
+        }
+        _ => None,
     }
 }
 
@@ -587,6 +663,46 @@ mod tests {
 
     fn total_rows(b: &[RecordBatch]) -> usize {
         b.iter().map(|x| x.num_rows()).sum()
+    }
+
+    /// An output column copies a column of `source` when it is that column, renamed or not,
+    /// through a filter, a subquery alias and a sort; one computed from it, a literal, or one
+    /// that an unnest produces copies none.
+    #[tokio::test]
+    async fn column_sources_are_the_copied_columns() {
+        let sources = |sql: &str| {
+            let sql = SqlTransform::new(sql);
+            async move { sql.column_sources(simple_batch().schema()).await.unwrap() }
+        };
+        let pairs = |p: &[(&str, &str)]| -> BTreeMap<String, String> {
+            p.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            sources("SELECT *, status AS state, upper(status) AS loud, 1 AS one FROM source").await,
+            pairs(&[
+                ("order_id", "order_id"),
+                ("status", "status"),
+                ("total", "total"),
+                ("state", "status")
+            ])
+        );
+        assert_eq!(
+            sources(
+                "SELECT s.total AS amount, s.order_id + 1 AS next FROM source s \
+                 WHERE s.status = 'OPEN' ORDER BY s.total"
+            )
+            .await,
+            pairs(&[("amount", "total")])
+        );
+        assert_eq!(
+            sources(
+                "SELECT x.order_id, x.n FROM (SELECT order_id, unnest([1, 2]) AS n FROM source) x"
+            )
+            .await,
+            pairs(&[("order_id", "order_id")])
+        );
     }
 
     #[tokio::test]
