@@ -817,6 +817,30 @@ fn cases() -> Vec<Case> {
             )],
         },
         Case {
+            avro: "decimal, scale 5 > precision 2 (invalid: its bytes)",
+            schema: r#"{"type":"bytes","logicalType":"decimal","precision":2,"scale":5}"#,
+            values: vec![A(Avro::Bytes(vec![1, 2]))],
+            targets: vec![("STRING", string(), Same)],
+        },
+        Case {
+            avro: "decimal, scale -2 (invalid: its bytes)",
+            schema: r#"{"type":"bytes","logicalType":"decimal","precision":10,"scale":-2}"#,
+            values: vec![A(Avro::Bytes(vec![0x30, 0x39]))],
+            targets: vec![("STRING", string(), Same)],
+        },
+        Case {
+            avro: "decimal(77,2) on bytes (more than Arrow holds: its bytes)",
+            schema: r#"{"type":"bytes","logicalType":"decimal","precision":77,"scale":2}"#,
+            values: vec![A(decimal(&[0x00, 0x04, 0xD2]))],
+            targets: vec![("STRING", string(), Same)],
+        },
+        Case {
+            avro: "decimal(10,2) on fixed(1) (more than it holds: its bytes)",
+            schema: r#"{"type":"fixed","name":"F1","size":1,"logicalType":"decimal","precision":10,"scale":2}"#,
+            values: vec![A(decimal(&[0xFB]))],
+            targets: vec![("STRING", string(), Same)],
+        },
+        Case {
             avro: "uuid on string",
             schema: r#"{"type":"string","logicalType":"uuid"}"#,
             values: vec![

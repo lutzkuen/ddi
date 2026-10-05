@@ -1697,6 +1697,137 @@ async fn java_and_connect_schemas_decode() {
     assert!(!to.is_null(0));
 }
 
+/// A decimal logical type the Avro specification calls invalid is ignored, and its values read
+/// as the `bytes` or `fixed` underneath, as Java's Avro, apache-avro 0.21.0 and so
+/// kafka-delta-ingest read them; likewise one arrow-avro cannot hold (precision above 76, more
+/// than its `fixed` holds). arrow-avro refused the first kind and the second, so every message
+/// of such a writer schema was undecodable and its pipeline held; and it read a negative scale
+/// as 0, and a missing precision on `bytes` as 10, writing values off by a power of ten. Each
+/// case's bytes come out as the bytes apache-avro read (kdi's JSON of the value), and a valid
+/// decimal is still a decimal.
+#[tokio::test]
+async fn an_invalid_decimal_is_read_as_its_bytes() {
+    let record = |t: &str| {
+        format!(
+            r#"{{"type":"record","name":"R","namespace":"x","fields":[
+                {{"name":"id","type":"long"}},{{"name":"d","type":{t}}}]}}"#
+        )
+    };
+    // (case, the type of `d`, the bytes of its value on the wire, the Arrow type ddi reads).
+    let cases: Vec<(&str, &str, Vec<u8>, DataType)> = vec![
+        (
+            "a Kafka Connect decimal, scale 5 > precision 2",
+            r#"{"type":"bytes","scale":5,"precision":2,"connect.version":1,
+                "connect.parameters":{"scale":"5","connect.decimal.precision":"2"},
+                "connect.name":"org.apache.kafka.connect.data.Decimal","logicalType":"decimal"}"#,
+            vec![1, 2],
+            DataType::Binary,
+        ),
+        (
+            "precision 0",
+            r#"{"type":"bytes","logicalType":"decimal","precision":0,"scale":0}"#,
+            vec![7],
+            DataType::Binary,
+        ),
+        (
+            "no precision",
+            r#"{"type":"bytes","logicalType":"decimal","scale":2}"#,
+            vec![0x04, 0xD2],
+            DataType::Binary,
+        ),
+        (
+            "a negative scale",
+            r#"{"type":"bytes","logicalType":"decimal","precision":10,"scale":-2}"#,
+            vec![0x30, 0x39],
+            DataType::Binary,
+        ),
+        (
+            "a fractional precision",
+            r#"{"type":"bytes","logicalType":"decimal","precision":10.0,"scale":2}"#,
+            vec![0x30, 0x39],
+            DataType::Binary,
+        ),
+        (
+            "precision 77, more than Arrow holds",
+            r#"{"type":"bytes","logicalType":"decimal","precision":77,"scale":2}"#,
+            vec![1, 2],
+            DataType::Binary,
+        ),
+        (
+            "precision 10 on a fixed(1), which holds 2",
+            r#"{"type":"fixed","name":"F1","size":1,"logicalType":"decimal","precision":10,"scale":2}"#,
+            vec![5],
+            DataType::FixedSizeBinary(1),
+        ),
+        (
+            "a duration on a fixed(8)",
+            r#"{"type":"fixed","name":"D8","size":8,"logicalType":"duration"}"#,
+            vec![1, 0, 0, 0, 2, 0, 0, 0],
+            DataType::FixedSizeBinary(8),
+        ),
+        (
+            "valid: decimal(5,2) on bytes",
+            r#"{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}"#,
+            vec![0x04, 0xD2],
+            DataType::Decimal128(5, 2),
+        ),
+        (
+            "valid: decimal(18,2) on a fixed(8)",
+            r#"{"type":"fixed","name":"F8","size":8,"logicalType":"decimal","precision":18,"scale":2}"#,
+            vec![0, 0, 0, 0, 0, 0, 0x04, 0xD2],
+            DataType::Decimal128(18, 2),
+        ),
+    ];
+    for (i, (case, t, bytes, want)) in cases.iter().enumerate() {
+        let id = 100 + i as u32;
+        let schema = record(t);
+        let fixed = matches!(want, DataType::FixedSizeBinary(_)) || t.contains(r#""fixed""#);
+        let body = [
+            zigzag_varint(1),
+            if fixed {
+                bytes.clone()
+            } else {
+                [zigzag_varint(bytes.len() as i64), bytes.clone()].concat()
+            },
+        ]
+        .concat();
+        // What kafka-delta-ingest made of it: apache-avro's value, as JSON, is these bytes
+        // (a valid decimal aside, whose JSON is its bytes too).
+        let parsed = apache_avro::Schema::parse_str(&schema).unwrap();
+        let read = apache_avro::from_avro_datum(&parsed, &mut &body[..], None);
+        if case.starts_with("a duration") {
+            // apache-avro reads a duration's 12 bytes whatever the fixed's size, so here it ran
+            // out of bytes, and kdi dropped the message: the specification reads the fixed.
+            assert!(read.is_err(), "{case}: {read:?}");
+        } else {
+            let json = serde_json::Value::try_from(read.unwrap()).unwrap();
+            assert_eq!(json["d"], serde_json::json!(bytes), "{case}: kdi's JSON");
+        }
+
+        let mut d = decoder(Schemas::with(&[(id, &schema)]));
+        let payload = [vec![0], id.to_be_bytes().to_vec(), body].concat();
+        d.feed(message(1, Some(payload))).await.unwrap();
+        let out = d.finish().unwrap();
+        assert!(out.undecodable.is_empty(), "{case}: {:?}", out.undecodable);
+        let batch = &out.batches[0];
+        let column = column(batch, "d");
+        assert_eq!(column.data_type(), want, "{case}");
+        let got: Vec<u8> = match want {
+            DataType::Binary => column.as_binary::<i32>().value(0).to_vec(),
+            DataType::FixedSizeBinary(_) => column.as_fixed_size_binary().value(0).to_vec(),
+            _ => {
+                let v = column.as_primitive::<deltalake::arrow::datatypes::Decimal128Type>();
+                assert_eq!(v.value(0), 1234, "{case}");
+                continue;
+            }
+        };
+        assert_eq!(&got, bytes, "{case}");
+        // The union `U` reads the same type off the same schema.
+        let u = decoded_schema(&registered(id, &schema)).unwrap();
+        assert_eq!(u.field_with_name("d").unwrap().data_type(), want, "{case}");
+    }
+}
+
 /// Avro allows a record to contain itself; Arrow has no such type. arrow-avro refuses such a
 /// schema when the decoder is built (its name is registered only after its fields,
 /// codec.rs:1499-1522), so every message of it is undecodable, with the reason, rather than the

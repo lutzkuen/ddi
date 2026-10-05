@@ -190,6 +190,8 @@ pub struct ArrowAvro;
 
 impl DecodeFactory for ArrowAvro {
     fn build(&self, id: u32, writer_schema: &str) -> std::result::Result<Box<dyn Decode>, String> {
+        let writer_schema = valid_logical_types(writer_schema);
+        let writer_schema = writer_schema.as_ref();
         // A store holding exactly this id, so the decoder never switches schema
         // (schema.rs:861, 884).
         let mut store = SchemaStore::new_with_type(FingerprintAlgorithm::Id);
@@ -1170,6 +1172,78 @@ fn top_level_record(schema: &str) -> std::result::Result<(), String> {
         serde_json::Value::Array(_) => Err("a union".to_string()),
         serde_json::Value::String(t) => Err(format!("of type {t}")),
         _ => Err("not a schema".to_string()),
+    }
+}
+
+/// The writer schema with every logical type the Avro specification calls invalid removed, so
+/// that its values are read as the type underneath, as the specification says, and as Java's
+/// Avro (`LogicalTypes.fromSchemaIgnoreInvalid`) and apache-avro 0.21.0 (schema.rs:1540-1558),
+/// and so kafka-delta-ingest, read them. The schema itself when nothing is invalid.
+///
+/// arrow-avro instead refuses a decimal whose scale exceeds its precision, whose precision is 0
+/// or missing on a `fixed`, above Arrow's 76, or more than its `fixed` holds, so every message of
+/// that writer schema was undecodable and its pipeline held (a Kafka Connect decimal from a
+/// column such as Oracle's NUMBER(2,5) is one); and it reads a negative or fractional scale as
+/// 0, and a missing precision on `bytes` as 10, so a value came out wrong by a power of ten. A
+/// decimal is kept where apache-avro keeps it and arrow-avro can hold it (codec.rs:1059-1110):
+/// a precision that is a whole number from 1 to 76, no more than its `fixed` holds; a scale that
+/// is absent or a whole number no larger than the precision. Otherwise it is its `bytes` or
+/// `fixed`, whose bytes are what kdi's JSON held for it either way (types.rs:313-337).
+///
+/// A `duration` on a `fixed` of other than 12 bytes is likewise its `fixed`, where arrow-avro
+/// refuses it; apache-avro 0.21.0 read 12 bytes there whatever the size (decode.rs:150-154).
+fn valid_logical_types(schema: &str) -> std::borrow::Cow<'_, str> {
+    use serde_json::Value;
+    fn whole(v: Option<&Value>) -> Option<u64> {
+        v.and_then(Value::as_u64)
+    }
+    /// Whether a decimal with these attributes, on a `fixed` of `size` when it is one, is valid.
+    fn decimal(o: &serde_json::Map<String, Value>, size: Option<u64>) -> bool {
+        let Some(precision) = whole(o.get("precision")) else {
+            return false;
+        };
+        let scale = match o.get("scale") {
+            None => Some(0),
+            Some(v) => whole(Some(v)),
+        };
+        // The largest precision `n` bytes of two's complement hold, for n = 1..=32, as arrow-avro
+        // tabulates it (codec.rs:1044-1057).
+        const MAX_PRECISION: [u64; 32] = [
+            2, 4, 6, 9, 11, 14, 16, 18, 21, 23, 26, 28, 31, 33, 35, 38, 40, 43, 45, 47, 50, 52, 55,
+            57, 59, 62, 64, 67, 69, 71, 74, 76,
+        ];
+        let fits =
+            |size: u64| (1..=32).contains(&size) && precision <= MAX_PRECISION[size as usize - 1];
+        (1..=76).contains(&precision)
+            && scale.is_some_and(|s| s <= precision)
+            && size.is_none_or(fits)
+    }
+    fn walk(v: &mut Value) -> bool {
+        match v {
+            Value::Array(items) => items.iter_mut().fold(false, |c, i| walk(i) | c),
+            Value::Object(o) => {
+                let kind = o.get("type").and_then(Value::as_str);
+                // A `size` on `bytes` is checked as a `fixed`'s by arrow-avro, so it is here.
+                let size = whole(o.get("size"));
+                let invalid = match (o.get("logicalType").and_then(Value::as_str), kind) {
+                    (Some("decimal"), Some("bytes" | "fixed")) => !decimal(o, size),
+                    (Some("duration"), Some("fixed")) => size != Some(12),
+                    _ => false,
+                };
+                if invalid {
+                    o.remove("logicalType");
+                }
+                o.values_mut().fold(invalid, |c, child| walk(child) | c)
+            }
+            _ => false,
+        }
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(schema) else {
+        return schema.into();
+    };
+    match walk(&mut value) {
+        true => value.to_string().into(),
+        false => schema.into(),
     }
 }
 
