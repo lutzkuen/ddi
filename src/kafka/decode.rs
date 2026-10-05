@@ -440,6 +440,14 @@ impl KafkaDecoder {
     ///
     /// Gives the message back, untouched, when its writer schema could not be had for a reason
     /// that is not the message's (§5.2), or holds the pipeline (§6.1).
+    ///
+    /// **Not cancel-safe.** The message is moved into the future, which waits on the registry
+    /// for a writer schema it has not seen: through an outage up to about two minutes (four
+    /// tries of 30 s, and 2.6 s between them). Dropped while it waits (a `select!` with a
+    /// shutdown, a revoke or a timeout), the future drops the message with it, neither decoded
+    /// nor handed back, and a commit after that would skip its offset. So await it to the end,
+    /// or keep a copy and feed that again: nothing of the decoder changes before the writer
+    /// schema is had, so feeding the copy decodes it as if for the first time.
     pub async fn feed(&mut self, message: KafkaMessage) -> std::result::Result<(), NotFed> {
         let Some(value) = message.value.as_deref() else {
             self.out.tombstones += 1;
