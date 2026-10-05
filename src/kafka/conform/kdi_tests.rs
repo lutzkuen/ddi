@@ -833,6 +833,17 @@ fn cases() -> Vec<Case> {
             ],
         },
         Case {
+            avro: "decimal(10,2) on zero bytes",
+            schema: r#"{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}"#,
+            // A length of 0: apache-avro's `Decimal::to_vec` fails on it (decimal.rs:91-102),
+            // and arrow-avro reads 0. Java's `BigInteger` refuses it; no Java producer writes it.
+            values: vec![Raw(vec![0])],
+            targets: vec![
+                ("STRING", string(), KdiDropped(&["[0]"])),
+                ("DECIMAL(10,2)", dec(10, 2), KdiDropped(&["0.00"])),
+            ],
+        },
+        Case {
             avro: "decimal(10,2) on padded bytes",
             schema: r#"{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}"#,
             values: vec![A(decimal(&[0x00, 0x00, 0x04, 0xD2]))],
@@ -1655,6 +1666,92 @@ async fn a_copied_struct_keeps_its_writers_keys() {
     assert_eq!(shown(&good, "r2")[0], r#"{"x":null}"#);
     assert_eq!(shown(&good, "r3")[0], "{x: null, y: NULL}");
     assert_eq!(shown(&good, "built")[0], r#"{"x":null,"y":null}"#);
+}
+
+/// Bodies that do not match their writer schema, which apache-avro 0.21.0 read anyway and kafka-
+/// delta-ingest wrote: bytes after the record (`from_avro_datum` never looks for any,
+/// reader.rs:446-456), and a body cut off at a trailing boolean, union or string, which it read
+/// as a null (decode.rs:85-100, 170-183, 244-259). A producer that tags a message with another
+/// version's id writes such bodies. ddi sets each aside as undecodable, rather than write a row
+/// its writer schema does not describe (§5.6, "Where ddi does not write what kdi wrote").
+#[tokio::test]
+async fn kdi_wrote_bodies_ddi_sets_aside() {
+    const W: &str = r#"{"type":"record","name":"R","fields":[
+        {"name":"id","type":"int"},{"name":"v","type":"string"},
+        {"name":"u","type":["null","string"]},{"name":"flag","type":"boolean"}]}"#;
+    const NO_FLAG: &str = r#"{"type":"record","name":"R","fields":[
+        {"name":"id","type":"int"},{"name":"v","type":"string"},
+        {"name":"u","type":["null","string"]}]}"#;
+    let full = body(
+        W,
+        record(vec![
+            ("id", Avro::Int(0)),
+            ("v", s("x")),
+            ("u", union(1, s("yy"))),
+            ("flag", Avro::Boolean(true)),
+        ]),
+    );
+    let with_null = body(
+        NO_FLAG,
+        record(vec![
+            ("id", Avro::Int(0)),
+            ("v", s("x")),
+            ("u", union(0, Avro::Null)),
+        ]),
+    );
+    let cut = |b: &[u8]| b[..b.len() - 1].to_vec();
+    let cases = [
+        (
+            "two bytes after the record",
+            W,
+            [full.clone(), vec![7, 7]].concat(),
+            serde_json::json!({"id": 0, "v": "x", "u": "yy", "flag": true}),
+            "after the record",
+        ),
+        (
+            "cut at a trailing boolean",
+            W,
+            cut(&full),
+            serde_json::json!({"id": 0, "v": "x", "u": "yy", "flag": null}),
+            "truncated",
+        ),
+        (
+            "cut at a trailing union",
+            NO_FLAG,
+            cut(&with_null),
+            serde_json::json!({"id": 0, "v": "x", "u": null}),
+            "malformed",
+        ),
+        (
+            "cut inside a trailing string",
+            W,
+            full[..full.len() - 2].to_vec(),
+            serde_json::json!({"id": 0, "v": "x", "u": null, "flag": null}),
+            "truncated",
+        ),
+    ];
+    for (case, writer, bytes, kdi_json, reason) in cases {
+        let schema = apache_avro::Schema::parse_str(writer).unwrap();
+        assert_eq!(
+            kdi::deserialize(&schema, &bytes).unwrap(),
+            kdi_json,
+            "{case}"
+        );
+        let mut d = KafkaDecoder::new(
+            "orders",
+            "kafka_",
+            Arc::new(Schemas([(1, registered(1, writer))].into_iter().collect())),
+        );
+        d.feed(message(0, 1, &bytes, None)).await.unwrap();
+        let out = d.finish().unwrap();
+        assert!(out.batches.is_empty(), "{case}");
+        assert_eq!(out.undecodable.len(), 1, "{case}");
+        assert!(
+            out.undecodable[0].reason.contains(reason),
+            "{case}: {:?}",
+            out.undecodable
+        );
+    }
 }
 
 /// A conformer writing kdi's text must know the writer schema of every row: one it was not
