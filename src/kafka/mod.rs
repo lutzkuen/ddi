@@ -6,6 +6,8 @@
 //!   message checked to be exactly one row and a malformed one isolated (§5.1, §5.4, §6.1);
 //! - [`conform`]: the union `U` the SQL path aligns its batches to (§5.5), and the conform
 //!   step that fits a batch to the target by name before the coercer (§5.6);
+//! - [`KafkaSource`], what a Kafka pipeline's `process` needs of its source: so far the
+//!   conform step;
 //! - what the build has to prove: that librdkafka is the version the design was checked
 //!   against, and that it was built with what ddi's clusters need (TLS, SCRAM, zstd).
 //!
@@ -18,6 +20,16 @@ pub mod decode;
 pub mod registry;
 #[cfg(test)]
 pub(crate) mod sr_stub;
+
+/// A Kafka pipeline's source, as `Pipeline::process` sees it (docs/kafka-design.md §1.2).
+///
+/// M3 adds the consumer, the partitions' state and the decoder; what is here is what a batch
+/// needs on its way to the target: the conform step its rows go through before the coercer
+/// (§5.6).
+#[derive(Debug)]
+pub(crate) struct KafkaSource {
+    pub(crate) conformer: conform::Conformer,
+}
 
 /// The librdkafka this binary was linked against, as librdkafka spells it (`"2.12.1"`).
 pub fn librdkafka_version() -> String {

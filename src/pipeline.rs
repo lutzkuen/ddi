@@ -233,8 +233,16 @@ pub struct Pipeline {
 /// Only the pull and the read differ between sources. Everything after them — the transform,
 /// coercion, the data-quality table, the commit — is [`Pipeline::process`], which every source
 /// shares, so a source keeps here only the state nothing else needs.
+// One per pipeline, never moved on a hot path: the Delta source's size is paid once, and
+// boxing it would put a pointer between every step and its log for nothing.
+#[cfg_attr(feature = "kafka", allow(clippy::large_enum_variant))]
 pub(crate) enum Source {
     Delta(DeltaSource),
+    /// A Kafka topic (docs/kafka-design.md). Nothing opens one until M3 brings the consumer;
+    /// what a Kafka batch needs of it in [`Pipeline::process`], the conform step, is here now.
+    #[cfg(feature = "kafka")]
+    #[allow(dead_code)] // constructed from M3, by the Kafka open
+    Kafka(Box<crate::kafka::KafkaSource>),
 }
 
 /// A Delta table, read commit by commit through its log.
@@ -252,12 +260,16 @@ impl Source {
     fn delta(&self) -> &DeltaSource {
         match self {
             Self::Delta(src) => src,
+            #[cfg(feature = "kafka")]
+            Self::Kafka(_) => unreachable!("only a Delta source reads a log or opens a window"),
         }
     }
 
     fn delta_mut(&mut self) -> &mut DeltaSource {
         match self {
             Self::Delta(src) => src,
+            #[cfg(feature = "kafka")]
+            Self::Kafka(_) => unreachable!("only a Delta source reads a log or opens a window"),
         }
     }
 }
@@ -655,6 +667,9 @@ impl Pipeline {
     pub fn cursor(&self) -> StreamCursor {
         match &self.source {
             Source::Delta(src) => src.stream.cursor(),
+            // No Kafka source is opened before M3, which makes this an `Option`.
+            #[cfg(feature = "kafka")]
+            Source::Kafka(_) => StreamCursor::at_version(0),
         }
     }
 
@@ -662,6 +677,8 @@ impl Pipeline {
     pub fn source_head_version(&self) -> Option<Version> {
         match &self.source {
             Source::Delta(src) => src.stream.last_known_head(),
+            #[cfg(feature = "kafka")]
+            Source::Kafka(_) => None,
         }
     }
 
@@ -676,6 +693,13 @@ impl Pipeline {
     pub async fn step(&mut self) -> Result<StepOutcome> {
         match &self.source {
             Source::Delta(_) => self.step_delta().await,
+            // `Pipeline::open` refuses a Kafka pipeline until M3 brings the consumer.
+            #[cfg(feature = "kafka")]
+            Source::Kafka(_) => Err(Error::Config(format!(
+                "pipeline {:?} reads a Kafka topic, and this version of ddi cannot run a Kafka \
+                 source yet",
+                self.cfg.name
+            ))),
         }
     }
 
@@ -1099,14 +1123,23 @@ impl Pipeline {
     /// A Delta source's rows already have the shape the transform was written against, so
     /// for one this hands `output` back as it is. A source whose rows arrive in more than one
     /// shape conforms them here instead, and adds the rows it cannot to `rejects`, so that the
-    /// batch still makes one data-quality commit (docs/kafka-design.md §5.6).
+    /// batch still makes one data-quality commit (docs/kafka-design.md §5.6): a Kafka source,
+    /// whose rows come in as many shapes as its writer schemas.
+    // Only a Kafka source adds to `rejects`, which a build without one never compiles.
+    #[cfg_attr(not(feature = "kafka"), allow(unused_variables, clippy::ptr_arg))]
     fn conform(
-        &self,
+        &mut self,
         output: Vec<RecordBatch>,
-        _rejects: &mut Vec<Rejected>,
+        rejects: &mut Vec<Rejected>,
     ) -> Result<Vec<RecordBatch>> {
-        match &self.source {
+        match &mut self.source {
             Source::Delta(_) => Ok(output),
+            // Without a data-quality table a row that does not fit fails the batch, as the
+            // coercer's strict cast does.
+            #[cfg(feature = "kafka")]
+            Source::Kafka(src) => src
+                .conformer
+                .conform_all(output, rejects, self.dq.is_some()),
         }
     }
 
@@ -2636,5 +2669,226 @@ mod tests {
 
         apply_lookup_table_id_transitions(&mut ids, &mut current_on_open, &pending);
         assert!(!current_on_open.contains("fx"));
+    }
+}
+
+/// The conform hook for a Kafka batch (docs/kafka-design.md §5.6), driven through
+/// [`Pipeline::process`] as M3's step will drive it. No Kafka pipeline opens before M3, so the
+/// test opens a Delta one over the same target and gives it a Kafka source.
+#[cfg(all(test, feature = "kafka"))]
+mod kafka_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use deltalake::arrow::array::{
+        Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    };
+    use deltalake::arrow::datatypes::{DataType, Field, Fields, Int64Type, Schema};
+    use deltalake::kernel::{DataType as Delta, StructField};
+    use deltalake::protocol::SaveMode;
+    use deltalake::DeltaTable;
+    use futures::TryStreamExt;
+
+    use super::{Batch, LookupBatch, Pipeline, Position, Source, StepOutcome};
+    use crate::config::ResolvedPipeline;
+    use crate::kafka::conform::{Conformer, KdiText};
+    use crate::kafka::KafkaSource;
+    use crate::sink::KafkaOffsets;
+
+    async fn create(path: &str, columns: Vec<StructField>) {
+        DeltaTable::try_from_url(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap()
+            .create()
+            .with_columns(columns)
+            .with_save_mode(SaveMode::ErrorIfExists)
+            .await
+            .unwrap();
+    }
+
+    async fn scan(path: &str) -> Vec<RecordBatch> {
+        let table = deltalake::open_table(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap();
+        let (_, stream) = table.scan_table().await.unwrap();
+        stream.try_collect().await.unwrap()
+    }
+
+    fn text(a: &ArrayRef, i: usize) -> Option<String> {
+        let a = deltalake::arrow::compute::cast(a, &DataType::Utf8).unwrap();
+        let a = a.as_string::<i32>();
+        a.is_valid(i).then(|| a.value(i).to_string())
+    }
+
+    fn cfg(source: &str, target: &str, dq: &str) -> ResolvedPipeline {
+        ResolvedPipeline {
+            name: "orders_bronze".into(),
+            app_id: "ddi.orders_bronze".into(),
+            source_uri: source.into(),
+            target_uri: target.into(),
+            lookups: vec![],
+            source_relation: None,
+            target_relation: None,
+            publish: None,
+            publish_to: None,
+            starting_version: 0,
+            change_policy: Default::default(),
+            transform_sql: None,
+            allowed_latency_secs: 1,
+            near_time_poll_interval_secs: 1,
+            max_bytes_per_batch: 64 * 1024 * 1024,
+            max_files_per_batch: 100,
+            max_output_rows_per_batch: 1_000_000,
+            target_file_size: 128 * 1024 * 1024,
+            watermark_uri: None,
+            dedup_timestamp: None,
+            dedup_key: None,
+            dedup_partition: Vec::new(),
+            write_mode: Default::default(),
+            upsert_key: None,
+            upsert_lookback: None,
+            upsert_tiebreak: Vec::new(),
+            upsert_grain_check: Default::default(),
+            stage_for: None,
+            dq_uri: Some(dq.into()),
+            max_evaluation_rejects_per_batch: 100,
+            storage: Default::default(),
+            kafka: None,
+        }
+    }
+
+    /// A Kafka batch's rows reach the target conformed by name (a record whose fields come in
+    /// another order, with one the target lacks and one it has under another type), and a row
+    /// the conform step sets aside goes to the data-quality table in the batch's one write,
+    /// with its message's offset, while the rest commits with the batch's offsets.
+    #[tokio::test]
+    async fn a_kafka_batch_is_conformed_before_the_coercer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        let (source, target, dq) = (path("source"), path("target"), path("dq"));
+        create(&source, vec![StructField::new("id", Delta::LONG, false)]).await;
+        let address = Delta::try_struct_type(vec![
+            StructField::new("street", Delta::STRING, false),
+            StructField::new("zip", Delta::STRING, true),
+        ])
+        .unwrap();
+        create(
+            &target,
+            vec![
+                StructField::new("id", Delta::LONG, false),
+                StructField::new("address", address, true),
+                StructField::new("kafka_offset", Delta::LONG, true),
+            ],
+        )
+        .await;
+        create(&dq, crate::dq::columns()).await;
+
+        let mut p = Pipeline::open(cfg(&source, &target, &dq)).await.unwrap();
+        let conformer = Conformer::new(p.coercer.target(), "kafka_", KdiText::default()).unwrap();
+        p.source = Source::Kafka(Box::new(KafkaSource { conformer }));
+
+        // As the decoder hands rows on: the writer's own field order, then the metadata.
+        let address_fields = Fields::from(vec![
+            Field::new("zip", DataType::Int32, false),
+            Field::new("city", DataType::Utf8, false),
+            Field::new("street", DataType::Utf8, true),
+        ]);
+        let address = StructArray::try_new(
+            address_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![10115, 75001])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["Berlin", "Paris"])),
+                Arc::new(StringArray::from(vec![Some("Unter den Linden"), None])),
+            ],
+            None,
+        )
+        .unwrap();
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("address", DataType::Struct(address_fields), false),
+                Field::new("kafka_partition", DataType::Int32, false),
+                Field::new("kafka_offset", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(address),
+                Arc::new(Int32Array::from(vec![0, 0])),
+                Arc::new(Int64Array::from(vec![40, 41])),
+            ],
+        )
+        .unwrap();
+        let offsets = KafkaOffsets {
+            topic: "orders".into(),
+            group_id: "ddi-orders_bronze".into(),
+            ranges: BTreeMap::from([(0, (40, 41))]),
+            assert: BTreeMap::from([(0, 41)]),
+            marks: BTreeMap::new(),
+            cleanup_logs: false,
+            baseline: false,
+            override_reason: None,
+            takeover_marker: false,
+        };
+        let outcome = p
+            .process(Batch {
+                started: Instant::now(),
+                through: 0,
+                files: 0,
+                input: vec![input],
+                rejects: Vec::new(),
+                lookups: LookupBatch::none(),
+                position: Position::Kafka(offsets),
+            })
+            .await
+            .unwrap();
+        let StepOutcome::Progressed { rows, rejected, .. } = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!((rows, rejected), (1, 1));
+
+        let written = scan(&target).await;
+        assert_eq!(written.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        let b = &written[0];
+        assert_eq!(
+            b.column_by_name("id")
+                .unwrap()
+                .as_primitive::<Int64Type>()
+                .value(0),
+            1
+        );
+        let address = b.column_by_name("address").unwrap().as_struct();
+        assert_eq!(
+            text(address.column_by_name("street").unwrap(), 0).as_deref(),
+            Some("Unter den Linden")
+        );
+        assert_eq!(
+            text(address.column_by_name("zip").unwrap(), 0).as_deref(),
+            Some("10115")
+        );
+
+        let recorded = scan(&dq).await;
+        assert_eq!(recorded.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        let r = &recorded[0];
+        assert_eq!(
+            r.column_by_name("source_version")
+                .unwrap()
+                .as_primitive::<Int64Type>()
+                .value(0),
+            41
+        );
+        assert_eq!(
+            text(r.column_by_name("column_name").unwrap(), 0).as_deref(),
+            Some("address")
+        );
+        let reason = text(r.column_by_name("reason").unwrap(), 0).unwrap();
+        assert!(
+            reason.contains("address.street is NOT NULL in the target"),
+            "{reason}"
+        );
+        let dq_table = deltalake::open_table(deltalake::ensure_table_uri(&dq).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(dq_table.version(), Some(1), "one data-quality commit");
     }
 }
