@@ -15,8 +15,9 @@
 //!   depth: a struct's children by name, a list's elements and a map's keys and values in
 //!   place, the containers rebuilt with the target's own field names (`element`, `key_value`,
 //!   `key`, `value`). A general union takes the branch each row holds, a float goes into a
-//!   decimal through its shortest text, and a row whose value does not fit goes to the
-//!   data-quality table, in the same write as the batch's other rejects.
+//!   decimal through its shortest text and a string through its own, read as kdi's arrow-json
+//!   read them, and a row whose value does not fit goes to the data-quality table, in the same
+//!   write as the batch's other rejects.
 //!
 //! # Why by name
 //!
@@ -52,6 +53,7 @@
 //! key, which the row's own writer schema says ([`crate::kafka::kdi_text`]). So a conformer that
 //! writes either is told every writer schema its rows can come from ([`Conformer::observe`]).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -67,8 +69,8 @@ use deltalake::arrow::compute::{
     can_cast_types, concat, filter_record_batch, interleave, is_not_null, CastOptions,
 };
 use deltalake::arrow::datatypes::{
-    DataType, Decimal128Type, Decimal256Type, Field, FieldRef, Fields, Float16Type, Float32Type,
-    Float64Type, Int32Type, Schema, SchemaRef, UnionFields, UnionMode,
+    DataType, Decimal128Type, Decimal256Type, DecimalType, Field, FieldRef, Fields, Float16Type,
+    Float32Type, Float64Type, Int32Type, Schema, SchemaRef, UnionFields, UnionMode,
 };
 use deltalake::arrow::error::ArrowError;
 use tracing::warn;
@@ -209,6 +211,10 @@ impl Fitter<'_> {
                 DataType::Float16 | DataType::Float32 | DataType::Float64,
                 DataType::Decimal128(..) | DataType::Decimal256(..),
             ) => self.float_to_decimal(array, to, path),
+            (
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+                DataType::Decimal128(..) | DataType::Decimal256(..),
+            ) => self.text_to_decimal(array, to, path),
             // Anything else into a struct, a list or a map (a record or a text into an ARRAY):
             // Arrow's cast would wrap it in a one-element list and pair a struct's fields by
             // position, or null an element inside a list that stays valid, and so would the
@@ -899,53 +905,82 @@ impl Fitter<'_> {
                 .collect(),
             _ => array.as_primitive::<Float64Type>().iter().collect(),
         };
-        let n = floats.len();
+        let (precision, scale) = decimal_shape(to);
+        let texts = floats
+            .into_iter()
+            .map(|v| v.map(|v| decimal_text(v, precision, scale).map(Cow::Owned)))
+            .collect();
+        self.parse_decimals(array, texts, to, path)
+    }
+
+    /// A text into a decimal as kafka-delta-ingest's arrow-json read a JSON string into one
+    /// (arrow-json 55 decimal_array.rs:55-60): arrow's `parse_decimal`, which reads an exponent
+    /// (`1.5e2`) and drops the digits past the scale. Arrow's cast would round half away from
+    /// zero (cast/decimal.rs:575-593), writing 12.35 where kdi wrote 12.34, and would trim
+    /// spaces kdi refused. A text that does not parse is rejected.
+    fn text_to_decimal(&self, array: &ArrayRef, to: &DataType, path: &str) -> Result<Fitted> {
+        let texts: Vec<Option<Option<Cow<'_, str>>>> = match array.data_type() {
+            DataType::LargeUtf8 => array
+                .as_string::<i64>()
+                .iter()
+                .map(|v| v.map(|t| Some(Cow::Borrowed(t))))
+                .collect(),
+            DataType::Utf8View => array
+                .as_string_view()
+                .iter()
+                .map(|v| v.map(|t| Some(Cow::Borrowed(t))))
+                .collect(),
+            _ => array
+                .as_string::<i32>()
+                .iter()
+                .map(|v| v.map(|t| Some(Cow::Borrowed(t))))
+                .collect(),
+        };
+        self.parse_decimals(array, texts, to, path)
+    }
+
+    /// The decimals `texts` hold, one per value of `array`, read by arrow's `parse_decimal` into
+    /// `to`: `None` for a null; `Some(None)` for a value no text of which fits, which is
+    /// rejected, as is a text that does not parse.
+    fn parse_decimals(
+        &self,
+        array: &ArrayRef,
+        texts: Vec<Option<Option<Cow<'_, str>>>>,
+        to: &DataType,
+        path: &str,
+    ) -> Result<Fitted> {
+        fn read<T: DecimalType>(
+            texts: &[Option<Option<Cow<'_, str>>>],
+            (precision, scale): (u8, i8),
+            mut reject: impl FnMut(usize),
+        ) -> Vec<Option<T::Native>> {
+            let parse = |t: &str| parse_decimal::<T>(t, precision, scale).ok();
+            (texts.iter().enumerate())
+                .map(|(i, text)| {
+                    let value = text.as_ref()?.as_deref().and_then(parse);
+                    if value.is_none() {
+                        reject(i);
+                    }
+                    value
+                })
+                .collect()
+        }
+        let n = texts.len();
         let mut bad = Reasons::default();
         let from = array.data_type();
-        let out: ArrayRef = match *to {
-            DataType::Decimal128(precision, scale) => {
-                let values: Vec<Option<i128>> = floats
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        let v = (*v)?;
-                        let parsed = decimal_text(v, precision, scale).and_then(|t| {
-                            parse_decimal::<Decimal128Type>(&t, precision, scale).ok()
-                        });
-                        if parsed.is_none() {
-                            bad.set(n, i, || self.not_converted(path, from, to));
-                        }
-                        parsed
-                    })
-                    .collect();
-                Arc::new(
-                    Decimal128Array::from(values)
-                        .with_precision_and_scale(precision, scale)
-                        .map_err(|e| assembly(path, e))?,
-                )
-            }
-            DataType::Decimal256(precision, scale) => {
-                let values: Vec<Option<_>> = floats
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        let v = (*v)?;
-                        let parsed = decimal_text(v, precision, scale).and_then(|t| {
-                            parse_decimal::<Decimal256Type>(&t, precision, scale).ok()
-                        });
-                        if parsed.is_none() {
-                            bad.set(n, i, || self.not_converted(path, from, to));
-                        }
-                        parsed
-                    })
-                    .collect();
-                Arc::new(
-                    Decimal256Array::from(values)
-                        .with_precision_and_scale(precision, scale)
-                        .map_err(|e| assembly(path, e))?,
-                )
-            }
-            _ => unreachable!("matched as a decimal"),
+        let (precision, scale) = decimal_shape(to);
+        let reject = |i: usize| bad.set(n, i, || self.not_converted(path, from, to));
+        let out: ArrayRef = match to {
+            DataType::Decimal128(..) => Arc::new(
+                Decimal128Array::from(read::<Decimal128Type>(&texts, (precision, scale), reject))
+                    .with_precision_and_scale(precision, scale)
+                    .map_err(|e| assembly(path, e))?,
+            ),
+            _ => Arc::new(
+                Decimal256Array::from(read::<Decimal256Type>(&texts, (precision, scale), reject))
+                    .with_precision_and_scale(precision, scale)
+                    .map_err(|e| assembly(path, e))?,
+            ),
         };
         self.unchanged(array, &out, path, &mut bad);
         Ok(Fitted {
@@ -1000,6 +1035,16 @@ impl Fitter<'_> {
             "{path} is NOT NULL in the target, and nothing produces it (the row's writer schema \
              has no such field)"
         )
+    }
+}
+
+/// The precision and scale of a decimal type.
+fn decimal_shape(t: &DataType) -> (u8, i8) {
+    match *t {
+        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+            (precision, scale)
+        }
+        _ => unreachable!("matched as a decimal"),
     }
 }
 

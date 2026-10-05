@@ -605,6 +605,34 @@ fn cases() -> Vec<Case> {
             targets: vec![("TIMESTAMP", Delta::TIMESTAMP, Same)],
         },
         Case {
+            avro: "string, a number",
+            schema: r#""string""#,
+            values: ["12.345", "0.125", "-1.005", "1.999", "1.5e2", "7"]
+                .into_iter()
+                .map(|v| A(s(v)))
+                .collect(),
+            targets: vec![("DECIMAL(10,2)", dec(10, 2), Same)],
+        },
+        Case {
+            avro: "string, a number with a space",
+            schema: r#""string""#,
+            values: vec![A(s(" 1.25"))],
+            targets: vec![("DECIMAL(10,2)", dec(10, 2), KdiFailed(&["REJECTED"]))],
+        },
+        Case {
+            avro: "record of a string, a number",
+            schema: r#"{"type":"record","name":"Amount","fields":[{"name":"a","type":"string"}]}"#,
+            values: vec![
+                A(record(vec![("a", s("12.345"))])),
+                A(record(vec![("a", s("-0.125"))])),
+            ],
+            targets: vec![(
+                "STRUCT<a DECIMAL(10,2)>",
+                strct(vec![field("a", dec(10, 2), true)]),
+                Same,
+            )],
+        },
+        Case {
             avro: "string, not a time",
             schema: r#""string""#,
             values: vec![A(s("not a time"))],
