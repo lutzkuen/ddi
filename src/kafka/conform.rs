@@ -8,8 +8,9 @@
 //!   only older ones have, newest first, each with the type of the newest writer schema that
 //!   has it, and the Kafka metadata columns after them. An older row is cast to that type, and
 //!   one that does not convert, or would not be the same value, goes to the data-quality table;
-//!   a field its writer schema lacks is null. Without SQL nothing is aligned: batches of different writer schemas go through
-//!   `Identity` as they are, and are conformed to the target one by one.
+//!   a field its writer schema lacks is null. Without SQL nothing is aligned: batches of
+//!   different writer schemas go through `Identity` as they are, and are conformed to the
+//!   target one by one.
 //! - **Into the target, after the transform and before the coercer** ([`Conformer`], §5.6). A
 //!   column goes to the target column of exactly its name, case included, and so on at every
 //!   depth: a struct's children by name, a list's elements and a map's keys and values in
@@ -1585,10 +1586,10 @@ impl Conformer {
     }
 
     /// Warns once per writer schema id about target columns its rows do not have, and nullable
-    /// fields of target structs their structs do not have (`nested`, by path), which are
-    /// written null: usually a field named in another case (`customerId` against
-    /// `customerid`), since names match exactly. `nested_near` names those of `unmatched` that
-    /// are nested and that the rows have in another case.
+    /// fields of target structs their structs do not have (both in `unmatched`, a field by its
+    /// path), which are written null: usually a field named in another case (`customerId`
+    /// against `customerid`), since names match exactly. `nested_near` names the nested ones
+    /// the rows have in another case.
     fn note_unmatched(
         &mut self,
         batch: &RecordBatch,
