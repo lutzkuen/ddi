@@ -202,8 +202,15 @@ impl Partitions {
         );
     }
 
+    /// Partition `p` waits for an operator, for `block`. One already blocked keeps the time it
+    /// blocked at, whatever its reason is now: a recheck that finds it still blocked does not
+    /// make it newly so (once-mode's idle rule counts from there).
     pub(crate) fn block(&mut self, p: i32, block: Block, now: Instant) {
-        self.map.insert(p, State::Blocked { block, since: now });
+        let since = match self.map.get(&p) {
+            Some(State::Blocked { since, .. }) => *since,
+            _ => now,
+        };
+        self.map.insert(p, State::Blocked { block, since });
     }
 
     /// Decide what to do with the message at `mark.offset` of partition `p` (§3.3), and move
@@ -530,5 +537,13 @@ mod tests {
             "only the stored offset was left"
         );
         assert!(!parts.done(0, 5, idle, now));
+
+        // A blocked partition is done once it has been blocked for the idle time, however
+        // often a recheck finds it still blocked.
+        let (mut parts, now) = ready(0, 3, None);
+        let block = Block::Regressed { stored: 9, high: 5 };
+        parts.block(0, block.clone(), now);
+        parts.block(0, block, now + idle / 2);
+        assert!(parts.done(0, 5, idle, now + idle));
     }
 }

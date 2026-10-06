@@ -1507,6 +1507,129 @@ pub async fn recent_txn_app_ids(table: &DeltaTable, max_commits: u64) -> Result<
     Ok(ids)
 }
 
+/// Whether the commit at `table`'s own version is still in its log: one HEAD.
+///
+/// A writer about to commit from a handle at version `v` writes version `v + 1` if nothing is
+/// there. Under a table dropped and recreated in place, nothing is, and the commit would land in
+/// the new table at the old one's next version. The new log lacks `v` itself, unless the new
+/// table already has as many versions; a missing `v` is the cue to look at the table id
+/// ([`stored_table_id`]). Log cleanup never removes the commit a handle refreshed within the
+/// last ten minutes stands at (docs/kafka-design.md §4.3, aging).
+pub async fn commit_exists(table: &DeltaTable) -> Result<bool> {
+    let Some(version) = table.version() else {
+        return Ok(true);
+    };
+    let log_store = table.log_store();
+    let path = log_store
+        .log_path()
+        .clone()
+        .join(format!("{version:020}.json").as_str());
+    match log_store.object_store(None).head(&path).await {
+        Ok(_) => Ok(true),
+        Err(deltalake::ObjectStoreError::NotFound { .. }) => Ok(false),
+        Err(e) => Err(store_error(e)),
+    }
+}
+
+/// The id of the table at `table`'s location as storage holds it now, not as the handle
+/// remembers it: from commit 0's `metaData`, or from the newest checkpoint's where log cleanup
+/// removed commit 0. `None` when neither can be read.
+///
+/// An incremental refresh cannot see a table dropped and recreated under a running writer: it
+/// reads the commits after the handle's version, which the new table may not have, and never
+/// reads a `metaData` again. Its handle keeps the old id, and the next commit would land in the
+/// new table at the old table's next version. One GET (commit 0) answers whether the table is
+/// still the one opened (docs/kafka-design.md §3.3 reset step 2, I18).
+pub async fn stored_table_id(table: &DeltaTable) -> Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Line {
+        #[serde(rename = "metaData")]
+        metadata: Option<Meta>,
+    }
+    #[derive(Deserialize)]
+    struct Meta {
+        id: String,
+    }
+    let from_json = |bytes: &[u8]| {
+        serde_json::Deserializer::from_slice(bytes)
+            .into_iter::<Line>()
+            .find_map(|l| l.ok().and_then(|l| l.metadata).map(|m| m.id))
+    };
+    let log_store = table.log_store();
+    if let Some(bytes) = log_store.read_commit_entry(0).await? {
+        return Ok(from_json(&bytes));
+    }
+    let store = crate::storage::with_every_checkpoint(log_store.as_ref());
+    let head = table.version().unwrap_or(0);
+    let Some(checkpoint) = newest_checkpoint(store.as_ref(), log_store.log_path(), head).await?
+    else {
+        return Ok(None);
+    };
+    for file in &checkpoint.files {
+        if file.location.as_ref().ends_with(".json") {
+            let bytes = store
+                .get(&file.location)
+                .await
+                .map_err(store_error)?
+                .bytes()
+                .await
+                .map_err(store_error)?;
+            if let Some(id) = from_json(&bytes) {
+                return Ok(Some(id));
+            }
+            continue;
+        }
+        if let Ok(Some(id)) = parquet_metadata_id(store.clone(), file).await {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// The `metaData.id` of a parquet checkpoint file, read through that column alone.
+async fn parquet_metadata_id(
+    store: Arc<dyn ObjectStore>,
+    file: &ObjectMeta,
+) -> std::result::Result<Option<String>, String> {
+    use deltalake::parquet::arrow::async_reader::{
+        ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+    };
+    use deltalake::parquet::arrow::ProjectionMask;
+
+    let reader = ParquetObjectReader::new(store, file.location.clone()).with_file_size(file.size);
+    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Ok(column) = builder.schema().index_of("metaData") else {
+        return Ok(None);
+    };
+    let projection = ProjectionMask::roots(builder.parquet_schema(), [column]);
+    let batches: Vec<RecordBatch> = builder
+        .with_projection(projection)
+        .build()
+        .map_err(|e| e.to_string())?
+        .try_collect()
+        .await
+        .map_err(|e| e.to_string())?;
+    for batch in &batches {
+        let Some(meta) = batch.column(0).as_struct_opt() else {
+            continue;
+        };
+        let Some(ids) = meta.column_by_name("id") else {
+            continue;
+        };
+        let ids =
+            deltalake::arrow::compute::cast(ids, &DataType::Utf8).map_err(|e| e.to_string())?;
+        let ids = ids.as_string::<i32>();
+        for row in 0..meta.len() {
+            if meta.is_valid(row) && ids.is_valid(row) {
+                return Ok(Some(ids.value(row).to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Refuse a target that sets `delta.setTransactionRetentionDuration`.
 ///
 /// Under it the kernel forgets a `txn` whose `lastUpdated` is at or before the cutoff, and

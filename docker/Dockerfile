@@ -25,12 +25,12 @@ FROM rust:1.97-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config libssl-dev zlib1g-dev make \
     && rm -rf /var/lib/apt/lists/*
-# Cargo features to build with: empty is the Delta-only binary; `kafka` adds the Kafka source
-# (docs/kafka-design.md), which stays empty here until that source is complete (M3).
-#   docker build --build-arg DDI_FEATURES=kafka -f docker/Dockerfile .
+# Cargo features to build with: `kafka` (the default) is the kafka-delta-ingest replacement,
+# with the Kafka source (docs/kafka-design.md); empty is the Delta-only binary.
+#   docker build --build-arg DDI_FEATURES= -f docker/Dockerfile .
 # Declared after the layer above on purpose: every RUN after an ARG has it in its environment,
 # which is part of that RUN's cache key, so declared earlier it would split the shared layer.
-ARG DDI_FEATURES=
+ARG DDI_FEATURES=kafka
 # libclang-dev, for a `kafka` build only: the zstd-sys this tree locks (2.0.16) turns on
 # bindgen by default, and rdkafka-sys asks for its defaults. A Delta-only build needs none of
 # its ~65 MB (432 MB installed) of LLVM.

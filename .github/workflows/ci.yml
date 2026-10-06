@@ -130,34 +130,68 @@ jobs:
       # and this proves it starts the way an operator will invoke it. On a push, this pulls
       # the image just published above — `docker run` fetches it implicitly. Any one of the
       # tags just pushed names the same image, so the primary (SHA) tag is enough here.
-      - run: docker run --rm ${{ steps.tag.outputs.primary }} --version
+      # The image is the kafka-delta-ingest replacement from M3 on (the Dockerfile's default
+      # features), and says which librdkafka it linked; a build that lost it fails here.
+      - run: docker run --rm ${{ steps.tag.outputs.primary }} --version | tee /dev/stderr | grep -F 'librdkafka 2.12.1'
 
-  image-kafka:
-    name: container image (kafka feature)
+  image-delta-only:
+    name: container image (Delta-only)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Until M3 the published image above is Delta-only (DDI_FEATURES empty), and check-kafka
-      # builds debug binaries on the runner. Without this job nothing builds what the image
-      # will ship from M3 on: the `kafka` release binary (its thin-LTO, single-unit link of a
-      # static librdkafka and bundled zstd), through the Dockerfile's own kafka path (libclang
-      # for bindgen, the dependency-cache layer with the feature, the in-image `--version`
-      # against the runtime stage's libssl3). Built here and never pushed, with a cache scope
-      # of its own so it does not evict the published image's.
+      # From M3 the published image above builds with `kafka` (the Dockerfile's default), so
+      # this job builds the other variant, `--build-arg DDI_FEATURES=`, which deployments that
+      # run only Delta pipelines may build from source. Never pushed, with a cache scope of its
+      # own so it does not evict the published image's.
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
-          build-args: DDI_FEATURES=kafka
+          build-args: DDI_FEATURES=
           push: false
           load: true
-          tags: ddi:kafka-ci
-          cache-from: type=gha,scope=kafka
-          cache-to: type=gha,mode=max,scope=kafka
-      # The image says which librdkafka it linked; a build that lost it, or linked another,
-      # fails here.
-      - run: docker run --rm ddi:kafka-ci --version | tee /dev/stderr | grep -F 'librdkafka 2.12.1'
+          tags: ddi:delta-only-ci
+          cache-from: type=gha,scope=delta-only
+          cache-to: type=gha,mode=max,scope=delta-only
+      # The Delta-only binary links no librdkafka.
+      - run: "! docker run --rm ddi:delta-only-ci --version | tee /dev/stderr | grep -F librdkafka"
+
+  kafka-integration:
+    name: Kafka source against Redpanda
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: kafka-integration
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev zlib1g-dev make libclang-dev
+      # Redpanda with its built-in Schema Registry, pinned: a broker upgrade is a change to
+      # review, not one that arrives with a CI run.
+      - name: Start Redpanda
+        run: |
+          docker run -d --name rp -p 9092:9092 -p 8081:8081 redpandadata/redpanda:v26.2.3 \
+            redpanda start --mode dev-container --smp 1 --memory 1G \
+            --kafka-addr 0.0.0.0:9092 --advertise-kafka-addr 127.0.0.1:9092 \
+            --schema-registry-addr 0.0.0.0:8081
+      # `fault-injection` compiles the hooks some tests set through DDI_TEST_FAULT.
+      - run: cargo test --features kafka,fault-injection --test 'kafka_*' --no-run
+      - name: Wait for Redpanda
+        run: |
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8081/subjects >/dev/null && docker exec rp rpk cluster health | grep -q 'Healthy:.*true' && exit 0
+            sleep 2
+          done
+          docker logs rp | tail -50
+          exit 1
+      - name: The Kafka integration tests
+        env:
+          DDI_TEST_KAFKA: 127.0.0.1:9092
+          DDI_TEST_SR: http://127.0.0.1:8081
+        run: cargo test --features kafka,fault-injection --test 'kafka_*' -- --ignored --test-threads=1 --skip soak
 
   licenses:
     name: licence policy

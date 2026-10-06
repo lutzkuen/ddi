@@ -1,7 +1,8 @@
-//! What the `ddi` binary does with Kafka pipelines before the Kafka source exists
-//! (docs/kafka-design.md, M1): `validate` judges them, everything else holds them back by
-//! name, and the Delta pipelines beside them run (I16). Meaningful, and run, in both feature
-//! configurations.
+//! What the `ddi` binary does with Kafka pipelines beside Delta pipelines
+//! (docs/kafka-design.md, M1 and M3): `validate` judges them; a build without the `kafka`
+//! feature holds them back by name (I16); with it they run, and one that cannot reach its
+//! broker fails on its own while the Delta pipelines beside it run. Meaningful, and run, in both
+//! feature configurations.
 
 mod common;
 
@@ -90,7 +91,6 @@ async fn validate_judges_a_kafka_pipeline_and_reads_nothing() {
             "{printed}"
         );
         assert!(printed.contains("app_id=kafka_delta_ingest"), "{printed}");
-        assert!(printed.contains("not run by this build yet"), "{printed}");
         assert!(printed.contains("2 pipeline(s) valid."), "{printed}");
     } else {
         // Held back, by name, and the exit code says so — a CI gate on `validate` gates.
@@ -105,7 +105,7 @@ async fn validate_judges_a_kafka_pipeline_and_reads_nothing() {
 }
 
 #[tokio::test]
-async fn kafka_pipelines_are_held_back_and_the_delta_pipelines_run() {
+async fn kafka_pipelines_are_held_back_or_fail_alone_and_the_delta_pipelines_run() {
     let f = Fixture::new().await;
     append(&f.source, &[1, 2, 3]).await;
     let config = write_config(f.dir.path(), &f.source, &f.target);
@@ -118,17 +118,19 @@ async fn kafka_pipelines_are_held_back_and_the_delta_pipelines_run() {
         .output()
         .unwrap();
     let printed = text(&out);
-    assert!(out.status.success(), "{printed}");
     assert_eq!(read_ids(&f.target).await, vec![1, 2, 3], "{printed}");
-
-    assert!(printed.contains("held back"), "{printed}");
     assert!(printed.contains("events"), "{printed}");
-    assert!(
-        printed.contains(if cfg!(feature = "kafka") {
-            "the Kafka source is not implemented yet"
-        } else {
-            "built without the `kafka` feature"
-        }),
-        "{printed}"
-    );
+    if cfg!(feature = "kafka") {
+        // It runs, and with no broker at 127.0.0.1:9 it fails on its own: the run's exit code
+        // says so, and the Delta pipeline beside it was not stopped.
+        assert!(!out.status.success(), "{printed}");
+        assert!(printed.contains("pipeline failed"), "{printed}");
+    } else {
+        assert!(out.status.success(), "{printed}");
+        assert!(printed.contains("held back"), "{printed}");
+        assert!(
+            printed.contains("built without the `kafka` feature"),
+            "{printed}"
+        );
+    }
 }

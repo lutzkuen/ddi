@@ -765,8 +765,11 @@ impl Pipeline {
         let started = Instant::now();
         // 1. A handle older than handle_max_age is refreshed before it plans a commit: the
         // conflict check would otherwise read every commit since, and fail on one log cleanup
-        // removed (EO-m8).
-        if self.kafka().refreshed_at.elapsed() >= fault::handle_max_age() {
+        // removed (EO-m8). So is one whose own commit is gone from the log: the table was
+        // dropped and recreated under it, and the refresh says so (I18).
+        if self.kafka().refreshed_at.elapsed() >= fault::handle_max_age()
+            || !fence::commit_exists(&self.target).await?
+        {
             let changed = self.refresh_and_reset().await?;
             if let Some(p) = batch.ranges.keys().find(|p| changed.contains(p)) {
                 return Err(self.moved(*p, batch));
@@ -1142,12 +1145,20 @@ impl Pipeline {
     /// be the table opened, with no txn retention and a protocol this build writes; the
     /// coercer and the conformer rebuilt if another writer changed its schema.
     pub(crate) async fn refresh_target(&mut self) -> Result<()> {
-        if let Err(e) = self.target.update_incremental(None).await {
-            debug!(pipeline = %self.cfg.name, "incremental refresh failed, opening again: {e}");
-            // Storage::open steps over a checkpoint another engine wrote (storage.rs:95-142).
-            self.target = self.cfg.storage.open(&self.cfg.target_uri).await?;
-        }
-        let found = crate::lookup::table_id(&self.target);
+        let found = match self.target.update_incremental(None).await {
+            // The handle remembers the id it was opened with; storage says which table is
+            // there now (a table dropped and recreated in place leaves the handle as it was).
+            Ok(()) => match fence::stored_table_id(&self.target).await? {
+                Some(id) => Some(id),
+                None => crate::lookup::table_id(&self.target),
+            },
+            Err(e) => {
+                debug!(pipeline = %self.cfg.name, "incremental refresh failed, opening again: {e}");
+                // Storage::open steps over a checkpoint another engine wrote (storage.rs:95-142).
+                self.target = self.cfg.storage.open(&self.cfg.target_uri).await?;
+                crate::lookup::table_id(&self.target)
+            }
+        };
         let opened = self.kafka().table_id.clone();
         if opened.is_some() && found != opened {
             return Err(Error::TargetReplaced {
@@ -1235,9 +1246,28 @@ impl Pipeline {
             Err(e) => return Err(e),
         };
         self.reposition_changed(&changed, None);
-        let blocked: Vec<i32> = self.kafka().parts.blocked().map(|(p, _)| p).collect();
+        // A partition blocked because the message at its stored offset is another one (I19)
+        // waits for that offset to move: the table and the watermarks cannot see a replaced
+        // topic, only the re-read can, and resolving it again would re-read and block it again
+        // every recheck.
+        let src = self.kafka();
+        let blocked: Vec<i32> = src
+            .parts
+            .blocked()
+            .filter(|(p, block)| match block {
+                Block::Replaced { recorded, .. } => {
+                    src.fence.base(*p).and_then(|b| b.0) != Some(recorded.offset)
+                }
+                _ => true,
+            })
+            .map(|(p, _)| p)
+            .collect();
         if blocked.is_empty() {
-            self.kafka_mut().blocked = None;
+            let src = self.kafka_mut();
+            src.blocked = None;
+            if src.parts.blocked().next().is_some() {
+                src.next_recheck = Some(Instant::now() + recheck);
+            }
             return Ok(());
         }
         let topic = self.kafka().kafka.topic.clone();
