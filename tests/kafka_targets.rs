@@ -14,9 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use delta_delta_ingest::pipeline::{Pipeline, StepOutcome};
-use delta_delta_ingest::sink::Sink;
 use deltalake::arrow::array::{Array, RecordBatch};
-use deltalake::delta_datafusion::DataFusionMixins;
 use deltalake::kernel::{DataType as Delta, PrimitiveType, StructField};
 use deltalake::protocol::SaveMode;
 
@@ -403,6 +401,8 @@ async fn partition_column_unmapped_refused_at_open() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs Redpanda; set DDI_TEST_KAFKA"]
 async fn handle_aged_past_log_retention() {
+    use delta_delta_ingest::sink::Sink;
+    use deltalake::delta_datafusion::DataFusionMixins;
     for aging in [true, false] {
         let f = Fixture::bare(1).await;
         create_table_with(

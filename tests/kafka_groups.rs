@@ -369,7 +369,7 @@ async fn liveness_under_churn() {
 
     let started = Instant::now();
     let mut churner: Option<Member> = None;
-    let mut last: Vec<(f64, Instant)> = vec![(0.0, Instant::now()); 3];
+    let mut last: [(f64, Instant); 3] = [(0.0, Instant::now()); 3];
     let mut worst = Duration::ZERO;
     let mut round = 0;
     while started.elapsed() < Duration::from_secs(180) {

@@ -181,8 +181,8 @@ group_id = "g-{app_id}"
 
     // Every 15 s, each member's committed batches: the longest stretch without a new one.
     let began = Instant::now();
-    let mut last: Vec<(f64, Instant)> = vec![(0.0, Instant::now()); 3];
-    let mut worst = vec![Duration::ZERO; 3];
+    let mut last: [(f64, Instant); 3] = [(0.0, Instant::now()); 3];
+    let mut worst = [Duration::ZERO; 3];
     let mut samples = 0u64;
     while began.elapsed() < Duration::from_secs(secs) {
         tokio::time::sleep(Duration::from_secs(15)).await;
