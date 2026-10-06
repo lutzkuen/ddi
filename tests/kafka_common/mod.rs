@@ -569,6 +569,16 @@ group_id = "g-{app}"
     }
 }
 
+impl Drop for Fixture {
+    /// The topic goes with the test: a broker started with little memory refuses new partitions
+    /// once it holds a few hundred, and a suite creates a topic per test. librdkafka's admin
+    /// client drives its own requests, so this needs no runtime.
+    fn drop(&mut self) {
+        let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+        let _ = futures::executor::block_on(admin().delete_topics(&[self.topic.as_str()], &opts));
+    }
+}
+
 /// The one Kafka pipeline `toml` describes, resolved; in once-mode when `once`.
 pub fn resolve(toml: &str, once: bool) -> ResolvedPipeline {
     let r = Config::from_toml_str(toml).unwrap().resolve_all().unwrap();

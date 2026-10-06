@@ -208,11 +208,14 @@ async fn kafka_kill_mid_batch() {
 
     let mut killed = 0;
     let mut i = 0u64;
-    while killed < 30 {
+    // Thirty kills, and on past them until one has landed between an upload and its commit,
+    // which leaves the file behind: a narrow window on a local disk, and wider than most.
+    let mut orphaned = 0;
+    while killed < 30 || orphaned == 0 {
         i += 1;
         assert!(
-            i < 120,
-            "only {killed} of {i} runs were still running when killed"
+            i < 200,
+            "{killed} of {i} runs were still running when killed, and {orphaned} files left"
         );
         let mut child = ddi()
             .arg("once")
@@ -234,8 +237,8 @@ async fn kafka_kill_mid_batch() {
         let rows = coordinates(&f.target).await;
         let distinct: BTreeSet<_> = rows.iter().copied().collect();
         assert_eq!(rows.len(), distinct.len(), "a duplicate after kill {i}");
+        orphaned = orphans(&f.target).await;
     }
-    let orphans = orphans(&f.target).await;
     stop.store(true, Ordering::Relaxed);
     let produced = producing.await.unwrap();
     // The rest in batches of any size.
@@ -244,8 +247,8 @@ async fn kafka_kill_mid_batch() {
     assert!(ok, "{out}");
     assert_exactly(&coordinates(&f.target).await, &produced);
     assert!(
-        orphans >= 1,
-        "no kill landed between an upload and its commit ({killed} kills)"
+        orphaned >= 1,
+        "no kill landed between an upload and its commit"
     );
 }
 
