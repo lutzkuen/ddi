@@ -16,8 +16,8 @@
 //! What follows is the error's class (§3.6, [`Error::kafka_class`]), never a reopen:
 //! - **Replan**: another writer got there first. The target is refreshed and every offset
 //!   re-read in place ([`Pipeline::reset_in_place`]); the batch is tried again at once when
-//!   none of its partitions moved, and dropped (its partitions read again from their offsets)
-//!   when one did.
+//!   each of its partitions still has the offset the batch was read from, and dropped (its
+//!   partitions read again from their offsets) when one does not.
 //! - **Transient** and **Capacity**: the batch is held, every partition paused, and the batch
 //!   tried again after a backoff. The member stays in its group.
 //! - **Blocking**: held as well, re-checked every `blocked_recheck_secs`, with the gauge set.
@@ -770,10 +770,14 @@ impl Pipeline {
         if self.kafka().refreshed_at.elapsed() >= fault::handle_max_age()
             || !fence::commit_exists(&self.target).await?
         {
-            let changed = self.refresh_and_reset().await?;
-            if let Some(p) = batch.ranges.keys().find(|p| changed.contains(p)) {
-                return Err(self.moved(*p, batch));
-            }
+            self.refresh_and_reset().await?;
+        }
+        // A batch is committed only over the offsets it was read from (I2). A refresh, this
+        // one or an earlier one, may have put another writer's offset into the fence, where
+        // `verify` takes it as carried: compared with the offset the batch was read from, it
+        // drops the batch, and the reset that follows reads the partition again.
+        if let Some(p) = self.moved_partition(batch) {
+            return Err(self.moved(p, batch));
         }
         // 2. Messages that cannot be decoded and cannot be set aside.
         if batch.undecodable > 0 {
@@ -849,6 +853,17 @@ impl Pipeline {
             self.pause_all();
         }
         Ok(outcome)
+    }
+
+    /// A partition of `batch` whose offset in the fence is not the one the batch was read
+    /// from, or that this member no longer owns: committing the batch over it would write its
+    /// rows twice, or skip a replay (§3.3).
+    fn moved_partition(&self, batch: &KafkaBatch) -> Option<i32> {
+        let src = self.kafka();
+        batch.ranges.keys().copied().find(|p| {
+            src.parts.get(*p).is_none()
+                || src.fence.base(*p).map(|b| b.0) != batch.bases.get(p).copied()
+        })
     }
 
     /// The `Fenced` a batch whose partition moved under it is dropped with.
@@ -1048,9 +1063,10 @@ impl Pipeline {
     // --------------------------------------------------------------------- resetting
 
     /// Refresh the target and re-read every owned partition's offset, staying in the group
-    /// (§3.3, `reset_in_place`). `batch` is kept, and tried again at once, if none of its
-    /// partitions' offsets moved; otherwise it is dropped, and every partition that moved, or
-    /// that it covered, is read again from its offset in the target.
+    /// (§3.3, `reset_in_place`). `batch` is kept, and tried again at once, if each of its
+    /// partitions still has the offset the batch was read from; otherwise it is dropped, and
+    /// every partition that moved, or that it covered, is read again from its offset in the
+    /// target.
     pub(crate) async fn reset_in_place(
         &mut self,
         batch: Option<KafkaBatch>,
@@ -1067,11 +1083,9 @@ impl Pipeline {
                 }
             }
         };
-        let survives = batch.filter(|b| {
-            b.ranges
-                .keys()
-                .all(|p| self.kafka().parts.get(*p).is_some() && !changed.contains(p))
-        });
+        // By the offsets the batch was read from, not by what this refresh changed: an
+        // earlier refresh (a commit's aging) may have moved the fence already.
+        let survives = batch.filter(|b| self.moved_partition(b).is_none());
         self.reposition_changed(&changed, survives.as_ref());
         if let Some(batch) = survives {
             let src = self.kafka_mut();
@@ -1237,7 +1251,7 @@ impl Pipeline {
             }
             Err(e) => return Err(e),
         };
-        let valid = batch.ranges.keys().all(|p| !changed.contains(p));
+        let valid = self.moved_partition(&batch).is_none();
         self.reposition_changed(&changed, valid.then_some(&batch));
         if valid {
             Ok(Some(batch))
