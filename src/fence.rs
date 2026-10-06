@@ -1531,6 +1531,38 @@ pub async fn commit_exists(table: &DeltaTable) -> Result<bool> {
     }
 }
 
+/// Whether a commit that landed after `table`'s version changes the protocol.
+///
+/// delta-rs's conflict check refuses a winning protocol only when it raises the reader
+/// version or lowers the writer version (conflict_checker.rs:409-436), so an append is rebased
+/// over another engine's writer-only upgrade (identity columns, check constraints, appendOnly)
+/// and lands in a table this build may not write. A writer reads the commits after its handle's
+/// version before committing, as the conflict check will (one 404 when there are none), and a
+/// protocol among them is a conflict: the reset that follows asks the new protocol
+/// ([`refuse_unwritable_protocol`]) before anything is written (EO-m19).
+pub async fn protocol_changed_since(table: &DeltaTable) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct Line {
+        protocol: Option<serde_json::Value>,
+    }
+    let Some(mut version) = table.version() else {
+        return Ok(false);
+    };
+    let log_store = table.log_store();
+    loop {
+        version += 1;
+        let Some(bytes) = log_store.read_commit_entry(version).await? else {
+            return Ok(false);
+        };
+        let changed = serde_json::Deserializer::from_slice(&bytes)
+            .into_iter::<Line>()
+            .any(|l| l.is_ok_and(|l| l.protocol.is_some()));
+        if changed {
+            return Ok(true);
+        }
+    }
+}
+
 /// The id of the table at `table`'s location as storage holds it now, not as the handle
 /// remembers it: from commit 0's `metaData`, or from the newest checkpoint's where log cleanup
 /// removed commit 0. `None` when neither can be read.
@@ -4124,6 +4156,68 @@ mod tests {
         assert_eq!(fence.base(2), Some((Some(7), None)));
         assert_eq!(fence.base(3), Some((None, None)));
         assert_eq!(fence.lookups().unverifiable(), 2, "partitions 1 and 2");
+    }
+
+    /// A table dropped and recreated in place under a handle: the handle's own commit is gone,
+    /// and the id storage holds is the new table's, though the handle, refreshed incrementally,
+    /// still has the old one (I18).
+    #[tokio::test]
+    async fn a_recreated_table_is_seen_through_an_incremental_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        let mut handle = open(path).await;
+        for _ in 0..2 {
+            let schema = schema_of(&handle);
+            handle = handle
+                .write(vec![RecordBatch::new_empty(schema)])
+                .with_save_mode(SaveMode::Append)
+                .await
+                .unwrap();
+        }
+        let opened = crate::lookup::table_id(&handle);
+        assert!(commit_exists(&handle).await.unwrap());
+        assert_eq!(stored_table_id(&handle).await.unwrap(), opened);
+
+        std::fs::remove_dir_all(path).unwrap();
+        create(path).await;
+        handle.update_incremental(None).await.unwrap();
+        assert_eq!(
+            crate::lookup::table_id(&handle),
+            opened,
+            "the handle cannot tell"
+        );
+        assert!(!commit_exists(&handle).await.unwrap());
+        let now = stored_table_id(&handle).await.unwrap();
+        assert!(now.is_some() && now != opened, "{now:?} vs {opened:?}");
+    }
+
+    /// delta-rs rebases an append over a writer-only protocol upgrade; the commits since the
+    /// handle say there was one (EO-m19).
+    #[tokio::test]
+    async fn a_protocol_change_since_the_handle_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        let handle = open(path).await;
+        assert!(!protocol_changed_since(&handle).await.unwrap());
+        // Another writer's plain append is no protocol change.
+        let other = open(path).await;
+        let schema = schema_of(&other);
+        other
+            .write(vec![RecordBatch::new_empty(schema)])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+        assert!(!protocol_changed_since(&handle).await.unwrap());
+        std::fs::write(
+            log_file(dir.path(), &commit_name(2)),
+            "{\"commitInfo\":{\"timestamp\":1700000000000,\"operation\":\"UPGRADE PROTOCOL\"}}\n\
+             {\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":7,\
+             \"writerFeatures\":[\"identityColumns\"]}}\n",
+        )
+        .unwrap();
+        assert!(protocol_changed_since(&handle).await.unwrap());
     }
 
     #[tokio::test]

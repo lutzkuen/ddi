@@ -539,10 +539,13 @@ async fn protocol_upgrade_blocks() {
     )
     .unwrap();
     produce_to(&f, id, 0, 5).await;
-    eventually(Duration::from_secs(60), "the member to hold", || async {
-        m.log_text().contains("needs a writer this build cannot be")
+    let held = tokio::time::timeout(Duration::from_secs(60), async {
+        while !m.log_text().contains("needs a writer this build cannot be") {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     })
     .await;
+    assert!(held.is_ok(), "the member did not hold:\n{}", m.log_text());
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert_eq!(coordinates(&f.target).await.len(), first.len());
     assert_eq!(

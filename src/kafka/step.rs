@@ -813,6 +813,18 @@ impl Pipeline {
             override_reason: None,
             takeover_marker: src.fence.takeover_marker_due(),
         };
+        // delta-rs rebases an append over another engine's writer-only protocol upgrade; a
+        // protocol among the commits since the handle is a conflict, and the reset that follows
+        // refuses a table this build cannot write (EO-m19).
+        if fence::protocol_changed_since(&self.target).await? {
+            return Err(Error::Delta(deltalake::DeltaTableError::Transaction {
+                source: deltalake::kernel::transaction::TransactionError::CommitConflict(
+                    deltalake::kernel::transaction::CommitConflictError::ProtocolChanged(
+                        "another writer changed the protocol since this handle's version".into(),
+                    ),
+                ),
+            }));
+        }
         // 5. The shared part: transform, conform, coerce, the data-quality write, the commit.
         let outcome = self
             .process(Batch {
@@ -826,6 +838,16 @@ impl Pipeline {
             })
             .await?;
         self.committed(batch, &offsets, started.elapsed()).await;
+        // The backstop for an upgrade that landed between that read and the commit: delta-rs
+        // rebased over it, and the handle it returned has it. Nothing more is written.
+        if let Err(e) = fence::refuse_unwritable_protocol(&self.target) {
+            error!(pipeline = %self.cfg.name, "the pipeline holds after this commit: {e}");
+            let recheck = self.blocked_recheck();
+            let src = self.kafka_mut();
+            src.blocked = Some(e.to_string());
+            src.next_recheck = Some(Instant::now() + recheck);
+            self.pause_all();
+        }
         Ok(outcome)
     }
 

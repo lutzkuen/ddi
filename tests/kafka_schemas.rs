@@ -377,7 +377,22 @@ async fn two_members_dq_rejects_concurrently() {
         &f.toml("dqpair", "", "allowed_latency_secs = 1"),
     );
     let log = |n: &str| f.dir.path().join(format!("{n}.log"));
+    // Taken over first: the first commit under a fresh app_id writes the takeover marker, and
+    // two members racing to write it is one ConcurrentTransaction and one replay (§4.3), which
+    // writes that batch's rejects again. Here nothing should replay.
     let mut a = Member::start(&config, &log("a"), &[]);
+    let first = Producer::new()
+        .send(
+            &f.topic,
+            0,
+            None,
+            Some(&framed(EVENT_V1, id, event(-1, None))),
+        )
+        .await;
+    eventually(Duration::from_secs(60), "the takeover", || async {
+        coordinates(&f.target).await.len() == 1
+    })
+    .await;
     let mut b = Member::start(&config, &log("b"), &[]);
     eventually(
         Duration::from_secs(60),
@@ -421,17 +436,30 @@ async fn two_members_dq_rejects_concurrently() {
     };
     tokio::time::sleep(Duration::from_secs(120)).await;
     stop.store(true, Ordering::Relaxed);
-    let (good, bad) = producing.await.unwrap();
+    let (mut good, bad) = producing.await.unwrap();
+    good.insert((0, first));
     eventually(Duration::from_secs(60), "every message", || async {
         coordinates(&f.target).await.len() == good.len()
     })
     .await;
     let rejected = rejects(&f.dq).await;
     let unique: BTreeSet<(i64, i64)> = rejected.iter().map(|(p, o, _)| (*p, *o)).collect();
-    assert_eq!(unique.len(), rejected.len(), "a reject was written twice");
+    assert_eq!(
+        unique.len(),
+        rejected.len(),
+        "a reject was written twice; fenced: {} and {}",
+        a.metric("ddi_kafka_fenced_total").await,
+        b.metric("ddi_kafka_fenced_total").await
+    );
     assert_eq!(unique, bad);
     assert_exactly(&coordinates(&f.target).await, &good);
     for m in [&a, &b] {
+        assert_eq!(
+            m.metric("ddi_kafka_fenced_total").await,
+            0.0,
+            "{}",
+            m.log_text()
+        );
         assert_eq!(m.metric("ddi_kafka_dq_conflict_retries_total").await, 0.0);
         assert_eq!(m.metric("ddi_errors_total").await, 0.0, "{}", m.log_text());
     }
