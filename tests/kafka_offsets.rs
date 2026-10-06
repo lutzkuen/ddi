@@ -245,6 +245,57 @@ async fn topic_recreated_fails() {
     );
 }
 
+/// 13. The topic recreated with fewer messages while a member reads it: the next offset it
+/// fetches is past the new end, librdkafka stops fetching the partition (`auto.offset.reset =
+/// error`), and the partition blocks as regressed rather than stalling unseen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Redpanda; set DDI_TEST_KAFKA"]
+async fn topic_recreated_smaller_while_running_blocks() {
+    let f = Fixture::new(1).await;
+    let id = register(&f.subject(), EVENT_V1).await;
+    produce_to(&f, id, 0, 40).await;
+    // Little prefetch, so that the member is still reading the old topic when it goes.
+    let settings = "max_messages_per_batch = 5\n[kafka.pipeline.settings]\n\
+                    \"queued.min.messages\" = 1\n\"fetch.message.max.bytes\" = 100";
+    let toml = f.toml("shrunk", "", settings);
+    let mut p = Pipeline::open_with(resolve(&toml, true), None)
+        .await
+        .unwrap();
+    while coordinates(&f.target).await.is_empty() {
+        p.step().await.unwrap();
+    }
+    delete_topic(&f.topic).await;
+    create_topic(&f.topic, 1).await;
+    produce_to(&f, id, 0, 2).await;
+    let mut outcome = None;
+    for _ in 0..120 {
+        match p.step().await {
+            Ok(StepOutcome::CaughtUp) => {
+                outcome = Some(Ok(()));
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                outcome = Some(Err(e));
+                break;
+            }
+        }
+    }
+    match outcome {
+        Some(Err(e)) => assert!(
+            matches!(
+                e,
+                delta_delta_ingest::Error::KafkaOffsetsRegressed { partition: 0, .. }
+            ),
+            "{e}"
+        ),
+        other => panic!(
+            "the run ended {other:?} with {} rows, the partition never blocked",
+            coordinates(&f.target).await.len()
+        ),
+    }
+}
+
 /// 13. The topic recreated and refilled past the stored offset: the message there is not the
 /// one ddi recorded (I19), and the partition blocks rather than reading on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

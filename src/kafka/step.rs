@@ -667,10 +667,13 @@ impl Pipeline {
         Ok(())
     }
 
-    /// `auto.offset.reset = error` (-140): some partition's next offset is gone, and the
-    /// error does not say which (§0.3.20, EO-m4). The watermarks do: an offender expects an
-    /// offset below its topic's low watermark. Each offender is blocked; what it buffered is
-    /// contiguous and valid, and is committed with the batch.
+    /// `auto.offset.reset = error` (-140): some partition's next offset is not in the topic,
+    /// librdkafka has stopped fetching it, and the error does not say which (§0.3.20, EO-m4).
+    /// The watermarks do: an offender expects an offset below its topic's low watermark
+    /// (retention), or past its high one (the topic recreated smaller). Each offender is
+    /// blocked; what it buffered is contiguous and valid, and is committed with the batch. With
+    /// no offender (the watermarks moved meanwhile), every Ready partition is sought again at
+    /// the offset it expects, which has librdkafka fetch it again (`release`).
     async fn out_of_range(&mut self) -> Result<()> {
         let ready: Vec<(i32, i64)> = self.kafka().parts.ready().collect();
         let partitions: Vec<i32> = ready.iter().map(|(p, _)| *p).collect();
@@ -679,27 +682,32 @@ impl Pipeline {
         let watermarks = super::rebalance::watermarks(&consumer, &topic, &partitions).await?;
         let mut any = false;
         for (p, next) in ready {
-            let Some((low, _)) = watermarks.get(&p) else {
+            let Some((low, high)) = watermarks.get(&p).copied() else {
                 continue;
             };
-            if next < *low {
-                any = true;
-                let block = Block::Unavailable {
-                    wanted: next,
-                    low: *low,
-                };
-                let e = block.error(&topic, p);
-                error!(pipeline = %self.cfg.name, partition = p, "{e}");
-                self.kafka().metrics.observe_error(&e);
-                self.block_partition(p, block);
-            }
+            let block = if next < low {
+                Block::Unavailable { wanted: next, low }
+            } else if next > high {
+                Block::Regressed {
+                    stored: next - 1,
+                    high,
+                }
+            } else {
+                continue;
+            };
+            any = true;
+            let e = block.error(&topic, p);
+            error!(pipeline = %self.cfg.name, partition = p, "{e}");
+            self.kafka().metrics.observe_error(&e);
+            self.block_partition(p, block);
         }
         if !any {
             warn!(
                 pipeline = %self.cfg.name,
-                "librdkafka reported an offset out of range, and no owned partition expects one \
-                 below its topic's start; carrying on"
+                "librdkafka reported an offset out of range, and every owned partition expects \
+                 one inside its topic; seeking each to it again"
             );
+            self.pause(&partitions);
         }
         Ok(())
     }
