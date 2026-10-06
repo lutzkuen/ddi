@@ -770,7 +770,11 @@ impl Pipeline {
         if self.kafka().refreshed_at.elapsed() >= fault::handle_max_age()
             || !fence::commit_exists(&self.target).await?
         {
-            self.refresh_and_reset().await?;
+            // Every partition another writer moved is read again from its new offset, the
+            // ones this batch did not read too: left where they were, they would be read on
+            // from the old offset and committed over the new one.
+            let changed = self.refresh_and_reset().await?;
+            self.reposition_changed(&changed, Some(batch));
         }
         // A batch is committed only over the offsets it was read from (I2). A refresh, this
         // one or an earlier one, may have put another writer's offset into the fence, where
