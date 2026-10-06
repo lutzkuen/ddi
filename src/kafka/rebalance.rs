@@ -344,8 +344,11 @@ impl Pipeline {
             .resume(&resume)
             .map_err(|e| client::classify(&e, "resuming partitions"))?;
         let src = self.kafka_mut();
+        let now = Instant::now();
         for e in resume.elements() {
             src.paused.remove(&e.partition());
+            // Paused is not idle: once-mode's idle rule counts from the resume (§3.8).
+            src.parts.polled_again(Some(e.partition()), now);
         }
         debug!(partitions = ?ready, "partitions resumed at their next offsets");
         Ok(())

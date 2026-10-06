@@ -109,7 +109,10 @@ pub(crate) enum State {
         start: i64,
         /// The stored offset, still to be re-read and checked.
         reread: Option<Reread>,
-        /// When the last message of this partition arrived: once-mode's idle rule.
+        /// When the last message of this partition arrived, or the member last went back to
+        /// polling it: after a commit, and when it resumed after a pause. Once-mode's idle
+        /// rule counts from here, so that time spent committing, holding a batch or waiting
+        /// is never idle.
         last_message: Instant,
     },
     Blocked {
@@ -213,6 +216,18 @@ impl Partitions {
         self.map.insert(p, State::Blocked { block, since });
     }
 
+    /// The member goes back to polling every Ready partition, or partition `p` only: idle
+    /// counts from `now` (§3.8).
+    pub(crate) fn polled_again(&mut self, p: Option<i32>, now: Instant) {
+        for (q, state) in &mut self.map {
+            if let State::Ready { last_message, .. } = state {
+                if p.is_none_or(|p| p == *q) {
+                    *last_message = now;
+                }
+            }
+        }
+    }
+
     /// Decide what to do with the message at `mark.offset` of partition `p` (§3.3), and move
     /// the partition's expectations on when it is taken or re-read.
     pub(crate) fn admit(&mut self, p: i32, mark: MessageMark, now: Instant) -> Admit {
@@ -264,7 +279,7 @@ impl Partitions {
     }
 
     /// Whether partition `p` has read everything up to `end`, or nothing has arrived for it for
-    /// `idle` (§3.8): once-mode's done rule.
+    /// `idle` while it was polled (§3.8): once-mode's done rule.
     pub(crate) fn done(&self, p: i32, end: i64, idle: Duration, now: Instant) -> bool {
         match self.map.get(&p) {
             None => true,
@@ -540,6 +555,17 @@ mod tests {
 
         // A blocked partition is done once it has been blocked for the idle time, however
         // often a recheck finds it still blocked.
+        // Idle counts only from when the member went back to polling: a commit or a pause as
+        // long as the idle time is not idle.
+        let (mut parts, now) = ready(0, 3, None);
+        parts.polled_again(None, now + idle);
+        assert!(!parts.done(0, 5, idle, now + idle + idle / 2));
+        assert!(parts.done(0, 5, idle, now + idle * 2));
+        parts.polled_again(Some(1), now + idle * 2);
+        assert!(parts.done(0, 5, idle, now + idle * 2), "another partition's resume");
+        parts.polled_again(Some(0), now + idle * 2);
+        assert!(!parts.done(0, 5, idle, now + idle * 2));
+
         let (mut parts, now) = ready(0, 3, None);
         let block = Block::Regressed { stored: 9, high: 5 };
         parts.block(0, block.clone(), now);

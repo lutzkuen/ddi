@@ -438,6 +438,25 @@ async fn once_finishes_with_idle_empty_and_caught_up_partitions() {
     assert_exactly(&coordinates(&f.target).await, &produced);
 }
 
+/// 28. A commit that takes longer than once-mode's idle time does not end the run: idle is
+/// counted only while a partition is polled, not while the member commits, holds a batch or
+/// waits for a seek.
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Redpanda; set DDI_TEST_KAFKA"]
+async fn once_outlasts_a_commit_slower_than_its_idle_time() {
+    let f = Fixture::new(1).await;
+    let id = register(&f.subject(), EVENT_V1).await;
+    let produced = produce_to(&f, id, 0, 30).await;
+    let config = f.write(
+        "once.toml",
+        &f.toml("slow", "", "max_messages_per_batch = 10"),
+    );
+    let (ok, out) = once_with(&config, &[("DDI_TEST_FAULT", "sleep_before_commit:11")]).await;
+    assert!(ok, "{out}");
+    assert_exactly(&coordinates(&f.target).await, &produced);
+}
+
 /// 28. Under read_committed once-mode ends at the last stable offset: an open transaction's
 /// messages are not read, and neither is anything after them, until it commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

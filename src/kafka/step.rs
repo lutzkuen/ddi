@@ -945,6 +945,8 @@ impl Pipeline {
         let src = self.kafka_mut();
         src.fence.committed(offsets);
         let now = Instant::now();
+        // Committing is not idle: once-mode's idle rule counts from here (§3.8).
+        src.parts.polled_again(None, now);
         src.last_commit = Some(now);
         src.refreshed_at = now;
         src.held_for = None;
