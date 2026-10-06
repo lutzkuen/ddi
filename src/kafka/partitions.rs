@@ -562,7 +562,10 @@ mod tests {
         assert!(!parts.done(0, 5, idle, now + idle + idle / 2));
         assert!(parts.done(0, 5, idle, now + idle * 2));
         parts.polled_again(Some(1), now + idle * 2);
-        assert!(parts.done(0, 5, idle, now + idle * 2), "another partition's resume");
+        assert!(
+            parts.done(0, 5, idle, now + idle * 2),
+            "another partition's resume"
+        );
         parts.polled_again(Some(0), now + idle * 2);
         assert!(!parts.done(0, 5, idle, now + idle * 2));
 
