@@ -63,6 +63,9 @@ pub(crate) const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// The wait after a capacity failure: the supervisor's `RETRY_MAX` (§3.6, Capacity).
 pub(crate) const BACKOFF_CAPACITY: Duration = Duration::from_secs(300);
+/// How long a shutdown waits for the consumer to close, and leave its group, before the
+/// process exits all the same (§3.9).
+pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A Kafka pipeline's source, as `Pipeline` holds it between steps (docs/kafka-design.md
 /// §1.2, §3.3). Everything a step can return in the middle of — the buffer, a held batch, a
@@ -426,24 +429,25 @@ impl KafkaSource {
     }
 }
 
-impl Drop for KafkaSource {
-    /// librdkafka's close blocks until the group has taken the partitions back
-    /// (base_consumer.rs:762-780), which can take as long as a rebalance. So the consumer is
-    /// handed to a thread of its own, which needs no runtime and never delays the process's
-    /// exit (EO-m7); the context answers the revoke the close brings by itself from now on.
-    fn drop(&mut self) {
-        let Some(consumer) = self.consumer.take() else {
-            return;
-        };
+impl KafkaSource {
+    /// Close the consumer, which the source no longer has afterwards. librdkafka's close
+    /// blocks until the group has taken the partitions back (base_consumer.rs:762-780), which
+    /// can take as long as a rebalance, so it runs on a thread of its own, which needs no
+    /// runtime (EO-m7); the context answers the revoke the close brings by itself from now on.
+    /// The receiver hears when the close is done; `None` when there was no consumer, or when
+    /// no thread could be started and it was closed here.
+    pub(crate) fn close_consumer(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        let consumer = self.consumer.take()?;
         consumer.context().closing();
         let topic = self.kafka.topic.clone();
+        let (done, closed) = tokio::sync::oneshot::channel();
         let spawned = std::thread::Builder::new()
             .name("ddi-kafka-close".into())
             .spawn(move || {
                 let started = Instant::now();
                 drop(consumer);
                 let took = started.elapsed();
-                if took > Duration::from_secs(30) {
+                if took > CLOSE_TIMEOUT {
                     warn!(
                         topic = %topic,
                         secs = took.as_secs(),
@@ -452,10 +456,24 @@ impl Drop for KafkaSource {
                 } else {
                     info!(topic = %topic, ms = took.as_millis() as u64, "Kafka consumer closed");
                 }
+                let _ = done.send(());
             });
-        if let Err(e) = spawned {
-            warn!("cannot start a thread to close the Kafka consumer, closing here: {e}");
+        match spawned {
+            Ok(_) => Some(closed),
+            Err(e) => {
+                warn!("cannot start a thread to close the Kafka consumer, closing here: {e}");
+                None
+            }
         }
+    }
+}
+
+impl Drop for KafkaSource {
+    /// A source dropped without a shutdown (the supervisor reopening it) closes its consumer
+    /// without waiting: the close never delays what comes next. A shutdown has closed it
+    /// already, and waited (`Pipeline::kafka_shutdown`).
+    fn drop(&mut self) {
+        let _ = self.close_consumer();
     }
 }
 

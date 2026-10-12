@@ -630,3 +630,45 @@ async fn idle_on_a_transactional_topic_is_caught_up() {
     assert_exactly(&coordinates(&f.target).await, &produced);
     a.kill().await;
 }
+
+/// A member stopped with SIGTERM closes its consumer before the process exits: it leaves
+/// its group at once, and the next member gets the partitions without waiting out the first
+/// one's session (45 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Redpanda; set DDI_TEST_KAFKA"]
+async fn sigterm_closes_the_consumer_before_exiting() {
+    let f = Fixture::new(2).await;
+    let id = register(&f.subject(), EVENT_V1).await;
+    let config = f.write("run.toml", &f.toml("term", "", ""));
+    let mut a = Member::start(&config, &f.dir.path().join("a.log"), &[]);
+    eventually(
+        Duration::from_secs(60),
+        "the member to own every partition",
+        || async { a.metric("ddi_kafka_assigned_partitions").await == 2.0 },
+    )
+    .await;
+    let produced = produce_n(&f, id, 10).await;
+    eventually(Duration::from_secs(30), "the rows", || async {
+        coordinates(&f.target).await.len() == produced.len()
+    })
+    .await;
+    a.sigterm();
+    assert!(
+        a.exited(Duration::from_secs(60)).await,
+        "SIGTERM did not stop it"
+    );
+    assert!(
+        a.log_text().contains("Kafka consumer closed"),
+        "exited before its consumer closed:\n{}",
+        a.log_text()
+    );
+    let mut b = Member::start(&config, &f.dir.path().join("b.log"), &[]);
+    eventually(
+        Duration::from_secs(20),
+        "the next member to own every partition",
+        || async { b.metric("ddi_kafka_assigned_partitions").await == 2.0 },
+    )
+    .await;
+    b.kill().await;
+    assert_exactly(&coordinates(&f.target).await, &produced);
+}

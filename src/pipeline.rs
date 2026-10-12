@@ -710,8 +710,9 @@ impl Pipeline {
     }
 
     /// Stop between steps (docs/kafka-design.md §3.9): a Kafka pipeline commits what it has
-    /// buffered, within its revoke time box, before its consumer closes and the group takes
-    /// its partitions back. A Delta pipeline has nothing buffered: a step is atomic.
+    /// buffered, within its revoke time box, then closes its consumer, so that the group takes
+    /// its partitions back, and waits for that, time-boxed. A Delta pipeline has nothing
+    /// buffered: a step is atomic.
     pub async fn shutdown(&mut self) {
         #[cfg(feature = "kafka")]
         if self.is_kafka() {

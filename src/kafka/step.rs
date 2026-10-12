@@ -59,7 +59,7 @@ use crate::kafka::registry::{SchemaRegistry, SubjectSchemas};
 use crate::kafka::start::{self, OpenFacts};
 use crate::kafka::{
     fault, Decoder, Held, KafkaBatch, KafkaProgress, KafkaSource, RawDecoder, SqlUnion, Stalled,
-    Work, BACKOFF_CAPACITY, BACKOFF_MAX, BACKOFF_MIN, ONCE_IDLE, TICK,
+    Work, BACKOFF_CAPACITY, BACKOFF_MAX, BACKOFF_MIN, CLOSE_TIMEOUT, ONCE_IDLE, TICK,
 };
 use crate::metrics::{KafkaMetrics, PartitionGauges};
 use crate::pipeline::{Batch, LookupBatch, Pipeline, Position, Source, StepOutcome};
@@ -1451,14 +1451,25 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Commit what a shutting-down member has buffered, within the revoke time box, before the
-    /// consumer closes (§3.9). The close then revokes as usual.
+    /// Commit what a shutting-down member has buffered, within the revoke time box, then close
+    /// the consumer and wait for it, up to [`CLOSE_TIMEOUT`] (§3.9): the close revokes as usual
+    /// and leaves the group, which a process that exits first never does, and the group then
+    /// waits out this member's session before it gives its partitions to another.
     pub(crate) async fn kafka_shutdown(&mut self) {
         match self.flush("shutdown").await {
             Ok(Some(_)) => info!(pipeline = %self.cfg.name, "committed the buffer before stopping"),
             Ok(None) => {}
             Err(e) => {
                 warn!(pipeline = %self.cfg.name, "could not commit the buffer before stopping: {e}")
+            }
+        }
+        if let Some(closed) = self.kafka_mut().close_consumer() {
+            if tokio::time::timeout(CLOSE_TIMEOUT, closed).await.is_err() {
+                warn!(
+                    pipeline = %self.cfg.name,
+                    secs = CLOSE_TIMEOUT.as_secs(),
+                    "the Kafka consumer has not closed yet; stopping without waiting longer"
+                );
             }
         }
     }
