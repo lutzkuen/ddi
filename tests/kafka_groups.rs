@@ -569,3 +569,64 @@ async fn waiting_not_progress_when_fenced() {
     .await;
     a.kill().await;
 }
+
+/// 32, the other side. A member caught up on a transactional topic is caught up: the commit
+/// marker after the last message is never delivered, so the last stable offset stays one past
+/// what was read, and lag read off it never reached 0. The member counted as progressing only
+/// for a minute after its last commit, then looked stuck while idle and healthy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Redpanda; set DDI_TEST_KAFKA"]
+async fn idle_on_a_transactional_topic_is_caught_up() {
+    use rdkafka::producer::Producer as _;
+    let f = Fixture::new(1).await;
+    let id = register(&f.subject(), EVENT_V1).await;
+    let settings = "[kafka.pipeline.settings]\n\"statistics.interval.ms\" = 1000";
+    let config = f.write("run.toml", &f.toml("tx", "", settings));
+    let mut a = Member::start(&config, &f.dir.path().join("a.log"), &[]);
+    eventually(
+        Duration::from_secs(60),
+        "the member to own its partition",
+        || async { a.metric("ddi_kafka_assigned_partitions").await == 1.0 },
+    )
+    .await;
+    let tx = Producer::with(&[("transactional.id", &unique("tx"))]);
+    tx.inner()
+        .init_transactions(Duration::from_secs(30))
+        .unwrap();
+    tx.inner().begin_transaction().unwrap();
+    let mut produced = BTreeSet::new();
+    for i in 0..5 {
+        let o = tx
+            .send(
+                &f.topic,
+                0,
+                None,
+                Some(&framed(EVENT_V1, id, event(i, None))),
+            )
+            .await;
+        produced.insert((0, o));
+    }
+    tx.inner()
+        .commit_transaction(Duration::from_secs(30))
+        .unwrap();
+    eventually(Duration::from_secs(60), "the rows", || async {
+        coordinates(&f.target).await.len() == produced.len()
+    })
+    .await;
+    let committed = Instant::now();
+    eventually(Duration::from_secs(30), "lag 0", || async {
+        a.metric("ddi_kafka_lag_messages{").await == 0.0
+    })
+    .await;
+    // Past the minute the last commit counts for (allowed_latency + 60 s): only caught up
+    // counts now.
+    tokio::time::sleep(Duration::from_secs(70).saturating_sub(committed.elapsed())).await;
+    let since = a.metric("ddi_pipeline_seconds_since_progress").await;
+    assert!(
+        since <= 3.0,
+        "seconds_since_progress is {since} on an idle member that read everything:\n{}",
+        a.log_text()
+    );
+    assert_exactly(&coordinates(&f.target).await, &produced);
+    a.kill().await;
+}

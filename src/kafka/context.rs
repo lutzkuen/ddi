@@ -47,7 +47,8 @@ pub(crate) enum Event {
     Fatal(String),
 }
 
-/// One partition's watermarks, as the last statistics reported them (§3.5).
+/// One partition's watermarks, and where librdkafka's fetcher is, as the last statistics
+/// reported them (§3.5).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Watermarks {
     /// The oldest offset the topic still holds.
@@ -56,6 +57,13 @@ pub(crate) struct Watermarks {
     pub hi: i64,
     /// The last stable offset: `hi` but for open transactions, under `read_committed`.
     pub ls: i64,
+    /// The next offset librdkafka fetches (`next_offset`): past every control record it has
+    /// stepped over, which it never hands on. Negative while it has none.
+    pub fetch_next: i64,
+    /// One past the last offset librdkafka handed on (`app_offset`); negative before any.
+    pub app_next: i64,
+    /// Messages fetched and not yet handed on (`fetchq_cnt`).
+    pub queued: i64,
 }
 
 /// The last statistics, as far as ddi reads them.
@@ -170,6 +178,16 @@ impl ClientContext for DdiContext {
             hi_offset: i64,
             #[serde(default)]
             ls_offset: i64,
+            #[serde(default = "unknown")]
+            next_offset: i64,
+            #[serde(default = "unknown")]
+            app_offset: i64,
+            #[serde(default)]
+            fetchq_cnt: i64,
+        }
+        // librdkafka's RD_KAFKA_OFFSET_INVALID, for a field a report leaves out.
+        fn unknown() -> i64 {
+            -1001
         }
         let doc: Doc = match serde_json::from_slice(statistics) {
             Ok(d) => d,
@@ -204,6 +222,9 @@ impl ClientContext for DdiContext {
                             } else {
                                 p.hi_offset
                             },
+                            fetch_next: p.next_offset,
+                            app_next: p.app_offset,
+                            queued: p.fetchq_cnt,
                         };
                         (p.partition, w)
                     })
@@ -314,7 +335,8 @@ mod tests {
             "topics": {
                 "orders": {"partitions": {
                     "-1": {"partition": -1, "lo_offset": -1001, "hi_offset": -1001, "ls_offset": -1001},
-                    "0": {"partition": 0, "lo_offset": 5, "hi_offset": 40, "ls_offset": 38},
+                    "0": {"partition": 0, "lo_offset": 5, "hi_offset": 40, "ls_offset": 38,
+                          "next_offset": 39, "app_offset": 37, "fetchq_cnt": 2},
                     "1": {"partition": 1, "lo_offset": -1001, "hi_offset": 7, "ls_offset": -1001}
                 }},
                 "other": {"partitions": {"0": {"partition": 0, "lo_offset": 0, "hi_offset": 9, "ls_offset": 9}}}
@@ -332,7 +354,10 @@ mod tests {
                     Watermarks {
                         lo: 5,
                         hi: 40,
-                        ls: 38
+                        ls: 38,
+                        fetch_next: 39,
+                        app_next: 37,
+                        queued: 2,
                     }
                 ),
                 (
@@ -340,7 +365,10 @@ mod tests {
                     Watermarks {
                         lo: 0,
                         hi: 7,
-                        ls: 7
+                        ls: 7,
+                        fetch_next: -1001,
+                        app_next: -1001,
+                        queued: 0,
                     }
                 ),
             ])

@@ -1469,8 +1469,22 @@ impl Pipeline {
         for (p, state) in src.parts.iter() {
             let committed = src.fence.base(*p).and_then(|b| b.0).unwrap_or(-1);
             let lag = match (state, stats.partitions.get(p)) {
-                (State::Ready { next_expected, .. }, Some(w)) => {
-                    let lag = (w.ls - next_expected).max(0);
+                (
+                    State::Ready {
+                        next_expected,
+                        last_message,
+                        ..
+                    },
+                    Some(w),
+                ) => {
+                    // No message, seek, resume or commit for a whole interval before these
+                    // statistics came: they describe the partition as it is.
+                    let settled = match (stats.at, src.stats_interval) {
+                        (Some(at), Some(interval)) => at >= *last_message + interval,
+                        _ => false,
+                    };
+                    let fetched = !src.paused.contains(p) && settled;
+                    let lag = partition_lag(*next_expected, fetched, w);
                     lag_total += lag;
                     lag_max = lag_max.max(lag);
                     let room = next_expected - w.lo;
@@ -1556,6 +1570,28 @@ impl Pipeline {
             })
             .collect();
         m.set_partitions(gauges);
+    }
+}
+
+/// A partition's lag (§3.5): the offsets between the next one it expects and the topic's last
+/// stable offset, or none when librdkafka has stepped over all of them without handing
+/// anything on. Under `read_committed` a transaction's commit marker sits after its last
+/// message and is never handed on, so the last stable offset stays one past what was read, and
+/// lag read off it alone never reaches 0 on an idle transactional topic.
+///
+/// That gap is taken as read only for a partition `fetched` as it is (not paused, and without
+/// a message, a seek, a resume or a commit for a whole statistics interval before these
+/// statistics came), with nothing waiting in librdkafka's queue, and both its fetcher and the
+/// position it has handed on (`app_offset`, which steps over control records too) at or past
+/// the last stable offset. Without control records that is the case only once every message up
+/// to the last stable offset was handed on and taken, where the difference is 0 already: a
+/// partition that is not transactional reads as before.
+fn partition_lag(next_expected: i64, fetched: bool, w: &crate::kafka::context::Watermarks) -> i64 {
+    let stepped_over = fetched && w.queued == 0 && w.fetch_next >= w.ls && w.app_next >= w.ls;
+    if stepped_over {
+        0
+    } else {
+        (w.ls - next_expected).max(0)
     }
 }
 
@@ -1722,6 +1758,71 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kafka::context::Watermarks;
+
+    /// An idle partition of a transactional topic is caught up: its last message at 9 read
+    /// and taken, the commit marker at 10 stepped over and never handed on, the last stable
+    /// offset 11. Anything else reads as it did: a partition paused or not settled, a message
+    /// still queued, the marker not fetched yet, and every partition without control records.
+    #[test]
+    fn a_commit_marker_stepped_over_is_not_lag() {
+        let idle = Watermarks {
+            lo: 0,
+            hi: 11,
+            ls: 11,
+            fetch_next: 11,
+            app_next: 11,
+            queued: 0,
+        };
+        assert_eq!(partition_lag(10, true, &idle), 0);
+        assert_eq!(partition_lag(10, false, &idle), 1, "paused, or not settled");
+        assert_eq!(
+            partition_lag(10, true, &Watermarks { queued: 1, ..idle }),
+            1,
+            "a message still queued"
+        );
+        assert_eq!(
+            partition_lag(
+                10,
+                true,
+                &Watermarks {
+                    fetch_next: 10,
+                    app_next: 10,
+                    ..idle
+                }
+            ),
+            1,
+            "the marker not fetched yet"
+        );
+        // Without control records: behind is behind, caught up is 0, as before.
+        let plain = Watermarks {
+            lo: 0,
+            hi: 40,
+            ls: 40,
+            fetch_next: 40,
+            app_next: 40,
+            queued: 0,
+        };
+        assert_eq!(partition_lag(40, true, &plain), 0);
+        assert_eq!(partition_lag(30, false, &plain), 10);
+        let fetching = Watermarks {
+            fetch_next: 35,
+            app_next: 30,
+            queued: 5,
+            ..plain
+        };
+        assert_eq!(partition_lag(30, true, &fetching), 10);
+        let unfetched = Watermarks {
+            fetch_next: -1001,
+            app_next: -1001,
+            ..plain
+        };
+        assert_eq!(
+            partition_lag(30, true, &unfetched),
+            10,
+            "nothing fetched yet"
+        );
+    }
 
     #[test]
     fn a_mark_is_the_offset_timestamp_and_value_length() {
