@@ -1135,12 +1135,15 @@ impl Pipeline {
     /// so that nothing arrives from the old position before the seek (`release`).
     fn reposition_changed(&mut self, changed: &BTreeSet<i32>, survives: Option<&KafkaBatch>) {
         let src = self.kafka_mut();
-        // A buffer with rows of a partition that moved holds rows read from the wrong place.
+        // A buffer with rows of a partition that moved holds rows read from the wrong place,
+        // and so does a message waiting for the registry: the buffer took it before the
+        // decoder handed it back. All of it is read again.
         let mut again: BTreeSet<i32> = changed.clone();
         if !src.buf.is_empty() && src.buf.ranges.keys().any(|p| changed.contains(p)) {
             again.extend(src.buf.ranges.keys().copied());
             src.buf = Buffer::default();
             src.decoder_mut().discard();
+            src.stalled = None;
         }
         // Partitions a dropped batch read, which only the batch accounted for.
         for (p, state) in src.parts.iter() {
@@ -1822,6 +1825,99 @@ mod tests {
             10,
             "nothing fetched yet"
         );
+    }
+
+    /// A Kafka pipeline with a consumer that reaches no broker, nothing assigned, a target
+    /// that is only in memory: enough to drive what a step does to its own state.
+    fn pipeline_without_a_broker() -> Pipeline {
+        use deltalake::arrow::datatypes::{DataType, Field, Schema};
+        let toml = "[kafka]\nbrokers = \"127.0.0.1:9\"\n\n[[kafka.pipeline]]\nname = \"t\"\n\
+                    app_id = \"t\"\ntopic = \"t\"\ntarget_uri = \"/tmp/t\"\n\
+                    value_format = \"raw\"\n";
+        let cfg = crate::config::Config::from_toml_str(toml)
+            .and_then(|c| c.resolve_all())
+            .unwrap()
+            .pipelines
+            .remove(0);
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "kafka_value",
+            DataType::Binary,
+            true,
+        )]));
+        let conformer = Conformer::new(schema.clone(), "kafka_", KdiText::default()).unwrap();
+        let mut source = KafkaSource::for_tests(conformer);
+        let settings = client::settings("t", &source.kafka).unwrap();
+        let context = DdiContext::new("t", "t", source.metrics.clone());
+        source.consumer = Some(client::consumer("t", &settings, context).unwrap());
+        Pipeline {
+            coercer: SchemaCoercer::new(schema),
+            cfg,
+            source: Source::Kafka(Box::new(source)),
+            target: DeltaTable::new_in_memory(),
+            transform: Box::new(Identity),
+            sink: Sink::new("t", 128 * 1024 * 1024),
+            cutoff: None,
+            dq: None,
+            grain_check_passes: 0,
+            lookup_table_ids: BTreeMap::new(),
+            lookup_current_on_open: BTreeSet::new(),
+            warned_lookup_table_id_changes: BTreeSet::new(),
+            publisher: None,
+            prev_published_through: None,
+        }
+    }
+
+    fn message(partition: i32, offset: i64) -> KafkaMessage {
+        KafkaMessage {
+            partition,
+            offset,
+            timestamp: KafkaTimestamp::CreateTime(1_700_000_000_000 + offset),
+            key: None,
+            value: Some(vec![1; 8]),
+            headers: Vec::new(),
+        }
+    }
+
+    /// A partition read again from another offset takes back everything read from the old
+    /// one, the message waiting for the registry among it (it is in the buffer already).
+    /// Kept, it was fed into the new decoder and read again after the seek: twice.
+    #[tokio::test]
+    async fn a_reseek_drops_the_message_waiting_for_the_registry() {
+        let mut p = pipeline_without_a_broker();
+        let now = Instant::now();
+        let src = p.kafka_mut();
+        src.parts.ready_at(0, 10, None, now);
+        for offset in [10, 11] {
+            let m = message(0, offset);
+            assert_eq!(src.parts.admit(0, mark_of(&m), now), Admit::Take { gap: 0 });
+            src.buf.take(0, mark_of(&m), decode::raw_len(&m), now);
+        }
+        assert!(src.decoder_mut().feed(message(0, 10)).await.is_ok());
+        // 11 was handed back: its writer schema could not be had.
+        src.stalled = Some(Stalled {
+            message: message(0, 11),
+            due: now,
+            backoff: BACKOFF_MIN,
+            blocking: None,
+        });
+        p.pause_all();
+
+        // Another writer moved partition 0 (a recheck's reset found it): read it again.
+        p.reposition_changed(&BTreeSet::from([0]), None);
+        let src = p.kafka_mut();
+        assert!(src.buf.is_empty());
+        assert!(
+            src.stalled.is_none(),
+            "the message waiting for the registry is kept, and would be read twice"
+        );
+        assert!(matches!(
+            src.parts.get(0),
+            Some(State::Ready {
+                next_expected: 0,
+                ..
+            })
+        ));
+        assert!(src.decoder_mut().finish().unwrap().batches.is_empty());
     }
 
     #[test]
