@@ -1480,7 +1480,7 @@ FROM source
 **Existing ddi families that apply unchanged** (dependency-free Prometheus text exposition):
 - `ddi_batches_committed_total` (kdi `delta.write.completed`) and `ddi_rows_written_total` (`recordbatch.completed`);
 - `ddi_rows_rejected_total`, `ddi_rows_rejected_by_transform_total`, `ddi_batches_fully_rejected_total`, `ddi_commits_skipped_total`;
-- `ddi_errors_total`, `ddi_pipeline_restarts_total`, `ddi_pipeline_up`, `ddi_pipeline_seconds_since_progress` (with the Kafka progress rule, §3.9), `ddi_pipeline_config_valid`.
+- `ddi_errors_total`, `ddi_pipeline_restarts_total`, `ddi_pipeline_up`, `ddi_pipeline_seconds_since_progress` (with the Kafka progress rule, §3.9), `ddi_pipeline_config_valid`. A Kafka pipeline's `ddi_errors_total` also counts the errors its step holds in place rather than returning (a held batch's failed attempt, a blocked partition or pipeline, a message waiting for the registry), one per attempt: they never reach the supervisor, which counts the rest.
 
 `PipelineMetrics` gains `kafka: Option<Arc<KafkaMetrics>>`, rendered after the existing block only when `Some`, so Delta pipelines' output is unchanged. Durations follow ddi's `_milliseconds_total` convention (as `ddi_merge_milliseconds_total`).
 
@@ -1502,6 +1502,7 @@ FROM source
 | `ddi_kafka_retention_headroom_messages` | gauge | — |
 | `ddi_kafka_oldest_buffered_seconds` | gauge | `buffer.lag` |
 | `ddi_kafka_brokers_up`, `ddi_kafka_retrying` | gauge | — |
+| `ddi_kafka_pipeline_blocked{reason}` | gauge: 1 for the reason the whole pipeline is held for now (`target_replaced`, `txn_retention`, `protocol_unsupported`, `offset_vanished`, `undecodable`, `schema_conflict`, `schema_references`, `metadata_collision`, `partition_column_unmapped`, `transform`, `evaluation`, `schema`, `data_quality`, `schema_registry`, else the class: `transient`, `capacity`, `other`), 0 for one it was held for before (`Error::kafka_block_reason`) | — |
 | `ddi_kafka_offsets_unavailable`, `ddi_kafka_offsets_regressed`, `ddi_kafka_offset_missing`, `ddi_kafka_topic_replaced`, `ddi_kafka_undecodable_blocking`, `ddi_kafka_schema_conflict`, `ddi_kafka_target_columns_unmatched`, `ddi_kafka_null_text_approximate` | gauge, held until the cause clears (like `ddi_source_file_vacuumed`, metrics.rs:245) | — |
 | `ddi_kafka_null_partition_values_total` | counter | — |
 | `ddi_kafka_offset_lookups_total`, `ddi_kafka_offset_lookup_seconds_total`, `ddi_kafka_offset_lookup_fallbacks_total`, `ddi_kafka_offset_lookup_below_checkpoint_reads_total`, `ddi_kafka_offset_lookup_unverifiable_total` (partitions' offsets a read returned without the mark that would verify their resume, §4.4 Unverifiable; once per read) | counter | — |
@@ -1511,7 +1512,7 @@ FROM source
 **Alert rules** (shipped in docs/alerts.yml, M5):
 - `rate(ddi_kafka_fenced_total[10m]) > 0` for 30 minutes (a second deployment, or kdi still running);
 - `sum by (pipeline) (ddi_kafka_assigned_partitions) == 0` while `max by (pipeline) (ddi_kafka_lag_messages) > 0`;
-- `ddi_kafka_blocked_partitions > 0`, and any of the held gauges `== 1`;
+- `ddi_kafka_blocked_partitions > 0`, `ddi_kafka_pipeline_blocked == 1`, and any of the held gauges `== 1`;
 - `ddi_kafka_retrying == 1` for 15 minutes;
 - `ddi_pipeline_seconds_since_progress > 3 × allowed_latency`;
 - `ddi_kafka_retention_headroom_messages` below a per-topic threshold.
@@ -1959,6 +1960,7 @@ Each milestone can be reviewed and merged on its own. Days are dev-days at ddi's
   - *The same refresh never re-sought a moved partition the batch had not read* (`an_aged_refresh_rereads_a_partition_outside_the_batch_that_moved_backward`, `…_forward`): the fence held the new offset while the partition read on from the old one, and its next batch was committed over the new offset (a restored range never replayed; an acknowledged skip written all the same). The aged refresh now seeks every partition it found moved, as a reset does.
   - *Once-mode stopped early after a slow commit* (`once_outlasts_a_commit_slower_than_its_idle_time`): the idle rule counted from each partition's last message, so a commit longer than `once_idle_secs` ended the run, successfully, after its first batch (10 of 30 rows). Idle now counts only while a partition is polled (§3.8).
   - *An offset out of range above the topic's end was ignored* (`topic_recreated_smaller_while_running_blocks`): with the topic recreated smaller under a running member, librdkafka stopped fetching the partition, and ddi, finding no partition below its topic's start, carried on; once-mode then ended successfully after the idle time with 3 of 40 rows read, and a member in a group would have stalled with its lag clamped to 0. A partition past its topic's end now blocks as regressed, and with no offender every Ready partition is sought again (§3.6, `AutoOffsetReset`).
+  - *A pipeline held whole was invisible* (`replaced_target_blocks` and `protocol_upgrade_blocks` assert the gauge; unit `held_errors_count_and_a_held_pipeline_says_why`, `a_held_pipeline_has_a_reason_per_cause`): an error a step holds in place never reached `PipelineMetrics::observe_error`, and `KafkaMetrics::observe_error` has a gauge for six variants only, so a member held for `TargetReplaced`, `KafkaTxnRetention`, `TargetProtocolUnsupported`, `KafkaOffsetVanished` or a `Transform`/`Evaluation`/`Schema` error showed `up = 1`, `errors_total = 0`, nothing blocked and nothing retrying. `ddi_kafka_pipeline_blocked{reason}` says why now, and every held error counts in `ddi_errors_total` (§7.1). `ddi_pipeline_up` stays 1: the member is up and in its group.
 
 **Total: about 38 dev-days** (range 33-43), plus soak and roughly 0.25 day per further table. This is above the critique's 30-35 because their findings added scope: deferred revoke flush, stay-in-group error handling, the txn walker in M0, and null-text presence.
 

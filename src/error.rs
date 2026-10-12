@@ -882,6 +882,34 @@ impl Error {
         }
     }
 
+    /// Why a Kafka pipeline that holds on this error is held, as the `reason` label of
+    /// `ddi_kafka_pipeline_blocked` (docs/kafka-design.md §7.1): one word per cause an
+    /// operator acts on, and the class for the rest.
+    pub fn kafka_block_reason(&self) -> &'static str {
+        match self {
+            Error::TargetReplaced { .. } => "target_replaced",
+            Error::KafkaTxnRetention { .. } => "txn_retention",
+            Error::TargetProtocolUnsupported { .. } => "protocol_unsupported",
+            Error::Delta(e) if is_unwritable(e) => "protocol_unsupported",
+            Error::KafkaOffsetVanished { .. } => "offset_vanished",
+            Error::KafkaUndecodable { .. } | Error::KafkaTooManyUndecodable { .. } => "undecodable",
+            Error::KafkaSchemaConflict { .. } => "schema_conflict",
+            Error::KafkaSchemaReferences { .. } => "schema_references",
+            Error::KafkaMetadataCollision { .. } => "metadata_collision",
+            Error::KafkaPartitionColumnUnmapped { .. } => "partition_column_unmapped",
+            Error::Transform(_) => "transform",
+            Error::Evaluation(_) => "evaluation",
+            Error::Schema(_) => "schema",
+            Error::DataQualityWrite { .. } => "data_quality",
+            Error::SchemaRegistry { .. } => "schema_registry",
+            other => match other.kafka_class() {
+                KafkaClass::Capacity => "capacity",
+                KafkaClass::Replan | KafkaClass::Transient => "transient",
+                _ => "other",
+            },
+        }
+    }
+
     /// The class of this error as the cause beneath a [`Self::DataQualityWrite`]: the table of
     /// causes in docs/kafka-design.md §3.6.
     ///
@@ -1438,6 +1466,59 @@ mod tests {
         ];
         for (e, class) in rows {
             assert_eq!(e.kafka_class(), class, "{e:?}");
+        }
+    }
+
+    /// A pipeline held on an error says why in `ddi_kafka_pipeline_blocked{reason}`: by the
+    /// cause an operator acts on, and by the class for anything else.
+    #[test]
+    fn a_held_pipeline_has_a_reason_per_cause() {
+        let rows = [
+            (
+                Error::TargetReplaced {
+                    target_uri: "/lake/orders".into(),
+                    opened: "a".into(),
+                    found: "b".into(),
+                },
+                "target_replaced",
+            ),
+            (
+                Error::KafkaTxnRetention {
+                    target_uri: "/lake/orders".into(),
+                    retention: "interval 1 days".into(),
+                },
+                "txn_retention",
+            ),
+            (
+                Error::TargetProtocolUnsupported {
+                    target_uri: "/lake/orders".into(),
+                    detail: "identityColumns".into(),
+                },
+                "protocol_unsupported",
+            ),
+            (
+                Error::KafkaOffsetVanished {
+                    target_uri: "/lake/orders".into(),
+                    app_id: "a".into(),
+                    partitions: vec![(0, 41)],
+                },
+                "offset_vanished",
+            ),
+            (Error::Transform("no such column".into()), "transform"),
+            (Error::Evaluation("division by zero".into()), "evaluation"),
+            (Error::Schema("column note is missing".into()), "schema"),
+            (
+                Error::Capacity("the spill directory is full".into()),
+                "capacity",
+            ),
+            (
+                Error::Config("the target cannot be opened".into()),
+                "transient",
+            ),
+            (Error::Other("internal".into()), "other"),
+        ];
+        for (e, reason) in rows {
+            assert_eq!(e.kafka_block_reason(), reason, "{e:?}");
         }
     }
 

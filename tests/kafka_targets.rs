@@ -187,6 +187,14 @@ async fn replaced_target_blocks() {
         2.0,
         "it left its group"
     );
+    // Held in its group, it says why: a gauge with the reason, and the error counted.
+    eventually(Duration::from_secs(10), "the blocked gauge", || async {
+        m.metric("ddi_kafka_pipeline_blocked{pipeline=\"replaced\",reason=\"target_replaced\"}")
+            .await
+            == 1.0
+    })
+    .await;
+    assert!(m.metric("ddi_errors_total").await >= 1.0);
     m.kill().await;
 }
 
@@ -553,5 +561,14 @@ async fn protocol_upgrade_blocks() {
         1.0,
         "it left its group"
     );
+    eventually(Duration::from_secs(10), "the blocked gauge", || async {
+        m.metric(
+            "ddi_kafka_pipeline_blocked{pipeline=\"upgraded\",reason=\"protocol_unsupported\"}",
+        )
+        .await
+            == 1.0
+    })
+    .await;
+    assert!(m.metric("ddi_errors_total").await >= 1.0);
     m.kill().await;
 }

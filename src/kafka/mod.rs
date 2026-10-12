@@ -91,8 +91,9 @@ pub(crate) struct KafkaSource {
     pub(crate) held: Option<Held>,
     /// A message the decoder handed back, waiting for the registry (§5.4).
     pub(crate) stalled: Option<Stalled>,
-    /// Why the whole pipeline is paused, while it is.
-    pub(crate) blocked: Option<String>,
+    /// Why the whole pipeline is paused, while it is: the `reason` of
+    /// `ddi_kafka_pipeline_blocked` ([`crate::Error::kafka_block_reason`]).
+    pub(crate) blocked: Option<&'static str>,
     /// When blocked partitions, or a blocked pipeline, are looked at again.
     pub(crate) next_recheck: Option<Instant>,
     /// Partitions paused in librdkafka.
@@ -143,6 +144,8 @@ pub(crate) struct Stalled {
     pub message: KafkaMessage,
     pub due: Instant,
     pub backoff: Duration,
+    /// Why the pipeline is held, when what the registry answered needs an operator.
+    pub blocking: Option<&'static str>,
 }
 
 /// The SQL path's union of writer schemas (§5.5).

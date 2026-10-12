@@ -366,6 +366,7 @@ impl Pipeline {
         ] {
             gauge.store(0, Ordering::Relaxed);
         }
+        metrics.set_pipeline_blocked(None);
 
         let once = k.once;
         let source = KafkaSource {
@@ -600,7 +601,7 @@ impl Pipeline {
             }
             Admit::Block(block) => {
                 let e = block.error(&src.kafka.topic, p);
-                src.metrics.observe_error(&e);
+                src.metrics.observe_held(&e);
                 error!(pipeline = %self.cfg.name, partition = p, "{e}");
                 self.block_partition(p, block);
             }
@@ -627,11 +628,17 @@ impl Pipeline {
             retry_in_ms = backoff.as_millis() as u64,
             "a message waits for its writer schema: {error}"
         );
-        src.metrics.observe_error(&error);
+        src.metrics.observe_held(&error);
+        let blocking = matches!(
+            class,
+            KafkaClass::BlockingPipeline | KafkaClass::BlockingPartition | KafkaClass::OpenRefusal
+        )
+        .then(|| error.kafka_block_reason());
         src.stalled = Some(Stalled {
             message,
             due: Instant::now() + backoff,
             backoff,
+            blocking,
         });
         self.pause_all();
         Ok(())
@@ -698,7 +705,7 @@ impl Pipeline {
             any = true;
             let e = block.error(&topic, p);
             error!(pipeline = %self.cfg.name, partition = p, "{e}");
-            self.kafka().metrics.observe_error(&e);
+            self.kafka().metrics.observe_held(&e);
             self.block_partition(p, block);
         }
         if !any {
@@ -860,7 +867,8 @@ impl Pipeline {
             error!(pipeline = %self.cfg.name, "the pipeline holds after this commit: {e}");
             let recheck = self.blocked_recheck();
             let src = self.kafka_mut();
-            src.blocked = Some(e.to_string());
+            src.metrics.observe_held(&e);
+            src.blocked = Some(e.kafka_block_reason());
             src.next_recheck = Some(Instant::now() + recheck);
             self.pause_all();
         }
@@ -1036,6 +1044,7 @@ impl Pipeline {
                     retry_in_ms = backoff.as_millis() as u64,
                     "the batch is held and tried again; this member stays in its group: {e}"
                 );
+                self.kafka().metrics.observe_held(&e);
                 self.hold(batch, backoff, why);
                 Ok(StepOutcome::Waiting)
             }
@@ -1051,8 +1060,8 @@ impl Pipeline {
                     recheck_in_secs = recheck.as_secs(),
                     "the pipeline holds until this is fixed; it stays in its group: {e}"
                 );
-                self.kafka().metrics.observe_error(&e);
-                self.kafka_mut().blocked = Some(e.to_string());
+                self.kafka().metrics.observe_held(&e);
+                self.kafka_mut().blocked = Some(e.kafka_block_reason());
                 self.hold(batch, recheck, HeldFor::Operator);
                 Ok(StepOutcome::Waiting)
             }
@@ -1259,7 +1268,8 @@ impl Pipeline {
             Err(e) if e.kafka_class() != KafkaClass::ConsumerFatal => {
                 debug!(pipeline = %self.cfg.name, "the recheck could not refresh the target: {e}");
                 let recheck = self.blocked_recheck();
-                self.kafka_mut().blocked = Some(e.to_string());
+                self.kafka().metrics.observe_held(&e);
+                self.kafka_mut().blocked = Some(e.kafka_block_reason());
                 self.hold(batch, recheck, HeldFor::Operator);
                 return Ok(None);
             }
@@ -1285,10 +1295,10 @@ impl Pipeline {
             Ok(c) => c,
             Err(e) if e.kafka_class() != KafkaClass::ConsumerFatal => {
                 debug!(pipeline = %self.cfg.name, "a recheck could not read the target: {e}");
-                self.kafka().metrics.observe_error(&e);
+                self.kafka().metrics.observe_held(&e);
                 let src = self.kafka_mut();
                 if src.parts.blocked().any(|(_, b)| *b == Block::Unresolved) {
-                    src.blocked = Some(e.to_string());
+                    src.blocked = Some(e.kafka_block_reason());
                 }
                 src.next_recheck = Some(Instant::now() + recheck);
                 return Ok(());
@@ -1522,6 +1532,10 @@ impl Pipeline {
         let retrying = src.stalled.is_some()
             || matches!(src.held_for, Some(HeldFor::Transient)) && src.held.is_some();
         m.retrying.store(i64::from(retrying), Ordering::Relaxed);
+        m.set_pipeline_blocked(
+            src.blocked
+                .or_else(|| src.stalled.as_ref().and_then(|s| s.blocking)),
+        );
         let gauges: BTreeMap<i32, PartitionGauges> = src
             .parts
             .owned()

@@ -128,9 +128,9 @@ impl Pipeline {
                     pipeline = %self.cfg.name,
                     "the partitions are assigned paused until their offsets can be read: {e}"
                 );
-                self.kafka().metrics.observe_error(&e);
+                self.kafka().metrics.observe_held(&e);
                 let src = self.kafka_mut();
-                src.blocked = Some(e.to_string());
+                src.blocked = Some(e.kafka_block_reason());
                 src.next_recheck = Some(
                     now + match e.kafka_class() {
                         KafkaClass::Transient => super::BACKOFF_MIN * 5,
@@ -158,7 +158,7 @@ impl Pipeline {
                         if *block != Block::Unresolved {
                             let e = block.error(&topic, *p);
                             warn!(partition = p, "{e}");
-                            src.metrics.observe_error(&e);
+                            src.metrics.observe_held(&e);
                             src.next_recheck.get_or_insert(now + recheck);
                         }
                         src.parts.block(*p, block.clone(), now);

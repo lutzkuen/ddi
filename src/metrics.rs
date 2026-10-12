@@ -264,6 +264,13 @@ pub struct KafkaMetrics {
     pub schema_registry_requests: Mutex<BTreeMap<String, u64>>,
     /// librdkafka errors by code.
     pub client_errors: Mutex<BTreeMap<String, u64>>,
+    /// Errors a step held instead of returning: a failed commit whose batch is held, a
+    /// partition or the pipeline blocked, a message waiting for the registry. Counted in
+    /// `ddi_errors_total` beside the errors the supervisor sees.
+    pub held_errors: AtomicU64,
+    /// `ddi_kafka_pipeline_blocked` by reason: 1 for the reason the whole pipeline is held
+    /// for now, 0 for every reason it was held for before.
+    pub pipeline_blocked: Mutex<BTreeMap<String, i64>>,
 }
 
 impl KafkaMetrics {
@@ -277,6 +284,27 @@ impl KafkaMetrics {
     /// for the ones it gave up.
     pub fn set_partitions(&self, gauges: BTreeMap<i32, PartitionGauges>) {
         *self.partitions.lock().unwrap_or_else(|e| e.into_inner()) = gauges;
+    }
+
+    /// An error a step held rather than returned: counted in `ddi_errors_total`, and its gauge
+    /// raised ([`Self::observe_error`]).
+    pub fn observe_held(&self, e: &crate::Error) {
+        self.held_errors.fetch_add(1, Ordering::Relaxed);
+        self.observe_error(e);
+    }
+
+    /// Why the whole pipeline is held now, or `None` when it is not.
+    pub fn set_pipeline_blocked(&self, reason: Option<&str>) {
+        let mut m = self
+            .pipeline_blocked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for v in m.values_mut() {
+            *v = 0;
+        }
+        if let Some(reason) = reason {
+            m.insert(reason.to_string(), 1);
+        }
     }
 
     /// Raise the gauge for an open-time or held error, so the reason a pipeline is not
@@ -489,8 +517,14 @@ impl Metrics {
                 "Source data files read.",
                 |m| m.files_read.load(Ordering::Relaxed) as i64,
             ),
+            // A Kafka pipeline's step holds most of its errors in place, staying in its group:
+            // those count here too.
             ("ddi_errors_total", "counter", "Step errors.", |m| {
-                m.errors.load(Ordering::Relaxed) as i64
+                let held = m
+                    .kafka
+                    .get()
+                    .map_or(0, |k| k.held_errors.load(Ordering::Relaxed));
+                (m.errors.load(Ordering::Relaxed) + held) as i64
             }),
             (
                 "ddi_commits_skipped_total",
@@ -852,7 +886,7 @@ fn render_kafka(s: &mut String, pipelines: &[(&String, &Arc<KafkaMetrics>)]) {
         &'static str,
         fn(&KafkaMetrics) -> Vec<(String, i64)>,
     );
-    let labelled: [Labelled; 7] = [
+    let labelled: [Labelled; 8] = [
         ("ddi_kafka_messages_dropped_total", "counter", "Messages read and dropped, by why: not owned, its partition blocked, below the next offset, or the stored offset re-read to verify it.", "reason", |k| vec![
             ("not_owned".into(), k.dropped_not_owned.load(Ordering::Relaxed) as i64),
             ("blocked".into(), k.dropped_blocked.load(Ordering::Relaxed) as i64),
@@ -883,6 +917,10 @@ fn render_kafka(s: &mut String, pipelines: &[(&String, &Arc<KafkaMetrics>)]) {
         ("ddi_kafka_partition_lag_messages", "gauge", "Each owned partition's lag, from librdkafka's statistics; -1 while unknown.", "partition", |k| {
             let p = k.partitions.lock().unwrap_or_else(|e| e.into_inner());
             p.iter().map(|(p, g)| (p.to_string(), g.lag)).collect()
+        }),
+        ("ddi_kafka_pipeline_blocked", "gauge", "1 while the whole pipeline is held until an operator acts (or a target it cannot read comes back), staying in its group, with the reason; 0 for a reason it was held for before.", "reason", |k| {
+            let m = k.pipeline_blocked.lock().unwrap_or_else(|e| e.into_inner());
+            m.iter().map(|(r, v)| (r.clone(), *v)).collect()
         }),
         ("ddi_kafka_schema_registry_requests_total", "counter", "Schema Registry requests, by how they ended.", "outcome", |k| {
             let m = k.schema_registry_requests.lock().unwrap_or_else(|e| e.into_inner());
@@ -967,6 +1005,56 @@ mod tests {
             text.contains("ddi_kafka_brokers_up{pipeline=\"events\"} 1"),
             "{text}"
         );
+    }
+
+    /// An error a Kafka step held in place counts in `ddi_errors_total` as one the supervisor
+    /// saw does, and a pipeline held whole says why, until it is not held any more. A Delta
+    /// pipeline's count is its own.
+    #[test]
+    fn held_errors_count_and_a_held_pipeline_says_why() {
+        let m = Metrics::new();
+        m.pipeline("orders").errors.fetch_add(2, Ordering::Relaxed);
+        let p = m.pipeline("events");
+        let k = p.kafka();
+        p.errors.fetch_add(1, Ordering::Relaxed);
+        k.observe_held(&crate::Error::KafkaUndecodable {
+            topic: "events".into(),
+            partition: 0,
+            offset: 7,
+            reason: "no magic byte".into(),
+            dq_uri: "/lake/events__ddi_dq".into(),
+        });
+        k.set_pipeline_blocked(Some("undecodable"));
+        let text = m.render();
+        assert!(
+            text.contains("ddi_errors_total{pipeline=\"events\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ddi_errors_total{pipeline=\"orders\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ddi_kafka_undecodable_blocking{pipeline=\"events\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "ddi_kafka_pipeline_blocked{pipeline=\"events\",reason=\"undecodable\"} 1"
+            ),
+            "{text}"
+        );
+        k.set_pipeline_blocked(Some("target_replaced"));
+        k.set_pipeline_blocked(None);
+        let text = m.render();
+        for reason in ["undecodable", "target_replaced"] {
+            assert!(
+                text.contains(&format!(
+                    "ddi_kafka_pipeline_blocked{{pipeline=\"events\",reason=\"{reason}\"}} 0"
+                )),
+                "{text}"
+            );
+        }
     }
 
     #[test]
