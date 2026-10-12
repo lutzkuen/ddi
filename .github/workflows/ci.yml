@@ -154,8 +154,16 @@ jobs:
           tags: ddi:delta-only-ci
           cache-from: type=gha,scope=delta-only
           cache-to: type=gha,mode=max,scope=delta-only
-      # The Delta-only binary links no librdkafka.
-      - run: "! docker run --rm ddi:delta-only-ci --version | tee /dev/stderr | grep -F librdkafka"
+      # The Delta-only binary links no librdkafka. `--version` runs as a step of its own: in a
+      # pipeline into `! grep` (bash -e, no pipefail) a binary that failed to start printed
+      # nothing, grep found no librdkafka in it, and the job passed.
+      - name: ddi --version (Delta-only)
+        run: docker run --rm ddi:delta-only-ci --version > version.txt
+      - name: The Delta-only binary links no librdkafka
+        run: |
+          cat version.txt
+          grep -q '^ddi ' version.txt
+          if grep -F librdkafka version.txt; then exit 1; fi
 
   kafka-integration:
     name: Kafka source against Redpanda
