@@ -496,6 +496,23 @@ async fn zombie_after_poll_interval() {
     // Let the zombie's late commits land, or be fenced.
     tokio::time::sleep(Duration::from_secs(15)).await;
     assert_exactly(&coordinates(&f.target).await, &produced);
+    // And it was a zombie: thrown out of its group for overrunning max.poll.interval.ms,
+    // while the other member took its partitions over and committed. Its own late commit is
+    // refused (fenced, or a revoke flush dropped) or lands first and fences the other's;
+    // which one depends on timing, and exactly-once above holds either way.
+    let thrown_out = zombie
+        .metric("ddi_kafka_client_errors_total{pipeline=\"zombie\",code=\"PollExceeded\"}")
+        .await;
+    assert!(
+        thrown_out >= 1.0,
+        "the zombie never overran max.poll.interval.ms:\n{}",
+        zombie.log_text()
+    );
+    assert!(
+        other.metric("ddi_batches_committed_total").await >= 1.0,
+        "the other member never took over:\n{}",
+        other.log_text()
+    );
     zombie.kill().await;
     other.kill().await;
 }
