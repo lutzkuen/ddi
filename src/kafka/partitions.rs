@@ -553,8 +553,6 @@ mod tests {
         );
         assert!(!parts.done(0, 5, idle, now));
 
-        // A blocked partition is done once it has been blocked for the idle time, however
-        // often a recheck finds it still blocked.
         // Idle counts only from when the member went back to polling: a commit or a pause as
         // long as the idle time is not idle.
         let (mut parts, now) = ready(0, 3, None);
@@ -569,6 +567,8 @@ mod tests {
         parts.polled_again(Some(0), now + idle * 2);
         assert!(!parts.done(0, 5, idle, now + idle * 2));
 
+        // A blocked partition is done once it has been blocked for the idle time, however
+        // often a recheck finds it still blocked.
         let (mut parts, now) = ready(0, 3, None);
         let block = Block::Regressed { stored: 9, high: 5 };
         parts.block(0, block.clone(), now);
