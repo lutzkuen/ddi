@@ -300,6 +300,9 @@ impl Pipeline {
 
     /// Resume every paused partition that is Ready, at the offset it expects next: a seek
     /// first, since messages read and dropped while it was paused moved librdkafka's position.
+    ///
+    /// A seek or a resume that fails transiently (one that timed out) leaves the partitions
+    /// paused, for the next pass to try again: the member stays in its group (§3.6).
     pub(crate) async fn release(&mut self) -> Result<()> {
         let src = self.kafka();
         let ready: Vec<(i32, i64)> = src
@@ -322,10 +325,26 @@ impl Pipeline {
             resume.add_partition(&topic, *p);
         }
         let consumer = src.consumer().clone();
-        let sought = blocking(&consumer, "seeking partitions", move |c| {
-            c.seek_partitions(seek, REQUEST_TIMEOUT)
-        })
-        .await?;
+        let sought = if super::fault::fail_seek() {
+            Err(Error::KafkaClient {
+                failure: crate::error::KafkaClientFailure::Transport,
+                detail: "seeking partitions: Local: Timed out (fault injected)".into(),
+            })
+        } else {
+            blocking(&consumer, "seeking partitions", move |c| {
+                c.seek_partitions(seek, REQUEST_TIMEOUT)
+            })
+            .await
+        };
+        let sought = match sought {
+            Ok(sought) => sought,
+            Err(e) if e.kafka_class() == KafkaClass::Transient => {
+                warn!(partitions = ?ready, "cannot seek; trying again on the next pass: {e}");
+                self.kafka().metrics.observe_held(&e);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         for e in sought.elements() {
             if let Err(err) = e.error() {
                 // Not resumed: it stays paused, and the next pass tries again.
@@ -340,9 +359,15 @@ impl Pipeline {
                 .map_err(|e| Error::Other(format!("internal: {e}")))?;
             }
         }
-        consumer
-            .resume(&resume)
-            .map_err(|e| client::classify(&e, "resuming partitions"))?;
+        if let Err(e) = consumer.resume(&resume) {
+            let e = client::classify(&e, "resuming partitions");
+            if e.kafka_class() != KafkaClass::Transient {
+                return Err(e);
+            }
+            warn!(partitions = ?ready, "cannot resume; trying again on the next pass: {e}");
+            self.kafka().metrics.observe_held(&e);
+            return Ok(());
+        }
         let src = self.kafka_mut();
         let now = Instant::now();
         for e in resume.elements() {

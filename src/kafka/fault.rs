@@ -14,13 +14,15 @@
 //! - `fail_after_commit`: report the first target commit that lands as failed, as a lost
 //!   response to its PUT would (`ambiguous_commit_error_no_duplicate`).
 //! - `handle_max_age:<secs>`: refresh a handle older than this before a commit, instead of
-//!   after ten minutes (`handle_aged_past_log_retention`).
+//!   after ten minutes (`handle_aged_past_log_retention`, tests/kafka_aging.rs).
+//! - `fail_seek:<n>`: fail the first `n` seeks of paused partitions as a seek that timed out
+//!   does (`a_seek_that_times_out_is_tried_again`).
 
 use std::time::Duration;
 
 #[cfg(any(test, feature = "fault-injection"))]
 mod active {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Duration;
 
     /// The argument of fault `name`, `Some("")` when it has none, `None` when it is not set.
@@ -62,6 +64,22 @@ mod active {
     pub(super) fn handle_max_age() -> Option<Duration> {
         secs("handle_max_age")
     }
+
+    pub(super) fn fail_seek() -> bool {
+        static FAILED: AtomicU32 = AtomicU32::new(0);
+        let Some(n) = arg("fail_seek").and_then(|a| a.parse::<u32>().ok()) else {
+            return false;
+        };
+        let fired = FAILED
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |f| {
+                (f < n).then_some(f + 1)
+            })
+            .is_ok();
+        if fired {
+            tracing::warn!(fault = "fail_seek", "fault injected");
+        }
+        fired
+    }
 }
 
 /// Before a Kafka batch's target commit.
@@ -80,6 +98,14 @@ pub(crate) fn after_dq() {
 pub(crate) fn fail_after_commit() -> bool {
     #[cfg(any(test, feature = "fault-injection"))]
     return active::fail_after_commit();
+    #[cfg(not(any(test, feature = "fault-injection")))]
+    false
+}
+
+/// Before a seek of paused partitions: whether to fail it, as one that timed out.
+pub(crate) fn fail_seek() -> bool {
+    #[cfg(any(test, feature = "fault-injection"))]
+    return active::fail_seek();
     #[cfg(not(any(test, feature = "fault-injection")))]
     false
 }

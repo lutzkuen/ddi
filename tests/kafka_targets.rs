@@ -222,6 +222,32 @@ async fn ambiguous_commit_error_no_duplicate() {
     assert_exactly(&coordinates(&f.target).await, &produced);
 }
 
+/// 23, a variant. The reset after that ambiguous commit seeks its partitions again, and the
+/// seek times out (fail_seek), twice: a transient failure, tried again on the next pass with
+/// the partitions paused, never an error that drops the consumer (in a group, a rebalance;
+/// here, a failed run).
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Redpanda; set DDI_TEST_KAFKA"]
+async fn a_seek_that_times_out_is_tried_again() {
+    let f = Fixture::new(2).await;
+    let id = register(&f.subject(), EVENT_V1).await;
+    let mut produced = produce_to(&f, id, 0, 30).await;
+    produced.extend(produce_to(&f, id, 1, 30).await);
+    let config = f.write(
+        "once.toml",
+        &f.toml("seek", "", "max_messages_per_batch = 20"),
+    );
+    let (ok, out) = once_with(
+        &config,
+        &[("DDI_TEST_FAULT", "fail_after_commit,fail_seek:2")],
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert!(out.contains("fail_seek"), "the fault did not fire: {out}");
+    assert_exactly(&coordinates(&f.target).await, &produced);
+}
+
 /// 27. A Delta→Delta pipeline over the bronze a Kafka pipeline wrote, with the cut-off kept
 /// per Kafka partition (`dedup_partition = "kafka_partition"`, `dedup_timestamp =
 /// "kafka_offset"`): after a rebuild of silver, the rescan is exact.

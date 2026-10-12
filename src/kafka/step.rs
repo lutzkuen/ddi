@@ -686,7 +686,22 @@ impl Pipeline {
         let partitions: Vec<i32> = ready.iter().map(|(p, _)| *p).collect();
         let topic = self.kafka().kafka.topic.clone();
         let consumer = self.kafka().consumer().clone();
-        let watermarks = super::rebalance::watermarks(&consumer, &topic, &partitions).await?;
+        let watermarks = match super::rebalance::watermarks(&consumer, &topic, &partitions).await {
+            Ok(w) => w,
+            // Not knowing which, every partition is sought again, as with no offender; still
+            // out of range, it is reported again, and the watermarks asked again (§3.6).
+            Err(e) if e.kafka_class() == KafkaClass::Transient => {
+                warn!(
+                    pipeline = %self.cfg.name,
+                    "librdkafka reported an offset out of range, and the watermarks that say \
+                     which partition cannot be read; seeking each again: {e}"
+                );
+                self.kafka().metrics.observe_held(&e);
+                self.pause(&partitions);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         let mut any = false;
         for (p, next) in ready {
             let Some((low, high)) = watermarks.get(&p).copied() else {
@@ -1918,6 +1933,26 @@ mod tests {
             })
         ));
         assert!(src.decoder_mut().finish().unwrap().batches.is_empty());
+    }
+
+    /// librdkafka reported an offset out of range and the watermarks that would say which
+    /// partition cannot be read (no broker answers): a transient failure, held in place. Every
+    /// Ready partition is paused, to be sought again on the next pass, and the member stays
+    /// in its group instead of the supervisor dropping its consumer.
+    #[tokio::test]
+    async fn out_of_range_without_watermarks_seeks_again_in_place() {
+        let mut p = pipeline_without_a_broker();
+        p.kafka_mut().parts.ready_at(0, 10, None, Instant::now());
+        let outcome = p.out_of_range().await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(p.kafka().paused.contains(&0));
+        assert!(matches!(
+            p.kafka().parts.get(0),
+            Some(State::Ready {
+                next_expected: 10,
+                ..
+            })
+        ));
     }
 
     #[test]
