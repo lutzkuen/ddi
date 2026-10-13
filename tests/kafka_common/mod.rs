@@ -18,6 +18,8 @@
 
 #![allow(dead_code)]
 
+pub mod bronze;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

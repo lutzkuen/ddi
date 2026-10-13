@@ -247,7 +247,7 @@ async fn set_offsets_moves_guards_and_reasserts() {
     let marker = delta_delta_ingest::fence::takeover_marker_app_id(&f.app_id);
     let read = delta_delta_ingest::fence::read_txns(
         &table,
-        &[marker.clone()],
+        std::slice::from_ref(&marker),
         &delta_delta_ingest::fence::LookupCounters::default(),
     )
     .await

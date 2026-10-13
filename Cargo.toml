@@ -111,6 +111,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "ne
 # moving to it is this one line. No default features: they are codecs for container files,
 # and `xz` would bring back the `links = "lzma"` collision.
 apache-avro = { version = "=0.21.0", default-features = false }
+# The apache-avro that schema_registry_converter 3.1.0 decodes with, which is the one the
+# production kafka-delta-ingest builds turn Confluent Avro into JSON with (M-1: 0.14.0 beside the
+# direct 0.17.0). tests/avro_production_parity.rs compares its JSON with the 0.21.0 the parity
+# matrices are written against.
+apache-avro-014 = { package = "apache-avro", version = "=0.14.0", default-features = false }
 
 # Debug builds link deltalake + datafusion + arrow into every test binary, and their
 # debug info — not their code — is what makes those binaries enormous. Keeping full

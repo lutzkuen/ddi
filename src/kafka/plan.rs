@@ -194,6 +194,23 @@ pub async fn plan(cfg: &ResolvedPipeline) -> Result<Plan> {
                 .join(", ")
         ));
     }
+    // A SELECT list replaces the source's columns, the value schema id included.
+    if let (Some(true), Some(sql)) = (k.kdi_compat, cfg.transform_sql.as_deref()) {
+        let compact = sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        if !compact.contains("value_schema_id") && compact != "select * from source" {
+            notes.push(format!(
+                "transform_sql does not select {}value_schema_id: with kdi_compat the text written into \
+                 STRING columns then cannot tell which writer schema a row had, and gives every row a key \
+                 for every field any schema version has (ddi_kafka_null_text_approximate). Add it to the \
+                 SELECT list; the target has no such column, so it is not written",
+                k.metadata_prefix
+            ));
+        }
+    }
     let prefix = &k.metadata_prefix;
     let missing: Vec<String> = ["topic", "partition", "offset", "timestamp"]
         .iter()

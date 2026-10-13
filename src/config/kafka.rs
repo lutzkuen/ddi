@@ -869,7 +869,7 @@ fn jaas_identity(var: &str, line: &str) -> Result<(String, String)> {
             let before_ok = rest[..at]
                 .chars()
                 .next_back()
-                .map_or(true, |c| c.is_whitespace() || c == ';');
+                .is_none_or(|c| c.is_whitespace() || c == ';');
             let after = rest[at + name.len()..].trim_start();
             if before_ok {
                 if let Some(value) = after.strip_prefix('=').map(str::trim_start) {

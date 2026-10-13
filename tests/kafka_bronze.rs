@@ -9,119 +9,10 @@
 mod common;
 mod kafka_common;
 
-use apache_avro::types::Value;
 use delta_delta_ingest::pipeline::{Pipeline, StepOutcome};
-use deltalake::kernel::{DataType as Delta, PrimitiveType, StructField};
 
+use kafka_common::bronze::*;
 use kafka_common::*;
-
-/// The envelope every production topic carries, with an invented payload record.
-const ENVELOPE: &str = r#"{"type":"record","name":"Envelope","namespace":"ddi.test","fields":[
-  {"name":"messageId","type":"string"},
-  {"name":"messageTime","type":"long"},
-  {"name":"correlationId","type":["null","string"],"default":null},
-  {"name":"producer","type":"string"},
-  {"name":"producerVersion","type":"string"},
-  {"name":"producerHost","type":"string"},
-  {"name":"data","type":{"type":"record","name":"Payload","fields":[
-    {"name":"orderId","type":"string"},
-    {"name":"captureGrossAmount","type":{"type":"record","name":"Money","fields":[
-      {"name":"amount","type":{"type":"bytes","logicalType":"decimal","precision":12,"scale":2}},
-      {"name":"currency","type":"string"}]}},
-    {"name":"additionalFees","type":["null","string"],"default":null},
-    {"name":"tags","type":{"type":"array","items":"string"}},
-    {"name":"attributes","type":{"type":"map","values":"string"}},
-    {"name":"createdAt","type":"long"}
-  ]}}
-]}"#;
-
-/// The transform every one of the 22 streams gets: the envelope in lower case, the Kafka
-/// coordinates, and `ingest_date`, the UTC date of the producer's `messageTime`.
-pub const BRONZE_SQL: &str = r#"SELECT
-  "messageId" AS messageid,
-  to_timestamp_millis("messageTime") AS messagetime,
-  "correlationId" AS correlationid,
-  producer,
-  "producerVersion" AS producerversion,
-  "producerHost" AS producerhost,
-  data,
-  kafka_topic, kafka_partition, kafka_offset, kafka_timestamp,
-  to_char(to_timestamp_millis("messageTime"), '%Y-%m-%d') AS ingest_date
-FROM source"#;
-
-fn string(name: &str) -> StructField {
-    StructField::new(name, Delta::Primitive(PrimitiveType::String), true)
-}
-
-fn bronze_columns() -> Vec<StructField> {
-    vec![
-        string("messageid"),
-        StructField::new(
-            "messagetime",
-            Delta::Primitive(PrimitiveType::Timestamp),
-            true,
-        ),
-        string("correlationid"),
-        string("producer"),
-        string("producerversion"),
-        string("producerhost"),
-        string("data"),
-        string("kafka_topic"),
-        StructField::new(
-            "kafka_partition",
-            Delta::Primitive(PrimitiveType::Integer),
-            true,
-        ),
-        StructField::new("kafka_offset", Delta::Primitive(PrimitiveType::Long), true),
-        StructField::new(
-            "kafka_timestamp",
-            Delta::Primitive(PrimitiveType::Timestamp),
-            true,
-        ),
-        string("ingest_date"),
-    ]
-}
-
-fn s(v: &str) -> Value {
-    Value::String(v.into())
-}
-
-fn message(id: &str, millis: i64, correlation: Option<&str>, fee: Option<&str>) -> Value {
-    let union = |v: Option<&str>| match v {
-        Some(x) => Value::Union(1, Box::new(s(x))),
-        None => Value::Union(0, Box::new(Value::Null)),
-    };
-    // Entries put in on purpose out of order: kdi wrote its JSON with sorted keys.
-    let attributes = Value::Map(
-        [("b".to_string(), s("2")), ("a".to_string(), s("1"))]
-            .into_iter()
-            .collect(),
-    );
-    let money = Value::Record(vec![
-        (
-            "amount".into(),
-            Value::Decimal(apache_avro::Decimal::from(vec![1u8, 44])),
-        ),
-        ("currency".into(), s("EUR")),
-    ]);
-    let payload = Value::Record(vec![
-        ("orderId".into(), s(&format!("o-{id}"))),
-        ("captureGrossAmount".into(), money),
-        ("additionalFees".into(), union(fee)),
-        ("tags".into(), Value::Array(vec![s("x"), s("y")])),
-        ("attributes".into(), attributes),
-        ("createdAt".into(), Value::Long(millis)),
-    ]);
-    Value::Record(vec![
-        ("messageId".into(), s(id)),
-        ("messageTime".into(), Value::Long(millis)),
-        ("correlationId".into(), union(correlation)),
-        ("producer".into(), s("cart2order")),
-        ("producerVersion".into(), s("1.2.3")),
-        ("producerHost".into(), s("host-1")),
-        ("data".into(), payload),
-    ])
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs Redpanda; set DDI_TEST_KAFKA"]
@@ -146,9 +37,7 @@ async fn the_production_envelope_lands_as_the_twelve_bronze_columns() {
     let toml = f.toml(
         "bronze",
         "",
-        &format!(
-            "kdi_compat = true\nkdi_null_text = false\ntransform_sql = \"\"\"{BRONZE_SQL}\"\"\""
-        ),
+        &format!("kdi_compat = true\ntransform_sql = \"\"\"{BRONZE_SQL}\"\"\""),
     );
     let mut p = Pipeline::open_with(resolve(&toml, true), None)
         .await
@@ -185,7 +74,7 @@ async fn the_production_envelope_lands_as_the_twelve_bronze_columns() {
     // The partition value is the UTC date of the producer's time, whatever Kafka's clock said.
     assert_eq!(rows[0].2, "2026-10-13");
     assert_eq!(rows[1].2, "2026-10-14");
-    // A union's null is a NULL, never the text "null" (kdi_null_text = false).
+    // A union's null is a NULL, never the text "null": an alias of the SQL is computed, and a computed null is NULL.
     assert_eq!(rows[0].1.as_deref(), Some("c-1"));
     assert_eq!(rows[1].1, None);
     assert!(
