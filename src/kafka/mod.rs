@@ -19,14 +19,17 @@
 //! this feature can still read and validate it, and hold its pipelines back by name.
 
 pub(crate) mod client;
+pub mod clone;
 pub mod conform;
 pub(crate) mod context;
 pub mod decode;
 pub(crate) mod fault;
 pub(crate) mod kdi_text;
 pub(crate) mod partitions;
+pub mod plan;
 pub(crate) mod rebalance;
 pub mod registry;
+pub mod setoffsets;
 #[cfg(test)]
 pub(crate) mod sr_stub;
 pub(crate) mod start;

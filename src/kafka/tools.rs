@@ -1,7 +1,8 @@
 //! Operator views of a Kafka pipeline that never disturb its group (docs/kafka-design.md
 //! §4.8): a client without a `group.id`, which joins nothing.
 //!
-//! M3 has `ddi status`; `plan`, `clone-table` and `set-offsets` come in M4 and M5.
+//! `ddi status` (M3), `ddi kafka plan` and `clone-table` (M4, [`super::plan`], [`super::clone`])
+//! and `set-offsets` (M5, [`super::setoffsets`]).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -42,15 +43,32 @@ impl PartitionStatus {
     }
 }
 
-/// Every partition of a Kafka pipeline's topic, with its offset in the target and its
-/// watermarks, and the era of its app_id's offsets (§4.3).
-pub async fn status(cfg: &ResolvedPipeline) -> Result<(fence::Era, Vec<PartitionStatus>)> {
-    let k = cfg
-        .kafka
-        .as_ref()
-        .ok_or_else(|| Error::Other("internal: status of a Kafka pipeline without one".into()))?;
+/// What the operator tools read in one go: the target, who wrote the offsets in it, and each
+/// partition of the topic with its offset and watermarks.
+pub struct View {
+    pub target: deltalake::DeltaTable,
+    pub era: fence::Era,
+    pub txns: BTreeMap<String, fence::TxnState>,
+    pub partitions: Vec<PartitionStatus>,
+}
+
+/// A client without a `group.id` for `cfg`'s pipeline, and its settings.
+pub(super) fn group_less_client(
+    cfg: &ResolvedPipeline,
+) -> Result<Arc<rdkafka::consumer::BaseConsumer>> {
+    let k = cfg.kafka.as_ref().ok_or_else(|| {
+        Error::Other("internal: a tool run on a pipeline that is not Kafka".into())
+    })?;
     let settings = super::client::settings(&cfg.name, k)?;
-    let consumer = Arc::new(super::client::group_less(&cfg.name, &settings)?);
+    Ok(Arc::new(super::client::group_less(&cfg.name, &settings)?))
+}
+
+/// Read a Kafka pipeline's target and topic without joining a group.
+pub async fn view(cfg: &ResolvedPipeline) -> Result<View> {
+    let k = cfg.kafka.as_ref().ok_or_else(|| {
+        Error::Other("internal: a tool run on a pipeline that is not Kafka".into())
+    })?;
+    let consumer = group_less_client(cfg)?;
     let topic = k.topic.clone();
     let metadata = {
         let consumer = consumer.clone();
@@ -76,7 +94,6 @@ pub async fn status(cfg: &ResolvedPipeline) -> Result<(fence::Era, Vec<Partition
     ids.push(fence::takeover_marker_app_id(&cfg.app_id));
     let txns = fence::read_txns(&target, &ids, &LookupCounters::default()).await?;
     let era = fence::era(&cfg.app_id, &txns);
-    let mut out = Vec::new();
     let mut watermarks = BTreeMap::new();
     for p in &partitions {
         let consumer = consumer.clone();
@@ -90,6 +107,7 @@ pub async fn status(cfg: &ResolvedPipeline) -> Result<(fence::Era, Vec<Partition
         .map_err(|e| super::client::classify(&e, "reading watermarks"))?;
         watermarks.insert(p, w);
     }
+    let mut out = Vec::new();
     for p in partitions {
         let (low, high) = watermarks[&p];
         let stored = txns
@@ -102,7 +120,19 @@ pub async fn status(cfg: &ResolvedPipeline) -> Result<(fence::Era, Vec<Partition
             high,
         });
     }
-    Ok((era, out))
+    Ok(View {
+        target,
+        era,
+        txns,
+        partitions: out,
+    })
+}
+
+/// Every partition of a Kafka pipeline's topic, with its offset in the target and its
+/// watermarks, and the era of its app_id's offsets (§4.3).
+pub async fn status(cfg: &ResolvedPipeline) -> Result<(fence::Era, Vec<PartitionStatus>)> {
+    let v = view(cfg).await?;
+    Ok((v.era, v.partitions))
 }
 
 #[cfg(test)]

@@ -127,6 +127,47 @@ enum Command {
     /// Work with a dbt project.
     #[command(subcommand)]
     Dbt(DbtCommand),
+    /// Operate on Kafka pipelines: preflight, clone a table, move offsets. Reads the topic
+    /// with a client that joins no group, so a running pipeline is not disturbed.
+    #[command(subcommand)]
+    Kafka(KafkaCommand),
+}
+
+#[derive(Subcommand)]
+enum KafkaCommand {
+    /// Read-only preflight of each selected Kafka pipeline: the target's table facts, whose
+    /// offsets are in it, what the takeover check says, every partition, and a
+    /// `starting_offsets` to paste. Exits non-zero when something blocks the pipeline.
+    Plan,
+    /// Create an empty copy of a pipeline's target, with its exact column names and case, for
+    /// a shadow run.
+    CloneTable {
+        /// The new table's location.
+        #[arg(long)]
+        to: String,
+    },
+    /// Move a pipeline's offsets. Offsets here are the NEXT offset to read.
+    SetOffsets {
+        /// The partition to move (repeatable with `--next` in the same order is not
+        /// supported: use one command per partition, or `--all-partitions`).
+        #[arg(long)]
+        partition: Option<i32>,
+        /// The next offset to read.
+        #[arg(long)]
+        next: Option<i64>,
+        /// Apply `--next` to every partition of the topic.
+        #[arg(long)]
+        all_partitions: bool,
+        /// Write every partition's offset again at its own stored value, with ddi's stamp.
+        #[arg(long)]
+        reassert: bool,
+        /// Why offsets the topic still holds are skipped. Recorded in the commit.
+        #[arg(long, value_name = "REASON")]
+        acknowledge_skip: Option<String>,
+        /// Allow a move backwards: those rows are written twice.
+        #[arg(long)]
+        allow_replay: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -188,6 +229,9 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
     // put in the config.
     if let Some(Command::Dbt(sub)) = &cli.command {
         return dbt_command(sub, &cfg, &cli).await;
+    }
+    if let Some(Command::Kafka(sub)) = &cli.command {
+        return kafka_command(sub, &cfg, &cli).await;
     }
 
     // Partial by design: one unusable entry in a config of three hundred must not keep the
@@ -379,7 +423,9 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
         Command::Status => status(pipelines, locator).await,
         Command::Once => run_all(pipelines, rejected, locator, cli.metrics_addr, true).await,
         Command::Run => run_all(pipelines, rejected, locator, cli.metrics_addr, false).await,
-        Command::Dbt(_) => unreachable!("handled above, before the config is resolved"),
+        Command::Dbt(_) | Command::Kafka(_) => {
+            unreachable!("handled above, before the config is resolved")
+        }
     }
 }
 
@@ -600,6 +646,127 @@ async fn dbt_command(sub: &DbtCommand, cfg: &Config, cli: &Cli) -> delta_delta_i
                     println!("wrote {}", p.display());
                 }
                 None => print!("{toml}"),
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `ddi kafka ...`: the operator tools of docs/kafka-design.md §4.8.
+#[cfg(not(feature = "kafka"))]
+async fn kafka_command(
+    _sub: &KafkaCommand,
+    _cfg: &Config,
+    _cli: &Cli,
+) -> delta_delta_ingest::Result<()> {
+    Err(delta_delta_ingest::Error::Other(
+        "this build has no Kafka support: build with `--features kafka`".into(),
+    ))
+}
+
+#[cfg(feature = "kafka")]
+async fn kafka_command(
+    sub: &KafkaCommand,
+    cfg: &Config,
+    cli: &Cli,
+) -> delta_delta_ingest::Result<()> {
+    use delta_delta_ingest::kafka::{clone, plan, setoffsets};
+    use delta_delta_ingest::Error;
+
+    let resolved = cfg.resolve_all()?;
+    let pipelines: Vec<ResolvedPipeline> =
+        select(resolved.pipelines, &cli.select, &resolved.rejected)?
+            .into_iter()
+            .filter(|p| p.kafka.is_some())
+            .collect();
+    if pipelines.is_empty() {
+        return Err(Error::Other(
+            "no Kafka pipeline selected (name one with --select NAME)".into(),
+        ));
+    }
+    let one = |what: &str| -> delta_delta_ingest::Result<&ResolvedPipeline> {
+        match pipelines.as_slice() {
+            [p] => Ok(p),
+            _ => Err(Error::Other(format!(
+                "{what} acts on one pipeline; name it with --select NAME ({} selected)",
+                pipelines.len()
+            ))),
+        }
+    };
+    match sub {
+        KafkaCommand::Plan => {
+            let mut blocked = false;
+            for p in &pipelines {
+                match plan::plan(p).await {
+                    Ok(plan) => {
+                        print!("{}", plan.render());
+                        blocked |= plan.is_blocked();
+                    }
+                    Err(e) => {
+                        println!("{:<24} ERROR: {e}", p.name);
+                        blocked = true;
+                    }
+                }
+            }
+            if blocked {
+                return Err(Error::Other("a pipeline is blocked (see above)".into()));
+            }
+            Ok(())
+        }
+        KafkaCommand::CloneTable { to } => {
+            let p = one("clone-table")?;
+            let version = clone::clone_table(p, to).await?;
+            println!(
+                "created {to} at version {version}, empty, with {}'s columns",
+                p.name
+            );
+            Ok(())
+        }
+        KafkaCommand::SetOffsets {
+            partition,
+            next,
+            all_partitions,
+            reassert,
+            acknowledge_skip,
+            allow_replay,
+        } => {
+            let p = one("set-offsets")?;
+            let mut moves = std::collections::BTreeMap::new();
+            match (partition, next, all_partitions) {
+                (Some(pn), Some(n), false) => {
+                    moves.insert(*pn, *n);
+                }
+                (None, Some(n), true) => {
+                    let view = delta_delta_ingest::kafka::tools::view(p).await?;
+                    for s in &view.partitions {
+                        moves.insert(s.partition, *n);
+                    }
+                }
+                (None, None, false) if *reassert => {}
+                _ => {
+                    return Err(Error::Other(
+                        "use --partition P --next O, or --all-partitions --next O, or --reassert"
+                            .into(),
+                    ))
+                }
+            }
+            let request = setoffsets::Request {
+                moves,
+                reassert: *reassert,
+                acknowledge_skip: acknowledge_skip.clone(),
+                allow_replay: *allow_replay,
+            };
+            let out = setoffsets::set_offsets(p, &request).await?;
+            println!("committed version {}", out.version);
+            for (part, (before, after)) in &out.moved {
+                println!(
+                    "  partition {part:>4}: next offset {} -> {}",
+                    before.map_or("-".to_string(), |b| (b + 1).to_string()),
+                    after + 1
+                );
+            }
+            if out.checkpointed {
+                println!("a checkpoint was written at that version (a move backwards)");
             }
             Ok(())
         }

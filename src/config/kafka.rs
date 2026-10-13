@@ -2690,9 +2690,13 @@ url = "http://my-sr:8081"
             assert_eq!(s.get("sasl.password"), Some("se/cr+et=="), "{line}");
         }
         // A field named like the one wanted is not it: `xusername` is not `username`.
-        let e = settings_of(&r, "events", &[(var, "required xusername='u' password='p';")])
-            .unwrap_err()
-            .to_string();
+        let e = settings_of(
+            &r,
+            "events",
+            &[(var, "required xusername='u' password='p';")],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains(var), "{e}");
 
         for bad in [
@@ -2702,7 +2706,9 @@ url = "http://my-sr:8081"
             "required username='' password='p';",
             "required username='u password='p;",
         ] {
-            let e = settings_of(&r, "events", &[(var, bad)]).unwrap_err().to_string();
+            let e = settings_of(&r, "events", &[(var, bad)])
+                .unwrap_err()
+                .to_string();
             assert!(e.contains(var), "{e}");
             assert!(!e.contains(bad), "the value must not reach the error: {e}");
         }
@@ -2726,7 +2732,12 @@ url = "http://my-sr:8081"
 
         // Unset in the config, nothing is read.
         let r = resolve(&format!("{SECTION}{}", entry("events", "")));
-        let s = settings_of(&r, "events", &[(var, "required username='u' password='p';")]).unwrap();
+        let s = settings_of(
+            &r,
+            "events",
+            &[(var, "required username='u' password='p';")],
+        )
+        .unwrap();
         assert!(s.get("sasl.username").is_none());
     }
 
