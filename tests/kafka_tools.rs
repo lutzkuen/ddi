@@ -134,7 +134,13 @@ async fn clone_table_keeps_the_case_and_the_partition_columns() {
         &f.target,
         columns,
         &["ingest_date"],
-        &[("delta.checkpointInterval", "10")],
+        &[
+            ("delta.checkpointInterval", "10"),
+            // What Trino shows as properties and some writers keep in the configuration.
+            ("delta.minReaderVersion", "1"),
+            ("delta.minWriterVersion", "2"),
+            ("delta.enableDeletionVectors", "false"),
+        ],
     )
     .await;
     create_dq(&f.dq).await;
