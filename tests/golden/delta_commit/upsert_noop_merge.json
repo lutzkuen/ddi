@@ -1,0 +1,243 @@
+{
+  "target": [
+    {
+      "actions": [
+        {
+          "metaData": {
+            "configuration": {},
+            "createdTime": "<timestamp>",
+            "description": null,
+            "format": {
+              "options": {},
+              "provider": "parquet"
+            },
+            "id": "<target table id>",
+            "name": null,
+            "partitionColumns": [],
+            "schemaString": {
+              "fields": [
+                {
+                  "metadata": {},
+                  "name": "order_id",
+                  "nullable": false,
+                  "type": "long"
+                },
+                {
+                  "metadata": {},
+                  "name": "region",
+                  "nullable": true,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "amount",
+                  "nullable": true,
+                  "type": "long"
+                },
+                {
+                  "metadata": {},
+                  "name": "_timestamp",
+                  "nullable": false,
+                  "type": "timestamp_ntz"
+                }
+              ],
+              "type": "struct"
+            }
+          }
+        },
+        {
+          "protocol": {
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": [
+              "timestampNtz"
+            ],
+            "writerFeatures": [
+              "timestampNtz"
+            ]
+          }
+        }
+      ],
+      "commitInfo": {
+        "clientVersion": "delta-rs.0.32.4",
+        "engineInfo": "delta-rs:0.32.4",
+        "operation": "CREATE TABLE",
+        "operationParameters": {
+          "location": "file://<lake>/orders_stg/",
+          "metadata": {
+            "configuration": {},
+            "createdTime": "<timestamp>",
+            "description": null,
+            "format": {
+              "options": {},
+              "provider": "parquet"
+            },
+            "id": "<target table id>",
+            "name": null,
+            "partitionColumns": [],
+            "schemaString": {
+              "fields": [
+                {
+                  "metadata": {},
+                  "name": "order_id",
+                  "nullable": false,
+                  "type": "long"
+                },
+                {
+                  "metadata": {},
+                  "name": "region",
+                  "nullable": true,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "amount",
+                  "nullable": true,
+                  "type": "long"
+                },
+                {
+                  "metadata": {},
+                  "name": "_timestamp",
+                  "nullable": false,
+                  "type": "timestamp_ntz"
+                }
+              ],
+              "type": "struct"
+            }
+          },
+          "mode": "ErrorIfExists",
+          "protocol": {
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": [
+              "timestampNtz"
+            ],
+            "writerFeatures": [
+              "timestampNtz"
+            ]
+          }
+        },
+        "timestamp": "<timestamp>"
+      },
+      "version": 0
+    },
+    {
+      "actions": [
+        {
+          "add": {
+            "baseRowId": null,
+            "clusteringProvider": null,
+            "dataChange": true,
+            "defaultRowCommitVersion": null,
+            "modificationTime": "<timestamp>",
+            "partitionValues": {},
+            "path": "part-00000-<file-1>-c000.snappy.parquet",
+            "size": "<size>",
+            "stats": {
+              "maxValues": {
+                "_timestamp": "1970-01-01T00:00:00.000030Z",
+                "amount": 100,
+                "order_id": 1,
+                "region": "eu"
+              },
+              "minValues": {
+                "_timestamp": "1970-01-01T00:00:00.000030Z",
+                "amount": 100,
+                "order_id": 1,
+                "region": "eu"
+              },
+              "nullCount": {
+                "_timestamp": 0,
+                "amount": 0,
+                "order_id": 0,
+                "region": 0
+              },
+              "numRecords": 1
+            },
+            "tags": null
+          }
+        },
+        {
+          "txn": {
+            "appId": "ddi.test.orders_stg",
+            "version": 1
+          }
+        }
+      ],
+      "commitInfo": {
+        "clientVersion": "delta-rs.0.32.4",
+        "ddi.appId": "ddi.test.orders_stg",
+        "ddi.sourceTableId": "<source table id>",
+        "ddi.sourceTableIdVersion": 1,
+        "ddi.sourceVersion": 1,
+        "engineInfo": "delta-rs:0.32.4",
+        "operation": "MERGE",
+        "operationMetrics": {
+          "execution_time_ms": "<ms>",
+          "num_output_rows": 1,
+          "num_source_rows": 1,
+          "num_target_files_added": 1,
+          "num_target_files_removed": 0,
+          "num_target_files_scanned": 0,
+          "num_target_files_skipped_during_scan": 0,
+          "num_target_rows_copied": 0,
+          "num_target_rows_deleted": 0,
+          "num_target_rows_inserted": 1,
+          "num_target_rows_updated": 0,
+          "rewrite_time_ms": "<ms>",
+          "scan_time_ms": "<ms>"
+        },
+        "operationParameters": {
+          "matchedPredicates": [
+            {
+              "actionType": "update",
+              "predicate": "t._timestamp < s._timestamp"
+            }
+          ],
+          "mergePredicate": "t.order_id = s.order_id AND t._timestamp >= arrow_cast('1970-01-01T00:00:00.000030', 'Timestamp(Microsecond, None)')",
+          "notMatchedBySourcePredicates": [],
+          "notMatchedPredicates": [
+            {
+              "actionType": "insert"
+            }
+          ],
+          "predicate": "order_id = 1 AND _timestamp >= arrow_cast('1970-01-01T00:00:00.000030', 'Timestamp(Microsecond, None)')"
+        },
+        "readVersion": 0,
+        "timestamp": "<timestamp>"
+      },
+      "version": 1
+    },
+    {
+      "actions": [
+        {
+          "txn": {
+            "appId": "ddi.test.orders_stg",
+            "version": 2
+          }
+        }
+      ],
+      "commitInfo": {
+        "clientVersion": "delta-rs.0.32.4",
+        "ddi.appId": "ddi.test.orders_stg",
+        "ddi.sourceTableId": "<source table id>",
+        "ddi.sourceTableIdVersion": 2,
+        "ddi.sourceVersion": 2,
+        "engineInfo": "delta-rs:0.32.4",
+        "operation": "WRITE",
+        "operationMetrics": {
+          "execution_time_ms": "<ms>",
+          "num_added_files": 0,
+          "num_added_rows": 0,
+          "num_partitions": 0,
+          "num_removed_files": 0
+        },
+        "operationParameters": {
+          "mode": "Append"
+        },
+        "timestamp": "<timestamp>"
+      },
+      "version": 2
+    }
+  ]
+}

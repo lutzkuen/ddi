@@ -173,6 +173,8 @@ async fn rows_the_cut_off_drops_are_counted_and_the_window_is_visible() {
             .store(p.coverage().is_some() as i64, Ordering::Relaxed);
         match outcome {
             StepOutcome::CaughtUp => break,
+            // Only a Kafka pipeline waits.
+            StepOutcome::Waiting => {}
             StepOutcome::Progressed { covered, .. } | StepOutcome::Skipped { covered, .. } => {
                 m.rows_skipped_as_covered
                     .fetch_add(covered as u64, Ordering::Relaxed);

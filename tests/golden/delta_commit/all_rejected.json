@@ -1,0 +1,387 @@
+{
+  "dq": [
+    {
+      "actions": [
+        {
+          "metaData": {
+            "configuration": {},
+            "createdTime": "<timestamp>",
+            "description": null,
+            "format": {
+              "options": {},
+              "provider": "parquet"
+            },
+            "id": "<dq table id>",
+            "name": null,
+            "partitionColumns": [],
+            "schemaString": {
+              "fields": [
+                {
+                  "metadata": {},
+                  "name": "app_id",
+                  "nullable": false,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "pipeline",
+                  "nullable": true,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "source_version",
+                  "nullable": false,
+                  "type": "long"
+                },
+                {
+                  "metadata": {},
+                  "name": "column_name",
+                  "nullable": true,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "reason",
+                  "nullable": false,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "payload",
+                  "nullable": true,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "_timestamp",
+                  "nullable": false,
+                  "type": "timestamp_ntz"
+                }
+              ],
+              "type": "struct"
+            }
+          }
+        },
+        {
+          "protocol": {
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": [
+              "timestampNtz"
+            ],
+            "writerFeatures": [
+              "timestampNtz"
+            ]
+          }
+        }
+      ],
+      "commitInfo": {
+        "clientVersion": "delta-rs.0.32.4",
+        "engineInfo": "delta-rs:0.32.4",
+        "operation": "CREATE TABLE",
+        "operationParameters": {
+          "location": "file://<lake>/orders_stg__ddi_dq/",
+          "metadata": {
+            "configuration": {},
+            "createdTime": "<timestamp>",
+            "description": null,
+            "format": {
+              "options": {},
+              "provider": "parquet"
+            },
+            "id": "<dq table id>",
+            "name": null,
+            "partitionColumns": [],
+            "schemaString": {
+              "fields": [
+                {
+                  "metadata": {},
+                  "name": "app_id",
+                  "nullable": false,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "pipeline",
+                  "nullable": true,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "source_version",
+                  "nullable": false,
+                  "type": "long"
+                },
+                {
+                  "metadata": {},
+                  "name": "column_name",
+                  "nullable": true,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "reason",
+                  "nullable": false,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "payload",
+                  "nullable": true,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "_timestamp",
+                  "nullable": false,
+                  "type": "timestamp_ntz"
+                }
+              ],
+              "type": "struct"
+            }
+          },
+          "mode": "ErrorIfExists",
+          "protocol": {
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": [
+              "timestampNtz"
+            ],
+            "writerFeatures": [
+              "timestampNtz"
+            ]
+          }
+        },
+        "timestamp": "<timestamp>"
+      },
+      "version": 0
+    },
+    {
+      "actions": [
+        {
+          "add": {
+            "baseRowId": null,
+            "clusteringProvider": null,
+            "dataChange": true,
+            "defaultRowCommitVersion": null,
+            "modificationTime": "<timestamp>",
+            "partitionValues": {},
+            "path": "part-00000-<file-1>-c000.snappy.parquet",
+            "size": 2831,
+            "stats": {
+              "maxValues": {
+                "_timestamp": "<timestamp>",
+                "app_id": "ddi.test.orders_stg",
+                "column_name": "amount",
+                "payload": "{\"order_id\":2,\"region\":\"us\",\"amount\":\"also bad\",\"_timestamp\":\"1:",
+                "pipeline": "orders_stg",
+                "reason": "value does not fit \"amount\" (Utf8 -> Int64)",
+                "source_version": 1
+              },
+              "minValues": {
+                "_timestamp": "<timestamp>",
+                "app_id": "ddi.test.orders_stg",
+                "column_name": "amount",
+                "payload": "{\"order_id\":1,\"region\":\"eu\",\"amount\":\"n/a\",\"_timestamp\":\"1970-01",
+                "pipeline": "orders_stg",
+                "reason": "value does not fit \"amount\" (Utf8 -> Int64)",
+                "source_version": 1
+              },
+              "nullCount": {
+                "_timestamp": 0,
+                "app_id": 0,
+                "column_name": 0,
+                "payload": 0,
+                "pipeline": 0,
+                "reason": 0,
+                "source_version": 0
+              },
+              "numRecords": 2
+            },
+            "tags": null
+          }
+        },
+        {
+          "txn": {
+            "appId": "ddi.test.orders_stg.dq",
+            "version": 1
+          }
+        }
+      ],
+      "commitInfo": {
+        "clientVersion": "delta-rs.0.32.4",
+        "ddi.appId": "ddi.test.orders_stg",
+        "ddi.sourceVersion": 1,
+        "engineInfo": "delta-rs:0.32.4",
+        "operation": "WRITE",
+        "operationMetrics": {
+          "execution_time_ms": "<ms>",
+          "num_added_files": 1,
+          "num_added_rows": 2,
+          "num_partitions": 0,
+          "num_removed_files": 0
+        },
+        "operationParameters": {
+          "mode": "Append"
+        },
+        "timestamp": "<timestamp>"
+      },
+      "version": 1
+    }
+  ],
+  "target": [
+    {
+      "actions": [
+        {
+          "metaData": {
+            "configuration": {},
+            "createdTime": "<timestamp>",
+            "description": null,
+            "format": {
+              "options": {},
+              "provider": "parquet"
+            },
+            "id": "<target table id>",
+            "name": null,
+            "partitionColumns": [],
+            "schemaString": {
+              "fields": [
+                {
+                  "metadata": {},
+                  "name": "order_id",
+                  "nullable": false,
+                  "type": "long"
+                },
+                {
+                  "metadata": {},
+                  "name": "region",
+                  "nullable": true,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "amount",
+                  "nullable": true,
+                  "type": "long"
+                },
+                {
+                  "metadata": {},
+                  "name": "_timestamp",
+                  "nullable": false,
+                  "type": "timestamp_ntz"
+                }
+              ],
+              "type": "struct"
+            }
+          }
+        },
+        {
+          "protocol": {
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": [
+              "timestampNtz"
+            ],
+            "writerFeatures": [
+              "timestampNtz"
+            ]
+          }
+        }
+      ],
+      "commitInfo": {
+        "clientVersion": "delta-rs.0.32.4",
+        "engineInfo": "delta-rs:0.32.4",
+        "operation": "CREATE TABLE",
+        "operationParameters": {
+          "location": "file://<lake>/orders_stg/",
+          "metadata": {
+            "configuration": {},
+            "createdTime": "<timestamp>",
+            "description": null,
+            "format": {
+              "options": {},
+              "provider": "parquet"
+            },
+            "id": "<target table id>",
+            "name": null,
+            "partitionColumns": [],
+            "schemaString": {
+              "fields": [
+                {
+                  "metadata": {},
+                  "name": "order_id",
+                  "nullable": false,
+                  "type": "long"
+                },
+                {
+                  "metadata": {},
+                  "name": "region",
+                  "nullable": true,
+                  "type": "string"
+                },
+                {
+                  "metadata": {},
+                  "name": "amount",
+                  "nullable": true,
+                  "type": "long"
+                },
+                {
+                  "metadata": {},
+                  "name": "_timestamp",
+                  "nullable": false,
+                  "type": "timestamp_ntz"
+                }
+              ],
+              "type": "struct"
+            }
+          },
+          "mode": "ErrorIfExists",
+          "protocol": {
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": [
+              "timestampNtz"
+            ],
+            "writerFeatures": [
+              "timestampNtz"
+            ]
+          }
+        },
+        "timestamp": "<timestamp>"
+      },
+      "version": 0
+    },
+    {
+      "actions": [
+        {
+          "txn": {
+            "appId": "ddi.test.orders_stg",
+            "version": 1
+          }
+        }
+      ],
+      "commitInfo": {
+        "clientVersion": "delta-rs.0.32.4",
+        "ddi.appId": "ddi.test.orders_stg",
+        "ddi.sourceTableId": "<source table id>",
+        "ddi.sourceTableIdVersion": 1,
+        "ddi.sourceVersion": 1,
+        "engineInfo": "delta-rs:0.32.4",
+        "operation": "WRITE",
+        "operationMetrics": {
+          "execution_time_ms": "<ms>",
+          "num_added_files": 0,
+          "num_added_rows": 0,
+          "num_partitions": 0,
+          "num_removed_files": 0
+        },
+        "operationParameters": {
+          "mode": "Append"
+        },
+        "timestamp": "<timestamp>"
+      },
+      "version": 1
+    }
+  ]
+}

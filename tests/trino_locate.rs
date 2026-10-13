@@ -133,6 +133,7 @@ fn pipeline(declared_source: &str, declared_target: &str) -> ResolvedPipeline {
         watermark_uri: None,
         dedup_timestamp: None,
         dedup_key: None,
+        dedup_partition: Vec::new(),
         write_mode: Default::default(),
         upsert_key: None,
         upsert_lookback: None,
@@ -142,6 +143,7 @@ fn pipeline(declared_source: &str, declared_target: &str) -> ResolvedPipeline {
         dq_uri: None,
         max_evaluation_rejects_per_batch: 100,
         storage: Default::default(),
+        kafka: None,
     }
 }
 

@@ -168,6 +168,7 @@ mod tests {
             watermark_uri: None,
             dedup_timestamp: None,
             dedup_key: None,
+            dedup_partition: Vec::new(),
             write_mode: Default::default(),
             upsert_key: None,
             upsert_lookback: None,
@@ -177,6 +178,7 @@ mod tests {
             dq_uri: None,
             max_evaluation_rejects_per_batch: 100,
             storage: Default::default(),
+            kafka: None,
         }
     }
 

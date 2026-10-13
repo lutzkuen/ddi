@@ -38,8 +38,29 @@ mod tokio_util_shim {
     }
 }
 
+/// What `ddi --version` prints after the name: this crate's version, and with the `kafka`
+/// feature the librdkafka linked into it. The image runs `--version` as it is built
+/// (docker/Dockerfile), so a librdkafka or an OpenSSL the loader cannot resolve fails there.
+fn version() -> &'static str {
+    #[cfg(feature = "kafka")]
+    {
+        static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        VERSION.get_or_init(|| {
+            format!(
+                "{} (librdkafka {})",
+                env!("CARGO_PKG_VERSION"),
+                delta_delta_ingest::kafka::librdkafka_version()
+            )
+        })
+    }
+    #[cfg(not(feature = "kafka"))]
+    {
+        env!("CARGO_PKG_VERSION")
+    }
+}
+
 #[derive(Parser)]
-#[command(name = "ddi", version, about, long_about = None)]
+#[command(name = "ddi", version = version(), about, long_about = None)]
 struct Cli {
     /// Path to the pipeline config (TOML).
     #[arg(
@@ -106,6 +127,49 @@ enum Command {
     /// Work with a dbt project.
     #[command(subcommand)]
     Dbt(DbtCommand),
+    /// Operate on Kafka pipelines: preflight, clone a table, move offsets. Reads the topic
+    /// with a client that joins no group, so a running pipeline is not disturbed.
+    #[command(subcommand)]
+    Kafka(KafkaCommand),
+}
+
+#[derive(Subcommand)]
+enum KafkaCommand {
+    /// Read-only preflight of each selected Kafka pipeline: the target's table facts, whose
+    /// offsets are in it, what the takeover check says, every partition, and a
+    /// `starting_offsets` to paste. Exits non-zero when something blocks the pipeline.
+    Plan,
+    /// Create an empty copy of a pipeline's target, with its exact column names and case, for
+    /// a shadow run.
+    CloneTable {
+        /// The new table's location.
+        #[arg(long)]
+        to: String,
+    },
+    /// Create the pipeline's data-quality table (`<target>__ddi_dq`) where it does not exist.
+    CreateDq,
+    /// Move a pipeline's offsets. Offsets here are the NEXT offset to read.
+    SetOffsets {
+        /// The partition to move (repeatable with `--next` in the same order is not
+        /// supported: use one command per partition, or `--all-partitions`).
+        #[arg(long)]
+        partition: Option<i32>,
+        /// The next offset to read.
+        #[arg(long)]
+        next: Option<i64>,
+        /// Apply `--next` to every partition of the topic.
+        #[arg(long)]
+        all_partitions: bool,
+        /// Write every partition's offset again at its own stored value, with ddi's stamp.
+        #[arg(long)]
+        reassert: bool,
+        /// Why offsets the topic still holds are skipped. Recorded in the commit.
+        #[arg(long, value_name = "REASON")]
+        acknowledge_skip: Option<String>,
+        /// Allow a move backwards: those rows are written twice.
+        #[arg(long)]
+        allow_replay: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -168,10 +232,15 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
     if let Some(Command::Dbt(sub)) = &cli.command {
         return dbt_command(sub, &cfg, &cli).await;
     }
+    if let Some(Command::Kafka(sub)) = &cli.command {
+        return kafka_command(sub, &cfg, &cli).await;
+    }
 
     // Partial by design: one unusable entry in a config of three hundred must not keep the
     // other two hundred and ninety-nine off the air. What cannot run is named, counted and
     // exported; what can, runs.
+    // A build without the `kafka` feature has held every Kafka pipeline back by name already,
+    // with the reason; with it, they run beside the Delta pipelines.
     let resolved = cfg.resolve_all()?;
     let rejected = resolved.rejected;
     let pipelines = select(resolved.pipelines, &cli.select, &rejected)?;
@@ -183,7 +252,7 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
     }
     // Divided by what will actually run, not by what was written down: a held-back pipeline
     // allocates nothing, and counting it would make everyone else's share too small.
-    let budget = cfg.budget(pipelines.len())?;
+    let budget = cfg.budget(&pipelines)?;
     budget.clone().install();
 
     // The third and fourth process-wide limits. The spill budget is the only one whose
@@ -295,6 +364,23 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
                 println!("INVALID  {:<24} {}", r.name, r.reason);
             }
             for p in &pipelines {
+                // A Kafka pipeline's `kafka://<topic>` is a label, not a table: its storage is
+                // the target and the data-quality table it writes. The topic and the broker
+                // are reached at open, never here — validation reads nothing.
+                if let Some(k) = &p.kafka {
+                    p.storage.check(&p.target_uri)?;
+                    p.storage.check(&p.dq_uri())?;
+                    println!(
+                        "{:<24} {} (group {}) -> {}  (app_id={}, value_format={})",
+                        p.name,
+                        p.source_uri,
+                        k.group_id,
+                        p.target_uri,
+                        p.app_id,
+                        k.value_format.as_str()
+                    );
+                    continue;
+                }
                 // Resolving each backend touches no storage, but it does catch a URI
                 // whose scheme was not compiled in and credentials that cannot assemble
                 // — both of which would otherwise surface on the first batch.
@@ -339,7 +425,9 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
         Command::Status => status(pipelines, locator).await,
         Command::Once => run_all(pipelines, rejected, locator, cli.metrics_addr, true).await,
         Command::Run => run_all(pipelines, rejected, locator, cli.metrics_addr, false).await,
-        Command::Dbt(_) => unreachable!("handled above, before the config is resolved"),
+        Command::Dbt(_) | Command::Kafka(_) => {
+            unreachable!("handled above, before the config is resolved")
+        }
     }
 }
 
@@ -461,6 +549,8 @@ async fn dbt_command(sub: &DbtCommand, cfg: &Config, cli: &Cli) -> delta_delta_i
             let path = manifest_path(manifest, cfg)?;
             let m = Manifest::from_path(&path)?;
             let mut verdicts = analyze_all(&m);
+            // What `ddi run` would hold back for a malformed meta key, said here too.
+            delta_delta_ingest::dbt::convert::reject_unreadable_meta(&m, &mut verdicts);
 
             // A row-wise model on an Iceberg table is not a Delta→Delta pipeline, however
             // streamable its SQL looks.
@@ -564,6 +654,134 @@ async fn dbt_command(sub: &DbtCommand, cfg: &Config, cli: &Cli) -> delta_delta_i
     }
 }
 
+/// `ddi kafka ...`: the operator tools of docs/kafka-design.md §4.8.
+#[cfg(not(feature = "kafka"))]
+async fn kafka_command(
+    _sub: &KafkaCommand,
+    _cfg: &Config,
+    _cli: &Cli,
+) -> delta_delta_ingest::Result<()> {
+    Err(delta_delta_ingest::Error::Other(
+        "this build has no Kafka support: build with `--features kafka`".into(),
+    ))
+}
+
+#[cfg(feature = "kafka")]
+async fn kafka_command(
+    sub: &KafkaCommand,
+    cfg: &Config,
+    cli: &Cli,
+) -> delta_delta_ingest::Result<()> {
+    use delta_delta_ingest::kafka::{clone, plan, setoffsets};
+    use delta_delta_ingest::Error;
+
+    let resolved = cfg.resolve_all()?;
+    let pipelines: Vec<ResolvedPipeline> =
+        select(resolved.pipelines, &cli.select, &resolved.rejected)?
+            .into_iter()
+            .filter(|p| p.kafka.is_some())
+            .collect();
+    if pipelines.is_empty() {
+        return Err(Error::Other(
+            "no Kafka pipeline selected (name one with --select NAME)".into(),
+        ));
+    }
+    let one = |what: &str| -> delta_delta_ingest::Result<&ResolvedPipeline> {
+        match pipelines.as_slice() {
+            [p] => Ok(p),
+            _ => Err(Error::Other(format!(
+                "{what} acts on one pipeline; name it with --select NAME ({} selected)",
+                pipelines.len()
+            ))),
+        }
+    };
+    match sub {
+        KafkaCommand::Plan => {
+            let mut blocked = false;
+            for p in &pipelines {
+                match plan::plan(p).await {
+                    Ok(plan) => {
+                        print!("{}", plan.render());
+                        blocked |= plan.is_blocked();
+                    }
+                    Err(e) => {
+                        println!("{:<24} ERROR: {e}", p.name);
+                        blocked = true;
+                    }
+                }
+            }
+            if blocked {
+                return Err(Error::Other("a pipeline is blocked (see above)".into()));
+            }
+            Ok(())
+        }
+        KafkaCommand::CreateDq => {
+            for p in &pipelines {
+                let uri = clone::create_dq(p).await?;
+                println!("created {uri}");
+            }
+            Ok(())
+        }
+        KafkaCommand::CloneTable { to } => {
+            let p = one("clone-table")?;
+            let version = clone::clone_table(p, to).await?;
+            println!(
+                "created {to} at version {version}, empty, with {}'s columns",
+                p.name
+            );
+            Ok(())
+        }
+        KafkaCommand::SetOffsets {
+            partition,
+            next,
+            all_partitions,
+            reassert,
+            acknowledge_skip,
+            allow_replay,
+        } => {
+            let p = one("set-offsets")?;
+            let mut moves = std::collections::BTreeMap::new();
+            match (partition, next, all_partitions) {
+                (Some(pn), Some(n), false) => {
+                    moves.insert(*pn, *n);
+                }
+                (None, Some(n), true) => {
+                    let view = delta_delta_ingest::kafka::tools::view(p).await?;
+                    for s in &view.partitions {
+                        moves.insert(s.partition, *n);
+                    }
+                }
+                (None, None, false) if *reassert => {}
+                _ => {
+                    return Err(Error::Other(
+                        "use --partition P --next O, or --all-partitions --next O, or --reassert"
+                            .into(),
+                    ))
+                }
+            }
+            let request = setoffsets::Request {
+                moves,
+                reassert: *reassert,
+                acknowledge_skip: acknowledge_skip.clone(),
+                allow_replay: *allow_replay,
+            };
+            let out = setoffsets::set_offsets(p, &request).await?;
+            println!("committed version {}", out.version);
+            for (part, (before, after)) in &out.moved {
+                println!(
+                    "  partition {part:>4}: next offset {} -> {}",
+                    before.map_or("-".to_string(), |b| (b + 1).to_string()),
+                    after + 1
+                );
+            }
+            if out.checkpointed {
+                println!("a checkpoint was written at that version (a move backwards)");
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Build the location resolver from `--target`, if one was named.
 fn build_locator(cli: &Cli) -> delta_delta_ingest::Result<Locator> {
     let Some(target) = cli.target.as_deref() else {
@@ -585,6 +803,33 @@ async fn status(
 ) -> delta_delta_ingest::Result<()> {
     for cfg in pipelines {
         let name = cfg.name.clone();
+        // A Kafka pipeline is read with a client that joins no group, so a running one is
+        // not disturbed (docs/kafka-design.md §3.9).
+        #[cfg(feature = "kafka")]
+        if cfg.kafka.is_some() {
+            match delta_delta_ingest::kafka::tools::status(&cfg).await {
+                Ok((era, partitions)) => {
+                    println!(
+                        "{name:<24} {} offsets in the target: {era:?}",
+                        cfg.source_uri
+                    );
+                    for p in partitions {
+                        println!(
+                            "{:<24}   partition {:>4}  stored={:<12} low={:<12} high={:<12} lag={:<10} {}",
+                            "",
+                            p.partition,
+                            p.stored.map_or("-".to_string(), |s| s.to_string()),
+                            p.low,
+                            p.high,
+                            p.lag(),
+                            p.verdict()
+                        );
+                    }
+                }
+                Err(e) => println!("{name:<24} ERROR: {e}"),
+            }
+            continue;
+        }
         let cfg = locator.refresh(&cfg).await;
         match Pipeline::open(cfg).await {
             Ok(p) => println!("{name:<24} resume_from={}", p.cursor()),
@@ -613,6 +858,19 @@ async fn run_all(
             .config_valid
             .store(0, Ordering::Relaxed);
     }
+    // `ddi once` reads each Kafka topic to its end by manual assignment and never joins the
+    // group, so it cannot rebalance a running daemon away from its partitions (§3.8).
+    #[cfg(feature = "kafka")]
+    let pipelines: Vec<ResolvedPipeline> = pipelines
+        .into_iter()
+        .map(|mut p| {
+            if let Some(k) = p.kafka.as_mut() {
+                Arc::make_mut(k).once = once;
+            }
+            p
+        })
+        .collect();
+    let kafka_pipelines = pipelines.iter().any(|p| p.kafka.is_some());
     for p in &pipelines {
         let m = metrics.pipeline(&p.name);
         m.config_valid.store(1, Ordering::Relaxed);
@@ -663,9 +921,28 @@ async fn run_all(
 
     // Graceful shutdown: let the in-flight step finish. A step is atomic, so stopping
     // between steps can never leave a half-applied batch.
+    //
+    // With a Kafka pipeline, SIGTERM too, which is how a container is stopped: a Kafka member
+    // then commits its buffer and closes its consumer, so the group revokes its partitions at
+    // once rather than after a session timeout (docs/kafka-design.md §3.9).
     let shutdown = {
         let t = token.clone();
         tokio::spawn(async move {
+            #[cfg(unix)]
+            if kafka_pipelines {
+                if let Ok(mut term) =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                {
+                    tokio::select! {
+                        _ = signal::ctrl_c() => {}
+                        _ = term.recv() => {}
+                    }
+                    warn!("shutdown requested; finishing the current batch then stopping");
+                    t.cancel();
+                    return;
+                }
+            }
+            let _ = kafka_pipelines;
             let _ = signal::ctrl_c().await;
             warn!("shutdown requested; finishing the current batch then stopping");
             t.cancel();
@@ -826,12 +1103,18 @@ async fn drive(
                 // are what make the wait safe to take: `ddi_bootstrap_unreachable` and
                 // `ddi_resume_unreachable` say a human is needed, so nobody is relying on the
                 // retry to notice.
-                if matches!(
-                    e,
-                    delta_delta_ingest::Error::Capacity(_)
-                        | delta_delta_ingest::Error::BootstrapUnreachable { .. }
-                        | delta_delta_ingest::Error::CursorUnavailable { .. }
-                ) {
+                //
+                // A Kafka pipeline reaches here only by failing to open, or by an error that
+                // ends its consumer (docs/kafka-design.md §3.6): its open-time refusals and the
+                // config-class consumer errors wait the full backoff too, for the same reason.
+                if e.is_capacity()
+                    || matches!(
+                        e,
+                        delta_delta_ingest::Error::BootstrapUnreachable { .. }
+                            | delta_delta_ingest::Error::CursorUnavailable { .. }
+                    )
+                    || (cfg.kafka.is_some() && e.kafka_waits_for_an_operator())
+                {
                     backoff = RETRY_MAX;
                 }
                 let wait = jitter(backoff, &name, attempts);
@@ -899,7 +1182,9 @@ async fn attempt(
         return Ok(());
     }
     let mut current = locator.refresh(cfg).await;
-    let mut pipeline = Pipeline::open(current.clone()).await?;
+    // A Kafka pipeline counts into series the supervisor keeps across reopens.
+    let kafka_metrics = cfg.kafka.as_ref().map(|_| m.kafka());
+    let mut pipeline = Pipeline::open_with(current.clone(), kafka_metrics.clone()).await?;
     m.grain_check_passes
         .store(pipeline.grain_check_passes() as u64, Ordering::Relaxed);
     m.coverage_cutoff_active
@@ -910,6 +1195,7 @@ async fn attempt(
 
     loop {
         if token.is_cancelled() {
+            pipeline.shutdown().await;
             info!(pipeline = %name, "stopped");
             return Ok(());
         }
@@ -929,7 +1215,7 @@ async fn attempt(
                 "table location changed; reopening"
             );
             current = fresh;
-            pipeline = Pipeline::open(current.clone()).await?;
+            pipeline = Pipeline::open_with(current.clone(), kafka_metrics.clone()).await?;
             m.grain_check_passes
                 .store(pipeline.grain_check_passes() as u64, Ordering::Relaxed);
             m.coverage_cutoff_active
@@ -944,8 +1230,11 @@ async fn attempt(
         if let Some(head) = pipeline.source_head_version() {
             m.source_head_version.store(head as i64, Ordering::Relaxed);
         }
-        m.cursor_version
-            .store(pipeline.cursor().version as i64, Ordering::Relaxed);
+        // A Kafka pipeline has no single cursor; its lag is per partition, in its own series.
+        if !pipeline.is_kafka() {
+            m.cursor_version
+                .store(pipeline.cursor().version as i64, Ordering::Relaxed);
+        }
         // Every step, like the cursor: a window can close on a step that commits nothing.
         m.coverage_cutoff_active
             .store(pipeline.coverage().is_some() as i64, Ordering::Relaxed);
@@ -964,7 +1253,28 @@ async fn attempt(
                     info!(pipeline = %name, "caught up");
                     return Ok(());
                 }
-                tokio::time::sleep(idle).await;
+                // A Kafka pipeline is caught up only in once-mode, which returned above; and
+                // sleeping without polling would break max.poll.interval.ms (§3.9).
+                if !pipeline.is_kafka() {
+                    tokio::time::sleep(idle).await;
+                }
+            }
+            // Only a Kafka pipeline waits: its step already polled for a second, so this never
+            // sleeps. It counts as progress only when the member is idle by design, caught up,
+            // or committed recently, and never while it retries, is blocked or has just reset
+            // (§3.9, PO-M5): otherwise a member stuck behind a fence would look healthy.
+            Ok(StepOutcome::Waiting) =>
+            {
+                #[cfg(feature = "kafka")]
+                if let Some(p) = pipeline.kafka_progress() {
+                    if p.counts(idle) {
+                        progressed.store(true, Ordering::Relaxed);
+                        m.mark_progress();
+                    }
+                    if p.capacity {
+                        m.capacity_exhausted.store(1, Ordering::Relaxed);
+                    }
+                }
             }
             Ok(StepOutcome::Progressed {
                 through_version,
@@ -994,8 +1304,10 @@ async fn attempt(
                 m.batches_committed.fetch_add(1, Ordering::Relaxed);
                 m.rows_written.fetch_add(rows as u64, Ordering::Relaxed);
                 m.files_read.fetch_add(files as u64, Ordering::Relaxed);
-                m.last_source_version
-                    .store(through_version as i64, Ordering::Relaxed);
+                if !pipeline.is_kafka() {
+                    m.last_source_version
+                        .store(through_version as i64, Ordering::Relaxed);
+                }
                 if let Some(u) = upsert {
                     m.rows_updated
                         .fetch_add(u.updated as u64, Ordering::Relaxed);
@@ -1038,8 +1350,10 @@ async fn attempt(
                 m.rows_skipped_as_covered
                     .fetch_add(covered as u64, Ordering::Relaxed);
                 m.commits_skipped.fetch_add(1, Ordering::Relaxed);
-                m.last_source_version
-                    .store(through_version as i64, Ordering::Relaxed);
+                if !pipeline.is_kafka() {
+                    m.last_source_version
+                        .store(through_version as i64, Ordering::Relaxed);
+                }
                 if let Some(p) = published {
                     m.observe_publish(&p);
                 }

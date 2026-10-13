@@ -4,9 +4,9 @@
 //! Pulling in a metrics framework for six counters would be the opposite of the "thin
 //! daemon" design.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 #[derive(Debug, Default)]
 pub struct PipelineMetrics {
@@ -93,8 +93,9 @@ pub struct PipelineMetrics {
     ///
     /// A gauge as well as the counter, because the window that drops them need not end on its
     /// own: after a replaced source, or on a staged upsert's apply half, only a row newer than
-    /// the target's watermark closes it. One that stays at 1 on an idle pipeline is waiting
-    /// for that row, and a watermark somebody pushed into the future would hold it there.
+    /// the target's watermark — than its partition's, with `dedup_partition` — closes it. One
+    /// that stays at 1 on an idle pipeline is waiting for that row, and a watermark somebody
+    /// pushed into the future would hold it there.
     pub coverage_cutoff_active: AtomicI64,
     /// 1 when this pipeline's configuration was accepted, 0 when it was held back at load.
     ///
@@ -185,6 +186,145 @@ pub struct PipelineMetrics {
     /// a pipeline that never publishes and one whose publishes all fail both leave
     /// `ddi_publish_sent_total` at zero.
     pub publish_configured: AtomicI64,
+
+    /// A Kafka pipeline's own series (docs/kafka-design.md §7.1), set when it is first opened.
+    /// Never set for a Delta pipeline, whose output is therefore what it always was.
+    pub kafka: OnceLock<Arc<KafkaMetrics>>,
+}
+
+/// One partition's gauges.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionGauges {
+    /// The last offset this member committed for it, or -1.
+    pub committed: i64,
+    /// Messages behind the topic's end, from the last statistics; -1 while unknown.
+    pub lag: i64,
+}
+
+/// What a Kafka pipeline exports beside the series every pipeline has (docs/kafka-design.md
+/// §7.1). Always compiled, with no librdkafka type in it, so `/metrics` is assembled the same
+/// way with or without the `kafka` feature.
+///
+/// Counters only ever rise, across reopens: the supervisor keeps one of these per pipeline
+/// and hands it to every consumer it opens. Gauges are what the newest consumer last set.
+#[derive(Debug, Default)]
+pub struct KafkaMetrics {
+    /// Messages of committed batches, tombstones and undecodable ones included.
+    pub messages: AtomicU64,
+    /// Their key and value bytes.
+    pub bytes: AtomicU64,
+    pub undecodable: AtomicU64,
+    pub tombstones: AtomicU64,
+    pub dropped_not_owned: AtomicU64,
+    pub dropped_blocked: AtomicU64,
+    pub dropped_duplicate: AtomicU64,
+    pub dropped_reread: AtomicU64,
+    /// Offsets a partition skipped between two messages (compaction, transaction markers).
+    pub offset_gaps: AtomicU64,
+    pub commit_millis: AtomicU64,
+    pub files_added: AtomicU64,
+    pub bytes_added: AtomicU64,
+    pub rebalances_assign: AtomicU64,
+    pub rebalances_revoke: AtomicU64,
+    pub rebalances_lost: AtomicU64,
+    pub rebalances_error: AtomicU64,
+    pub revoke_flushes_committed: AtomicU64,
+    pub revoke_flushes_dropped: AtomicU64,
+    pub revoke_flushes_timeout: AtomicU64,
+    pub revoke_flushes_none: AtomicU64,
+    pub fenced_concurrent_txn: AtomicU64,
+    pub fenced_base_mismatch: AtomicU64,
+    pub fenced_other_conflict: AtomicU64,
+    pub null_partition_values: AtomicU64,
+
+    pub assigned_partitions: AtomicI64,
+    pub blocked_partitions: AtomicI64,
+    pub lag_messages: AtomicI64,
+    pub lag_messages_max: AtomicI64,
+    pub retention_headroom_messages: AtomicI64,
+    pub oldest_buffered_seconds: AtomicI64,
+    pub brokers_up: AtomicI64,
+    pub retrying: AtomicI64,
+    pub offsets_unavailable: AtomicI64,
+    pub offsets_regressed: AtomicI64,
+    pub offset_missing: AtomicI64,
+    pub topic_replaced: AtomicI64,
+    pub undecodable_blocking: AtomicI64,
+    pub schema_conflict: AtomicI64,
+    pub target_columns_unmatched: AtomicI64,
+    pub null_text_approximate: AtomicI64,
+
+    /// By partition.
+    pub partitions: Mutex<BTreeMap<i32, PartitionGauges>>,
+    /// Offset reads (`crate::fence::read_txns`), shared with the pipeline's fence.
+    pub lookups: Arc<crate::fence::LookupCounters>,
+    /// The data-quality table's conflict retries, shared with its writer.
+    pub dq: Arc<crate::dq::KafkaCounters>,
+    /// Schema Registry requests by outcome.
+    pub schema_registry_requests: Mutex<BTreeMap<String, u64>>,
+    /// librdkafka errors by code.
+    pub client_errors: Mutex<BTreeMap<String, u64>>,
+    /// Errors a step held instead of returning: a failed commit whose batch is held, a
+    /// partition or the pipeline blocked, a message waiting for the registry. Counted in
+    /// `ddi_errors_total` beside the errors the supervisor sees.
+    pub held_errors: AtomicU64,
+    /// `ddi_kafka_pipeline_blocked` by reason: 1 for the reason the whole pipeline is held
+    /// for now, 0 for every reason it was held for before.
+    pub pipeline_blocked: Mutex<BTreeMap<String, i64>>,
+}
+
+impl KafkaMetrics {
+    /// Count one more under `key` of a labelled counter.
+    pub fn count(map: &Mutex<BTreeMap<String, u64>>, key: &str) {
+        let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+        *m.entry(key.to_string()).or_default() += 1;
+    }
+
+    /// Replace every partition's gauges: the partitions this member owns now, and nothing
+    /// for the ones it gave up.
+    pub fn set_partitions(&self, gauges: BTreeMap<i32, PartitionGauges>) {
+        *self.partitions.lock().unwrap_or_else(|e| e.into_inner()) = gauges;
+    }
+
+    /// An error a step held rather than returned: counted in `ddi_errors_total`, and its gauge
+    /// raised ([`Self::observe_error`]).
+    pub fn observe_held(&self, e: &crate::Error) {
+        self.held_errors.fetch_add(1, Ordering::Relaxed);
+        self.observe_error(e);
+    }
+
+    /// Why the whole pipeline is held now, or `None` when it is not.
+    pub fn set_pipeline_blocked(&self, reason: Option<&str>) {
+        let mut m = self
+            .pipeline_blocked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for v in m.values_mut() {
+            *v = 0;
+        }
+        if let Some(reason) = reason {
+            m.insert(reason.to_string(), 1);
+        }
+    }
+
+    /// Raise the gauge for an open-time or held error, so the reason a pipeline is not
+    /// reading is a series and not only a log line. Raised, never lowered here: the source
+    /// clears what its next successful open or step no longer holds.
+    pub fn observe_error(&self, e: &crate::Error) {
+        use crate::Error;
+        let gauge = match e {
+            Error::KafkaOffsetMissing { .. } => &self.offset_missing,
+            Error::KafkaOffsetsUnavailable { .. } => &self.offsets_unavailable,
+            Error::KafkaOffsetsRegressed { .. } => &self.offsets_regressed,
+            Error::KafkaTopicReplaced { .. } => &self.topic_replaced,
+            Error::KafkaUndecodable { .. } | Error::KafkaTooManyUndecodable { .. } => {
+                &self.undecodable_blocking
+            }
+            Error::KafkaSchemaConflict { .. } => &self.schema_conflict,
+            _ => return,
+        };
+        gauge.store(1, Ordering::Relaxed);
+    }
 }
 
 impl PipelineMetrics {
@@ -269,9 +409,26 @@ impl PipelineMetrics {
         // Not the same thing as `up = 0`, which every failure sets. This one says the machine
         // ran out rather than the data being wrong — which is what decides whether an
         // operator reaches for the config or for the data.
-        if matches!(e, crate::Error::Capacity(_)) {
+        // Through the data-quality write's wrapper too, where a Kafka pipeline's rejects ran
+        // out of room (docs/kafka-design.md §3.6); a Delta pipeline never raises one.
+        if e.is_capacity() {
             self.capacity_exhausted.store(1, Ordering::Relaxed);
         }
+        if let Some(kafka) = self.kafka.get() {
+            kafka.observe_error(e);
+        }
+    }
+
+    /// The Kafka series of this pipeline, made on first use. Only a Kafka pipeline asks.
+    pub fn kafka(&self) -> Arc<KafkaMetrics> {
+        self.kafka
+            .get_or_init(|| {
+                Arc::new(KafkaMetrics {
+                    brokers_up: AtomicI64::new(1),
+                    ..Default::default()
+                })
+            })
+            .clone()
     }
 
     /// Seconds since this pipeline last made progress, or -1 before its first step.
@@ -360,8 +517,14 @@ impl Metrics {
                 "Source data files read.",
                 |m| m.files_read.load(Ordering::Relaxed) as i64,
             ),
+            // A Kafka pipeline's step holds most of its errors in place, staying in its group:
+            // those count here too.
             ("ddi_errors_total", "counter", "Step errors.", |m| {
-                m.errors.load(Ordering::Relaxed) as i64
+                let held = m
+                    .kafka
+                    .get()
+                    .map_or(0, |k| k.held_errors.load(Ordering::Relaxed));
+                (m.errors.load(Ordering::Relaxed) + held) as i64
             }),
             (
                 "ddi_commits_skipped_total",
@@ -604,6 +767,16 @@ impl Metrics {
             }
         }
 
+        // A Kafka pipeline's own families, after the ones every pipeline has, and only when
+        // one exists: a Delta-only process renders exactly what it always did.
+        let kafka: Vec<(&String, &Arc<KafkaMetrics>)> = map
+            .iter()
+            .filter_map(|(name, m)| m.kafka.get().map(|k| (name, k)))
+            .collect();
+        if !kafka.is_empty() {
+            render_kafka(&mut s, &kafka);
+        }
+
         // Process-wide, and therefore unlabelled: the limits in `crate::gate` are shared by
         // every pipeline, so attributing a queue to one of them would be a fiction. These
         // are what say whether the fleet is waiting on itself.
@@ -651,9 +824,238 @@ impl Metrics {
     }
 }
 
+/// A Kafka family read off one pipeline's [`KafkaMetrics`].
+type KafkaSpec = (
+    &'static str,
+    &'static str,
+    &'static str,
+    fn(&KafkaMetrics) -> i64,
+);
+
+/// The Kafka families (docs/kafka-design.md §7.1), one block per family, a line per Kafka
+/// pipeline (and per label value, where the family has one).
+fn render_kafka(s: &mut String, pipelines: &[(&String, &Arc<KafkaMetrics>)]) {
+    fn get(a: &AtomicU64) -> i64 {
+        a.load(Ordering::Relaxed) as i64
+    }
+    let plain: [KafkaSpec; 31] = [
+        ("ddi_kafka_messages_total", "counter", "Messages of committed batches, tombstones and undecodable ones included.", |k| get(&k.messages)),
+        ("ddi_kafka_bytes_total", "counter", "Key and value bytes of those messages.", |k| get(&k.bytes)),
+        ("ddi_kafka_undecodable_total", "counter", "Messages that could not be decoded, written to the data-quality table.", |k| get(&k.undecodable)),
+        ("ddi_kafka_tombstones_total", "counter", "Messages without a value, skipped; their offsets advance.", |k| get(&k.tombstones)),
+        ("ddi_kafka_offset_gaps_total", "counter", "Offsets a partition skipped between two messages: compaction or transaction markers.", |k| get(&k.offset_gaps)),
+        ("ddi_kafka_commit_milliseconds_total", "counter", "Time spent committing batches to the target, the data-quality write included.", |k| get(&k.commit_millis)),
+        ("ddi_kafka_files_added_total", "counter", "Data files the target commits added.", |k| get(&k.files_added)),
+        ("ddi_kafka_bytes_added_total", "counter", "Bytes of those files.", |k| get(&k.bytes_added)),
+        ("ddi_kafka_null_partition_values_total", "counter", "Rows whose target partition column was null: they land in __HIVE_DEFAULT_PARTITION__.", |k| get(&k.null_partition_values)),
+        ("ddi_kafka_offset_lookups_total", "counter", "Reads of the target's offsets, however many partitions each asked about.", |k| k.lookups.lookups() as i64),
+        ("ddi_kafka_offset_lookup_seconds_total", "counter", "Time spent in those reads.", |k| k.lookups.seconds() as i64),
+        ("ddi_kafka_offset_lookup_fallbacks_total", "counter", "Offsets read one at a time through the kernel, because a checkpoint could not be read.", |k| k.lookups.fallbacks() as i64),
+        ("ddi_kafka_offset_lookup_below_checkpoint_reads_total", "counter", "Commits read below a checkpoint for the marks it does not keep.", |k| k.lookups.below_checkpoint_reads() as i64),
+        ("ddi_kafka_offset_lookup_unverifiable_total", "counter", "Partitions' offsets read without the mark that would verify their resume.", |k| k.lookups.unverifiable() as i64),
+        ("ddi_kafka_dq_conflict_retries_total", "counter", "Data-quality writes tried again in place after a conflict.", |k| k.dq.conflict_retries() as i64),
+        ("ddi_kafka_assigned_partitions", "gauge", "Partitions this member owns.", |k| k.assigned_partitions.load(Ordering::Relaxed)),
+        ("ddi_kafka_blocked_partitions", "gauge", "Owned partitions paused until an operator acts: see the cause gauges and ddi status.", |k| k.blocked_partitions.load(Ordering::Relaxed)),
+        ("ddi_kafka_lag_messages", "gauge", "Messages behind the end of the owned partitions, from librdkafka's statistics.", |k| k.lag_messages.load(Ordering::Relaxed)),
+        ("ddi_kafka_lag_messages_max", "gauge", "The largest one partition's lag.", |k| k.lag_messages_max.load(Ordering::Relaxed)),
+        ("ddi_kafka_retention_headroom_messages", "gauge", "Messages between the next one to read and the oldest the topic still holds, at the closest partition; at 0 retention overtakes this pipeline. -1 while unknown.", |k| k.retention_headroom_messages.load(Ordering::Relaxed)),
+        ("ddi_kafka_oldest_buffered_seconds", "gauge", "Age of the oldest message buffered and not yet committed.", |k| k.oldest_buffered_seconds.load(Ordering::Relaxed)),
+        ("ddi_kafka_brokers_up", "gauge", "0 while librdkafka reaches no broker.", |k| k.brokers_up.load(Ordering::Relaxed)),
+        ("ddi_kafka_retrying", "gauge", "1 while a batch is held and retried after a transient failure; the member stays in its group.", |k| k.retrying.load(Ordering::Relaxed)),
+        ("ddi_kafka_offsets_unavailable", "gauge", "1 while a partition's next offset has been removed by retention.", |k| k.offsets_unavailable.load(Ordering::Relaxed)),
+        ("ddi_kafka_offsets_regressed", "gauge", "1 while a partition's stored offset is past the end of its topic.", |k| k.offsets_regressed.load(Ordering::Relaxed)),
+        ("ddi_kafka_offset_missing", "gauge", "1 while the open is refused for partitions without an offset that the takeover check cannot account for.", |k| k.offset_missing.load(Ordering::Relaxed)),
+        ("ddi_kafka_topic_replaced", "gauge", "1 while a partition's resume found another message at its stored offset than the one recorded.", |k| k.topic_replaced.load(Ordering::Relaxed)),
+        ("ddi_kafka_undecodable_blocking", "gauge", "1 while undecodable messages hold the pipeline: no data-quality table, or more than the cap.", |k| k.undecodable_blocking.load(Ordering::Relaxed)),
+        ("ddi_kafka_schema_conflict", "gauge", "1 while transform_sql no longer plans over the writer schemas.", |k| k.schema_conflict.load(Ordering::Relaxed)),
+        ("ddi_kafka_target_columns_unmatched", "gauge", "Nullable target columns the last batch did not produce, written null.", |k| k.target_columns_unmatched.load(Ordering::Relaxed)),
+        ("ddi_kafka_null_text_approximate", "gauge", "1 when kdi_null_text read where kafka-delta-ingest had a key off every writer schema, because the SQL dropped the schema id column.", |k| k.null_text_approximate.load(Ordering::Relaxed)),
+    ];
+    for (name, kind, help, read) in plain {
+        s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+        for (pipeline, k) in pipelines {
+            s.push_str(&format!("{name}{{pipeline=\"{pipeline}\"}} {}\n", read(k)));
+        }
+    }
+
+    // name, type, help, the label's name, and each label value with its count.
+    type Labelled = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        fn(&KafkaMetrics) -> Vec<(String, i64)>,
+    );
+    let labelled: [Labelled; 8] = [
+        ("ddi_kafka_messages_dropped_total", "counter", "Messages read and dropped, by why: not owned, its partition blocked, below the next offset, or the stored offset re-read to verify it.", "reason", |k| vec![
+            ("not_owned".into(), k.dropped_not_owned.load(Ordering::Relaxed) as i64),
+            ("blocked".into(), k.dropped_blocked.load(Ordering::Relaxed) as i64),
+            ("duplicate".into(), k.dropped_duplicate.load(Ordering::Relaxed) as i64),
+            ("reread".into(), k.dropped_reread.load(Ordering::Relaxed) as i64),
+        ]),
+        ("ddi_kafka_rebalances_total", "counter", "Rebalance events, by kind.", "kind", |k| vec![
+            ("assign".into(), k.rebalances_assign.load(Ordering::Relaxed) as i64),
+            ("revoke".into(), k.rebalances_revoke.load(Ordering::Relaxed) as i64),
+            ("lost".into(), k.rebalances_lost.load(Ordering::Relaxed) as i64),
+            ("error".into(), k.rebalances_error.load(Ordering::Relaxed) as i64),
+        ]),
+        ("ddi_kafka_revoke_flushes_total", "counter", "What happened to the buffer when partitions were revoked.", "outcome", |k| vec![
+            ("committed".into(), k.revoke_flushes_committed.load(Ordering::Relaxed) as i64),
+            ("dropped".into(), k.revoke_flushes_dropped.load(Ordering::Relaxed) as i64),
+            ("timeout".into(), k.revoke_flushes_timeout.load(Ordering::Relaxed) as i64),
+            ("none".into(), k.revoke_flushes_none.load(Ordering::Relaxed) as i64),
+        ]),
+        ("ddi_kafka_fenced_total", "counter", "Commits another writer of the same offsets got to first; above zero for long means a second deployment or a kafka-delta-ingest still running.", "kind", |k| vec![
+            ("concurrent_txn".into(), k.fenced_concurrent_txn.load(Ordering::Relaxed) as i64),
+            ("base_mismatch".into(), k.fenced_base_mismatch.load(Ordering::Relaxed) as i64),
+            ("other_conflict".into(), k.fenced_other_conflict.load(Ordering::Relaxed) as i64),
+        ]),
+        ("ddi_kafka_partition_committed_offset", "gauge", "The last offset this member committed for each partition it owns; -1 before its first.", "partition", |k| {
+            let p = k.partitions.lock().unwrap_or_else(|e| e.into_inner());
+            p.iter().map(|(p, g)| (p.to_string(), g.committed)).collect()
+        }),
+        ("ddi_kafka_partition_lag_messages", "gauge", "Each owned partition's lag, from librdkafka's statistics; -1 while unknown.", "partition", |k| {
+            let p = k.partitions.lock().unwrap_or_else(|e| e.into_inner());
+            p.iter().map(|(p, g)| (p.to_string(), g.lag)).collect()
+        }),
+        ("ddi_kafka_pipeline_blocked", "gauge", "1 while the whole pipeline is held until an operator acts (or a target it cannot read comes back), staying in its group, with the reason; 0 for a reason it was held for before.", "reason", |k| {
+            let m = k.pipeline_blocked.lock().unwrap_or_else(|e| e.into_inner());
+            m.iter().map(|(r, v)| (r.clone(), *v)).collect()
+        }),
+        ("ddi_kafka_schema_registry_requests_total", "counter", "Schema Registry requests, by how they ended.", "outcome", |k| {
+            let m = k.schema_registry_requests.lock().unwrap_or_else(|e| e.into_inner());
+            m.iter().map(|(o, n)| (o.clone(), *n as i64)).collect()
+        }),
+    ];
+    for (name, kind, help, label, read) in labelled {
+        s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+        for (pipeline, k) in pipelines {
+            for (value, n) in read(k) {
+                s.push_str(&format!(
+                    "{name}{{pipeline=\"{pipeline}\",{label}=\"{value}\"}} {n}\n"
+                ));
+            }
+        }
+    }
+    let name = "ddi_kafka_client_errors_total";
+    s.push_str(&format!(
+        "# HELP {name} Errors librdkafka reported, by code.\n# TYPE {name} counter\n"
+    ));
+    for (pipeline, k) in pipelines {
+        let m = k.client_errors.lock().unwrap_or_else(|e| e.into_inner());
+        for (code, n) in m.iter() {
+            s.push_str(&format!(
+                "{name}{{pipeline=\"{pipeline}\",code=\"{code}\"}} {n}\n"
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Delta pipeline's `/metrics` has no Kafka family at all (docs/kafka-design.md §1.3
+    /// item 7); a Kafka pipeline's has every one, labelled where §7.1 labels it.
+    #[test]
+    fn kafka_series_are_rendered_only_for_kafka_pipelines() {
+        let m = Metrics::new();
+        m.pipeline("orders");
+        assert!(!m.render().contains("ddi_kafka_"));
+
+        let k = m.pipeline("events").kafka();
+        k.messages.store(7, Ordering::Relaxed);
+        k.dropped_reread.store(2, Ordering::Relaxed);
+        k.set_partitions(BTreeMap::from([(
+            3,
+            PartitionGauges {
+                committed: 41,
+                lag: 0,
+            },
+        )]));
+        KafkaMetrics::count(&k.client_errors, "AllBrokersDown");
+        let text = m.render();
+        assert!(
+            text.contains("ddi_kafka_messages_total{pipeline=\"events\"} 7"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("ddi_kafka_messages_total{pipeline=\"orders\"}"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "ddi_kafka_messages_dropped_total{pipeline=\"events\",reason=\"reread\"} 2"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "ddi_kafka_partition_committed_offset{pipeline=\"events\",partition=\"3\"} 41"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "ddi_kafka_client_errors_total{pipeline=\"events\",code=\"AllBrokersDown\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("ddi_kafka_brokers_up{pipeline=\"events\"} 1"),
+            "{text}"
+        );
+    }
+
+    /// An error a Kafka step held in place counts in `ddi_errors_total` as one the supervisor
+    /// saw does, and a pipeline held whole says why, until it is not held any more. A Delta
+    /// pipeline's count is its own.
+    #[test]
+    fn held_errors_count_and_a_held_pipeline_says_why() {
+        let m = Metrics::new();
+        m.pipeline("orders").errors.fetch_add(2, Ordering::Relaxed);
+        let p = m.pipeline("events");
+        let k = p.kafka();
+        p.errors.fetch_add(1, Ordering::Relaxed);
+        k.observe_held(&crate::Error::KafkaUndecodable {
+            topic: "events".into(),
+            partition: 0,
+            offset: 7,
+            reason: "no magic byte".into(),
+            dq_uri: "/lake/events__ddi_dq".into(),
+        });
+        k.set_pipeline_blocked(Some("undecodable"));
+        let text = m.render();
+        assert!(
+            text.contains("ddi_errors_total{pipeline=\"events\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ddi_errors_total{pipeline=\"orders\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ddi_kafka_undecodable_blocking{pipeline=\"events\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "ddi_kafka_pipeline_blocked{pipeline=\"events\",reason=\"undecodable\"} 1"
+            ),
+            "{text}"
+        );
+        k.set_pipeline_blocked(Some("target_replaced"));
+        k.set_pipeline_blocked(None);
+        let text = m.render();
+        for reason in ["undecodable", "target_replaced"] {
+            assert!(
+                text.contains(&format!(
+                    "ddi_kafka_pipeline_blocked{{pipeline=\"events\",reason=\"{reason}\"}} 0"
+                )),
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn pipeline_handles_are_stable() {

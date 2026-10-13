@@ -439,6 +439,63 @@ async fn replaying_a_batch_does_not_record_its_rejects_twice() {
     assert_eq!(rejects[0].2, "seeded", "the one written before the crash");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_data_quality_write_that_fails_leaves_the_target_where_it_was() {
+    // The order the replay above relies on: the rejects are written before the target
+    // commits, so a failure to write them stops the batch with nothing advanced. Were the
+    // target to commit first, its offset would move past rows whose rejects never landed,
+    // and the retry would read on from there: those rows would be in neither table.
+    use delta_delta_ingest::offset::OffsetStore;
+    use std::os::unix::fs::PermissionsExt;
+
+    let lake = Lake::new().await;
+    lake.create_dq().await;
+    lake.arrive(&[
+        (1, Some("100"), 10),
+        (2, Some("n/a"), 11),
+        (3, Some("300"), 12),
+    ])
+    .await;
+    let cfg = lake.cfg();
+    let mut p = Pipeline::open(cfg.clone()).await.unwrap();
+
+    // Once the pipeline is open, the data-quality table stops taking commits.
+    let log = std::path::Path::new(&lake.dq).join("_delta_log");
+    let writable = std::fs::metadata(&log).unwrap().permissions();
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let read_only = std::fs::File::create(log.join("probe")).is_err();
+    let outcome = p.step().await;
+    std::fs::set_permissions(&log, writable).unwrap();
+    if !read_only {
+        return; // running as root, where the mode bits do not bite. Nothing to pin.
+    }
+
+    let e = outcome.expect_err("the rejects were not recorded, so the batch must not commit");
+    assert!(e.to_string().contains("data-quality table"), "{e}");
+    let target = open_table(ensure_table_uri(&lake.stg).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(target.version(), Some(0), "the target did not commit");
+    assert_eq!(
+        OffsetStore::new(&cfg.app_id, 0)
+            .last_committed_version(&target)
+            .await
+            .unwrap(),
+        None,
+        "and its offset did not move"
+    );
+    assert!(lake.silver().await.is_empty());
+    assert!(lake.rejects().await.is_empty());
+
+    // Writable again, the retry commits the batch and records its reject, once.
+    lake.stream().await.unwrap();
+    assert_eq!(lake.silver().await, vec![(1, Some(100)), (3, Some(300))]);
+    assert_eq!(lake.rejects().await.len(), 1);
+    lake.stream().await.unwrap();
+    assert_eq!(lake.rejects().await.len(), 1, "and nothing more on a rerun");
+}
+
 #[tokio::test]
 async fn a_null_in_a_not_null_target_column_is_rejected_per_row() {
     // Not a cast failure — the value is simply absent where the target insists on one. Same

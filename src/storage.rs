@@ -32,7 +32,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 // arrow / parquet / object_store are reached through the deltalake re-exports, never as
 // direct dependencies — see the note in Cargo.toml.
@@ -290,7 +290,7 @@ impl Storage {
     /// So the replay is proved equivalent before it is trusted, by one request: if commit 0
     /// is still there, contiguity does the rest. If it is not, this refuses, and the caller
     /// reports the original failure with its cause named.
-    async fn open_replaying_the_log(&self, url: &url::Url) -> Result<DeltaTable> {
+    pub(crate) async fn open_replaying_the_log(&self, url: &url::Url) -> Result<DeltaTable> {
         use deltalake::logstore::{logstore_for, logstore_with, StorageConfig};
         use deltalake::{DeltaTable, DeltaTableConfig};
         use std::sync::Arc;
@@ -314,6 +314,7 @@ impl Storage {
         }
 
         let filtered = Arc::new(WithoutCheckpoints::new(plain.root_object_store(None)));
+        remember_unfiltered(&filtered, plain.object_store(None));
         let log_store = logstore_with(filtered, url, config()?).map_err(Error::Delta)?;
 
         let mut table = DeltaTable::new(log_store, DeltaTableConfig::default());
@@ -612,6 +613,55 @@ impl deltalake::ObjectStore for WithoutCheckpoints {
         self.remember(to);
         self.inner.copy_opts(from, to, options).await
     }
+}
+
+/// For every handle [`Storage::open_replaying_the_log`] built, the table's store with nothing
+/// hidden in it, by the filtered store the handle reads through.
+///
+/// The filter is there so that the kernel never parses a checkpoint it cannot read. The
+/// offsets of a partitioned source are read otherwise ([`crate::fence::read_txns`]): from a
+/// checkpoint's `txn` column alone, which another engine writes like any other. Behind the
+/// filter that reader finds no checkpoint at all — not the unreadable one, nor any written
+/// since by another handle — and reads every commit down to version 0 instead, one request
+/// each, on every reset, for as long as the handle lives.
+///
+/// Held weakly, so an entry goes with its handle; and an entry keeps its address from being
+/// reused for as long as it is held.
+static UNFILTERED: Mutex<
+    Vec<(
+        Weak<WithoutCheckpoints>,
+        deltalake::logstore::ObjectStoreRef,
+    )>,
+> = Mutex::new(Vec::new());
+
+fn remember_unfiltered(
+    filtered: &Arc<WithoutCheckpoints>,
+    unfiltered: deltalake::logstore::ObjectStoreRef,
+) {
+    let mut handles = UNFILTERED
+        .lock()
+        .expect("the unfiltered-store list is never poisoned");
+    handles.retain(|(view, _)| view.strong_count() > 0);
+    handles.push((Arc::downgrade(filtered), unfiltered));
+}
+
+/// The store under `log_store`'s table in which every checkpoint can be seen: its own, unless
+/// `log_store` belongs to a handle [`Storage::open_replaying_the_log`] built, whose own store
+/// hides them.
+///
+/// Prefixed with the table's path, as `log_store.object_store(None)` is.
+pub(crate) fn with_every_checkpoint(
+    log_store: &dyn deltalake::logstore::LogStore,
+) -> deltalake::logstore::ObjectStoreRef {
+    let root = log_store.root_object_store(None);
+    let address = Arc::as_ptr(&root) as *const ();
+    let unfiltered = UNFILTERED
+        .lock()
+        .expect("the unfiltered-store list is never poisoned")
+        .iter()
+        .find(|(view, _)| view.strong_count() > 0 && view.as_ptr() as *const () == address)
+        .map(|(_, store)| store.clone());
+    unfiltered.unwrap_or_else(|| log_store.object_store(None))
 }
 
 /// Turn the usual failure into the usual next step.

@@ -18,7 +18,7 @@ use crate::dq::DataQuality;
 use crate::error::{Error, Result};
 use crate::offset::OffsetStore;
 use crate::schema::{Rejected, SchemaCoercer};
-use crate::sink::{Sink, UpsertStats};
+use crate::sink::{KafkaOffsets, Offsets, Sink, UpsertStats};
 use crate::source::{classify, CommitClass, LogBatch, LogStreamBuilder, StreamCursor, Version};
 use crate::transform::{Identity, SqlTransform, Transform};
 use crate::upsert::{self, MergePlan};
@@ -72,6 +72,12 @@ pub enum StepOutcome {
         /// lost.
         published: Option<crate::publish::PublishStats>,
     },
+
+    /// A Kafka pipeline polled for a while and has nothing to commit yet: its batch has not
+    /// closed, or one is held and waits to be tried again (docs/kafka-design.md §3.3). Never
+    /// produced by a Delta source. Whether it counts as progress is the pipeline's to say
+    /// ([`Pipeline::kafka_progress`]).
+    Waiting,
 }
 
 impl StepOutcome {
@@ -84,7 +90,7 @@ impl StepOutcome {
     /// `ddi_batches_fully_rejected_total`.
     pub fn fully_rejected(&self) -> bool {
         match *self {
-            Self::CaughtUp => false,
+            Self::CaughtUp | Self::Waiting => false,
             Self::Progressed {
                 rows,
                 rejected,
@@ -102,25 +108,41 @@ impl StepOutcome {
 /// only if that batch's target transaction commits. Keeping the transition with the batch is
 /// important: a failure after lookup selection must retry with the same `use_current` decision
 /// and provenance marker, rather than silently returning to timestamp pinning.
-struct LookupBatch {
+#[derive(Clone)]
+pub(crate) struct LookupBatch {
     snapshots: Vec<crate::lookup::LookupSnapshot>,
     transitions: Vec<LookupTableIdTransition>,
 }
 
+impl LookupBatch {
+    /// No lookups, and so nothing to acknowledge once the batch commits: a Kafka batch has
+    /// no source commit to pin lookups by.
+    #[cfg_attr(not(feature = "kafka"), allow(dead_code))] // built by the Kafka step
+    pub(crate) fn none() -> Self {
+        Self {
+            snapshots: Vec::new(),
+            transitions: Vec::new(),
+        }
+    }
+}
+
 /// A lookup identity accepted by `use_current` for the source batch being committed.
+#[derive(Clone)]
 struct LookupTableIdTransition {
     name: String,
     table_id: String,
 }
 
 /// A stretch of the source over which the pipeline has to infer from the target's data what
-/// the target already holds. See [`crate::dedup`].
+/// the target already holds, whether by one cut-off or one per `dedup_partition` value. See
+/// [`crate::dedup`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoverageWindow {
     pub reason: CoverageReason,
     /// The source version the window closes after once read, as well as on the first row
-    /// newer than the target's watermark. `None` when only such a row closes it: for a
-    /// replaced source, and for a staged upsert's apply half.
+    /// newer than the target's watermark (its partition's, with `dedup_partition`). `None`
+    /// when only such a row closes it: for a replaced source, and for a staged upsert's apply
+    /// half.
     pub through: Option<Version>,
     /// True when this window was opened by an earlier process and recorded in its commits,
     /// rather than inferred just now.
@@ -128,7 +150,7 @@ pub struct CoverageWindow {
 }
 
 /// A coverage window and the cut-off applied inside it.
-struct Cutoff {
+pub(crate) struct Cutoff {
     dedup: Dedup,
     window: CoverageWindow,
     /// Rows dropped since it opened in this process, for the line that says it closed.
@@ -140,6 +162,7 @@ impl Cutoff {
         RecordedCutoff {
             reason: self.window.reason,
             source_through: self.window.through,
+            partition_columns: self.dedup.partition_columns().to_vec(),
         }
     }
 }
@@ -147,7 +170,8 @@ impl Cutoff {
 /// What ended a coverage window.
 #[derive(Clone, Copy)]
 enum Closed {
-    /// A batch carried a row newer than the target's watermark.
+    /// A batch carried a row newer than the target's watermark — than its own partition's,
+    /// or in a partition the target lacks, when the cut-off is kept per partition.
     Beyond,
     /// The source head the window was opened against has been read.
     ReadThrough,
@@ -156,50 +180,50 @@ enum Closed {
 impl Closed {
     fn describe(self) -> &'static str {
         match self {
-            Self::Beyond => "a row newer than the target's watermark arrived",
+            Self::Beyond => {
+                "a row newer than the target's watermark (its partition's, when kept per \
+                 partition) arrived"
+            }
             Self::ReadThrough => "the source head it opened against has been read",
         }
     }
 }
 
 pub struct Pipeline {
-    cfg: ResolvedPipeline,
-    source: DeltaTable,
-    target: DeltaTable,
-    stream: LogStreamBuilder,
-    transform: Box<dyn Transform>,
-    sink: Sink,
-    offsets: OffsetStore,
-    coercer: SchemaCoercer,
+    pub(crate) cfg: ResolvedPipeline,
+    /// Where batches come from, and everything that only matters for that kind of source.
+    pub(crate) source: Source,
+    pub(crate) target: DeltaTable,
+    pub(crate) transform: Box<dyn Transform>,
+    pub(crate) sink: Sink,
+    pub(crate) coercer: SchemaCoercer,
     /// What the target already holds, while this pipeline has to infer that from its data.
     ///
     /// `None` on an ordinary resume, which is the usual case: the `txn` offset is exact on
     /// its own, and a timestamp filter on top of it could only drop rows — every late row
     /// older than the target's newest, at every restart. `Some` only inside a coverage window,
     /// and cleared the moment the window closes. See [`crate::dedup`] and [`coverage_cutoff`].
-    cutoff: Option<Cutoff>,
+    pub(crate) cutoff: Option<Cutoff>,
     /// Where rows the target will not take are put. `None` when there is no such table, in
     /// which case a bad row still stops the pipeline — see [`crate::dq`].
-    dq: Option<DataQuality>,
-    /// What decoding this source costs, shared with the stream that sizes batches by it.
-    amplification: Arc<crate::budget::Amplification>,
+    pub(crate) dq: Option<DataQuality>,
     /// Passes the startup uniqueness check took, so the supervisor can export it. Zero on an
     /// appending pipeline, which has no grain to check.
-    grain_check_passes: u32,
+    pub(crate) grain_check_passes: u32,
     /// Identities checked when the pipeline opened. Re-checking every selected snapshot stops a
     /// drop/recreate at the same URI from silently changing a lookup halfway through a run.
-    lookup_table_ids: BTreeMap<String, String>,
+    pub(crate) lookup_table_ids: BTreeMap<String, String>,
     /// Lookups whose target provenance named a prior table id when this pipeline opened.
     /// `use_current` accepts that deliberate migration once, recording the first new target
     /// commit with the current head before returning to ordinary timestamp pinning.
-    lookup_current_on_open: BTreeSet<String>,
+    pub(crate) lookup_current_on_open: BTreeSet<String>,
     /// Table-id transitions already warned about in this process. A historical backfill can
     /// cross the same replacement in many batches; it should be observable without flooding
     /// the log once per source commit.
-    warned_lookup_table_id_changes: BTreeSet<(String, String, String)>,
+    pub(crate) warned_lookup_table_id_changes: BTreeSet<(String, String, String)>,
     /// What to push after each commit. `None` unless a dbt model asked for it, this
     /// deployment configured somewhere to push it, and this pipeline is append-only.
-    publisher: Option<crate::publish::Publisher>,
+    pub(crate) publisher: Option<crate::publish::Publisher>,
     /// The `through_version` of the last batch this process published.
     ///
     /// The client's gap detector, and the reason it is held here rather than read off the
@@ -208,12 +232,140 @@ pub struct Pipeline {
     /// the reader. A fact about the publication sequence is, and this is it. `None` until
     /// the first publication of the process, which is itself a signal — a restart is a gap,
     /// because whatever was in flight when the process died was not sent.
-    prev_published_through: Option<Version>,
+    pub(crate) prev_published_through: Option<Version>,
+}
+
+/// Where a pipeline's batches come from.
+///
+/// Only the pull and the read differ between sources. Everything after them — the transform,
+/// coercion, the data-quality table, the commit — is [`Pipeline::process`], which every source
+/// shares, so a source keeps here only the state nothing else needs.
+// One per pipeline, never moved on a hot path: the Delta source's size is paid once, and
+// boxing it would put a pointer between every step and its log for nothing.
+#[cfg_attr(feature = "kafka", allow(clippy::large_enum_variant))]
+pub(crate) enum Source {
+    Delta(DeltaSource),
+    /// A Kafka topic (docs/kafka-design.md): the consumer, the partitions' state, the buffer
+    /// and the conform step its rows go through ([`Pipeline::process`]).
+    #[cfg(feature = "kafka")]
+    Kafka(Box<crate::kafka::KafkaSource>),
+}
+
+/// A Delta table, read commit by commit through its log.
+pub(crate) struct DeltaSource {
+    table: DeltaTable,
+    stream: LogStreamBuilder,
+    offsets: OffsetStore,
+    /// What decoding this source costs, shared with the stream that sizes batches by it.
+    amplification: Arc<crate::budget::Amplification>,
+}
+
+impl Source {
+    /// The Delta source, for the paths only it reaches: pulling and reading a batch, and the
+    /// coverage window, which is opened only over a Delta source.
+    fn delta(&self) -> &DeltaSource {
+        match self {
+            Self::Delta(src) => src,
+            #[cfg(feature = "kafka")]
+            Self::Kafka(_) => unreachable!("only a Delta source reads a log or opens a window"),
+        }
+    }
+
+    fn delta_mut(&mut self) -> &mut DeltaSource {
+        match self {
+            Self::Delta(src) => src,
+            #[cfg(feature = "kafka")]
+            Self::Kafka(_) => unreachable!("only a Delta source reads a log or opens a window"),
+        }
+    }
+}
+
+/// One batch, read and ready for [`Pipeline::process`]: what a source hands on.
+///
+/// Cheap to clone, since the arrays are reference-counted, so a source can keep a batch it
+/// may have to process again.
+#[derive(Clone)]
+pub(crate) struct Batch {
+    /// When the step began, for the line that says it committed.
+    pub started: Instant,
+    /// The last source version the batch holds. Zero for a source without versions.
+    pub through: Version,
+    /// Source files read. Zero for a source without files.
+    pub files: usize,
+    pub input: Vec<RecordBatch>,
+    /// Rows set aside before the transform, because the source could not read them. Always
+    /// empty for a Delta source.
+    pub rejects: Vec<Rejected>,
+    pub lookups: LookupBatch,
+    /// Where the batch sits in its source, which is what its commit records.
+    pub position: Position,
+}
+
+/// Where a batch sits in its source.
+#[derive(Clone)]
+pub(crate) enum Position {
+    Delta {
+        start: StreamCursor,
+        end: StreamCursor,
+    },
+    /// The offsets a Kafka batch read, and the ones its commit re-asserts.
+    #[cfg_attr(not(feature = "kafka"), allow(dead_code))] // built by the Kafka step
+    Kafka(KafkaOffsets),
+}
+
+impl Position {
+    /// Where a Delta batch ends. `None` for any other source.
+    fn delta_end(&self) -> Option<StreamCursor> {
+        match self {
+            Self::Delta { end, .. } => Some(*end),
+            Self::Kafka(_) => None,
+        }
+    }
+
+    /// The source version a Delta batch starts at. `None` for any other source.
+    fn delta_start_version(&self) -> Option<Version> {
+        match self {
+            Self::Delta { start, .. } => Some(start.version),
+            Self::Kafka(_) => None,
+        }
+    }
 }
 
 impl Pipeline {
     /// Open both tables, resolve the resume point, and prepare the loop.
+    ///
+    /// A Kafka pipeline opens its consumer instead of a source table, with metrics of its own
+    /// that last as long as this pipeline does; [`Self::open_with`] hands it ones that outlive
+    /// it, as the supervisor does.
     pub async fn open(cfg: ResolvedPipeline) -> Result<Self> {
+        Self::open_with(cfg, None).await
+    }
+
+    /// As [`Self::open`], a Kafka pipeline counting into `kafka`, which the supervisor keeps
+    /// across reopens. Ignored for a Delta pipeline.
+    pub async fn open_with(
+        cfg: ResolvedPipeline,
+        kafka: Option<Arc<crate::metrics::KafkaMetrics>>,
+    ) -> Result<Self> {
+        // `kafka://<topic>` is not a table: a Kafka pipeline reads a consumer (docs/kafka-design.md).
+        if cfg.kafka.is_some() {
+            #[cfg(feature = "kafka")]
+            {
+                let metrics = kafka
+                    .unwrap_or_else(|| crate::metrics::Metrics::new().pipeline(&cfg.name).kafka());
+                return Self::open_kafka(cfg, metrics).await;
+            }
+            #[cfg(not(feature = "kafka"))]
+            {
+                let _ = kafka;
+                return Err(Error::Config(format!(
+                    "pipeline {:?}: {}",
+                    cfg.name,
+                    crate::config::kafka::NOT_BUILT
+                )));
+            }
+        }
+        let _ = kafka;
         let source = cfg
             .storage
             .open(&cfg.source_uri)
@@ -270,7 +422,31 @@ impl Pipeline {
         // the cut-off every open built, and a misnamed column is a mistake whatever state the
         // target is in — better named at this restart than at the next rebuild.
         if let Some(ts) = cfg.dedup_timestamp.as_deref() {
-            dedup::require_columns(&target_schema, ts, cfg.dedup_key.as_deref())?;
+            dedup::require_columns(
+                &target_schema,
+                ts,
+                cfg.dedup_key.as_deref(),
+                &cfg.dedup_partition,
+            )?;
+            // Offsets are a sequence within one partition only, and a merge compares the
+            // sequence across them whenever a key moves partition. Not refused: whether that
+            // column is an offset, and whether keys move, is not something this can know.
+            let integer = target_schema
+                .field_with_name(ts)
+                .is_ok_and(|f| f.data_type().is_integer());
+            if integer && !cfg.dedup_partition.is_empty() && cfg.write_mode.is_upsert() {
+                warn!(
+                    pipeline = %cfg.name,
+                    dedup_timestamp = %ts,
+                    dedup_partition = ?cfg.dedup_partition,
+                    "dedup_timestamp is an integer and the cut-off is kept per partition, so it \
+                     is probably an offset. It is also this merge's sequence, which compares it \
+                     across partitions: a key that moves partition can be merged onto an older \
+                     row, and upsert_lookback and the merge window's pruning read it as one \
+                     order. Prefer a timestamp as the sequence; the cut-off is per partition \
+                     either way."
+                );
+            }
         }
 
         let cutoff = coverage_cutoff(
@@ -327,6 +503,8 @@ impl Pipeline {
                 resumed = cut.window.resumed,
                 dedup_timestamp = %ts,
                 dedup_key = ?cfg.dedup_key,
+                dedup_partition = ?cut.dedup.partition_columns(),
+                partitions = cut.dedup.partition_count(),
                 watermark_known = cut.dedup.watermark_is_known(),
                 boundary_keys = cut.dedup.boundary_key_count(),
                 watermark = %watermark_display(&cut.dedup),
@@ -481,16 +659,18 @@ impl Pipeline {
 
         Ok(Self {
             cfg,
-            source,
+            source: Source::Delta(DeltaSource {
+                table: source,
+                stream,
+                offsets,
+                amplification,
+            }),
             target,
-            stream,
             transform,
             sink,
-            offsets,
             coercer: SchemaCoercer::new(target_schema),
             cutoff,
             dq,
-            amplification,
             grain_check_passes,
             lookup_table_ids: lookup_validation.table_ids,
             lookup_current_on_open: lookup_validation.use_current_on_open,
@@ -513,13 +693,46 @@ impl Pipeline {
         self.grain_check_passes
     }
 
+    /// Where a Delta pipeline reads next. A Kafka pipeline has no single cursor: it answers
+    /// version 0, and says where each partition is through [`Self::kafka_progress`] and its
+    /// metrics instead ([`Self::is_kafka`]).
     pub fn cursor(&self) -> StreamCursor {
-        self.stream.cursor()
+        match &self.source {
+            Source::Delta(src) => src.stream.cursor(),
+            #[cfg(feature = "kafka")]
+            Source::Kafka(_) => StreamCursor::at_version(0),
+        }
+    }
+
+    /// Whether this pipeline reads a Kafka topic.
+    pub fn is_kafka(&self) -> bool {
+        !matches!(self.source, Source::Delta(_))
+    }
+
+    /// Stop between steps (docs/kafka-design.md §3.9): a Kafka pipeline commits what it has
+    /// buffered, within its revoke time box, then closes its consumer, so that the group takes
+    /// its partitions back, and waits for that, time-boxed. A Delta pipeline has nothing
+    /// buffered: a step is atomic.
+    pub async fn shutdown(&mut self) {
+        #[cfg(feature = "kafka")]
+        if self.is_kafka() {
+            self.kafka_shutdown().await;
+        }
+    }
+
+    /// A Kafka pipeline's progress (§3.9); `None` without the feature.
+    #[cfg(not(feature = "kafka"))]
+    pub fn kafka_progress(&self) -> Option<std::convert::Infallible> {
+        None
     }
 
     /// Source head as of the last step. `None` before the first step.
     pub fn source_head_version(&self) -> Option<Version> {
-        self.stream.last_known_head()
+        match &self.source {
+            Source::Delta(src) => src.stream.last_known_head(),
+            #[cfg(feature = "kafka")]
+            Source::Kafka(_) => None,
+        }
     }
 
     /// The coverage window this pipeline is in, if it is in one: while it lasts, rows at or
@@ -531,6 +744,15 @@ impl Pipeline {
 
     /// One iteration: pull, read, transform, coerce, commit — all or nothing.
     pub async fn step(&mut self) -> Result<StepOutcome> {
+        match &self.source {
+            Source::Delta(_) => self.step_delta().await,
+            #[cfg(feature = "kafka")]
+            Source::Kafka(_) => self.step_kafka().await,
+        }
+    }
+
+    /// Pull and read one batch from a Delta source, then [`Self::process`] it.
+    async fn step_delta(&mut self) -> Result<StepOutcome> {
         let started = Instant::now();
 
         // 1. Pull one bounded batch of new files from the source log. A window whose head
@@ -538,9 +760,9 @@ impl Pipeline {
         // without a batch — and a stream that came back empty only because it was held at
         // that head is asked again.
         self.retire_cutoff_if_read_through();
-        let mut next = self.stream.next_batch().await?;
+        let mut next = self.source.delta_mut().stream.next_batch().await?;
         if next.is_none() && self.retire_cutoff_if_read_through() {
-            next = self.stream.next_batch().await?;
+            next = self.source.delta_mut().stream.next_batch().await?;
         }
         let Some(batch) = next else {
             return Ok(StepOutcome::CaughtUp);
@@ -549,7 +771,8 @@ impl Pipeline {
         let through = batch.through_version;
         // The id this batch was read under, which is not the one at open once the stream has
         // read across a table replaced in place: a reopen compares it with the log's.
-        self.sink.set_source_identity(self.stream.identity());
+        self.sink
+            .set_source_identity(self.source.delta().stream.identity());
 
         // A lookup is selected from the source commit's timestamp before any input is read or
         // target write is attempted. If anything below fails, retrying this source version asks
@@ -559,14 +782,44 @@ impl Pipeline {
 
         // 2. Read those files as Arrow.
         let input = self.scan(&batch).await?;
-        let in_rows: usize = input.iter().map(|b| b.num_rows()).sum();
 
         // What that cost, so the next batch can be sized by it rather than by a constant.
         // `max_bytes_per_batch` counts the compressed bytes the log recorded; this is what
         // they became once decoded, and the ratio between them is the whole reason a
         // 256 MB setting can hold a gigabyte and a half.
         let decoded: u64 = input.iter().map(|b| b.get_array_memory_size() as u64).sum();
-        self.amplification.observe(batch.total_bytes(), decoded);
+        self.source
+            .delta()
+            .amplification
+            .observe(batch.total_bytes(), decoded);
+
+        self.process(Batch {
+            started,
+            through,
+            files,
+            input,
+            rejects: Vec::new(),
+            lookups: lookup_batch,
+            position: Position::Delta {
+                start: batch.start,
+                end: batch.end,
+            },
+        })
+        .await
+    }
+
+    /// Transform, coerce and commit one batch: the part of a step every source shares.
+    pub(crate) async fn process(&mut self, batch: Batch) -> Result<StepOutcome> {
+        let Batch {
+            started,
+            through,
+            files,
+            input,
+            lookups: lookup_batch,
+            position,
+            ..
+        } = batch;
+        let in_rows: usize = input.iter().map(|b| b.num_rows()).sum();
 
         // 3. Transform. Stateless, row-local, validated at config load. A row it cannot
         // evaluate is set aside like one the target will not take, and for the same reason:
@@ -599,9 +852,13 @@ impl Pipeline {
         };
         let output = isolated.output;
         let reevaluations = isolated.reevaluations;
-        // Unevaluable rows go first, and in the same list as the coercion rejects below, so
-        // the data-quality table still gets one write, and one commit, per source version.
-        let mut rejects: Vec<Rejected> = Vec::new();
+        // Every row this batch sets aside goes into one list, so the data-quality table still
+        // gets one write, and one commit, per batch: the rows the source could not read
+        // first, then those `conform` cannot fit, then the rows the transform could not
+        // evaluate, then the coercion rejects below. A Delta source has none of the first
+        // two, so for it the list starts with the unevaluable rows, as it always did.
+        let mut rejects: Vec<Rejected> = batch.rejects;
+        let output = self.conform(output, &mut rejects)?;
         let mut unevaluable = 0;
         if let Some(bad) = isolated.unevaluable {
             unevaluable = bad.len();
@@ -686,6 +943,7 @@ impl Pipeline {
             };
             let c = match &self.cutoff {
                 Some(cut) => {
+                    // Refuses a null partition as well as a null timestamp, on every mode.
                     let f = cut.dedup.filter(c)?;
                     covered += f.covered;
                     beyond += f.beyond;
@@ -695,11 +953,16 @@ impl Pipeline {
                     // The one check the cut-off made of every batch that is still needed
                     // without it: a row with no timestamp, once written, is one the next
                     // rebuild handover cannot place. Upsert has its own, about the merge.
-                    if let (Some(ts), false) = (
-                        self.cfg.dedup_timestamp.as_deref(),
-                        self.cfg.write_mode.is_upsert(),
-                    ) {
-                        dedup::require_timestamps(&c, ts)?;
+                    if let Some(ts) = self.cfg.dedup_timestamp.as_deref() {
+                        if !self.cfg.write_mode.is_upsert() {
+                            dedup::require_timestamps(&c, ts)?;
+                        }
+                        // And for the same reason a row with no partition, where the cut-off
+                        // is kept per partition: the next handover's read passes it over, and
+                        // the window it opens refuses it. On every mode, as the merge knows
+                        // nothing of partitions; a transform that leaves the column out is
+                        // caught here too, on its first batch, as a column of nulls.
+                        dedup::require_partitions(&c, &self.cfg.dedup_partition)?;
                     }
                     c
                 }
@@ -715,10 +978,12 @@ impl Pipeline {
         // recorded with its commit, so a reopen before the next one carries on filtering
         // rather than re-emitting what the target holds; the one that does records nothing,
         // so a reopen after it does not.
-        let closes = self
-            .cutoff
-            .as_ref()
-            .map(|c| window_closes_after(c.window.through, batch.end, beyond));
+        let closes = self.cutoff.as_ref().map(|c| {
+            let end = position
+                .delta_end()
+                .expect("a cut-off implies a Delta source");
+            window_closes_after(c.window.through, end, beyond)
+        });
         self.sink.set_cutoff(match (&self.cutoff, closes) {
             (Some(c), Some(false)) => Some(c.recorded()),
             _ => None,
@@ -729,7 +994,8 @@ impl Pipeline {
                 through_version = through,
                 covered,
                 reason = %self.cutoff.as_ref().map_or("none", |c| c.window.reason.as_str()),
-                "skipped rows the target already holds (at or below its watermark)"
+                "skipped rows the target already holds (at or below its watermark, or its \
+                 partition's)"
             );
         }
 
@@ -748,7 +1014,7 @@ impl Pipeline {
 
         // The offset must advance even when a batch produces no rows — otherwise a
         // fully-filtered commit would be re-read forever.
-        let txn_version = self.offsets.txn_version_for(batch.end)?;
+        let offsets = self.offsets_for(&position)?;
 
         // 4b. Rejects go to their own table *before* the target commits, and they are the
         // only thing here that is not covered by the batch's own atomicity — two tables
@@ -757,7 +1023,7 @@ impl Pipeline {
         // reject is written again unless the data-quality table's own txn action says it
         // is already there. See `crate::dq`.
         if rejected_rows > 0 {
-            let written = self.write_rejects(&rejects, txn_version).await?;
+            let written = self.write_rejects(&rejects, &offsets).await?;
             if in_rows > 0 && out_rows == 0 && covered == 0 {
                 // Every row failed. That is far more likely to be an upstream type change
                 // than a batch of uniformly bad data, and it is invisible in the target —
@@ -819,14 +1085,19 @@ impl Pipeline {
             // declines to commit a merge that produced no actions, which would take the
             // txn action down with it and strand the offset here forever.
             let empty = RecordBatch::new_empty(self.coercer.target());
-            self.commit(vec![empty], txn_version).await?;
+            self.commit(vec![empty], &offsets).await?;
             self.acknowledge_lookup_table_id_transitions(&lookup_batch.transitions);
             self.settle_cutoff(closes, covered, beyond);
             // This commit moved the offset too, so it gets a message like any other. Staying
             // silent on a fully-filtered batch would leave a hole in the version chain and
             // make the *next* real message look like one the client had lost.
             let published = self
-                .publish(pending, batch.start.version, through, self.target.version())
+                .publish(
+                    pending,
+                    position.delta_start_version().unwrap_or(0),
+                    through,
+                    self.target.version(),
+                )
                 .await;
             return Ok(StepOutcome::Skipped {
                 through_version: through,
@@ -840,10 +1111,16 @@ impl Pipeline {
 
         // 5+6. Write parquet and commit the data actions AND the txn action atomically.
         let (out_rows, upsert) = if self.cfg.write_mode.is_upsert() {
+            // Only a Delta source can be configured to upsert.
+            let Offsets::Version(txn_version) = offsets else {
+                return Err(Error::Other(
+                    "internal: an upsert needs a source version to commit".into(),
+                ));
+            };
             let stats = self.upsert(coerced, produced, txn_version).await?;
             (stats.rows_written(), Some(stats))
         } else {
-            self.commit(coerced, txn_version).await?;
+            self.commit(coerced, &offsets).await?;
             (out_rows, None)
         };
         self.acknowledge_lookup_table_id_transitions(&lookup_batch.transitions);
@@ -867,7 +1144,12 @@ impl Pipeline {
         // `crate::publish` for why that is a property of the signature rather than a
         // convention here.
         let published = self
-            .publish(pending, batch.start.version, through, target_version)
+            .publish(
+                pending,
+                position.delta_start_version().unwrap_or(0),
+                through,
+                target_version,
+            )
             .await;
 
         Ok(StepOutcome::Progressed {
@@ -881,6 +1163,57 @@ impl Pipeline {
             reevaluations,
             covered,
             published,
+        })
+    }
+
+    /// Fit the transform's output to the target by name, before the coercer casts it.
+    ///
+    /// A Delta source's rows already have the shape the transform was written against, so
+    /// for one this hands `output` back as it is. A source whose rows arrive in more than one
+    /// shape conforms them here instead, and adds the rows it cannot to `rejects`, so that the
+    /// batch still makes one data-quality commit (docs/kafka-design.md §5.6): a Kafka source,
+    /// whose rows come in as many shapes as its writer schemas.
+    // Only a Kafka source adds to `rejects`, which a build without one never compiles.
+    #[cfg_attr(not(feature = "kafka"), allow(unused_variables, clippy::ptr_arg))]
+    fn conform(
+        &mut self,
+        output: Vec<RecordBatch>,
+        rejects: &mut Vec<Rejected>,
+    ) -> Result<Vec<RecordBatch>> {
+        match &mut self.source {
+            Source::Delta(_) => Ok(output),
+            // Without a data-quality table a row that does not fit fails the batch, as the
+            // coercer's strict cast does.
+            #[cfg(feature = "kafka")]
+            Source::Kafka(src) => {
+                let out = src
+                    .conformer
+                    .conform_all(output, rejects, self.dq.is_some())?;
+                // A row with a null partition value lands in __HIVE_DEFAULT_PARTITION__, which
+                // kafka-delta-ingest allowed too; it is counted (docs/kafka-design.md §5.6).
+                let nulls: usize = out
+                    .iter()
+                    .flat_map(|b| {
+                        src.partition_columns
+                            .iter()
+                            .filter_map(move |c| b.column_by_name(c).map(|a| a.null_count()))
+                    })
+                    .sum();
+                src.metrics
+                    .null_partition_values
+                    .fetch_add(nulls as u64, std::sync::atomic::Ordering::Relaxed);
+                Ok(out)
+            }
+        }
+    }
+
+    /// The offset a batch at `position` commits.
+    fn offsets_for(&self, position: &Position) -> Result<Offsets> {
+        Ok(match position {
+            Position::Delta { end, .. } => {
+                Offsets::Version(self.source.delta().offsets.txn_version_for(*end)?)
+            }
+            Position::Kafka(offsets) => Offsets::Kafka(offsets.clone()),
         })
     }
 
@@ -916,7 +1249,7 @@ impl Pipeline {
             "coverage window closed: the target's coverage is behind the stream, so from here \
              an older timestamp is a late row, not a covered one"
         );
-        self.stream.release_stop();
+        self.source.delta_mut().stream.release_stop();
     }
 
     /// Retire a window whose source head the stream has read past, and say whether it did.
@@ -927,7 +1260,7 @@ impl Pipeline {
         let Some(through) = self.cutoff.as_ref().and_then(|c| c.window.through) else {
             return false;
         };
-        if cutoff_applies(through, self.stream.cursor()) {
+        if cutoff_applies(through, self.source.delta().stream.cursor()) {
             return false;
         }
         self.retire(Closed::ReadThrough);
@@ -938,8 +1271,10 @@ impl Pipeline {
     ///
     /// Errors rather than swallowing: if the rejects cannot be recorded, the target must not
     /// commit either, or the offset would advance past rows that went nowhere. Failing here
-    /// leaves the whole batch to be retried, which is why the write is idempotent.
-    async fn write_rejects(&mut self, rejects: &[Rejected], txn_version: i64) -> Result<usize> {
+    /// leaves the whole batch to be retried. A Delta batch's rejects are then not written
+    /// twice ([`DataQuality::write`]'s equality rule); a Kafka batch's are, a visible
+    /// duplicate rather than a possible loss (docs/kafka-design.md §5.7).
+    async fn write_rejects(&mut self, rejects: &[Rejected], offsets: &Offsets) -> Result<usize> {
         let Some(dq) = self.dq.as_mut() else {
             // Unreachable: rejects are only produced when a table was opened.
             return Err(Error::Other(
@@ -947,7 +1282,15 @@ impl Pipeline {
             ));
         };
         let now = chrono::Utc::now().naive_utc().and_utc().timestamp_micros();
-        dq.write(rejects, txn_version, now).await
+        match offsets {
+            Offsets::Version(txn_version) => dq.write(rejects, *txn_version, now).await,
+            Offsets::Kafka(offsets) => {
+                let written = dq.write_kafka(rejects, offsets, now).await?;
+                #[cfg(feature = "kafka")]
+                crate::kafka::fault::after_dq();
+                Ok(written)
+            }
+        }
     }
 
     async fn lookup_snapshots(&mut self, batch: &LogBatch) -> Result<LookupBatch> {
@@ -1250,7 +1593,11 @@ impl Pipeline {
         Some(stats)
     }
 
-    async fn commit(&mut self, batches: Vec<RecordBatch>, txn_version: i64) -> Result<()> {
+    async fn commit(&mut self, batches: Vec<RecordBatch>, offsets: &Offsets) -> Result<()> {
+        let txn_version = match offsets {
+            Offsets::Version(v) => *v,
+            Offsets::Kafka(offsets) => return self.commit_kafka(batches, offsets).await,
+        };
         // The sink consumes the table and returns it at its new version.
         let table = std::mem::replace(&mut self.target, DeltaTable::new_in_memory());
         match self.sink.commit(table, batches, txn_version).await {
@@ -1264,6 +1611,38 @@ impl Pipeline {
                 Err(e)
             }
         }
+    }
+
+    /// Commit a Kafka batch's rows and offsets.
+    ///
+    /// The sink is handed a clone of the handle rather than the handle itself, so a failed
+    /// commit leaves `self.target` at the snapshot the batch was planned and fenced against,
+    /// instead of reopening the table. A Kafka pipeline's handle changes only through its own
+    /// commits and its deliberate refreshes, and what follows a failure depends on the
+    /// error's class (docs/kafka-design.md §3.6, §4.3).
+    async fn commit_kafka(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        offsets: &KafkaOffsets,
+    ) -> Result<()> {
+        #[cfg(feature = "kafka")]
+        crate::kafka::fault::before_commit().await;
+        let table = self.target.clone();
+        let committed = self.sink.commit_kafka(table, batches, offsets).await?;
+        #[cfg(feature = "kafka")]
+        if crate::kafka::fault::fail_after_commit() {
+            // The commit landed and its acknowledgement is lost: the handle stays where it
+            // was, as it would after a PUT whose response never came (I17).
+            drop(committed);
+            return Err(Error::Delta(deltalake::DeltaTableError::from(
+                deltalake::logstore::object_store::Error::Generic {
+                    store: "fault",
+                    source: "fail_after_commit: the commit landed, its response was lost".into(),
+                },
+            )));
+        }
+        self.target = committed;
+        Ok(())
     }
 
     /// Read exactly the files in `batch` — not the whole table.
@@ -1285,7 +1664,7 @@ impl Pipeline {
     /// file and one delta-rs-written file would not even be a batch: two schemas, one
     /// transform.
     async fn scan(&self, batch: &LogBatch) -> Result<Vec<RecordBatch>> {
-        scan_source(&self.source, &self.cfg.source_uri, batch).await
+        scan_source(&self.source.delta().table, &self.cfg.source_uri, batch).await
     }
 
     /// Run until caught up, then return how many batches were committed.
@@ -1294,6 +1673,7 @@ impl Pipeline {
         loop {
             match self.step().await? {
                 StepOutcome::CaughtUp => return Ok(n),
+                StepOutcome::Waiting => {}
                 _ => n += 1,
             }
         }
@@ -1808,26 +2188,28 @@ async fn resume_cursor(
     if let Some(ts) = cfg.dedup_timestamp.as_deref() {
         // How far back the rescan has to reach is a question the source's own file
         // statistics can answer, so ask rather than re-reading history every night.
-        let dedup = Dedup::read(target, ts, cfg.dedup_key.as_deref()).await?;
-        let from = match dedup.watermark() {
-            Some(w) => StreamCursor::at_version(
-                dedup::bounded_rescan_start(
-                    source,
-                    ts,
-                    w,
-                    cfg.starting_version,
-                    watermark::DEFAULT_MAX_SCAN,
-                )
-                .await?,
-            ),
-            None => StreamCursor::at_version(cfg.starting_version),
-        };
+        let dedup =
+            Dedup::read_partitioned(target, ts, cfg.dedup_key.as_deref(), &cfg.dedup_partition)
+                .await?;
+        let from = StreamCursor::at_version(
+            dedup::rescan_start(
+                source,
+                &dedup,
+                cfg.starting_version,
+                watermark::DEFAULT_MAX_SCAN,
+            )
+            .await?,
+        );
         warn!(
             pipeline = %cfg.name,
             overwritten_at_target_version = at,
             own_offset = %own,
             dedup_timestamp = ts,
+            dedup_partition = ?cfg.dedup_partition,
             rescan_from = %from,
+            // False when the log could not show where the rebuild read to: a source without
+            // statistics, or — kept per partition — one whose files had to be read and could
+            // not be, or a walk that ran out of `max_scan` first.
             bounded = (from.version > cfg.starting_version),
             // Source versions between our own offset and the rescan's start, which the file
             // statistics say the rebuild covered. Where another writer repaired the target
@@ -1939,11 +2321,27 @@ struct Resume {
 /// half's own pace, and a raw row a rebuild covered can be staged long after this head.
 ///
 /// Recorded windows re-read the target rather than remembering its watermark: a commit made
-/// inside an open window holds only rows exactly at the watermark, so the target's newest
-/// is still the same one, and the keys at it now include ours, which our offset is already
-/// past. A recorded window whose remaining versions up to `H` hold no data is not resumed,
-/// so an idle pipeline whose window ended in compactions does not re-read its target on
-/// every restart.
+/// inside an open window holds only rows exactly at the watermark — with `dedup_partition`,
+/// exactly at their own partition's — so the target's newest is still the same one, and the
+/// keys at it now include ours, which our offset is already past. They are re-read in the form
+/// they were recorded in:
+///
+/// | Recorded per | Configured per | Resumed as |
+/// |---|---|---|
+/// | nothing | nothing | one cut-off |
+/// | `c` | `c` | a cut-off per value of `c` |
+/// | nothing | `c` | not resumed: duplicates, never a gap |
+/// | `c` | nothing, or other columns | not resumed: duplicates, never a gap |
+///
+/// The last because a commit inside a partitioned window can hold rows above other partitions'
+/// marks, which a single cut-off, or one by other columns, would take for covered. The one
+/// before it because a commit does not record its `dedup_timestamp`, and adopting
+/// `dedup_partition` is when that is likely to change — to an offset, whose one global maximum
+/// covers every lower-offset partition.
+///
+/// A recorded window whose remaining versions up to `H` hold no data is not resumed, so an
+/// idle pipeline whose window ended in compactions does not re-read its target on every
+/// restart.
 ///
 /// `H` is fixed only once the window's first commit records it. A reopen before that infers
 /// the window again from whatever the head is then, which matters only where the newer-row
@@ -1961,6 +2359,7 @@ async fn coverage_cutoff(
         return Ok(None);
     };
     let key = cfg.dedup_key.as_deref();
+    let partition = cfg.dedup_partition.as_slice();
     let head = match crate::stage::is_stage_uri(&cfg.source_uri) {
         true => None,
         false => source.version(),
@@ -1969,21 +2368,53 @@ async fn coverage_cutoff(
     let (reason, through, resumed, dedup) = if replaced {
         let dedup = match resume.rebuilt {
             Some(d) => d,
-            None => Dedup::read(target, ts, key).await?,
+            None => Dedup::read_partitioned(target, ts, key, partition).await?,
         };
+        warn_of_restarted_offsets(cfg, target, ts, &dedup)?;
         (CoverageReason::SourceReplaced, None, false, dedup)
     } else if let Some(dedup) = resume.rebuilt {
         (CoverageReason::Rebuilt, head, false, dedup)
     } else if resume.bootstrapping {
-        let dedup = Dedup::read(target, ts, key).await?;
+        let dedup = Dedup::read_partitioned(target, ts, key, partition).await?;
         (CoverageReason::Bootstrap, head, false, dedup)
-    } else if let Some(recorded) = ours.cutoff {
+    } else if let Some(recorded) = &ours.cutoff {
         if let Some(through) = recorded.source_through {
             if !has_data_commit_between(source, cursor.version, through).await? {
                 return Ok(None);
             }
         }
-        let dedup = Dedup::read(target, ts, key).await?;
+        // Resumed only in the form it was recorded in. One recorded per partition can hold
+        // rows above other partitions' marks, so any other reading of it would over-cover.
+        // One recorded with a single cut-off is not resumed under `dedup_partition` either:
+        // the commit does not record which `dedup_timestamp` it was kept on, and adopting
+        // the option is the moment that is likely to change — to an offset, whose one global
+        // maximum would cover every lower-offset partition. Not resumed errs towards
+        // duplicates.
+        let resume_as = match (recorded.partition_columns.as_slice(), partition) {
+            (r, c) if r == c => r,
+            ([], c) => {
+                warn!(
+                    pipeline = %cfg.name,
+                    dedup_partition = ?c,
+                    "a coverage window of ours was recorded with a single cut-off, before \
+                     dedup_partition was set; resuming as though it had closed, so rows the \
+                     target holds may be written again"
+                );
+                return Ok(None);
+            }
+            (r, c) => {
+                warn!(
+                    pipeline = %cfg.name,
+                    recorded = ?r,
+                    dedup_partition = ?c,
+                    "a coverage window of ours was recorded per partition of other columns; \
+                     resuming as though it had closed, so rows the target holds may be \
+                     written again"
+                );
+                return Ok(None);
+            }
+        };
+        let dedup = Dedup::read_partitioned(target, ts, key, resume_as).await?;
         (recorded.reason, recorded.source_through, true, dedup)
     } else {
         return Ok(None);
@@ -2049,14 +2480,69 @@ fn window_closes_after(through: Option<Version>, end: StreamCursor, beyond: usiz
     beyond > 0 || through.is_some_and(|h| !cutoff_applies(h, end))
 }
 
-/// The watermark as a value, for the startup line.
+/// The watermark as a value, for the startup line. Kept per partition, the first few marks
+/// on the line and every one of them at debug.
 fn watermark_display(dedup: &Dedup) -> String {
     use deltalake::arrow::util::display::array_value_to_string;
 
-    dedup
-        .watermark()
-        .and_then(|w| array_value_to_string(w, 0).ok())
-        .unwrap_or_else(|| "none".to_string())
+    const SHOWN: usize = 8;
+    if dedup.partition_columns().is_empty() {
+        return dedup
+            .watermark()
+            .and_then(|w| array_value_to_string(w, 0).ok())
+            .unwrap_or_else(|| "none".to_string());
+    }
+    let marks: Vec<String> = dedup
+        .partition_marks()
+        .into_iter()
+        .map(|(p, m)| format!("{p}={}", array_value_to_string(&m, 0).unwrap_or_default()))
+        .collect();
+    if marks.len() > SHOWN {
+        debug!(marks = %marks.join(", "), "every partition's mark");
+    }
+    match marks.len() {
+        0 => "none".to_string(),
+        n if n > SHOWN => format!("{n} partitions: {}, …", marks[..SHOWN].join(", ")),
+        n => format!("{n} partitions: {}", marks.join(", ")),
+    }
+}
+
+/// Say so when a replaced source is about to be measured against offsets of the old one.
+///
+/// An offset is a position in one topic on one cluster. A topic recreated, or mirrored to
+/// another cluster, starts again near zero, and a replaced source's window has no head to
+/// close at — so until the new offsets pass the old marks, every row it delivers is dropped
+/// as covered.
+fn warn_of_restarted_offsets(
+    cfg: &ResolvedPipeline,
+    target: &DeltaTable,
+    ts: &str,
+    dedup: &Dedup,
+) -> Result<()> {
+    if dedup.partition_columns().is_empty() || dedup.is_inert() {
+        return Ok(());
+    }
+    let schema = target
+        .snapshot()
+        .map_err(Error::Delta)?
+        .snapshot()
+        .read_schema();
+    if schema
+        .field_with_name(ts)
+        .is_ok_and(|f| f.data_type().is_integer())
+    {
+        warn!(
+            pipeline = %cfg.name,
+            dedup_timestamp = %ts,
+            partitions = dedup.partition_count(),
+            "the source was replaced and dedup_timestamp is an integer, kept per partition: \
+             if it is an offset and the topic was recreated or moved to another cluster, its \
+             offsets started again and every row below the old marks is being dropped as \
+             covered. Prefer a timestamp as dedup_timestamp, or reset this pipeline if the \
+             topic changed."
+        );
+    }
+    Ok(())
 }
 
 /// Refuse to start a pipeline whose first version the source's log no longer holds.
@@ -2268,5 +2754,226 @@ mod tests {
 
         apply_lookup_table_id_transitions(&mut ids, &mut current_on_open, &pending);
         assert!(!current_on_open.contains("fx"));
+    }
+}
+
+/// The conform hook for a Kafka batch (docs/kafka-design.md §5.6), driven through
+/// [`Pipeline::process`] as M3's step will drive it. No Kafka pipeline opens before M3, so the
+/// test opens a Delta one over the same target and gives it a Kafka source.
+#[cfg(all(test, feature = "kafka"))]
+mod kafka_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use deltalake::arrow::array::{
+        Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    };
+    use deltalake::arrow::datatypes::{DataType, Field, Fields, Int64Type, Schema};
+    use deltalake::kernel::{DataType as Delta, StructField};
+    use deltalake::protocol::SaveMode;
+    use deltalake::DeltaTable;
+    use futures::TryStreamExt;
+
+    use super::{Batch, LookupBatch, Pipeline, Position, Source, StepOutcome};
+    use crate::config::ResolvedPipeline;
+    use crate::kafka::conform::{Conformer, KdiText};
+    use crate::kafka::KafkaSource;
+    use crate::sink::KafkaOffsets;
+
+    async fn create(path: &str, columns: Vec<StructField>) {
+        DeltaTable::try_from_url(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap()
+            .create()
+            .with_columns(columns)
+            .with_save_mode(SaveMode::ErrorIfExists)
+            .await
+            .unwrap();
+    }
+
+    async fn scan(path: &str) -> Vec<RecordBatch> {
+        let table = deltalake::open_table(deltalake::ensure_table_uri(path).unwrap())
+            .await
+            .unwrap();
+        let (_, stream) = table.scan_table().await.unwrap();
+        stream.try_collect().await.unwrap()
+    }
+
+    fn text(a: &ArrayRef, i: usize) -> Option<String> {
+        let a = deltalake::arrow::compute::cast(a, &DataType::Utf8).unwrap();
+        let a = a.as_string::<i32>();
+        a.is_valid(i).then(|| a.value(i).to_string())
+    }
+
+    fn cfg(source: &str, target: &str, dq: &str) -> ResolvedPipeline {
+        ResolvedPipeline {
+            name: "orders_bronze".into(),
+            app_id: "ddi.orders_bronze".into(),
+            source_uri: source.into(),
+            target_uri: target.into(),
+            lookups: vec![],
+            source_relation: None,
+            target_relation: None,
+            publish: None,
+            publish_to: None,
+            starting_version: 0,
+            change_policy: Default::default(),
+            transform_sql: None,
+            allowed_latency_secs: 1,
+            near_time_poll_interval_secs: 1,
+            max_bytes_per_batch: 64 * 1024 * 1024,
+            max_files_per_batch: 100,
+            max_output_rows_per_batch: 1_000_000,
+            target_file_size: 128 * 1024 * 1024,
+            watermark_uri: None,
+            dedup_timestamp: None,
+            dedup_key: None,
+            dedup_partition: Vec::new(),
+            write_mode: Default::default(),
+            upsert_key: None,
+            upsert_lookback: None,
+            upsert_tiebreak: Vec::new(),
+            upsert_grain_check: Default::default(),
+            stage_for: None,
+            dq_uri: Some(dq.into()),
+            max_evaluation_rejects_per_batch: 100,
+            storage: Default::default(),
+            kafka: None,
+        }
+    }
+
+    /// A Kafka batch's rows reach the target conformed by name (a record whose fields come in
+    /// another order, with one the target lacks and one it has under another type), and a row
+    /// the conform step sets aside goes to the data-quality table in the batch's one write,
+    /// with its message's offset, while the rest commits with the batch's offsets.
+    #[tokio::test]
+    async fn a_kafka_batch_is_conformed_before_the_coercer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        let (source, target, dq) = (path("source"), path("target"), path("dq"));
+        create(&source, vec![StructField::new("id", Delta::LONG, false)]).await;
+        let address = Delta::try_struct_type(vec![
+            StructField::new("street", Delta::STRING, false),
+            StructField::new("zip", Delta::STRING, true),
+        ])
+        .unwrap();
+        create(
+            &target,
+            vec![
+                StructField::new("id", Delta::LONG, false),
+                StructField::new("address", address, true),
+                StructField::new("kafka_offset", Delta::LONG, true),
+            ],
+        )
+        .await;
+        create(&dq, crate::dq::columns()).await;
+
+        let mut p = Pipeline::open(cfg(&source, &target, &dq)).await.unwrap();
+        let conformer = Conformer::new(p.coercer.target(), "kafka_", KdiText::default()).unwrap();
+        p.source = Source::Kafka(Box::new(KafkaSource::for_tests(conformer)));
+
+        // As the decoder hands rows on: the writer's own field order, then the metadata.
+        let address_fields = Fields::from(vec![
+            Field::new("zip", DataType::Int32, false),
+            Field::new("city", DataType::Utf8, false),
+            Field::new("street", DataType::Utf8, true),
+        ]);
+        let address = StructArray::try_new(
+            address_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![10115, 75001])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["Berlin", "Paris"])),
+                Arc::new(StringArray::from(vec![Some("Unter den Linden"), None])),
+            ],
+            None,
+        )
+        .unwrap();
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("address", DataType::Struct(address_fields), false),
+                Field::new("kafka_partition", DataType::Int32, false),
+                Field::new("kafka_offset", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(address),
+                Arc::new(Int32Array::from(vec![0, 0])),
+                Arc::new(Int64Array::from(vec![40, 41])),
+            ],
+        )
+        .unwrap();
+        let offsets = KafkaOffsets {
+            topic: "orders".into(),
+            group_id: "ddi-orders_bronze".into(),
+            ranges: BTreeMap::from([(0, (40, 41))]),
+            assert: BTreeMap::from([(0, 41)]),
+            marks: BTreeMap::new(),
+            cleanup_logs: false,
+            baseline: false,
+            override_reason: None,
+            takeover_marker: false,
+        };
+        let outcome = p
+            .process(Batch {
+                started: Instant::now(),
+                through: 0,
+                files: 0,
+                input: vec![input],
+                rejects: Vec::new(),
+                lookups: LookupBatch::none(),
+                position: Position::Kafka(offsets),
+            })
+            .await
+            .unwrap();
+        let StepOutcome::Progressed { rows, rejected, .. } = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!((rows, rejected), (1, 1));
+
+        let written = scan(&target).await;
+        assert_eq!(written.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        let b = &written[0];
+        assert_eq!(
+            b.column_by_name("id")
+                .unwrap()
+                .as_primitive::<Int64Type>()
+                .value(0),
+            1
+        );
+        let address = b.column_by_name("address").unwrap().as_struct();
+        assert_eq!(
+            text(address.column_by_name("street").unwrap(), 0).as_deref(),
+            Some("Unter den Linden")
+        );
+        assert_eq!(
+            text(address.column_by_name("zip").unwrap(), 0).as_deref(),
+            Some("10115")
+        );
+
+        let recorded = scan(&dq).await;
+        assert_eq!(recorded.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        let r = &recorded[0];
+        assert_eq!(
+            r.column_by_name("source_version")
+                .unwrap()
+                .as_primitive::<Int64Type>()
+                .value(0),
+            41
+        );
+        assert_eq!(
+            text(r.column_by_name("column_name").unwrap(), 0).as_deref(),
+            Some("address")
+        );
+        let reason = text(r.column_by_name("reason").unwrap(), 0).unwrap();
+        assert!(
+            reason.contains("address.street is NOT NULL in the target"),
+            "{reason}"
+        );
+        let dq_table = deltalake::open_table(deltalake::ensure_table_uri(&dq).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(dq_table.version(), Some(1), "one data-quality commit");
     }
 }

@@ -201,6 +201,7 @@ pub fn pipeline_cfg(name: &str, source: &str, target: &str) -> ResolvedPipeline 
         watermark_uri: None,
         dedup_timestamp: None,
         dedup_key: None,
+        dedup_partition: Vec::new(),
         write_mode: Default::default(),
         upsert_key: None,
         upsert_lookback: None,
@@ -214,6 +215,7 @@ pub fn pipeline_cfg(name: &str, source: &str, target: &str) -> ResolvedPipeline 
         publish: None,
         publish_to: None,
         storage: delta_delta_ingest::storage::Storage::default(),
+        kafka: None,
     }
 }
 

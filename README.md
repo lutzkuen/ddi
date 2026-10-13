@@ -430,6 +430,43 @@ Use this for compact, keyed relations such as daily FX rates. It is not a substi
 joining a many-gigabyte historical RRP/COGS table into every 5,000-row source batch; materialize
 a compact lookup with a documented key first, or enrich downstream.
 
+## Kafka source
+
+A build with the `kafka` feature (the published image has it) also runs `[[kafka.pipeline]]`s: a Confluent-framed
+Avro topic into an append-only Delta table, with the same exactly-once rule as the Delta pipelines. A batch is one
+Delta commit holding the rows and one `txn` per partition, so a row is in the table exactly when its offset is. The
+consumer group only shares partitions; offsets live in the table and nothing is committed to Kafka.
+
+```toml
+[kafka]
+brokers  = "b-1.kafka.internal:9092"
+jaas_env = "KAFKA_SASL_JAAS_CONFIG"                  # a JAAS line; or scram_json_env, or settings_env
+[kafka.settings]
+"security.protocol" = "SASL_SSL"
+"sasl.mechanism"    = "PLAIN"
+[kafka.schema_registry]
+url = "https://sr.internal"                          # SCHEMA_REGISTRY_USERNAME / _PASSWORD
+
+[[kafka.pipeline]]
+name       = "orders_raw"
+app_id     = "ddi.orders_raw"
+topic      = "orders.created"
+target_uri = "abfss://lake@acct.dfs.core.windows.net/raw/orders_created"
+transform_sql = "SELECT * FROM source"               # optional, row-local, Trino spellings
+```
+
+- Every Avro field becomes a column by name, and the Kafka coordinates are appended as `kafka_topic`,
+  `kafka_partition`, `kafka_offset`, `kafka_timestamp` (also `kafka_key`, `kafka_headers`, ...); a column the target
+  does not have is dropped. Messages written with older or newer versions of the schema are conformed to the target
+  by name.
+- A message it cannot decode, or a row the SQL cannot evaluate, goes to `<target>__ddi_dq` with the reason
+  (`ddi kafka create-dq`). Something it cannot decide alone (a retention gap, a recreated topic, a table another
+  engine rewrote) **blocks** the partition or pipeline and says why in `ddi_kafka_pipeline_blocked`.
+- **Taking over a table kafka-delta-ingest wrote**: same `app_id`, kdi stopped, `kdi_compat = true` to keep its STRING
+  rendering. `ddi kafka plan` is the read-only preflight, `ddi kafka set-offsets` the guarded way to move offsets,
+  `ddi kafka clone-table` makes the shadow table. The whole procedure is in [docs/kafka-runbook.md](docs/kafka-runbook.md);
+  alerts in [docs/alerts.yml](docs/alerts.yml); the design and its proofs in [docs/kafka-design.md](docs/kafka-design.md).
+
 ## Running alongside dbt
 
 The two-speed lakehouse: dbt rebuilds a model nightly and owns correctness; `ddi` streams
@@ -611,11 +648,84 @@ holds a lagging partition's rows that are older than rows already delivered. Ins
 those are dropped with the covered ones — counted, but dropped — and the rescan bound below
 can start past them. So after a rebuild, on a first start against a populated target and
 after a replaced source, such a source can lose a lagging partition's late rows at or below the
-target's newest timestamp. That is a known limitation, and `watermark_uri` does not lift it:
-with `dedup_timestamp` set it is not read (above). A watermark per value of a partition column
-— the newest timestamp or offset per Kafka partition — would be exact there, and so would
-resuming from the source version a rebuild recorded, given a way to tell which rebuild
-recorded it; both are possible future options, not something `ddi` does today.
+target's newest timestamp — unless the cut-off is kept per partition. `watermark_uri` does not
+lift it: with `dedup_timestamp` set it is not read (above).
+
+#### One cut-off per Kafka partition
+
+```toml
+dedup_timestamp = "_timestamp"        # or "kafka_offset"
+dedup_key       = "id"
+dedup_partition = "kafka_partition"   # or ["kafka_topic", "kafka_partition"]
+```
+
+```yaml
+models:
+  - name: events_stg
+    meta:
+      ddi_key: id
+      ddi_partition: kafka_partition
+```
+
+With `dedup_partition` set, the target's coverage is read per value of that column: for each
+partition, its newest `dedup_timestamp` and the keys tied at it. A row is covered only when its
+own partition's mark covers it, and a partition the target holds no row of has nothing
+covered. The ordering requirement relaxes to match — non-decreasing within each partition,
+which `kafka_offset` always is, a `LogAppendTime` timestamp is too, and a `CreateTime` one is
+only as far as the producers' clocks are monotonic. So `kafka_offset` can be the
+`dedup_timestamp` here; nothing assumes a clock.
+
+- **The target must carry the column**, and `kafka_offset` too if that is the sequence: a
+  silver model has to select them. Every open checks it, and the column must be an integer or
+  a string. And **the source columns of those names must hold the same values**: the marks are
+  read from the target, the rescan bound from the source. A source without them is rescanned
+  from the start. The key need not be in the source: a model that derives it is still
+  bounded, a row exactly at its partition's mark just counts as not covered there.
+- **A row with no partition is refused**, on every batch and every write mode. Upsert included,
+  though there a row with no timestamp is left to the merge: the merge knows nothing of
+  partitions, and a row accepted outside a window would stop the next one. So an upserting
+  transform must select the column too, or its first batch stops. Target rows with none cover
+  nothing.
+- **A table fed from several topics** needs the topic too, `["kafka_topic", "kafka_partition"]`:
+  partition 0 of two topics is two partitions.
+- **`dedup_partition = []` names no column**, so it is not read as "unset": in TOML it stops
+  the file from loading, as any malformed value does. Leave the key out for a single cut-off.
+  In dbt, a `ddi_partition` that is not a column name or a list of them, `[]` included, holds
+  back that model, named, and the rest of the project runs.
+- **Offsets are valid for one topic on one cluster.** A topic recreated, or mirrored to another
+  cluster, starts again near zero, below every old mark, and a replaced source's window has no
+  head to close at: until the new offsets pass the old marks, every row is dropped as covered.
+  `ddi` warns when a replaced source meets an integer `dedup_timestamp` kept per partition;
+  prefer a timestamp, or reset the pipeline if the topic changed.
+- **For `upsert` and `staged_upsert`, `dedup_timestamp` is also the merge's sequence**, and the
+  merge compares it across partitions: a key that moves partition is merged by it, an
+  `upsert_lookback` in offsets reads it as one order, and so does the merge window's pruning by
+  its statistics. Offsets from different partitions are not comparable, so keep a timestamp as
+  the sequence there — the cut-off is per partition either way. `ddi` warns at open when an
+  upserting pipeline combines the two.
+- **It is still one window**, closed by the first row past its own partition's mark (or in a
+  partition the target lacks): what filled the target read a prefix of the source, so such a row
+  is past that prefix and so is everything after it. With a mark per partition an early close
+  is a little likelier — a `DELETE` on the target, or a partition aged out of it, lowers one —
+  and an early close writes rows again; it never drops one. That includes deleted rows: a
+  `DELETE` of a partition's newest rows in the target lowers its mark below them, so the
+  rescan after the next handover writes them back. Under a single cut-off that happens only to
+  the newest rows of the whole table.
+- **A window records its form in its commits** (`ddi.cutoff.partitionColumns`, and a
+  `ddi.cutoff.reason` such as `rebuilt.partitioned`), and a reopen resumes it only in that
+  form. Changing `dedup_partition`, or rolling back to 0.4.0 mid-window, is safe at the price of
+  duplicates: a window recorded with one cut-off is not resumed once `dedup_partition` is set
+  (its commits do not say which `dedup_timestamp` they were kept on, and adopting the option
+  is when that tends to change), one recorded per partition that no longer matches is not
+  resumed, and 0.4.0 does not know the partitioned reason and resumes as though the window had
+  closed. Each writes rows again rather than dropping any; wait for
+  `ddi_coverage_cutoff_active` to be 0 to avoid that. 0.3.1 and earlier are different: they
+  apply one cut-off at every open, so they drop a lagging partition's late rows whatever the
+  window state.
+
+Resuming from the source version a rebuild recorded, given a way to tell which rebuild
+recorded it, would be exact too; that is a possible future option, not something `ddi` does
+today.
 
 The rescan is bounded by the source's own file statistics. Delta records `maxValues` per
 file, so the log itself says how far back the rebuild's contents reach: walking backwards
@@ -624,6 +734,35 @@ everything before it is covered too. A rebuild of a table with months of history
 the last commit or two, not the history. Where statistics are missing or of a type that
 will not line up, it falls back to a full rescan — being slow is a cost, being wrong is
 not an option.
+
+Kept per partition, the bound asks of each commit whether **every** row in it is covered by its
+own partition's mark, walking back from the head; the first commit that is ends the walk. A
+commit with one old row among new ones — a redelivery, a producer clock running behind — is not
+covered, so a stray row cannot move the start forward. A file holding one partition, known
+exactly (a Delta partition value, or equal integer statistics), is answered from its
+statistics; a file mixing partitions, as kafka-delta-ingest writes them, or without statistics
+on the partition column, is not covered when its lowest timestamp is past every partition's
+mark — so on a timestamp sequence most commits after the rebuild's read are settled without a
+read; one carrying a lagging partition's rows older than the newest mark is still read — and is
+otherwise answered by reading just its timestamp, partition and key columns, which stops at
+the first row that is not covered. Only plain appends can end the walk: a `DELETE`, `UPDATE`,
+`MERGE` or `RESTORE` on the source re-adds old rows and proves nothing. The start lands right
+after the newest commit the rebuild read, idle partitions or not; the walk gives up to a full
+rescan only past the same `max_scan`, or after reading 10 000 files.
+
+That needs **every partition in the commits the walk must settle to have rows in the
+target**. A row of a partition the target holds none of is not covered — it may be a new or
+lagging partition's — so a model that filters out whole partitions whose rows share source
+commits with the ones it keeps (a `WHERE` on `kafka_partition`, on the message key when that
+leaves some partitions empty, or on the topic when one ingester's commits mix topics) leaves no
+source commit that can prove coverage: every handover rescans from `starting_version`, which
+stops with the cursor unavailable once the source's log no longer reaches back that far. `ddi`
+warns and names the partition when that happens. A topic filter over commits that each hold
+one topic stays bounded: the walk passes the other topic's commits and stops at the newest one
+of its own that the rebuild read. For the mixing case give the model a source of its own;
+leaving `dedup_partition` off bounds the rescan again, but brings back the single cut-off's
+loss of a lagging partition's late rows. A partition whose rows the model keeps only rarely bounds the start by its newest
+kept row, not by the newest overall.
 
 `watermark_uri` is exact, needs no rescan and puts no ordering requirement on any column, but
 only a pipeline without `dedup_timestamp` reads it: one written out in TOML that appends, since
@@ -636,7 +775,8 @@ Only on an open that has to infer coverage — an ordinary restart does not read
 and never per batch. And only two columns: the timestamp and the key are projected into the Delta scan,
 so the parquet reader never decodes the rest of the row, and the pass is streaming: the
 running answer is one timestamp plus the keys tied with it, so memory is bounded by that
-rather than by the table.
+rather than by the table. Kept per partition it is three columns and one such answer per
+partition; more than 100 000 distinct values is refused as a misconfiguration.
 
 This matters more than it sounds. Reading the whole row instead is gigabytes on a silver
 table whose rows carry JSON payloads, it would be paid again on every open that needs it, and

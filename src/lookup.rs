@@ -389,6 +389,7 @@ async fn lookup_log_timestamp(
 /// It is intentionally owned rather than cached globally. The FX table is small, and opening a
 /// new provider per source commit keeps the snapshot boundary explicit and prevents a later
 /// lookup refresh leaking into an in-flight retry.
+#[derive(Clone)]
 pub struct LookupSnapshot {
     pub name: String,
     pub version: Version,
