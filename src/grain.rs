@@ -333,7 +333,7 @@ where
              doubling halves the passes; \"4GB\" would make this about {}), or set \
              upsert_grain_check = \"off\" on this pipeline if you already know the target holds \
              one row per key. Nothing has been read and no other pipeline was touched.",
-            bytesize::ByteSize(ceiling.bytes()),
+            bytesize::ByteSize(ceiling.bytes()).display().si(),
             rows.map(|r| r.to_string()).unwrap_or_else(|| format!(
                 "an estimated {}",
                 bytes / Ceiling::ASSUMED_BYTES_PER_ROW

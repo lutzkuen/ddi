@@ -14,7 +14,7 @@
 - ddi: budget.rs:60-70, 120-135, 265-296; dq.rs:60-300; config.rs:1405-1440; sink.rs:170-185; dedup.rs:390-412, 705-716; dbt/watermark.rs:200-250; pipeline.rs:1382-1402, 1521; main.rs:728-738, 820-852; metrics.rs (family names); transform/validate.rs:1495-1503.
 - buoyant_kernel-0.22.2: log_reader/commit.rs:20-35; engine/default/json.rs:110-125; actions/set_transaction.rs:10-25, 60-82.
 - apache-avro-0.21.0: types.rs:299-356; decimal.rs:85-151.
-- arrow-avro-58.4.0: the public `Decoder` API (reader/mod.rs:677-880).
+- arrow-avro-58.4.0 (the version the decoder was written against; =59.3.0 since 0.5.0): the public `Decoder` API (reader/mod.rs:677-880).
 - `scratchpad/rdk-probe`, built today by the parity-ops reviewer.
 
 Everything else cites the earlier verification pass (§11). Claims a milestone must still settle are marked **verify (Mx)**.
@@ -34,7 +34,7 @@ Everything else cites the earlier verification pass (§11). Claims a milestone m
 | Offsets | Kept only in the target. txn appId `"<app_id>-<p>"`; `version` = last offset accounted for (kdi's convention). Every commit re-asserts every owned partition whose base is known, so delta-rs's txn conflict check fences everything. Lookups use a backward commit walker bounded by the newest checkpoint: one GET in steady state. |
 | Missing offsets | **Fresh app_id:** `starting_offsets` (`earliest`, `latest`, or a complete map with an optional `"*"`). A txn-only baseline is committed when any start is > 0. **Not fresh:** a partition without a txn starts at **exactly offset 0**; `low > 0` is a retention gap that needs an acknowledged `set-offsets`. **Takeover:** ddi's first commit under an app_id writes one marker txn, `<app_id>.ddi`, and no commit after it. Until it is there (kdi's era, or a fresh app_id on a target that holds rows), a partition without a txn whose topic holds messages needs an explicit `starting_offsets` entry, checked once at open; in kdi's era the open then commits a **takeover baseline** (the marker, kdi's txns re-asserted, every acknowledgment as a txn). Every Kafka txn carries a `lastUpdated` of 9999-12-31, which no engine expires. The typo guard (with a shared-table exemption) and the txn-retention refusal stay. |
 | Incarnation | A partition resumes by re-reading its last written offset and comparing it with the timestamp and length ddi recorded. A recreated topic blocks the partition. |
-| Decode | arrow-avro =58.4.0, plus a small SR client on reqwest 0.12 (`?deleted=true`). One decoder per writer schema id, a strict per-message check, isolation by re-decoding a chunk. |
+| Decode | arrow-avro =59.3.0, plus a small SR client on reqwest 0.13 (`?deleted=true`). One decoder per writer schema id, a strict per-message check, isolation by re-decoding a chunk. |
 | Evolution | **Identity path:** by-name nested conform to the target. **SQL path:** inputs are aligned to `U` = the latest registered version ∪ every id seen. The newest id's type wins; older values are cast, and rows that cannot be cast go to DQ. Never refuses to start because of history. |
 | kdi parity | `kdi_compat`: a non-string value going into a STRING column is rendered by its **Arrow type, at every depth**, the way kdi's serde_json rendered it. `kdi_null_text`: a null becomes the text `"null"` where kdi's JSON would have had the key. Unset on a kdi-written table refuses to start; false on new tables. The parity reference is the apache-avro version inside the **production** kdi binary. |
 | Bad messages | DQ table, written as plain appends with no txn, each reject with its offset. A replay after a crash between the DQ and the target commit writes its rejects again: a visible duplicate (deduplicable by the whole row but `_timestamp`), never a loss. A DQ conflict is retried in place; a DQ write that failed after landing finds its own commit. With no DQ table, that pipeline pauses but stays in its group. |
@@ -361,7 +361,7 @@ url          = "https://sr.internal:8081"
 username_env = "SCHEMA_REGISTRY_USERNAME"   # kdi's names (serialization.rs:96-107)
 password_env = "SCHEMA_REGISTRY_PASSWORD"
 proxy_env    = "SCHEMA_REGISTRY_PROXY"
-# ca_pem_env = "SCHEMA_REGISTRY_CA_PEM"     # PEM added to rustls' webpki roots (kdi used the OS store)
+# ca_pem_env = "SCHEMA_REGISTRY_CA_PEM"     # PEM added to the OS trust store (as kdi's native-tls)
 
 [kafka.settings]                         # librdkafka passthrough (kdi -K k=v)
 "security.protocol" = "SASL_SSL"
@@ -1084,7 +1084,7 @@ It exits non-zero on blocking findings.
 - A `None` payload is a tombstone: skipped, counted, offset accounted.
 - Fewer than 5 bytes, or a wrong magic byte, is undecodable, with a reason such as "not Confluent-framed (first byte 0x7b; is this topic JSON?)".
 
-### 5.2 SR client (src/kafka/registry.rs, reqwest 0.12 rustls, Cargo.toml:57-59)
+### 5.2 SR client (src/kafka/registry.rs, reqwest 0.13 rustls)
 
 **`GET {url}/schemas/ids/{id}?deleted=true`**, with `Accept: application/vnd.schemaregistry.v1+json`. The trailing `/` of the URL is trimmed (kdi serialization.rs:91-94).
 
@@ -1105,9 +1105,8 @@ It exits non-zero on blocking findings.
 - 30 s timeout.
 
 **TLS:**
-- reqwest's `rustls-tls` uses webpki roots, where kdi used native-tls (the OS store).
+- reqwest 0.13's `rustls` feature verifies against the operating system's store (rustls-platform-verifier), as kdi's native-tls did. Through 0.4.0 (reqwest 0.12 `rustls-tls`) it used the bundled webpki roots; the Trino and PubSub clients moved with it, so a container needs `ca-certificates` (the image has it).
 - `ca_pem_env` adds a private CA (`Certificate::from_pem` + `add_root_certificate`).
-- We do not turn on `rustls-tls-native-roots`: feature unification would change the Trino and PubSub clients' trust, i.e. Delta pipeline behaviour.
 
 **Not `schema_registry_converter`:** it defaults to native-tls, pulls reqwest 0.13 and apache-avro, and brings a JSON-schema validator.
 

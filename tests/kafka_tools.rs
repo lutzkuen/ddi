@@ -8,6 +8,7 @@
 mod common;
 mod kafka_common;
 
+use futures::TryStreamExt as _;
 use std::collections::{BTreeMap, BTreeSet};
 
 use delta_delta_ingest::fence::Era;
@@ -288,8 +289,7 @@ async fn set_offsets_moves_guards_and_reasserts() {
     .await
     .unwrap();
     assert_eq!(read[&marker].version, None);
-    let history = table.history(Some(1)).await.unwrap();
-    let info = history.into_iter().next().unwrap();
+    let info = table.history(Some(1)).try_next().await.unwrap().unwrap();
     assert_eq!(
         info.info
             .get("ddi.kafka.offsetOverride")

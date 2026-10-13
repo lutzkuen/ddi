@@ -39,7 +39,6 @@
 //! a body; a lambda anywhere but as the second argument of `transform` or `filter`; a
 //! lambda with more than one parameter. Each names the construct.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -239,7 +238,7 @@ fn replacement(expr: &Expr) -> Result<Option<Expr>> {
     };
     // The body is planned against a field of this name. Unquoted identifiers are
     // lower-cased by the planner, so the field is too; a quoted one is kept as written.
-    let param_name = planner_name(param);
+    let param_name = planner_name(&param.name);
 
     check_body(&lambda.body, spelling)?;
 
@@ -271,7 +270,7 @@ fn replacement(expr: &Expr) -> Result<Option<Expr>> {
 /// was just written, and every `__capture_N` it names has to be one of the arguments that
 /// follow, so a hand-written call cannot reach past the gate either.
 fn check_folded(f: &Function, name: &str) -> Result<()> {
-    use deltalake::datafusion::sql::sqlparser::dialect::GenericDialect;
+    use crate::transform::dialect::NativeDialect;
     use deltalake::datafusion::sql::sqlparser::parser::Parser;
     use deltalake::datafusion::sql::sqlparser::tokenizer::Token;
 
@@ -301,7 +300,7 @@ fn check_folded(f: &Function, name: &str) -> Result<()> {
     let (Some(_param), Some(body)) = (text_at(1), text_at(2)) else {
         return Err(shape());
     };
-    let parsed = Parser::new(&GenericDialect {})
+    let parsed = Parser::new(&NativeDialect)
         .try_with_sql(&body)
         .and_then(|mut p| {
             let expr = p.parse_expr()?;
@@ -783,10 +782,11 @@ fn compile(
     // `arrow_cast` are turned into what they mean — then the function rewrites
     // `create_physical_expr` applies.
     let simplifier = ExprSimplifier::new(
-        SimplifyContext::default()
+        SimplifyContext::builder()
             .with_schema(Arc::new(df_schema.clone()))
             .with_config_options(Arc::clone(state.config_options()))
-            .with_query_execution_start_time(state.execution_props().query_execution_start_time),
+            .with_query_execution_start_time(state.execution_props().query_execution_start_time)
+            .build(),
     );
     let simplified = simplifier
         .coerce(logical, &df_schema)
@@ -868,9 +868,6 @@ impl LambdaFn {
 }
 
 impl ScalarUDFImpl for LambdaFn {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         self.kind.name()
     }

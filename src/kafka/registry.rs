@@ -31,8 +31,8 @@
 //! `username_env`, with `password_env` optional as in kdi (serialization.rs:96-101); a proxy
 //! for every request from `proxy_env` (kdi used `reqwest::Proxy::all` too), which otherwise
 //! leaves reqwest's own `HTTP(S)_PROXY` handling as kdi had it; a private CA from
-//! `ca_pem_env`, added to the webpki roots rustls trusts (kdi used the operating system's store
-//! through native-tls). 30 s per request.
+//! `ca_pem_env`, added to the roots reqwest trusts, which are the operating system's store (as with
+//! kdi's native-tls). 30 s per request.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};

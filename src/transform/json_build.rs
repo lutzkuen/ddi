@@ -74,7 +74,6 @@
 //! VARCHAR)` becomes `ddi_text`, Trino's JSON-to-varchar cast on a JSON-typed input and the
 //! plain cast on any other.
 
-use std::any::Any;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -700,9 +699,6 @@ impl BuildFn {
 }
 
 impl ScalarUDFImpl for BuildFn {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         self.kind.name()
     }

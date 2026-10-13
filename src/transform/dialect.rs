@@ -38,6 +38,320 @@ use deltalake::datafusion::sql::sqlparser::keywords::Keyword;
 use deltalake::datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer, Word};
 use std::ops::ControlFlow;
 
+/// `GenericDialect`, which is what the engine's own parser reads, with `x -> expr` lambdas
+/// switched back on: sqlparser 0.62 stopped parsing them in the generic dialect, where 0.61
+/// did, and without it `transform(xs, x -> ..)` reads as a JSON-arrow operator.
+///
+/// Every method but the lambda flag is delegated to `GenericDialect`, so a query that parsed
+/// before parses to the same tree. Generated from sqlparser 0.62's generic.rs; a new flag
+/// there is a new default (false) here until it is added.
+#[derive(Debug, Default)]
+pub(crate) struct NativeDialect;
+
+impl Dialect for NativeDialect {
+    fn dialect(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<GenericDialect>()
+    }
+
+    fn supports_lambda_functions(&self) -> bool {
+        true
+    }
+
+    fn is_delimited_identifier_start(&self, ch: char) -> bool {
+        GenericDialect {}.is_delimited_identifier_start(ch)
+    }
+
+    fn is_identifier_start(&self, ch: char) -> bool {
+        GenericDialect {}.is_identifier_start(ch)
+    }
+
+    fn is_identifier_part(&self, ch: char) -> bool {
+        GenericDialect {}.is_identifier_part(ch)
+    }
+
+    fn supports_unicode_string_literal(&self) -> bool {
+        GenericDialect {}.supports_unicode_string_literal()
+    }
+
+    fn supports_partition_by_after_order_by(&self) -> bool {
+        GenericDialect {}.supports_partition_by_after_order_by()
+    }
+
+    fn supports_array_join_syntax(&self) -> bool {
+        GenericDialect {}.supports_array_join_syntax()
+    }
+
+    fn supports_group_by_expr(&self) -> bool {
+        GenericDialect {}.supports_group_by_expr()
+    }
+
+    fn supports_group_by_with_modifier(&self) -> bool {
+        GenericDialect {}.supports_group_by_with_modifier()
+    }
+
+    fn supports_left_associative_joins_without_parens(&self) -> bool {
+        GenericDialect {}.supports_left_associative_joins_without_parens()
+    }
+
+    fn supports_connect_by(&self) -> bool {
+        GenericDialect {}.supports_connect_by()
+    }
+
+    fn supports_match_recognize(&self) -> bool {
+        GenericDialect {}.supports_match_recognize()
+    }
+
+    fn supports_pipe_operator(&self) -> bool {
+        GenericDialect {}.supports_pipe_operator()
+    }
+
+    fn supports_start_transaction_modifier(&self) -> bool {
+        GenericDialect {}.supports_start_transaction_modifier()
+    }
+
+    fn supports_window_function_null_treatment_arg(&self) -> bool {
+        GenericDialect {}.supports_window_function_null_treatment_arg()
+    }
+
+    fn supports_dictionary_syntax(&self) -> bool {
+        GenericDialect {}.supports_dictionary_syntax()
+    }
+
+    fn supports_window_clause_named_window_reference(&self) -> bool {
+        GenericDialect {}.supports_window_clause_named_window_reference()
+    }
+
+    fn supports_parenthesized_set_variables(&self) -> bool {
+        GenericDialect {}.supports_parenthesized_set_variables()
+    }
+
+    fn supports_select_wildcard_except(&self) -> bool {
+        GenericDialect {}.supports_select_wildcard_except()
+    }
+
+    fn support_map_literal_syntax(&self) -> bool {
+        GenericDialect {}.support_map_literal_syntax()
+    }
+
+    fn allow_extract_custom(&self) -> bool {
+        GenericDialect {}.allow_extract_custom()
+    }
+
+    fn allow_extract_single_quotes(&self) -> bool {
+        GenericDialect {}.allow_extract_single_quotes()
+    }
+
+    fn supports_extract_comma_syntax(&self) -> bool {
+        GenericDialect {}.supports_extract_comma_syntax()
+    }
+
+    fn supports_create_view_comment_syntax(&self) -> bool {
+        GenericDialect {}.supports_create_view_comment_syntax()
+    }
+
+    fn supports_parens_around_table_factor(&self) -> bool {
+        GenericDialect {}.supports_parens_around_table_factor()
+    }
+
+    fn supports_values_as_table_factor(&self) -> bool {
+        GenericDialect {}.supports_values_as_table_factor()
+    }
+
+    fn supports_create_index_with_clause(&self) -> bool {
+        GenericDialect {}.supports_create_index_with_clause()
+    }
+
+    fn supports_explain_with_utility_options(&self) -> bool {
+        GenericDialect {}.supports_explain_with_utility_options()
+    }
+
+    fn supports_limit_comma(&self) -> bool {
+        GenericDialect {}.supports_limit_comma()
+    }
+
+    fn supports_update_order_by(&self) -> bool {
+        GenericDialect {}.supports_update_order_by()
+    }
+
+    fn supports_from_first_select(&self) -> bool {
+        GenericDialect {}.supports_from_first_select()
+    }
+
+    fn supports_projection_trailing_commas(&self) -> bool {
+        GenericDialect {}.supports_projection_trailing_commas()
+    }
+
+    fn supports_asc_desc_in_column_definition(&self) -> bool {
+        GenericDialect {}.supports_asc_desc_in_column_definition()
+    }
+
+    fn supports_try_convert(&self) -> bool {
+        GenericDialect {}.supports_try_convert()
+    }
+
+    fn supports_bitwise_shift_operators(&self) -> bool {
+        GenericDialect {}.supports_bitwise_shift_operators()
+    }
+
+    fn supports_comment_on(&self) -> bool {
+        GenericDialect {}.supports_comment_on()
+    }
+
+    fn supports_load_extension(&self) -> bool {
+        GenericDialect {}.supports_load_extension()
+    }
+
+    fn supports_named_fn_args_with_assignment_operator(&self) -> bool {
+        GenericDialect {}.supports_named_fn_args_with_assignment_operator()
+    }
+
+    fn supports_struct_literal(&self) -> bool {
+        GenericDialect {}.supports_struct_literal()
+    }
+
+    fn supports_empty_projections(&self) -> bool {
+        GenericDialect {}.supports_empty_projections()
+    }
+
+    fn supports_nested_comments(&self) -> bool {
+        GenericDialect {}.supports_nested_comments()
+    }
+
+    fn supports_multiline_comment_hints(&self) -> bool {
+        GenericDialect {}.supports_multiline_comment_hints()
+    }
+
+    fn supports_user_host_grantee(&self) -> bool {
+        GenericDialect {}.supports_user_host_grantee()
+    }
+
+    fn supports_string_escape_constant(&self) -> bool {
+        GenericDialect {}.supports_string_escape_constant()
+    }
+
+    fn supports_array_typedef_with_brackets(&self) -> bool {
+        GenericDialect {}.supports_array_typedef_with_brackets()
+    }
+
+    fn supports_match_against(&self) -> bool {
+        GenericDialect {}.supports_match_against()
+    }
+
+    fn supports_set_names(&self) -> bool {
+        GenericDialect {}.supports_set_names()
+    }
+
+    fn supports_comma_separated_set_assignments(&self) -> bool {
+        GenericDialect {}.supports_comma_separated_set_assignments()
+    }
+
+    fn supports_filter_during_aggregation(&self) -> bool {
+        GenericDialect {}.supports_filter_during_aggregation()
+    }
+
+    fn supports_select_wildcard_exclude(&self) -> bool {
+        GenericDialect {}.supports_select_wildcard_exclude()
+    }
+
+    fn supports_data_type_signed_suffix(&self) -> bool {
+        GenericDialect {}.supports_data_type_signed_suffix()
+    }
+
+    fn supports_interval_options(&self) -> bool {
+        GenericDialect {}.supports_interval_options()
+    }
+
+    fn supports_quote_delimited_string(&self) -> bool {
+        GenericDialect {}.supports_quote_delimited_string()
+    }
+
+    fn supports_select_wildcard_replace(&self) -> bool {
+        GenericDialect {}.supports_select_wildcard_replace()
+    }
+
+    fn supports_select_wildcard_ilike(&self) -> bool {
+        GenericDialect {}.supports_select_wildcard_ilike()
+    }
+
+    fn supports_select_wildcard_rename(&self) -> bool {
+        GenericDialect {}.supports_select_wildcard_rename()
+    }
+
+    fn supports_optimize_table(&self) -> bool {
+        GenericDialect {}.supports_optimize_table()
+    }
+
+    fn supports_install(&self) -> bool {
+        GenericDialect {}.supports_install()
+    }
+
+    fn supports_detach(&self) -> bool {
+        GenericDialect {}.supports_detach()
+    }
+
+    fn supports_prewhere(&self) -> bool {
+        GenericDialect {}.supports_prewhere()
+    }
+
+    fn supports_with_fill(&self) -> bool {
+        GenericDialect {}.supports_with_fill()
+    }
+
+    fn supports_limit_by(&self) -> bool {
+        GenericDialect {}.supports_limit_by()
+    }
+
+    fn supports_interpolate(&self) -> bool {
+        GenericDialect {}.supports_interpolate()
+    }
+
+    fn supports_settings(&self) -> bool {
+        GenericDialect {}.supports_settings()
+    }
+
+    fn supports_select_format(&self) -> bool {
+        GenericDialect {}.supports_select_format()
+    }
+
+    fn supports_comment_optimizer_hint(&self) -> bool {
+        GenericDialect {}.supports_comment_optimizer_hint()
+    }
+
+    fn supports_constraint_keyword_without_name(&self) -> bool {
+        GenericDialect {}.supports_constraint_keyword_without_name()
+    }
+
+    fn supports_key_column_option(&self) -> bool {
+        GenericDialect {}.supports_key_column_option()
+    }
+
+    fn supports_comma_separated_trim(&self) -> bool {
+        GenericDialect {}.supports_comma_separated_trim()
+    }
+
+    fn supports_cte_without_as(&self) -> bool {
+        GenericDialect {}.supports_cte_without_as()
+    }
+
+    fn supports_select_item_multi_column_alias(&self) -> bool {
+        GenericDialect {}.supports_select_item_multi_column_alias()
+    }
+
+    fn supports_xml_expressions(&self) -> bool {
+        GenericDialect {}.supports_xml_expressions()
+    }
+}
+
+/// Parse with the engine's own grammar, lambdas included. Every first parse goes through here.
+pub(crate) fn parse_native(
+    sql: &str,
+) -> std::result::Result<
+    std::collections::VecDeque<deltalake::datafusion::sql::parser::Statement>,
+    deltalake::datafusion::error::DataFusionError,
+> {
+    deltalake::datafusion::sql::parser::DFParser::parse_sql_with_dialect(sql, &NativeDialect)
+}
+
 /// The dialect the fallback parse uses: Trino's spellings that are gated behind flags.
 ///
 /// Everything not listed here follows `sqlparser`'s defaults, which are the ones the

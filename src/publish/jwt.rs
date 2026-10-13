@@ -6,7 +6,7 @@
 //! rather than a code problem, and both are called out below.
 
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 /// Mint a bearer token for exactly this request URL.

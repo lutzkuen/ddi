@@ -112,9 +112,9 @@ impl Budget {
                      Kafka pipeline) before any pipeline gets a share. Raise [runtime] \
                      max_memory or the container's limit, or run fewer Kafka pipelines in this \
                      process.",
-                    bytesize::ByteSize(t),
-                    bytesize::ByteSize(reserved),
-                    bytesize::ByteSize(KAFKA_RESERVE_BYTES)
+                    bytesize::ByteSize(t).display().si(),
+                    bytesize::ByteSize(reserved).display().si(),
+                    bytesize::ByteSize(KAFKA_RESERVE_BYTES).display().si()
                 )));
             }
         }
@@ -348,6 +348,22 @@ impl Amplification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_in_messages_are_decimal_like_the_config_that_parses_them() {
+        // bytesize 2 prints binary by default ("3.8 MiB") while it still parses "4MB" as four
+        // million, so a message quoting a size in one and advising one in the other would not
+        // agree. Every size ddi prints goes through `.display().si()`.
+        assert_eq!(
+            bytesize::ByteSize(4_000_000).display().si().to_string(),
+            "4.0 MB"
+        );
+        assert_eq!(bytesize::ByteSize(999).display().si().to_string(), "999 B");
+        assert_eq!(
+            "4MB".parse::<bytesize::ByteSize>().unwrap().as_u64(),
+            4_000_000
+        );
+    }
 
     #[test]
     fn a_configured_budget_is_divided_between_the_pipelines_that_share_it() {

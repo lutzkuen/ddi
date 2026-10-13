@@ -53,6 +53,11 @@ fn schema() -> SchemaRef {
     ]))
 }
 
+/// Delta-rs 1.x records a timestamp's statistics to the millisecond, so rows a microsecond
+/// apart cannot be told apart by the log. These tests write their logical time in
+/// milliseconds: `ts` 5 is five milliseconds, whole ones, which the statistics keep exactly.
+const MS: i64 = 1_000;
+
 /// One Kafka message: its id, partition, offset, what it says, and when.
 #[derive(Clone, Copy, Debug)]
 struct Msg {
@@ -98,7 +103,7 @@ fn batch(rows: &[Msg]) -> RecordBatch {
                 rows.iter().map(|r| r.status).collect::<Vec<_>>(),
             )) as ArrayRef,
             Arc::new(TimestampMicrosecondArray::from(
-                rows.iter().map(|r| Some(r.ts)).collect::<Vec<_>>(),
+                rows.iter().map(|r| Some(r.ts * MS)).collect::<Vec<_>>(),
             )) as ArrayRef,
         ],
     )
@@ -394,8 +399,8 @@ async fn a_rebuild_keeps_a_lagging_partitions_late_rows() {
     assert_eq!(
         marks(&lake.dedup().await),
         [
-            ("0".to_string(), "1970-01-01T00:00:00.000011".to_string()),
-            ("1".to_string(), "1970-01-01T00:00:00.000001".to_string())
+            ("0".to_string(), "1970-01-01T00:00:00.011".to_string()),
+            ("1".to_string(), "1970-01-01T00:00:00.001".to_string())
         ]
     );
     assert_eq!(
@@ -881,7 +886,7 @@ async fn a_source_without_the_key_column_is_still_bounded() {
                     rows.iter().map(|r| r.1).collect::<Vec<i32>>(),
                 )) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(
-                    rows.iter().map(|r| r.2).collect::<Vec<i64>>(),
+                    rows.iter().map(|r| r.2 * MS).collect::<Vec<i64>>(),
                 )) as ArrayRef,
             ],
         )
@@ -1049,7 +1054,7 @@ async fn null_partitions_in_the_target_are_ignored_not_fatal() {
     .await;
     assert_eq!(
         marks(&lake.dedup().await),
-        [("0".to_string(), "1970-01-01T00:00:00.000010".to_string())],
+        [("0".to_string(), "1970-01-01T00:00:00.010".to_string())],
         "the row with no partition claims coverage for none"
     );
 }
@@ -1118,8 +1123,8 @@ async fn per_partition_maxima_are_carried_across_files() {
     assert_eq!(
         marks(&d),
         [
-            ("0".to_string(), "1970-01-01T00:00:00.000030".to_string()),
-            ("1".to_string(), "1970-01-01T00:00:00.000003".to_string())
+            ("0".to_string(), "1970-01-01T00:00:00.030".to_string()),
+            ("1".to_string(), "1970-01-01T00:00:00.003".to_string())
         ]
     );
     assert_eq!(d.boundary_key_count(), 2, "one key at each mark");

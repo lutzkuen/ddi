@@ -39,7 +39,7 @@ function spellings, lambdas, JSON), `dbt/` (manifest, `dbt check`/`convert`), `s
 `publish/`, `lookup.rs`, `trino.rs` (client), `kafka/` (consumer, decode, conform, start, step,
 rebalance, tools; design in `docs/kafka-design.md`, milestones M-1..M6 in its §13).
 `tests/` one file per topic; `tests/golden/` pins commit shapes; `tests/kafka_*.rs` are integration.
-Dependency sources for lookups: `~/.cargo/registry/src/*/deltalake-core-0.32.4` etc. (grep, do not guess).
+Dependency sources for lookups: `~/.cargo/registry/src/*/deltalake-core-1.1.1` etc. (grep, do not guess).
 
 ## Rules already settled
 - Scope: a PR ships what its issues ask. Add-ons that keep failing review go on their own branch.

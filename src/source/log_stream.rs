@@ -13,10 +13,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use deltalake::kernel::{Action, Add, Remove, StructType};
+use deltalake::kernel::{Action, Add, Remove, Snapshot, StructType};
 use deltalake::logstore::object_store::ObjectStoreExt;
 use deltalake::logstore::{commit_uri_from_version, get_actions, LogStore};
-use deltalake::{DeltaTable, DeltaTableConfig, DeltaTableError};
+use deltalake::{DeltaTable, DeltaTableError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -287,9 +287,10 @@ impl LogStreamBuilder {
         ts: chrono::DateTime<chrono::Utc>,
     ) -> Result<Self> {
         // Reuse the log store rather than rebuilding one from the URL: it already
-        // carries the object-store credentials, and a rebuilt one would not. Without
-        // files, for the reasons in `schema_at`: the answer is a version number.
-        let mut table = DeltaTable::new(self.log_store.clone(), without_files());
+        // carries the object-store credentials, and a rebuilt one would not. This one load
+        // does materialise the file list (delta-rs 1.x has no lazy timestamp lookup), but it
+        // runs once, when the stream starts, and never per batch.
+        let mut table = DeltaTable::new(self.log_store.clone());
         table.load_with_datetime(ts).await.map_err(Error::Delta)?;
         let v = table.version().unwrap_or(0);
         self.cursor = StreamCursor::at_version(v);
@@ -313,37 +314,28 @@ impl LogStreamBuilder {
     /// only meant something in the old one. `Pipeline::open` decides what to do about it. A
     /// table replaced in place keeps its log, and is read on; see [`Self::check_identity`].
     pub async fn latest_version(&mut self) -> Result<Version> {
-        let stale = match self.log_store.get_latest_version(self.version_floor).await {
+        match self.log_store.get_latest_version(self.version_floor).await {
             Ok(v) => {
                 // Forward only. A head below the floor cannot be reported by this call — the
                 // kernel errors instead — so this is just the ordinary advance.
                 self.version_floor = v;
                 return Ok(v);
             }
-            Err(DeltaTableError::InvalidVersion(_)) if self.version_floor != 0 => None,
+            Err(DeltaTableError::InvalidVersion(_)) if self.version_floor != 0 => {}
             // A floor of 0 that is rejected is the original bug's own shape, and there is no
             // newer floor to fall back to: the log does not reach back to 0 and this stream
             // has never seen a version that it does. Re-resolve from the log all the same —
             // it is one listing, and it is the difference between recovering and not.
-            Err(DeltaTableError::InvalidVersion(v)) => Some(v),
+            Err(DeltaTableError::InvalidVersion(_)) => {}
             Err(e) => return Err(Error::Delta(e)),
-        };
+        }
 
-        let mut table = DeltaTable::new(self.log_store.clone(), without_files());
-        table.load().await.map_err(Error::Delta)?;
-        let Some(resolved) = table.version() else {
-            // Never store this as a floor: 0 is exactly the value that does not work here,
-            // and storing it would pay for this re-resolve on every poll from now on while
-            // still failing.
-            return Err(Error::Other(format!(
-                "cannot resolve the head version of {}: its log does not reach back to \
-                 version {}, and reloading it produced no version at all. The table may be \
-                 mid-creation, or its log may have been truncated with no checkpoint left to \
-                 rebuild a snapshot from.",
-                self.log_store.root_url(),
-                stale.unwrap_or(self.version_floor),
-            )));
-        };
+        let head = log_state(&self.log_store, None)
+            .await
+            .map_err(Error::Delta)?;
+        // A kernel snapshot always has a version, so there is no "loaded but empty" case
+        // left to refuse here.
+        let resolved = head.version();
         if resolved < self.version_floor {
             return Err(self.replaced(format!(
                 "its head is now version {resolved}, below version {} which this stream had \
@@ -351,7 +343,8 @@ impl LogStreamBuilder {
                 self.version_floor
             )));
         }
-        self.check_identity(&table).await?;
+        self.check_identity(resolved, crate::lookup::metadata_id(head.metadata()))
+            .await?;
         debug!(
             stale_floor = self.version_floor,
             resolved, "source log no longer reaches the floor we held; re-resolved it"
@@ -571,7 +564,7 @@ impl LogStreamBuilder {
 
     /// Schema as of `version`, cached.
     ///
-    /// Loaded **without files**, and that is not only an optimisation. The schema lives in
+    /// Loaded **without files** ([`log_state`]), and that is not only an optimisation. The schema lives in
     /// the `metaData` action, so the list of live files is answering a question nobody
     /// asked — on a large source it is the whole file set of the table, rebuilt whenever a
     /// batch reaches a version this has not seen.
@@ -587,12 +580,16 @@ impl LogStreamBuilder {
         if let Some(s) = self.schema_cache.get(&version) {
             return Ok(s.clone());
         }
-        let mut table = DeltaTable::new(self.log_store.clone(), without_files());
-        table.load_version(version).await.map_err(Error::Delta)?;
+        let snapshot = log_state(&self.log_store, Some(version))
+            .await
+            .map_err(Error::Delta)?;
         // Loaded anyway, once per version a batch ends at, so this is where a table recreated
         // at this path and grown past the cursor is noticed — before any of its rows are.
-        self.check_identity(&table).await?;
-        let snapshot = table.snapshot().map_err(Error::Delta)?;
+        self.check_identity(
+            snapshot.version(),
+            crate::lookup::metadata_id(snapshot.metadata()),
+        )
+        .await?;
         let schema = snapshot.schema();
         // Keep the cache small; schema changes are rare and we only ever look backwards
         // by one version in practice.
@@ -618,17 +615,18 @@ impl LogStreamBuilder {
     /// starts from `starting_version`, met the same batch again: a pipeline that never moved.
     ///
     /// Only when both ids are known: a table without one says nothing either way.
-    async fn check_identity(&mut self, table: &DeltaTable) -> Result<()> {
-        let (Some(version), Some(now)) = (table.version(), crate::lookup::table_id(table)) else {
+    async fn check_identity(&mut self, version: Version, now: Option<String>) -> Result<()> {
+        let Some(now) = now else {
             return Ok(());
         };
         let Some((seen_at, was)) = &self.identity else {
             return Ok(());
         };
         if *was != now {
-            let mut then = DeltaTable::new(self.log_store.clone(), without_files());
-            then.load_version(*seen_at).await.map_err(Error::Delta)?;
-            if crate::lookup::table_id(&then).as_deref() != Some(was.as_str()) {
+            let then = log_state(&self.log_store, Some(*seen_at))
+                .await
+                .map_err(Error::Delta)?;
+            if crate::lookup::metadata_id(then.metadata()).as_deref() != Some(was.as_str()) {
                 return Err(self.replaced(format!("its table id changed from {was} to {now}")));
             }
             warn!(
@@ -671,9 +669,8 @@ pub(crate) async fn keeps_identity(table: &DeltaTable, version: Version, id: &st
     if table.version().is_none_or(|head| version > head) {
         return Ok(false);
     }
-    let mut then = DeltaTable::new(table.log_store(), without_files());
-    match then.load_version(version).await {
-        Ok(()) => Ok(crate::lookup::table_id(&then).as_deref() == Some(id)),
+    match log_state(&table.log_store(), Some(version)).await {
+        Ok(then) => Ok(crate::lookup::metadata_id(then.metadata()).as_deref() == Some(id)),
         Err(DeltaTableError::InvalidVersion(_) | DeltaTableError::NotATable(_)) => Ok(false),
         Err(DeltaTableError::ObjectStore {
             source: object_store::Error::NotFound { .. },
@@ -744,17 +741,21 @@ pub async fn earliest_readable_commit(
     Ok(oldest)
 }
 
-/// Load the log, but not the list of files it leaves live.
+/// The log's own state at `version` (the head for `None`): protocol, metadata and schema,
+/// never the list of live files.
 ///
-/// Both uses here ask the log a question about *itself* — what the schema was, which
-/// version a timestamp lands on — and neither needs to know which files survived. Saying so
-/// is what stops delta-rs materialising them, which costs a full replay of the file set and,
-/// on a table another engine has compacted, means parsing that engine's checkpoint.
-fn without_files() -> DeltaTableConfig {
-    DeltaTableConfig {
-        require_files: false,
-        ..Default::default()
-    }
+/// Every question this module asks of a past version is about the log itself — what the
+/// schema was, which table id it carried — and none needs to know which files survived.
+/// delta-rs 1.x's `DeltaTable::load*` always materialises that list (`EagerSnapshot`); on a
+/// large source it is the whole file set of the table, rebuilt for every version a batch ends
+/// at. The kernel snapshot underneath it is lazy, and is what `DeltaTable` would have built
+/// first, refresh included, so it fails the same ways.
+async fn log_state(
+    log_store: &Arc<dyn LogStore>,
+    version: Option<Version>,
+) -> std::result::Result<Snapshot, DeltaTableError> {
+    log_store.refresh().await?;
+    Snapshot::try_new(log_store.as_ref(), version).await
 }
 
 /// The `dataChange: true` `Add` actions of a commit, in log order.
@@ -826,6 +827,90 @@ mod tests {
             data_change,
             ..Default::default()
         })
+    }
+
+    /// A table at a temporary path with one appended row (version 1), its log store, and
+    /// the path of version 1's commit.
+    async fn table_with_one_append(dir: &std::path::Path) -> (DeltaTable, std::path::PathBuf) {
+        use deltalake::arrow::array::{ArrayRef, Int64Array};
+        use deltalake::arrow::record_batch::RecordBatch;
+        use deltalake::kernel::{DataType, PrimitiveType, StructField};
+        use deltalake::protocol::SaveMode;
+
+        let table = DeltaTable::try_from_url(
+            deltalake::table::builder::ensure_table_uri(dir.to_str().unwrap()).unwrap(),
+        )
+        .await
+        .unwrap()
+        .create()
+        .with_columns([StructField::new(
+            "id",
+            DataType::Primitive(PrimitiveType::Long),
+            true,
+        )])
+        .with_save_mode(SaveMode::ErrorIfExists)
+        .await
+        .unwrap();
+        let schema = std::sync::Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+            deltalake::arrow::datatypes::Field::new(
+                "id",
+                deltalake::arrow::datatypes::DataType::Int64,
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![std::sync::Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        )
+        .unwrap();
+        let table = table
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+        (table, dir.join(format!("_delta_log/{:020}.json", 1)))
+    }
+
+    /// The schema a batch is read with comes from the log's `metaData`, and asking for it
+    /// must not replay the file list: delta-rs 1.x's `DeltaTable::load_version` always
+    /// does, which on a large source is the whole table's file set per batch. An `add` that
+    /// only a file replay parses (its `size` is not a number) tells the two apart: the
+    /// question is answered all the same.
+    #[tokio::test]
+    async fn the_schema_at_a_version_does_not_replay_the_file_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let (table, commit) = table_with_one_append(dir.path()).await;
+        let mut builder = LogStreamBuilder::new(&table);
+
+        let text = std::fs::read_to_string(&commit).unwrap();
+        let mut lines = Vec::new();
+        for line in text.lines() {
+            let mut action: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(add) = action.get_mut("add") {
+                add["size"] = serde_json::json!("not a size");
+            }
+            lines.push(action.to_string());
+        }
+        std::fs::write(&commit, lines.join("\n") + "\n").unwrap();
+
+        // The fixture must break what it is guarding against.
+        let mut eager = DeltaTable::new(table.log_store());
+        assert!(
+            eager.load_version(1).await.is_err(),
+            "a file replay must trip over the add"
+        );
+
+        let schema = builder
+            .schema_at(1)
+            .await
+            .expect("the schema needs no files");
+        assert!(schema.field("id").is_some());
+        assert_eq!(builder.latest_version().await.unwrap(), 1);
+        assert!(
+            keeps_identity(&table, 1, &crate::lookup::table_id(&table).unwrap())
+                .await
+                .unwrap()
+        );
     }
 
     #[test]

@@ -988,9 +988,10 @@ async fn an_unbounded_rescan_is_still_correct_when_statistics_are_missing() {
     assert_eq!(start, 0, "no usable statistics must mean a full rescan");
 }
 
-/// Rewrite the `maxValues` of `column` in commit `version`'s adds the way Spark writes them:
-/// truncated to the millisecond, which the protocol allows. delta-rs keeps every digit.
-fn truncate_timestamp_max_to_millis(table_path: &str, version: u64, column: &str) {
+/// Set the `maxValues` of `column` in commit `version`'s adds to the spelling a given writer
+/// uses: Spark truncates to the millisecond, which the protocol allows, and older delta-rs
+/// kept every digit.
+fn set_timestamp_max(table_path: &str, version: u64, column: &str, max: &str) {
     let commit = format!("{table_path}/_delta_log/{version:020}.json");
     let mut lines = Vec::new();
     for line in std::fs::read_to_string(&commit).unwrap().lines() {
@@ -998,9 +999,7 @@ fn truncate_timestamp_max_to_millis(table_path: &str, version: u64, column: &str
         if let Some(add) = action.get_mut("add") {
             let mut stats: serde_json::Value =
                 serde_json::from_str(add["stats"].as_str().unwrap()).unwrap();
-            let max = stats["maxValues"][column].as_str().unwrap().to_string();
-            let (whole, fraction) = max.split_once('.').unwrap();
-            stats["maxValues"][column] = serde_json::json!(format!("{whole}.{}Z", &fraction[..3]));
+            stats["maxValues"][column] = serde_json::json!(max);
             add["stats"] = serde_json::json!(stats.to_string());
         }
         lines.push(action.to_string());
@@ -1021,7 +1020,21 @@ async fn a_rescan_does_not_skip_a_commit_whose_timestamp_max_was_truncated_to_th
     for (id, ts) in [(1, W - 3_600_000_000), (2, W), (3, W + 700)] {
         lake.arrive(&[Order { id, ts }]).await; // versions 1, 2, 3
     }
-    truncate_timestamp_max_to_millis(&lake.raw, 3, DEFAULT_TIMESTAMP_COLUMN);
+    // Delta-rs 1.x truncates every timestamp maximum to the millisecond itself, so the two
+    // spellings this test is about are written by hand: Spark's, truncated, for the commit
+    // under test, and a writer that keeps the microsecond for the one the watermark names.
+    set_timestamp_max(
+        &lake.raw,
+        2,
+        DEFAULT_TIMESTAMP_COLUMN,
+        "2026-09-25T10:00:00.000200Z",
+    );
+    set_timestamp_max(
+        &lake.raw,
+        3,
+        DEFAULT_TIMESTAMP_COLUMN,
+        "2026-09-25T10:00:00.000Z",
+    );
 
     let source = open_table(ensure_table_uri(&lake.raw).unwrap())
         .await

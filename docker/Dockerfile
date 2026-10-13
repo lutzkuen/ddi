@@ -31,9 +31,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Declared after the layer above on purpose: every RUN after an ARG has it in its environment,
 # which is part of that RUN's cache key, so declared earlier it would split the shared layer.
 ARG DDI_FEATURES=kafka
-# libclang-dev, for a `kafka` build only: the zstd-sys this tree locks (2.0.16) turns on
-# bindgen by default, and rdkafka-sys asks for its defaults. A Delta-only build needs none of
-# its ~65 MB (432 MB installed) of LLVM.
+# libclang-dev, for a `kafka` build only. It was needed because zstd-sys 2.0.16 turned on
+# bindgen by default and rdkafka-sys asks for its defaults; the 2.1.1 this tree now locks has
+# no bindgen, so nothing here needs it any more. Kept until an image built without it has
+# been seen to pass, and then it can go. A Delta-only build needs none of its ~65 MB (432 MB
+# installed) of LLVM.
 RUN case " $DDI_FEATURES " in \
         *kafka*) apt-get update \
             && apt-get install -y --no-install-recommends libclang-dev \
