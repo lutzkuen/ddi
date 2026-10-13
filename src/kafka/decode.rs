@@ -322,8 +322,9 @@ pub struct Undecodable {
     /// The writer schema id its header named, when it had one.
     pub schema_id: Option<u32>,
     pub reason: String,
-    /// Whether decoding it again could ever succeed: false only for a schema id the registry
-    /// did not know, which may be registered later.
+    /// Whether decoding it again would fail the same way: false where it could succeed (a
+    /// schema id the registry did not know, which may be registered later, or an internal
+    /// fault such as a decoder that could not be built).
     pub deterministic: bool,
 }
 
@@ -730,12 +731,15 @@ impl Ctx<'_> {
         // The decoder whose flush of the whole chunk failed may hold anything.
         let mut clean = false;
         for m in chunk {
+            // A decoder that cannot be built is an internal fault, not this message's.
+            let mut internal = false;
             let one = match clean {
                 true => Ok(()),
                 false => self
                     .factory
                     .build(self.id, &group.schema.schema)
-                    .map(|d| group.decoder = d),
+                    .map(|d| group.decoder = d)
+                    .inspect_err(|_| internal = true),
             }
             .and_then(|()| {
                 clean = false;
@@ -753,6 +757,10 @@ impl Ctx<'_> {
                 Ok(b) => {
                     rows.push(b);
                     kept.push(m);
+                }
+                Err(e) if internal => {
+                    let reason = format!("cannot decode writer schema {}: {e}", self.id);
+                    out.reject(m, Some(self.id), reason, false)
                 }
                 Err(e) => {
                     let reason = format!("cannot turn the decoded record into Arrow: {e}");
@@ -1391,16 +1399,23 @@ fn named_fixed(schema: &str) -> HashMap<(String, Option<String>), (u64, Option<S
 fn zero_width(t: &DataType) -> bool {
     match t {
         DataType::Null | DataType::FixedSizeBinary(0) => true,
-        DataType::Struct(fs) => fs.iter().all(|f| zero_width(f.data_type())),
+        DataType::Struct(fs) => fs.iter().all(|f| zero_width_field(f)),
         _ => false,
     }
+}
+
+/// Whether a value of this field takes no bytes: its type takes none, and it is not a
+/// `["null", T]` union, which arrow-avro gives as a nullable `T` and whose branch index takes
+/// a byte.
+fn zero_width_field(f: &Field) -> bool {
+    zero_width(f.data_type()) && !(f.is_nullable() && *f.data_type() != DataType::Null)
 }
 
 /// The first array whose items take no bytes on the wire, by its path.
 fn zero_width_items(fields: &Fields) -> Option<String> {
     fn find(t: &DataType, path: String) -> Option<String> {
         match t {
-            DataType::List(item) if zero_width(item.data_type()) => Some(path),
+            DataType::List(item) if zero_width_field(item) => Some(path),
             DataType::List(item) => find(item.data_type(), format!("{path}[]")),
             DataType::Struct(fs) => fs
                 .iter()

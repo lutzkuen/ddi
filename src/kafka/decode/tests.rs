@@ -2135,6 +2135,33 @@ async fn a_record_of_zero_bytes_is_undecodable_with_its_reason() {
     assert!(raw.batch_is_empty(), "no row from a header alone");
 }
 
+/// A `["null", T]` union of a type that takes no bytes (here `fixed(0)`) takes the byte of its
+/// branch index: arrow-avro gives it as a nullable `T`, and a record of only such fields, or an
+/// array of such items, decodes one row per message like any other. (A record without fields
+/// cannot be built into Arrow by arrow-avro at all, nullable or not.)
+#[tokio::test]
+async fn a_nullable_empty_type_takes_its_union_byte() {
+    const OPTIONAL: &str = r#"{"type":"record","name":"Opt","fields":[
+        {"name":"f","type":["null",{"type":"fixed","name":"F","size":0}]},
+        {"name":"fs","type":{"type":"array","items":["null","F"]}}]}"#;
+    let mut d = decoder(Schemas::with(&[(16, OPTIONAL)]));
+    // f = F(""), fs = [F(""), null]; then f = null, fs = [].
+    let bodies: [&[u8]; 2] = [&[2, 4, 2, 0, 0], &[0, 0]];
+    for (o, body) in bodies.iter().enumerate() {
+        let mut m = vec![0, 0, 0, 0, 16];
+        m.extend_from_slice(body);
+        d.feed(message(o as i64, Some(m))).await.unwrap();
+    }
+    let out = d.finish().unwrap();
+    assert!(out.undecodable.is_empty(), "{:?}", out.undecodable);
+    let b = deltalake::arrow::compute::concat_batches(&out.batches[0].schema(), &out.batches).unwrap();
+    assert_eq!(i64s(&b, "kafka_offset"), [0, 1]);
+    let f = column(&b, "f");
+    assert_eq!((f.is_valid(0), f.is_valid(1)), (true, false));
+    let fs = column(&b, "fs").as_list::<i32>();
+    assert_eq!((fs.value_length(0), fs.value_length(1)), (2, 0));
+}
+
 // --------------------------------------------------------------------------- helpers
 
 /// The schema with every `logicalType` removed: the form its values travel in.
