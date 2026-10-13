@@ -447,8 +447,12 @@ pub fn valid_name(name: &str) -> bool {
 
 /// A Delta table's protocol identity, used to make lookup provenance auditable.
 pub fn table_id(table: &DeltaTable) -> Option<String> {
-    let snapshot = table.snapshot().ok()?;
-    serde_json::to_value(snapshot.metadata())
+    metadata_id(table.snapshot().ok()?.metadata())
+}
+
+/// The `id` of a `metaData` action, however it was read.
+pub(crate) fn metadata_id(metadata: &impl serde::Serialize) -> Option<String> {
+    serde_json::to_value(metadata)
         .ok()?
         .get("id")?
         .as_str()
