@@ -206,6 +206,18 @@ async fn kafka_kill_mid_batch() {
         })
     };
 
+    // How long one run takes on this machine, from an unkilled run over a backlog of the
+    // producer's making. The kills below are spread over that span, not over a fixed one:
+    // where a run takes longer than the fixed span did (a slow runner), every kill landed
+    // before the first upload and none could orphan a file.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let started = std::time::Instant::now();
+    let (ok, out) = once(&config).await;
+    assert!(ok, "{out}");
+    let span = started
+        .elapsed()
+        .clamp(Duration::from_secs(1), Duration::from_secs(20));
+
     let mut killed = 0;
     let mut i = 0u64;
     // Thirty kills, and on past them until one has landed between an upload and its commit,
@@ -225,7 +237,10 @@ async fn kafka_kill_mid_batch() {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let after = Duration::from_millis(250 + (i * 397) % 1400);
+        // The golden-ratio fraction of the span: the kills never repeat a point and spread
+        // evenly however many runs it takes.
+        let after =
+            Duration::from_millis(150) + span.mul_f64((i as f64 * 0.618_033_988_7).fract() * 1.1);
         tokio::select! {
             status = child.wait() => assert!(status.unwrap().success(), "ddi once failed"),
             _ = tokio::time::sleep(after) => {
