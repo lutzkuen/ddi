@@ -2044,6 +2044,7 @@ async fn huge_length_prefix_errors_without_allocation() {
         framed(14, &physical(HOSTILE), row)
     };
 
+    alloc_probe::ignore_panic_hook();
     // The probe sees an allocation of the size this test is about.
     let (_, largest) = alloc_probe::largest_during(|| vec![0u8; 4 << 20]);
     assert!(
@@ -2249,14 +2250,34 @@ mod alloc_probe {
 
     thread_local! {
         static LARGEST: Cell<usize> = const { Cell::new(0) };
+        static IN_PANIC_HOOK: Cell<bool> = const { Cell::new(false) };
     }
 
     fn note(size: usize) {
+        if IN_PANIC_HOOK.try_with(Cell::get).unwrap_or(false) {
+            return;
+        }
         // Not during the thread's teardown, when the slot may be gone.
         let _ = LARGEST.try_with(|l| {
             if size > l.get() {
                 l.set(size)
             }
+        });
+    }
+
+    /// Leave out what the panic hook allocates: a panic the decoder catches is reported by the
+    /// hook, which with `RUST_BACKTRACE=1` (as in CI) captures and symbolises a backtrace, so
+    /// megabytes the first time. That is the test harness's, not the decoder's. The hook wraps
+    /// the one before it, which still runs; installed once per process.
+    pub fn ignore_panic_hook() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let _ = IN_PANIC_HOOK.try_with(|p| p.set(true));
+                previous(info);
+                let _ = IN_PANIC_HOOK.try_with(|p| p.set(false));
+            }));
         });
     }
 
