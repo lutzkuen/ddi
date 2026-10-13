@@ -118,6 +118,35 @@ async fn plan_names_the_partition_a_takeover_must_acknowledge() {
     let (ok, out) = run(&config, &["plan"]).await;
     assert!(ok, "{out}");
     assert!(out.contains("acknowledged at 0"), "{out}");
+
+    // Without `kdi_compat`, the open of kafka-delta-ingest's table refuses, and so does the plan.
+    let unset = f.toml(
+        "tools",
+        "",
+        "starting_offsets = { \"2\" = 0, \"*\" = \"earliest\" }",
+    );
+    let plan = plan::plan(&resolve(&unset, false)).await.unwrap();
+    assert!(
+        plan.blocking.iter().any(|b| b.contains("kdi_compat")),
+        "{:?}",
+        plan.blocking
+    );
+}
+
+/// A new pipeline on an empty target starts where `starting_offsets` says, also on a
+/// partition whose oldest messages were trimmed: the plan does not block what the open starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Redpanda; set DDI_TEST_KAFKA"]
+async fn plan_lets_a_fresh_pipeline_start_past_trimmed_messages() {
+    let f = Fixture::new(1).await;
+    let id = register(&f.subject(), EVENT_V1).await;
+    produce(&f, id, 0, 10).await;
+    trim(&f.topic, 0, 5).await;
+    let plan = plan::plan(&resolve(&f.toml("tools", "", ""), false))
+        .await
+        .unwrap();
+    assert_eq!(plan.era, Era::Fresh);
+    assert!(!plan.is_blocked(), "{:?}", plan.blocking);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

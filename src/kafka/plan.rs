@@ -92,9 +92,10 @@ pub async fn plan(cfg: &ResolvedPipeline) -> Result<Plan> {
         .iter()
         .map(|p| (p.partition, (p.stored, p.high)))
         .collect();
-    // Whether the target may hold this topic's rows: the same question `open` asks.
-    let holds_rows = table.files > 0;
-    let acknowledged: BTreeSet<i32> = configured.keys().copied().collect();
+    // Whether the target may hold this topic's rows: the same question `open` asks, the
+    // same way.
+    let (data_files, holds_rows) =
+        super::start::target_rows(&view.target, &k.metadata_prefix, &k.topic)?;
     let takeover = fence::takeover_check(
         &cfg.app_id,
         view.era,
@@ -104,19 +105,43 @@ pub async fn plan(cfg: &ResolvedPipeline) -> Result<Plan> {
     )
     .err()
     .map(|e| e.to_string());
-    let still_open = fence::takeover_check(
-        &cfg.app_id,
-        view.era,
+    // What the open decides from these facts (§4.4 steps 3, 6, 7, 8): the typo guard, the
+    // takeover check, the `kdi_compat` refusal and the fresh baseline, by the open's own code.
+    let app_ids = if view.era == Era::Fresh && data_files > 0 && !k.starting_offsets_explicit {
+        fence::recent_txn_app_ids(&view.target, super::start::TYPO_GUARD_COMMITS).await?
+    } else {
+        BTreeSet::new()
+    };
+    let stored: BTreeMap<i32, Option<i64>> = view
+        .partitions
+        .iter()
+        .map(|p| (p.partition, p.stored))
+        .collect();
+    let watermarks: BTreeMap<i32, (i64, i64)> = view
+        .partitions
+        .iter()
+        .map(|p| (p.partition, (p.low, p.high)))
+        .collect();
+    let open = super::start::plan_open(&super::start::OpenFacts {
+        app_id: &cfg.app_id,
+        topic: &k.topic,
+        target_uri: &cfg.target_uri,
+        stored: &stored,
+        watermarks: &watermarks,
+        era: view.era,
+        data_files,
         holds_rows,
-        &by_partition,
-        &acknowledged,
-    )
-    .err();
+        policy: &k.starting_offsets,
+        explicit: k.starting_offsets_explicit,
+        kdi_compat: k.kdi_compat,
+        neighbours: &k.neighbours,
+        app_ids: &app_ids,
+    });
 
     let mut blocking = Vec::new();
     let mut notes = Vec::new();
-    if let Some(e) = &still_open {
-        blocking.push(format!("the takeover check refuses the open: {e}"));
+    if let Err(e) = &open {
+        blocking.push(format!("the open refuses: {e}"));
     }
     if let Err(e) = fence::refuse_txn_retention(&view.target) {
         blocking.push(e.to_string());
@@ -143,7 +168,12 @@ pub async fn plan(cfg: &ResolvedPipeline) -> Result<Plan> {
                     p.low,
                     p.high
                 ));
-            } else if p.verdict() == "NO_TXN->blocked" && configured.is_none() {
+            } else if p.verdict() == "NO_TXN->blocked"
+                && configured.is_none()
+                && view.era == Era::Ddi
+            {
+                // In a fresh era the open's baseline starts every partition, and in
+                // kafka-delta-ingest's the takeover check above speaks for it.
                 blocking.push(format!(
                     "partition {} has no offset and the topic starts at {}: messages ddi never \
                      read were trimmed",
