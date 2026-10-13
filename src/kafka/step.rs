@@ -586,7 +586,8 @@ impl Pipeline {
                 src.buf.take(p, mark, decode::raw_len(&message), now);
                 // Awaited to the end: `feed` owns the message while it waits on the registry,
                 // and a dropped future would drop it (§5.4).
-                if let Err(NotFed { error, message }) = src.decoder_mut().feed(message).await {
+                if let Err(not_fed) = src.decoder_mut().feed(message).await {
+                    let NotFed { error, message } = *not_fed;
                     self.stall(message, error, None)?;
                 }
             }
@@ -655,7 +656,10 @@ impl Pipeline {
                 m.schema_conflict.store(0, Ordering::Relaxed);
                 Ok(())
             }
-            Err(NotFed { error, message }) => self.stall(message, error, Some(stalled.backoff)),
+            Err(not_fed) => {
+                let NotFed { error, message } = *not_fed;
+                self.stall(message, error, Some(stalled.backoff))
+            }
         }
     }
 

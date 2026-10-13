@@ -448,7 +448,7 @@ impl KafkaDecoder {
     /// nor handed back, and a commit after that would skip its offset. So await it to the end,
     /// or keep a copy and feed that again: nothing of the decoder changes before the writer
     /// schema is had, so feeding the copy decodes it as if for the first time.
-    pub async fn feed(&mut self, message: KafkaMessage) -> std::result::Result<(), NotFed> {
+    pub async fn feed(&mut self, message: KafkaMessage) -> std::result::Result<(), Box<NotFed>> {
         let Some(value) = message.value.as_deref() else {
             self.out.tombstones += 1;
             return Ok(());
@@ -462,7 +462,7 @@ impl KafkaDecoder {
         };
         if !self.groups.contains_key(&id) {
             match self.schemas.writer_schema(id).await {
-                Err(error) => return Err(NotFed { error, message }),
+                Err(error) => return Err(Box::new(NotFed { error, message })),
                 Ok(Lookup::Undecodable {
                     reason,
                     deterministic,
@@ -490,7 +490,7 @@ impl KafkaDecoder {
                     field: field.clone(),
                     prefix: self.prefix.clone(),
                 };
-                return Err(NotFed { error, message });
+                return Err(Box::new(NotFed { error, message }));
             }
             Group::Ready(group) => {
                 let ctx = Ctx {

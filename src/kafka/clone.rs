@@ -11,8 +11,8 @@ use deltalake::{ensure_table_uri, DeltaTable};
 use crate::config::ResolvedPipeline;
 use crate::error::{Error, Result};
 
-/// Properties that belong to the source table and are not copied: its column mapping state
-/// (the clone has none, so a mapped source is refused), and anything that names its id.
+/// Properties that belong to the source table and are not copied: its column mapping state.
+/// The clone has none; a mapped source is refused before this (`refuse_unwritable_protocol`).
 const NOT_COPIED: [&str; 2] = [
     "delta.columnMapping.maxColumnId",
     "delta.columnMapping.mode",

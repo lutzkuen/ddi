@@ -207,7 +207,10 @@ pub(crate) enum Decoder {
 }
 
 impl Decoder {
-    pub(crate) async fn feed(&mut self, message: KafkaMessage) -> std::result::Result<(), NotFed> {
+    pub(crate) async fn feed(
+        &mut self,
+        message: KafkaMessage,
+    ) -> std::result::Result<(), Box<NotFed>> {
         match self {
             Self::Avro(d) => d.feed(message).await,
             Self::Raw(d) => {

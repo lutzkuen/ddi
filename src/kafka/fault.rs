@@ -70,6 +70,8 @@ mod active {
         let Some(n) = arg("fail_seek").and_then(|a| a.parse::<u32>().ok()) else {
             return false;
         };
+        // `fetch_update` is `try_update` from Rust 1.99, after the crate's rust-version.
+        #[allow(deprecated)]
         let fired = FAILED
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |f| {
                 (f < n).then_some(f + 1)

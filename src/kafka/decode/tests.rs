@@ -1556,7 +1556,7 @@ async fn metadata_prefix_collision_blocks() {
     let NotFed {
         error,
         message: back,
-    } = d.feed(m.clone()).await.unwrap_err();
+    } = *d.feed(m.clone()).await.unwrap_err();
     assert_eq!(back, m, "the message is handed back untouched");
     assert!(
         matches!(&error, Error::KafkaMetadataCollision { schema_id: 8, field, prefix } if field == "kafka_offset" && prefix == "kafka_"),
@@ -1584,7 +1584,7 @@ async fn a_registry_outage_hands_the_message_back() {
     schemas.down.store(true, Ordering::SeqCst);
     let mut d = decoder(schemas.clone());
     let m = message(0, Some(framed(1, V1, v1(0, "a"))));
-    let NotFed { error, message } = d.feed(m.clone()).await.unwrap_err();
+    let NotFed { error, message } = *d.feed(m.clone()).await.unwrap_err();
     assert_eq!(message, m);
     assert_eq!(error.kafka_class(), KafkaClass::Transient);
     assert!(d.is_empty());

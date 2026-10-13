@@ -182,9 +182,13 @@ pub async fn set_offsets(cfg: &ResolvedPipeline, request: &Request) -> Result<Ou
         Error::Other("internal: set-offsets on a pipeline that is not Kafka".into())
     })?;
     let mut last = None;
+    // A move backwards seen by any attempt: a commit reported as a conflict may have landed,
+    // and the next attempt then finds the partition already there and decides no move.
+    let mut backward = false;
     for attempt in 0..ATTEMPTS {
         let view = tools::view(cfg).await?;
         let decision = decide(&view.partitions, view.era, request)?;
+        backward |= decision.backward;
         let schema = view
             .target
             .snapshot()
@@ -210,7 +214,7 @@ pub async fn set_offsets(cfg: &ResolvedPipeline, request: &Request) -> Result<Ou
             Ok(table) => {
                 let version = table.version().map_or(-1, |v| v as i64);
                 let mut checkpointed = false;
-                if decision.backward {
+                if backward {
                     deltalake::checkpoints::create_checkpoint(&table, None)
                         .await
                         .map_err(Error::Delta)?;
