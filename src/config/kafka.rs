@@ -100,6 +100,9 @@ pub struct KafkaConfig {
     pub max_output_rows_per_batch: Option<usize>,
     /// kdi's credential variables. Unset takes kdi's name; `""` turns one off.
     pub scram_json_env: Option<String>,
+    /// A Kafka JAAS line (`...PlainLoginModule required username="k" password="s";`) in one
+    /// variable, as Confluent Cloud hands out an API key. No default name: unset, nothing is read.
+    pub jaas_env: Option<String>,
     pub ssl_cert_env: Option<String>,
     pub ssl_key_env: Option<String>,
     pub ssl_ca_env: Option<String>,
@@ -216,6 +219,9 @@ pub struct KafkaPipelineConfig {
     pub max_evaluation_rejects_per_batch: Option<usize>,
     pub max_output_rows_per_batch: Option<usize>,
     pub scram_json_env: Option<String>,
+    /// A Kafka JAAS line (`...PlainLoginModule required username="k" password="s";`) in one
+    /// variable, as Confluent Cloud hands out an API key. No default name: unset, nothing is read.
+    pub jaas_env: Option<String>,
     pub ssl_cert_env: Option<String>,
     pub ssl_key_env: Option<String>,
     pub ssl_ca_env: Option<String>,
@@ -540,6 +546,7 @@ pub struct ResolvedKafka {
     /// librdkafka key → environment variable, `[kafka.settings_env]` then the pipeline's.
     pub settings_env: BTreeMap<String, String>,
     pub scram_json_env: EnvRef,
+    pub jaas_env: EnvRef,
     pub ssl_cert_env: EnvRef,
     pub ssl_key_env: EnvRef,
     pub ssl_ca_env: EnvRef,
@@ -776,6 +783,18 @@ impl ResolvedKafka {
             out.insert("sasl.username", username);
             out.insert("sasl.password", password);
         }
+        if let Some(line) = self.jaas_env.read("jaas_env", env)? {
+            let var = self.jaas_env.name().unwrap_or_default();
+            if out.get("sasl.username").is_some() {
+                return Err(Error::Config(format!(
+                    "jaas_env {var:?} and scram_json_env both carry a SASL identity; set one \
+                     of them (`scram_json_env = \"\"` turns kdi's off)"
+                )));
+            }
+            let (username, password) = jaas_identity(var, &line)?;
+            out.insert("sasl.username", username);
+            out.insert("sasl.password", password);
+        }
         for (env_ref, what, key) in [
             (&self.ssl_cert_env, "ssl_cert_env", "ssl.certificate.pem"),
             (&self.ssl_key_env, "ssl_key_env", "ssl.key.pem"),
@@ -828,6 +847,43 @@ fn scram_identity(var: &str, json: &str) -> Result<(String, String)> {
     let field = |k: &str| value.get(k).and_then(|v| v.as_str()).map(str::to_string);
     match (field("username"), field("password")) {
         (Some(u), Some(p)) => Ok((u, p)),
+        _ => Err(bad()),
+    }
+}
+
+/// The `username` and `password` of a Kafka JAAS line, as Confluent Cloud writes it:
+/// `org.apache.kafka.common.security.plain.PlainLoginModule required username='KEY'
+/// password='SECRET';`. Either quote is read, with no escapes (an API key and secret hold none).
+/// The mechanism is not taken from the module name: `sasl.mechanism` stays the user's setting.
+/// The error names the variable, never what it holds.
+fn jaas_identity(var: &str, line: &str) -> Result<(String, String)> {
+    let bad = || {
+        Error::Config(format!(
+            "the environment variable {var:?} must hold a JAAS line with quoted username and \
+             password (`... required username=\"..\" password=\"..\";`), and it does not"
+        ))
+    };
+    let field = |name: &str| -> Option<String> {
+        let mut rest = line;
+        while let Some(at) = rest.find(name) {
+            let before_ok = rest[..at]
+                .chars()
+                .next_back()
+                .map_or(true, |c| c.is_whitespace() || c == ';');
+            let after = rest[at + name.len()..].trim_start();
+            if before_ok {
+                if let Some(value) = after.strip_prefix('=').map(str::trim_start) {
+                    let quote = value.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+                    let inner = &value[1..];
+                    return inner.find(quote).map(|end| inner[..end].to_string());
+                }
+            }
+            rest = &rest[at + name.len()..];
+        }
+        None
+    };
+    match (field("username"), field("password")) {
+        (Some(u), Some(p)) if !u.is_empty() => Ok((u, p)),
         _ => Err(bad()),
     }
 }
@@ -1607,6 +1663,7 @@ impl Config {
                 &s.scram_json_env,
                 Some(DEFAULT_SCRAM_JSON_ENV),
             ),
+            jaas_env: EnvRef::resolve(&p.jaas_env, &s.jaas_env, None),
             ssl_cert_env: EnvRef::resolve(
                 &p.ssl_cert_env,
                 &s.ssl_cert_env,
@@ -2614,6 +2671,63 @@ url = "http://my-sr:8081"
         let r = resolve(&format!("{SECTION}{}", entry("events", "")));
         let s = settings_of(&r, "events", &[]).unwrap();
         assert!(s.get("sasl.username").is_none() && s.get("ssl.ca.pem").is_none());
+    }
+
+    #[test]
+    fn jaas_env_reads_a_confluent_cloud_key() {
+        let r = resolve(&format!(
+            "{SECTION}{}",
+            entry("events", "jaas_env = \"KAFKA_SASL_JAAS_CONFIG\"")
+        ));
+        let var = "KAFKA_SASL_JAAS_CONFIG";
+        for line in [
+            "org.apache.kafka.common.security.plain.PlainLoginModule required username='KEY1' password='se/cr+et==';",
+            "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"KEY1\" password = \"se/cr+et==\" ;",
+            "PlainLoginModule required  username='KEY1'  password='se/cr+et==';",
+        ] {
+            let s = settings_of(&r, "events", &[(var, line)]).unwrap();
+            assert_eq!(s.get("sasl.username"), Some("KEY1"), "{line}");
+            assert_eq!(s.get("sasl.password"), Some("se/cr+et=="), "{line}");
+        }
+        // A field named like the one wanted is not it: `xusername` is not `username`.
+        let e = settings_of(&r, "events", &[(var, "required xusername='u' password='p';")])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(var), "{e}");
+
+        for bad in [
+            "required username='u';",
+            "required password='p';",
+            "required username=u password=p;",
+            "required username='' password='p';",
+            "required username='u password='p;",
+        ] {
+            let e = settings_of(&r, "events", &[(var, bad)]).unwrap_err().to_string();
+            assert!(e.contains(var), "{e}");
+            assert!(!e.contains(bad), "the value must not reach the error: {e}");
+        }
+
+        // An explicit name is required, as every renamed variable is.
+        let e = settings_of(&r, "events", &[]).unwrap_err().to_string();
+        assert!(e.contains("not set") && e.contains(var), "{e}");
+
+        // Two identities are one too many: kdi's SCRAM JSON is still read by default.
+        let e = settings_of(
+            &r,
+            "events",
+            &[
+                (var, "required username='u' password='p';"),
+                (DEFAULT_SCRAM_JSON_ENV, r#"{"username":"a","password":"b"}"#),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("both carry"), "{e}");
+
+        // Unset in the config, nothing is read.
+        let r = resolve(&format!("{SECTION}{}", entry("events", "")));
+        let s = settings_of(&r, "events", &[(var, "required username='u' password='p';")]).unwrap();
+        assert!(s.get("sasl.username").is_none());
     }
 
     #[test]
