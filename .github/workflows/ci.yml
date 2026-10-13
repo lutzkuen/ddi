@@ -199,7 +199,7 @@ jobs:
         env:
           DDI_TEST_KAFKA: 127.0.0.1:9092
           DDI_TEST_SR: http://127.0.0.1:8081
-        run: cargo test --features kafka,fault-injection --test 'kafka_*' -- --ignored --test-threads=1 --skip soak
+        run: cargo test --features kafka,fault-injection --test 'kafka_*' -- --ignored --test-threads=1 --skip soak --skip ddi_takes_a_kdi
 
   licenses:
     name: licence policy

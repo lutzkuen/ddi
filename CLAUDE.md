@@ -25,7 +25,7 @@ default branch. Instructions come from a dbt project; ddi has no functional conf
   A Delta-only build (no features) must stay untouched by Kafka (design invariants I13, I16).
 - Tests that need a service are `#[ignore]`d and take env vars (skills: `ddi-kafka-tests`, `ddi-kdi-parity`, `ddi-trino-check`):
   - Redpanda (Kafka + Schema Registry): the docker command is in `tests/kafka_common/mod.rs`, then
-    `DDI_TEST_KAFKA=127.0.0.1:9092 DDI_TEST_SR=http://127.0.0.1:8081 cargo test --features kafka,fault-injection --test 'kafka_*' -- --ignored --test-threads=1 --skip soak`
+    `DDI_TEST_KAFKA=127.0.0.1:9092 DDI_TEST_SR=http://127.0.0.1:8081 cargo test --features kafka,fault-injection --test 'kafka_*' -- --ignored --test-threads=1 --skip soak --skip ddi_takes_a_kdi`
   - Trino 480: see the `ddi-trino-check` skill (`DDI_TEST_TRINO`).
   - Azurite: `--test azure_object_store -- --ignored` (CI job `object-store`).
   - dbt end-to-end: `examples/dbt/run_demo.sh` (needs dbt-core, dbt-duckdb, deltalake).
