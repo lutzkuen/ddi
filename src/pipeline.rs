@@ -1741,6 +1741,7 @@ fn is_commit_conflict(e: &Error) -> bool {
     )
 }
 
+#[allow(deprecated)] // parquet 59.2 deprecates ParquetObjectReader; replacing it is its own change
 /// Did this fail because the object store does not have the file?
 ///
 /// The typed cause survives the read: `object_store` is what every backend funnels its

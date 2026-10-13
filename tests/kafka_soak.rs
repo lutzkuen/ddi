@@ -199,7 +199,7 @@ group_id = "g-{app_id}"
             }
             worst[i] = worst[i].max(last[i].1.elapsed());
         }
-        if samples % 20 == 0 {
+        if samples.is_multiple_of(20) {
             let mut line = format!(
                 "t={:>5}s produced={}",
                 began.elapsed().as_secs(),

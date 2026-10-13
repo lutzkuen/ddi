@@ -809,16 +809,10 @@ impl Metrics {
              # HELP ddi_spill_limit_bytes The budget those two are measured against. Never \
              zero: unset means DataFusion's own 100GB.\n\
              # TYPE ddi_spill_limit_bytes gauge\n\
-             ddi_spill_limit_bytes {}\n\
-             # HELP ddi_spill_stranded_bytes_total Spill bytes abandoned because DataFusion \
-             left them charged after a capacity failure. Above zero means this process has hit \
-             its spill cap and recovered; it does not mean anything is wrong now.\n\
-             # TYPE ddi_spill_stranded_bytes_total counter\n\
-             ddi_spill_stranded_bytes_total {}\n",
+             ddi_spill_limit_bytes {}\n",
             spill.used_bytes(),
             spill.active_files(),
             spill.limit_bytes(),
-            spill.stranded_bytes(),
         ));
         s
     }

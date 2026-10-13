@@ -1684,11 +1684,11 @@ fn cleans_up(target: &DeltaTable) -> bool {
     let properties = snapshot.table_config();
     let next = target.version().map_or(0, |v| v + 1);
     properties.enable_expired_log_cleanup()
-        && (next + 1) % properties.checkpoint_interval().get() == 0
+        && (next + 1).is_multiple_of(properties.checkpoint_interval().get())
 }
 
 /// The files commit `version` of `target` added, and their bytes (`ddi_kafka_files_added_total`):
-/// delta-rs 0.32.4's writer does not hand its own metrics back, so they are read off the
+/// delta-rs 1.1's writer does not hand its own metrics back, so they are read off the
 /// commit, one GET. Best effort: `None` if it cannot be read.
 async fn added_files(target: &DeltaTable, version: Option<u64>) -> Option<(u64, u64)> {
     #[derive(serde::Deserialize)]

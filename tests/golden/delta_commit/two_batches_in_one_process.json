@@ -77,8 +77,8 @@
         }
       ],
       "commitInfo": {
-        "clientVersion": "delta-rs.0.32.4",
-        "engineInfo": "delta-rs:0.32.4",
+        "clientVersion": "delta-rs.1.1.1",
+        "engineInfo": "delta-rs:1.1.1",
         "operation": "CREATE TABLE",
         "operationParameters": {
           "location": "file://<lake>/orders_stg__ddi_dq/",
@@ -168,7 +168,7 @@
             "modificationTime": "<timestamp>",
             "partitionValues": {},
             "path": "part-00000-<file-2>-c000.snappy.parquet",
-            "size": 2795,
+            "size": 2794,
             "stats": {
               "maxValues": {
                 "_timestamp": "<timestamp>",
@@ -210,17 +210,18 @@
         }
       ],
       "commitInfo": {
-        "clientVersion": "delta-rs.0.32.4",
+        "clientVersion": "delta-rs.1.1.1",
         "ddi.appId": "ddi.test.orders_stg",
         "ddi.sourceVersion": 1,
-        "engineInfo": "delta-rs:0.32.4",
+        "engineInfo": "delta-rs:1.1.1",
         "operation": "WRITE",
         "operationMetrics": {
           "execution_time_ms": "<ms>",
           "num_added_files": 1,
           "num_added_rows": 1,
           "num_partitions": 0,
-          "num_removed_files": 0
+          "num_removed_files": 0,
+          "num_retries": 0
         },
         "operationParameters": {
           "mode": "Append"
@@ -240,7 +241,7 @@
             "modificationTime": "<timestamp>",
             "partitionValues": {},
             "path": "part-00000-<file-3>-c000.snappy.parquet",
-            "size": 2795,
+            "size": 2794,
             "stats": {
               "maxValues": {
                 "_timestamp": "<timestamp>",
@@ -282,17 +283,18 @@
         }
       ],
       "commitInfo": {
-        "clientVersion": "delta-rs.0.32.4",
+        "clientVersion": "delta-rs.1.1.1",
         "ddi.appId": "ddi.test.orders_stg",
         "ddi.sourceVersion": 2,
-        "engineInfo": "delta-rs:0.32.4",
+        "engineInfo": "delta-rs:1.1.1",
         "operation": "WRITE",
         "operationMetrics": {
           "execution_time_ms": "<ms>",
           "num_added_files": 1,
           "num_added_rows": 1,
           "num_partitions": 0,
-          "num_removed_files": 0
+          "num_removed_files": 0,
+          "num_retries": 0
         },
         "operationParameters": {
           "mode": "Append"
@@ -362,8 +364,8 @@
         }
       ],
       "commitInfo": {
-        "clientVersion": "delta-rs.0.32.4",
-        "engineInfo": "delta-rs:0.32.4",
+        "clientVersion": "delta-rs.1.1.1",
+        "engineInfo": "delta-rs:1.1.1",
         "operation": "CREATE TABLE",
         "operationParameters": {
           "location": "file://<lake>/orders_stg/",
@@ -435,16 +437,16 @@
             "modificationTime": "<timestamp>",
             "partitionValues": {},
             "path": "part-00000-<file-1>-c000.snappy.parquet",
-            "size": 1384,
+            "size": 1383,
             "stats": {
               "maxValues": {
-                "_timestamp": "1970-01-01T00:00:00.000010Z",
+                "_timestamp": "1970-01-01 00:00:00.000",
                 "amount": 100,
                 "order_id": 1,
                 "region": "eu"
               },
               "minValues": {
-                "_timestamp": "1970-01-01T00:00:00.000010Z",
+                "_timestamp": "1970-01-01 00:00:00.000",
                 "amount": 100,
                 "order_id": 1,
                 "region": "eu"
@@ -468,19 +470,20 @@
         }
       ],
       "commitInfo": {
-        "clientVersion": "delta-rs.0.32.4",
+        "clientVersion": "delta-rs.1.1.1",
         "ddi.appId": "ddi.test.orders_stg",
         "ddi.sourceTableId": "<source table id>",
         "ddi.sourceTableIdVersion": 1,
         "ddi.sourceVersion": 1,
-        "engineInfo": "delta-rs:0.32.4",
+        "engineInfo": "delta-rs:1.1.1",
         "operation": "WRITE",
         "operationMetrics": {
           "execution_time_ms": "<ms>",
           "num_added_files": 1,
           "num_added_rows": 1,
           "num_partitions": 0,
-          "num_removed_files": 0
+          "num_removed_files": 0,
+          "num_retries": 0
         },
         "operationParameters": {
           "mode": "Append"
@@ -499,19 +502,20 @@
         }
       ],
       "commitInfo": {
-        "clientVersion": "delta-rs.0.32.4",
+        "clientVersion": "delta-rs.1.1.1",
         "ddi.appId": "ddi.test.orders_stg",
         "ddi.sourceTableId": "<source table id>",
         "ddi.sourceTableIdVersion": 2,
         "ddi.sourceVersion": 2,
-        "engineInfo": "delta-rs:0.32.4",
+        "engineInfo": "delta-rs:1.1.1",
         "operation": "WRITE",
         "operationMetrics": {
           "execution_time_ms": "<ms>",
           "num_added_files": 0,
           "num_added_rows": 0,
           "num_partitions": 0,
-          "num_removed_files": 0
+          "num_removed_files": 0,
+          "num_retries": 0
         },
         "operationParameters": {
           "mode": "Append"

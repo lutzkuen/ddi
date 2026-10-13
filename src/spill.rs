@@ -48,46 +48,15 @@
 //! needs `.with_session_state(..)` or it opens the hole again, and nothing here can catch that
 //! at compile time.
 //!
-//! The cap is also enforced *after* each write rather than as an admission check
-//! (`RefCountedTempFile::update_disk_usage`), so it can be overshot by roughly one write
-//! buffer per open spill file. Set it below the volume, never equal to it.
-//!
-//! # The upstream leak this has to clean up after, and when to delete that code
-//!
-//! Hitting the cap costs more than the query that hit it. `RefCountedTempFile::update_disk_usage`
-//! charges the new file size to the shared total, then returns `ResourcesExhausted` *before*
-//! recording that size on the file — so the `Drop` that follows subtracts the older, smaller
-//! figure and the whole difference stays charged. Not a rounding error: the file that broke a
-//! 100 KB budget in a reproduction stranded 490 KB, five times the budget itself. After that
-//! the counter sits permanently above the cap and **every** subsequent spill in the process is
-//! refused, including a one-kilobyte sort in a pipeline that has nothing to do with the one
-//! that overran.
-//!
-//! That was survivable while each operation built its own manager, because the residue died
-//! with the operation. Sharing one manager is exactly what makes it permanent — so this module
-//! replaces the manager once it has become useless, and *not before*: a replacement issued
-//! while the old one could still accept a byte would leave the process holding two managers
-//! with a full cap each, which is the arithmetic that evicted the pod in the first place. See
-//! [`wedged`] for the threshold that rules that out, and `ddi_spill_stranded_bytes_total` for
-//! how much has been abandoned this way.
-//!
-//! **This is a workaround for DataFusion 53.1, and it has an expiry date.** Upstream replaced
-//! the whole `update_disk_usage` design in 55.0.0: `FileSpillWriter::write` now adds, checks,
-//! and *rolls the add back* before returning the error, so nothing is left charged. 53.1 and
-//! 54.x have the bug; 55.0.0 and later do not. `deltalake` pins the DataFusion version this
-//! crate gets (`Cargo.toml`), so a bump past 54 is the signal to delete
-//! [`Spill::recover_if_wedged`], [`wedged`], the `stranded` counter,
-//! `ddi_spill_stranded_bytes_total` and the test that pins them, together; the `RwLock` around
-//! the prototype exists only for this and can go back to a plain `Arc` at the same time.
-//!
-//! That signal arrives as a *compile* error rather than a failing assertion, because 55.0.0
-//! deletes `RefCountedTempFile::update_disk_usage` outright and the test calls it directly.
-//! Which is the loudest reminder available, and the reason the test drives the leak by hand
-//! rather than through a query that happens to spill.
+//! The cap is enforced by `FileSpillWriter::write`, which adds the write to the shared total,
+//! checks it against the cap and takes the add back before returning the error, so a refused
+//! write leaves nothing charged. A refusal therefore costs the query that hit the cap and no
+//! other. (DataFusion 53.1 and 54.x charged first and failed without recording it, which left
+//! the shared counter above the cap for good; this module used to replace the manager when
+//! that happened. 55.0.0 fixed it upstream and the workaround is gone.)
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use deltalake::datafusion::error::DataFusionError;
 use deltalake::datafusion::execution::cache::cache_manager::CacheManagerConfig;
@@ -114,19 +83,9 @@ pub const MIN_TEMP_DIRECTORY_SIZE: u64 = 1_000_000;
 pub struct Spill {
     /// Every runtime in this process is derived from this one, which is what makes them share
     /// its `Arc<DiskManager>` — and therefore its one byte counter.
-    ///
-    /// Behind a lock only because it is replaced when that counter is wedged, which is a
-    /// thing DataFusion's accounting makes necessary rather than a thing this design wanted.
-    /// See [`Spill::recover_if_wedged`]. Read on every runtime build, written approximately
-    /// never.
-    prototype: RwLock<Arc<RuntimeEnv>>,
-    /// What to rebuild the prototype from — the same directory and the same cap.
-    builder: DiskManagerBuilder,
+    prototype: Arc<RuntimeEnv>,
     directory: Option<PathBuf>,
     configured_cap: bool,
-    /// Bytes abandoned by wedged managers this process has replaced, so the loss is visible
-    /// rather than merely gone.
-    stranded: AtomicU64,
 }
 
 impl std::fmt::Debug for Spill {
@@ -203,11 +162,9 @@ impl Spill {
                 })
             })?;
         Ok(Self {
-            prototype: RwLock::new(prototype),
-            builder,
+            prototype,
             directory: dir,
             configured_cap: cap.is_some(),
-            stranded: AtomicU64::new(0),
         })
     }
 
@@ -222,90 +179,20 @@ impl Spill {
             .build_arc()
             .expect("a default RuntimeEnv cannot fail to build");
         Self {
-            prototype: RwLock::new(prototype),
-            builder,
+            prototype,
             directory: None,
             configured_cap: false,
-            stranded: AtomicU64::new(0),
         }
     }
 
-    /// The runtime every other one is derived from, after any needed recovery.
-    fn prototype(&self) -> Arc<RuntimeEnv> {
-        self.recover_if_wedged();
-        self.prototype.read().expect("not poisoned").clone()
-    }
-
-    /// Replace the shared manager when its counter has been left above the cap.
-    ///
-    /// DataFusion 53.1 charges a spill write to the shared total and *then* returns the
-    /// limit error, without recording that size on the file — so the `Drop` that follows
-    /// subtracts the older, smaller figure and the difference stays charged forever
-    /// (`RefCountedTempFile::update_disk_usage` steps 2, 3 and 4). A single failure can
-    /// therefore strand more than the whole budget, after which every subsequent spill in the
-    /// process is refused: not the pipeline that overran, all of them, including a one-kilobyte
-    /// sort in a stream that has nothing to do with it.
-    ///
-    /// That was survivable while each operation built its own manager, because the residue died
-    /// with the operation. Sharing one manager is what makes it permanent, so sharing one
-    /// manager is what has to clean up after it.
-    ///
-    /// It waits until the residue reaches the whole cap before acting — see [`wedged`] for why
-    /// that specific threshold is what keeps a replacement from doubling the process's budget.
-    /// A runtime built before the swap keeps the old manager, and that manager refuses every
-    /// spill, so an operation still holding one fails once and retries onto a fresh runtime.
-    /// That is the cost, and it is paid against a process that would otherwise never spill
-    /// again.
-    ///
-    /// Fixed upstream in DataFusion 55.0.0; delete this with its test when `deltalake` takes
-    /// us past 54. See the module header.
-    fn recover_if_wedged(&self) {
-        let seen = {
-            let guard = self.prototype.read().expect("not poisoned");
-            if !wedged(&guard.disk_manager) {
-                return;
-            }
-            guard.clone()
-        };
-
-        let mut guard = self.prototype.write().expect("not poisoned");
-        // Another thread may have replaced it between the two locks, and its replacement is
-        // as good as ours would have been.
-        if !Arc::ptr_eq(&guard, &seen) || !wedged(&guard.disk_manager) {
-            return;
-        }
-        let lost = guard.disk_manager.used_disk_space();
-        match RuntimeEnvBuilder::new()
-            .with_disk_manager_builder(self.builder.clone())
-            .build_arc()
-        {
-            Ok(fresh) => {
-                *guard = fresh;
-                self.stranded.fetch_add(lost, Ordering::Relaxed);
-                tracing::warn!(
-                    stranded_bytes = lost,
-                    "the spill budget's counter reached its whole {} with nothing actually on \
-                     disk — DataFusion charges the write that breaks the cap and then returns \
-                     before recording it, so the difference stays charged. Every spill in this \
-                     process was going to be refused from here on. A fresh temporary directory \
-                     has been opened and spilling continues; nothing was lost but the \
-                     accounting. Repeated occurrences mean this process is hitting its spill \
-                     cap often — see ddi_spill_stranded_bytes_total.",
-                    bytesize::ByteSize(lost)
-                );
-            }
-            Err(e) => tracing::error!(
-                "the spill budget's counter is wedged at {} with nothing on disk, and a \
-                 replacement directory could not be opened: {e}. Spilling will be refused \
-                 until this process restarts.",
-                bytesize::ByteSize(lost)
-            ),
-        }
+    /// The runtime every other one is derived from.
+    fn prototype(&self) -> &Arc<RuntimeEnv> {
+        &self.prototype
     }
 
     /// A builder for a runtime that spills into this budget — **the one place sharing happens**.
     pub fn runtime_builder(&self) -> RuntimeEnvBuilder {
-        RuntimeEnvBuilder::from_runtime_env(&self.prototype())
+        RuntimeEnvBuilder::from_runtime_env(self.prototype())
             // `from_runtime_env` carries three things across besides the disk manager, and
             // only the disk manager is meant to be shared. The memory pool is re-set by the
             // caller; these two are reset here.
@@ -362,58 +249,6 @@ impl Spill {
     pub fn disk_manager(&self) -> Arc<DiskManager> {
         Arc::clone(&self.prototype().disk_manager)
     }
-
-    /// Bytes abandoned by wedged managers this process has replaced.
-    ///
-    /// Zero on almost every process. A number here means the budget has been through a
-    /// capacity failure and DataFusion's accounting did not give the space back — the space
-    /// itself was returned, the count of it was not.
-    pub fn stranded_bytes(&self) -> u64 {
-        self.stranded.load(Ordering::Relaxed)
-    }
-}
-
-/// This manager will refuse every spill from now on, and the bytes it is refusing over are
-/// not really there.
-///
-/// Both halves are load-bearing, and the second one is what makes replacing the manager safe
-/// rather than a way of reintroducing the bug this module exists to fix.
-///
-/// **`used >= max`** — not merely `used > 0`. A manager carrying residue *below* its cap still
-/// works; it just has less room, which is a bounded loss and the right one to accept. Replacing
-/// it would not be: a runtime built before the swap keeps the old manager, so for a while the
-/// process would hold two, each with a full cap, and two times the cap is precisely the
-/// arithmetic that evicted a pod. Once the residue reaches the cap the old manager refuses
-/// *everything*, so it can contribute no bytes at all and a replacement cannot take the total
-/// past one cap. Waiting for that is what keeps the process bound true. It is also two atomic
-/// loads, which is what lets this be called on every runtime build.
-///
-/// **The spill directories are empty** — the proof that the count is residue rather than real
-/// usage. `create_tmp_file` builds every spill file with `Builder::tempfile_in`, so a live one
-/// is always a linked, visible entry in one of these directories; no entries means nothing is
-/// on disk and a replacement loses no accounting.
-///
-/// The obvious witness — `active_files_count == 0` — is the wrong one, and it took a
-/// reproduction to see why. `create_tmp_file` increments that counter *before* creating the
-/// file and returns early if the creation fails (`fetch_add`, then `tempfile_in(..)?`), so no
-/// `RefCountedTempFile` is ever built to decrement it. One `EMFILE`, one read-only remount, one
-/// full volume leaks the count permanently — and it stays leaked after the directory is
-/// healthy again, which disarms this recovery for the life of a process that is otherwise
-/// perfectly able to spill. The filesystem cannot lie in that direction, and recovering also
-/// replaces the leaked counter with a fresh one.
-///
-/// A directory that cannot be read is treated as not-empty, so an unreadable spill volume
-/// declines recovery rather than assuming it. That is re-evaluated on the next call rather than
-/// remembered, which is the difference from the counter.
-fn wedged(dm: &DiskManager) -> bool {
-    if dm.used_disk_space() < dm.max_temp_directory_size() {
-        return false;
-    }
-    dm.temp_dir_paths().iter().all(|dir| {
-        std::fs::read_dir(dir)
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(false)
-    })
 }
 
 static INSTALLED: OnceLock<Arc<Spill>> = OnceLock::new();
@@ -473,6 +308,10 @@ pub fn classify(e: DataFusionError, context: &str) -> Error {
 pub(crate) fn is_capacity(e: &DataFusionError) -> bool {
     matches!(e.find_root(), DataFusionError::ResourcesExhausted(_))
         || e.to_string().contains(SPILL_FILE_CREATE)
+        // DataFusion 55 refuses a write past the cap from `FileSpillWriter::write` as a plain
+        // `io::Error`, so it reaches here wrapped as an I/O or Arrow error and not as
+        // `ResourcesExhausted`; only its sentence says what it is.
+        || e.to_string().contains(DISK_EXHAUSTED)
 }
 
 /// Read a delta-rs failure as a capacity failure, or leave it as [`Error::Delta`].
@@ -485,7 +324,7 @@ pub(crate) fn is_capacity(e: &DataFusionError) -> bool {
 /// second later, forever, holding the shared budget while it does.
 pub fn classify_delta(e: deltalake::DeltaTableError, context: &str) -> Error {
     let s = e.to_string();
-    if !s.contains(EXHAUSTED) {
+    if !s.contains(EXHAUSTED) && !s.contains(DISK_EXHAUSTED) {
         return Error::Delta(e);
     }
     capacity(s, context)
@@ -506,7 +345,7 @@ fn capacity(s: String, context: &str) -> Error {
         format!(
             "the process's spill budget ([runtime] max_temp_directory_size, currently {} \
              ({} bytes), in {})",
-            bytesize::ByteSize(spill.limit_bytes()),
+            bytesize::ByteSize(spill.limit_bytes()).display().si(),
             spill.limit_bytes(),
             directory()
         )

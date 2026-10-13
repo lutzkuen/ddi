@@ -585,7 +585,7 @@ impl DataQuality {
             .table_config();
         let next = self.table.version().map_or(0, |v| v + 1);
         let cleanup = properties.enable_expired_log_cleanup()
-            && (next + 1) % properties.checkpoint_interval().get() == 0;
+            && (next + 1).is_multiple_of(properties.checkpoint_interval().get());
         // No `txn`: a plain append, which delta-rs rebases over any other.
         let props = CommitProperties::default()
             .with_cleanup_expired_logs(Some(cleanup))
@@ -1638,7 +1638,7 @@ mod tests {
             store.config().location(),
             store.config().options(),
         );
-        let mut table = DeltaTable::new(flaky, plain.config.clone());
+        let mut table = DeltaTable::new(flaky);
         table.load().await.unwrap();
         dq.table = table;
         struck
@@ -2024,8 +2024,8 @@ mod tests {
             .count()
     }
 
-    /// delta-rs reads a column-mapped table and refuses to write one, with an error that is
-    /// not its protocol error. The write asks first, so the cause is the typed refusal a
+    /// ddi refuses to write a column-mapped table (delta-rs 1.x could, but ddi's writers are
+    /// not proven against it). The write asks first, so the cause is the typed refusal a
     /// target gets, which §3.6 classifies Blocking, pipeline: retrying cannot help until
     /// someone points the pipeline at another table. And nothing is written first.
     #[tokio::test]
@@ -2046,7 +2046,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(cause(&e), Error::TargetProtocolUnsupported { detail, .. }
-                if detail.contains("ColumnMapping")),
+                if detail.contains("column mapping")),
             "{e:?}"
         );
         assert_eq!(e.kafka_class(), KafkaClass::BlockingPipeline);

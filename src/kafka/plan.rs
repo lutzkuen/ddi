@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use futures::StreamExt as _;
+use futures::TryStreamExt as _;
 
 use crate::config::ResolvedPipeline;
 use crate::error::Result;
@@ -295,17 +295,14 @@ async fn facts(target: &deltalake::DeltaTable, uri: &str) -> Result<TableFacts> 
         .iter()
         .map(|f| (f.name().to_string(), f.data_type().to_string()))
         .collect();
-    let last_commit = match target.history(Some(1)).await {
-        Ok(h) => {
-            let mut stream = futures::stream::iter(h);
-            stream.next().await.map(|c| {
-                format!(
-                    "{} {}",
-                    c.engine_info.as_deref().unwrap_or("unknown engine"),
-                    c.operation.as_deref().unwrap_or("unknown operation")
-                )
-            })
-        }
+    let last_commit = match target.history(Some(1)).try_next().await {
+        Ok(h) => h.map(|c| {
+            format!(
+                "{} {}",
+                c.engine_info.as_deref().unwrap_or("unknown engine"),
+                c.operation.as_deref().unwrap_or("unknown operation")
+            )
+        }),
         Err(_) => None,
     };
     Ok(TableFacts {

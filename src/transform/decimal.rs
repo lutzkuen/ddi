@@ -71,7 +71,6 @@
 //! decimal from the one it reads as a double. The README gives the spelling that means the
 //! same in both.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use deltalake::arrow::array::{Array, ArrayRef, AsArray, FixedSizeListArray, GenericListArray};
@@ -351,9 +350,6 @@ impl DecimalToFloat {
 }
 
 impl ScalarUDFImpl for DecimalToFloat {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         self.name
     }
@@ -402,8 +398,8 @@ impl ScalarUDFImpl for DecimalToFloat {
 pub(crate) fn rewrite_expr(expr: Expr, schema: &DFSchema) -> DFResult<Transformed<Expr>> {
     expr.transform_up(|e| {
         let (inner, to, try_cast) = match e {
-            Expr::Cast(Cast { expr, data_type }) => (expr, data_type, false),
-            Expr::TryCast(TryCast { expr, data_type }) => (expr, data_type, true),
+            Expr::Cast(Cast { expr, field }) => (expr, field.data_type().clone(), false),
+            Expr::TryCast(TryCast { expr, field }) => (expr, field.data_type().clone(), true),
             other => return Ok(Transformed::no(other)),
         };
         if !inner

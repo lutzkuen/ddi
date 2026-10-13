@@ -292,7 +292,7 @@ impl Storage {
     /// reports the original failure with its cause named.
     pub(crate) async fn open_replaying_the_log(&self, url: &url::Url) -> Result<DeltaTable> {
         use deltalake::logstore::{logstore_for, logstore_with, StorageConfig};
-        use deltalake::{DeltaTable, DeltaTableConfig};
+        use deltalake::DeltaTable;
         use std::sync::Arc;
 
         let config = || {
@@ -317,7 +317,7 @@ impl Storage {
         remember_unfiltered(&filtered, plain.object_store(None));
         let log_store = logstore_with(filtered, url, config()?).map_err(Error::Delta)?;
 
-        let mut table = DeltaTable::new(log_store, DeltaTableConfig::default());
+        let mut table = DeltaTable::new(log_store);
         table.load().await.map_err(Error::Delta)?;
         Ok(table)
     }
@@ -346,6 +346,7 @@ impl Storage {
         );
     }
 
+    #[allow(deprecated)] // parquet 59.2 deprecates ParquetObjectReader; replacing it is its own change
     /// Whatever the newest checkpoint's parquet footer says wrote it, best effort.
     ///
     /// Best effort throughout: this runs only to make a warning more useful, so every step

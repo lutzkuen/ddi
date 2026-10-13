@@ -44,7 +44,6 @@
 //! by hand would bind this module to one version of `sqlparser`'s struct layout for no gain;
 //! going through the parser means the result is a thing the parser accepts, by construction.
 
-use deltalake::datafusion::sql::parser::DFParser;
 use deltalake::datafusion::sql::sqlparser::ast::{
     DataType, Expr, Join, Query, Select, SelectItem, SetExpr, Statement as SqlStatement,
     TableFactor, TableWithJoins, VisitMut, VisitorMut,
@@ -367,7 +366,7 @@ fn parse_from(from: &str) -> Result<Vec<TableWithJoins>> {
 
 /// Parse a whole `SELECT`, so fragments are built by the parser rather than by hand.
 fn parse_select(sql: &str) -> Result<Select> {
-    let mut statements = DFParser::parse_sql(sql).map_err(|e| {
+    let mut statements = crate::transform::dialect::parse_native(sql).map_err(|e| {
         Error::Config(format!(
             "could not rewrite into a form this engine runs ({e}). The rewritten SQL was: \
              {sql}"
@@ -404,7 +403,7 @@ mod tests {
 
     /// Parse, rewrite, and render back — what the pipeline will actually run.
     fn rewritten(sql: &str) -> Result<String> {
-        let mut statements = DFParser::parse_sql(sql).unwrap();
+        let mut statements = crate::transform::dialect::parse_native(sql).unwrap();
         let statement = statements.pop_front().unwrap();
         let deltalake::datafusion::sql::parser::Statement::Statement(inner) = statement else {
             panic!("not a statement")

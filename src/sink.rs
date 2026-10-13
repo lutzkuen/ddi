@@ -1097,7 +1097,7 @@ mod tests {
             store.config().location(),
             store.config().options(),
         );
-        let mut table = DeltaTable::new(flaky, plain.config.clone());
+        let mut table = DeltaTable::new(flaky);
         table.load().await.unwrap();
 
         let batch = rows(&table, &[1, 2]);

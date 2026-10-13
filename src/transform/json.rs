@@ -32,7 +32,6 @@
 //! DuckDB's `json_extract_string` and Spark's `get_json_object` are registered as aliases
 //! of `json_extract_scalar`, so a model written against either streams unchanged.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use deltalake::arrow::array::{
@@ -395,9 +394,6 @@ impl JsonFn {
 }
 
 impl ScalarUDFImpl for JsonFn {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         self.name
     }

@@ -11,7 +11,6 @@
 //! it would otherwise truncate to a wrong date without a word. Registering a function under
 //! a built-in's name replaces the built-in in that session, as `array_length` already does.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use deltalake::arrow::array::{
@@ -54,9 +53,6 @@ impl ArrayLength {
 }
 
 impl ScalarUDFImpl for ArrayLength {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "array_length"
     }
@@ -175,9 +171,6 @@ impl CheckedDateTrunc {
 }
 
 impl ScalarUDFImpl for CheckedDateTrunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -260,9 +253,6 @@ impl ArrayReduce {
 }
 
 impl ScalarUDFImpl for ArrayReduce {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         self.op.name()
     }

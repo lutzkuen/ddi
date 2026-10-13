@@ -1620,6 +1620,7 @@ impl Probe<'_> {
         })
     }
 
+    #[allow(deprecated)] // parquet 59.2 deprecates ParquetObjectReader; replacing it is its own change
     async fn read(
         &self,
         add: &deltalake::kernel::Add,

@@ -79,7 +79,7 @@ impl Grain {
 fn reparse_natively(statement: &SqlStatement, grain: Grain) -> Result<SqlStatement> {
     let text = statement.to_string();
     let subject = grain.subject();
-    let mut parsed = DFParser::parse_sql(&text).map_err(|e| {
+    let mut parsed = crate::transform::dialect::parse_native(&text).map_err(|e| {
         Error::Config(format!(
             "{subject} uses a dialect this engine cannot run, and rewriting did not \
              resolve it ({e}). After rewriting it read: {text}"
@@ -115,7 +115,7 @@ pub(crate) fn parse_permissively(
     // are rewritten before parsing; see `crate::transform::dialect`.
     let sql = prepare_trino_text(sql);
 
-    match DFParser::parse_sql(&sql) {
+    match crate::transform::dialect::parse_native(&sql) {
         Ok(s) => Ok(s),
         Err(native) => DFParser::parse_sql_with_dialect(&sql, &TrinoDialect)
             .or_else(|_| DFParser::parse_sql_with_dialect(&sql, &ClickHouseDialect {}))
@@ -239,7 +239,7 @@ fn validate_sql_with_grain(
     // a dialect difference elsewhere in the query would be discovered on the first batch —
     // the failure mode this whole module exists to close.
     let text = rewritten.to_string();
-    DFParser::parse_sql(&text).map_err(|e| {
+    crate::transform::dialect::parse_native(&text).map_err(|e| {
         Error::Config(format!(
             "{subject} uses a dialect this engine cannot run, and rewriting did not \
              resolve it ({e}). After rewriting it read: {text}"
@@ -317,10 +317,11 @@ pub(crate) fn cross_row_construct(normalised: &str) -> Option<String> {
         }
     }
 
-    let statement = match DFParser::parse_sql(normalised).map(|mut s| s.pop_front()) {
-        Ok(Some(Statement::Statement(inner))) => inner,
-        _ => return Some("SQL that could not be analysed".into()),
-    };
+    let statement =
+        match crate::transform::dialect::parse_native(normalised).map(|mut s| s.pop_front()) {
+            Ok(Some(Statement::Statement(inner))) => inner,
+            _ => return Some("SQL that could not be analysed".into()),
+        };
     let mut v = V(None);
     let _ = statement.visit(&mut v);
     v.0.map(str::to_string)

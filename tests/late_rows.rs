@@ -56,6 +56,11 @@ struct Row {
     ts: Option<i64>,
 }
 
+/// Delta-rs 1.x records a timestamp's statistics to the millisecond, so rows a microsecond
+/// apart cannot be told apart by the log. These tests write their logical time in
+/// milliseconds: `ts` 5 is five milliseconds, whole ones, which the statistics keep exactly.
+const MS: i64 = 1_000;
+
 fn row(id: i64, part: &'static str, ts: i64) -> Row {
     Row {
         id,
@@ -93,7 +98,9 @@ fn batch(rows: &[Row]) -> RecordBatch {
                 rows.iter().map(|r| r.status).collect::<Vec<_>>(),
             )) as ArrayRef,
             Arc::new(TimestampMicrosecondArray::from(
-                rows.iter().map(|r| r.ts).collect::<Vec<_>>(),
+                rows.iter()
+                    .map(|r| r.ts.map(|t| t * MS))
+                    .collect::<Vec<_>>(),
             )) as ArrayRef,
         ],
     )
@@ -236,7 +243,7 @@ impl Lake {
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
             for i in 0..b.num_rows() {
-                out.push((ids.value(i), st.value(i).to_string(), ts.value(i)));
+                out.push((ids.value(i), st.value(i).to_string(), ts.value(i) / MS));
             }
         }
         out.sort();

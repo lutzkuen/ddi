@@ -1053,6 +1053,7 @@ async fn json_txns(
     Ok(txns)
 }
 
+#[allow(deprecated)] // parquet 59.2 deprecates ParquetObjectReader; replacing it is its own change
 /// Every `txn` in a parquet checkpoint file, read through its `txn` column alone.
 async fn parquet_txns(
     store: Arc<dyn ObjectStore>,
@@ -1618,6 +1619,7 @@ pub async fn stored_table_id(table: &DeltaTable) -> Result<Option<String>> {
     Ok(None)
 }
 
+#[allow(deprecated)] // parquet 59.2 deprecates ParquetObjectReader; replacing it is its own change
 /// The `metaData.id` of a parquet checkpoint file, read through that column alone.
 async fn parquet_metadata_id(
     store: Arc<dyn ObjectStore>,
@@ -1691,8 +1693,8 @@ pub fn refuse_txn_retention(table: &DeltaTable) -> Result<()> {
 
 /// Refuse a target this build of delta-rs cannot write.
 ///
-/// delta-rs checks the protocol only once a commit is attempted, and reads a column-mapped
-/// table it then refuses to write. Asking first turns a table another engine upgraded while
+/// delta-rs checks the protocol only once a commit is attempted, and ddi refuses a column-mapped
+/// table whatever the protocol says. Asking first turns a table another engine upgraded while
 /// the pipeline ran into one clear error at open or refresh, rather than a failed commit
 /// after every batch.
 pub fn refuse_unwritable_protocol(table: &DeltaTable) -> Result<()> {
@@ -1705,7 +1707,7 @@ pub fn refuse_unwritable_protocol(table: &DeltaTable) -> Result<()> {
     };
     if let Err(e) = PROTOCOL.can_write_to(snapshot) {
         return refuse(format!(
-            "its protocol (reader {}, writer {}) asks for what delta-rs 0.32.4 cannot write: {e}",
+            "its protocol (reader {}, writer {}) asks for what this build of delta-rs cannot write: {e}",
             snapshot.protocol().min_reader_version(),
             snapshot.protocol().min_writer_version()
         ));
@@ -1713,8 +1715,10 @@ pub fn refuse_unwritable_protocol(table: &DeltaTable) -> Result<()> {
     let mode = snapshot.metadata().configuration().get(COLUMN_MAPPING_MODE);
     if let Some(mode) = mode.filter(|m| !m.eq_ignore_ascii_case("none")) {
         return refuse(format!(
-            "it uses column mapping ({COLUMN_MAPPING_MODE} = {mode}), which delta-rs reads but \
-             does not write"
+            "it uses column mapping ({COLUMN_MAPPING_MODE} = {mode}), which ddi does not \
+             write to (delta-rs 1.x can write column-mapped tables; ddi's append, upsert and \
+             data-quality paths have not been proven against that, so it refuses rather than \
+             risk writing logical names into a physically named table)"
         ));
     }
     Ok(())
@@ -2118,7 +2122,7 @@ mod tests {
             store.config().location(),
             store.config().options(),
         );
-        let mut table = DeltaTable::new(log_store, plain.config.clone());
+        let mut table = DeltaTable::new(log_store);
         table.load().await.unwrap();
         counting.reset();
         (table, counting)

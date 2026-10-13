@@ -207,6 +207,10 @@ fn retype_file_timestamps(table_path: &str, version: u64, to: DataType) {
 /// Replace the checkpoint at `version` with one shaped the way Trino writes it: carrying a
 /// `stats_parsed` struct typed after the table's columns, so a `timestamp` column becomes
 /// `timestamp[ms]` — a physical type the Delta protocol does not have.
+///
+/// Delta-rs 0.32 refused such a checkpoint ("Invalid data type for Delta Lake") and `open` had
+/// to step over it by replaying the log. The kernel in delta-rs 1.1 reads it, so it no longer
+/// makes a table unopenable: the tests that use it pin that the answers are the same either way.
 fn trinoize_checkpoint(table_path: &str, version: u64) {
     use deltalake::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use deltalake::parquet::arrow::ArrowWriter;
@@ -407,17 +411,13 @@ async fn a_checkpoint_another_engine_wrote_does_not_decide_whether_the_table_ope
         .unwrap();
     trinoize_checkpoint(&path, 2);
 
-    // What production saw: the kernel validates the checkpoint's physical types and refuses
-    // a table whose own schema is perfectly correct.
-    let raw = deltalake::open_table(ensure_table_uri(&path).unwrap()).await;
-    let raw = raw.expect_err("the fixture must reproduce the failure it is guarding against");
-    assert!(
-        raw.to_string().contains("Invalid data type for Delta Lake"),
-        "got: {raw}"
-    );
-
-    // And what this tool does about it: the checkpoint is a derived cache of the commits,
-    // so it replays them instead.
+    // What production saw with delta-rs 0.32 was a refusal: the kernel validated the
+    // checkpoint's physical types and rejected a table whose own schema is correct. The 1.1
+    // kernel reads it, so the ordinary open works, and what is pinned is that this tool's
+    // answer is still right.
+    deltalake::open_table(ensure_table_uri(&path).unwrap())
+        .await
+        .expect("delta-rs 1.1 reads a checkpoint with millisecond statistics itself");
     let opened = Storage::default().open(&path).await.expect("must open");
     assert_eq!(opened.version(), Some(2));
     assert_eq!(
@@ -537,7 +537,8 @@ async fn a_log_that_no_longer_reaches_version_zero_is_refused_rather_than_half_r
     // delta-rs would eventually write that truncated file set out as a real checkpoint and
     // make the loss everybody's.
     //
-    // Half a table is not an acceptable answer to an unreadable checkpoint. Refusing is.
+    // Half a table is not an acceptable answer to a checkpoint that cannot be read: refusing is.
+    // (That path needs a checkpoint delta-rs 1.1 cannot read, and no fixture makes one.)
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     let path = root.join("t").to_str().unwrap().to_string();
@@ -556,22 +557,19 @@ async fn a_log_that_no_longer_reaches_version_zero_is_refused_rather_than_half_r
         std::fs::remove_file(format!("{path}/_delta_log/{v:020}.json")).unwrap();
     }
 
-    let e = Storage::default()
+    // Delta-rs 0.32 could not read the checkpoint, so the only way in was a replay that was
+    // refused for want of version 0. The 1.1 kernel reads it, and the checkpoint is the whole
+    // table, so the table opens complete: what must never happen is an open that is missing
+    // the rows below the checkpoint.
+    let opened = Storage::default()
         .open(&path)
         .await
-        .expect_err("a table that can only be read in part must not open at all")
-        .to_string();
-    assert!(
-        e.contains("version 0"),
-        "the message must name why replaying was not an option: {e}"
-    );
-    assert!(
-        e.contains("Invalid data type for Delta Lake"),
-        "and still carry the original cause: {e}"
-    );
-    assert!(
-        e.contains("log retention"),
-        "and point at what to do about it: {e}"
+        .expect("a checkpoint the kernel reads stands in for the commits below it");
+    assert_eq!(opened.version(), Some(3));
+    assert_eq!(
+        read_timestamps(&path).await,
+        vec![(1, T0), (2, T1), (3, T2)],
+        "and every row below the checkpoint is there"
     );
 }
 
@@ -601,12 +599,6 @@ async fn a_table_opened_that_way_is_still_fully_writable() {
         .await
         .unwrap();
     trinoize_checkpoint(&target, 1);
-    assert!(
-        deltalake::open_table(ensure_table_uri(&target).unwrap())
-            .await
-            .is_err(),
-        "the fixture must leave the target unopenable the ordinary way"
-    );
 
     for row in [(1i64, T1), (2, T2), (3, T2 + 1_000_000)] {
         append_ts(&source, &[row]).await;

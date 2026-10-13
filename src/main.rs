@@ -295,7 +295,7 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
             bytes = b,
             "each pipeline may use about {} — DataFusion spills at it, and batches are sized \
              so what they decode to fits inside it",
-            bytesize::ByteSize(b)
+            bytesize::ByteSize(b).display().si()
         ),
         None => info!(
             "no memory budget: neither [runtime] max_memory nor a container limit. Nothing \
@@ -308,7 +308,7 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
         source = ?ceiling.source(),
         "each startup uniqueness check may hold about {} — eight bytes per key, so a target \
          larger than that is read in more than one pass",
-        bytesize::ByteSize(ceiling.bytes())
+        bytesize::ByteSize(ceiling.bytes()).display().si()
     );
     match (&spill_dir, spill_configured) {
         (Some(d), true) => info!(
@@ -316,7 +316,7 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
             directory = %d,
             "the whole process may hold about {} of DataFusion spill at once, under {d}, \
              shared by every pipeline in it",
-            bytesize::ByteSize(spill_limit)
+            bytesize::ByteSize(spill_limit).display().si()
         ),
         (Some(d), false) => {
             info!(directory = %d, "DataFusion spills into {d}");
@@ -326,7 +326,7 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
                      DataFusion's own {} default stands. This process is in a container, where \
                      that is larger than most pods' ephemeral-storage limit — which means the \
                      pod is evicted before the budget is ever reached.",
-                    bytesize::ByteSize(spill_limit)
+                    bytesize::ByteSize(spill_limit).display().si()
                 );
             }
         }
@@ -343,7 +343,7 @@ async fn run(cli: Cli) -> delta_delta_ingest::Result<()> {
              unset, so DataFusion spills into the OS temporary directory up to its own {}. \
              Fine on a workstation; in a container that is the setting between a slow query \
              and an evicted pod.",
-            bytesize::ByteSize(spill_limit)
+            bytesize::ByteSize(spill_limit).display().si()
         ),
     }
     let command = cli.command.unwrap_or(Command::Run);

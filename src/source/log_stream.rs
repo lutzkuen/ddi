@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use deltalake::kernel::{Action, Add, Remove, StructType};
 use deltalake::logstore::object_store::ObjectStoreExt;
 use deltalake::logstore::{commit_uri_from_version, get_actions, LogStore};
-use deltalake::{DeltaTable, DeltaTableConfig, DeltaTableError};
+use deltalake::{DeltaTable, DeltaTableError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -289,7 +289,7 @@ impl LogStreamBuilder {
         // Reuse the log store rather than rebuilding one from the URL: it already
         // carries the object-store credentials, and a rebuilt one would not. Without
         // files, for the reasons in `schema_at`: the answer is a version number.
-        let mut table = DeltaTable::new(self.log_store.clone(), without_files());
+        let mut table = DeltaTable::new(self.log_store.clone());
         table.load_with_datetime(ts).await.map_err(Error::Delta)?;
         let v = table.version().unwrap_or(0);
         self.cursor = StreamCursor::at_version(v);
@@ -329,7 +329,7 @@ impl LogStreamBuilder {
             Err(e) => return Err(Error::Delta(e)),
         };
 
-        let mut table = DeltaTable::new(self.log_store.clone(), without_files());
+        let mut table = DeltaTable::new(self.log_store.clone());
         table.load().await.map_err(Error::Delta)?;
         let Some(resolved) = table.version() else {
             // Never store this as a floor: 0 is exactly the value that does not work here,
@@ -587,7 +587,7 @@ impl LogStreamBuilder {
         if let Some(s) = self.schema_cache.get(&version) {
             return Ok(s.clone());
         }
-        let mut table = DeltaTable::new(self.log_store.clone(), without_files());
+        let mut table = DeltaTable::new(self.log_store.clone());
         table.load_version(version).await.map_err(Error::Delta)?;
         // Loaded anyway, once per version a batch ends at, so this is where a table recreated
         // at this path and grown past the cursor is noticed — before any of its rows are.
@@ -626,7 +626,7 @@ impl LogStreamBuilder {
             return Ok(());
         };
         if *was != now {
-            let mut then = DeltaTable::new(self.log_store.clone(), without_files());
+            let mut then = DeltaTable::new(self.log_store.clone());
             then.load_version(*seen_at).await.map_err(Error::Delta)?;
             if crate::lookup::table_id(&then).as_deref() != Some(was.as_str()) {
                 return Err(self.replaced(format!("its table id changed from {was} to {now}")));
@@ -671,7 +671,7 @@ pub(crate) async fn keeps_identity(table: &DeltaTable, version: Version, id: &st
     if table.version().is_none_or(|head| version > head) {
         return Ok(false);
     }
-    let mut then = DeltaTable::new(table.log_store(), without_files());
+    let mut then = DeltaTable::new(table.log_store());
     match then.load_version(version).await {
         Ok(()) => Ok(crate::lookup::table_id(&then).as_deref() == Some(id)),
         Err(DeltaTableError::InvalidVersion(_) | DeltaTableError::NotATable(_)) => Ok(false),
@@ -742,19 +742,6 @@ pub async fn earliest_readable_commit(
         }
     }
     Ok(oldest)
-}
-
-/// Load the log, but not the list of files it leaves live.
-///
-/// Both uses here ask the log a question about *itself* — what the schema was, which
-/// version a timestamp lands on — and neither needs to know which files survived. Saying so
-/// is what stops delta-rs materialising them, which costs a full replay of the file set and,
-/// on a table another engine has compacted, means parsing that engine's checkpoint.
-fn without_files() -> DeltaTableConfig {
-    DeltaTableConfig {
-        require_files: false,
-        ..Default::default()
-    }
 }
 
 /// The `dataChange: true` `Add` actions of a commit, in log order.
