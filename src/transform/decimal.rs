@@ -397,22 +397,27 @@ impl ScalarUDFImpl for DecimalToFloat {
 /// left as it was, with Arrow's cast.
 pub(crate) fn rewrite_expr(expr: Expr, schema: &DFSchema) -> DFResult<Transformed<Expr>> {
     expr.transform_up(|e| {
-        let (inner, to, try_cast) = match e {
-            Expr::Cast(Cast { expr, field }) => (expr, field.data_type().clone(), false),
-            Expr::TryCast(TryCast { expr, field }) => (expr, field.data_type().clone(), true),
+        let (inner, field, try_cast) = match e {
+            Expr::Cast(Cast { expr, field }) => (expr, field, false),
+            Expr::TryCast(TryCast { expr, field }) => (expr, field, true),
             other => return Ok(Transformed::no(other)),
         };
         if !inner
             .get_type(schema)
-            .is_ok_and(|from| is_decimal_to_float(&from, &to))
+            .is_ok_and(|from| is_decimal_to_float(&from, field.data_type()))
         {
+            // Put back as it was, field and all: DataFusion 55 casts to a field, whose
+            // metadata (an extension type, say) a cast rebuilt from its type alone would drop.
             return Ok(Transformed::no(if try_cast {
-                Expr::TryCast(TryCast::new(inner, to))
+                Expr::TryCast(TryCast::new_from_field(inner, field))
             } else {
-                Expr::Cast(Cast::new(inner, to))
+                Expr::Cast(Cast::new_from_field(inner, field))
             }));
         }
-        let udf = Arc::new(ScalarUDF::from(DecimalToFloat::new(to, try_cast)));
+        let udf = Arc::new(ScalarUDF::from(DecimalToFloat::new(
+            field.data_type().clone(),
+            try_cast,
+        )));
         Ok(Transformed::yes(Expr::ScalarFunction(
             ScalarFunction::new_udf(udf, vec![*inner]),
         )))
@@ -467,6 +472,35 @@ mod tests {
         Decimal128Array, Decimal256Array, Float64Array, Int32Array, ListArray,
     };
     use deltalake::arrow::buffer::OffsetBuffer;
+
+    /// A cast this pass does not take over is put back as it was. DataFusion 55 casts to a
+    /// field rather than a type, so rebuilding one from its type would drop the field's
+    /// metadata from every cast in every plan.
+    #[test]
+    fn a_cast_left_alone_keeps_its_target_field() {
+        use deltalake::arrow::datatypes::Field;
+        use deltalake::datafusion::logical_expr::col;
+
+        let schema =
+            DFSchema::try_from(deltalake::arrow::datatypes::Schema::new(vec![Field::new(
+                "n",
+                DataType::Int32,
+                true,
+            )]))
+            .unwrap();
+        let field =
+            Arc::new(Field::new("", DataType::Utf8, true).with_metadata(
+                [("ARROW:extension:name".to_string(), "ddi.test".to_string())].into(),
+            ));
+        for cast in [
+            Expr::Cast(Cast::new_from_field(Box::new(col("n")), field.clone())),
+            Expr::TryCast(TryCast::new_from_field(Box::new(col("n")), field.clone())),
+        ] {
+            let out = rewrite_expr(cast.clone(), &schema).unwrap();
+            assert!(!out.transformed);
+            assert_eq!(out.data, cast, "the field, metadata included, must survive");
+        }
+    }
 
     #[test]
     fn the_issue_rows_convert_to_the_nearest_double() {
