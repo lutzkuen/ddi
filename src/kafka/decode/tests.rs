@@ -2154,7 +2154,8 @@ async fn a_nullable_empty_type_takes_its_union_byte() {
     }
     let out = d.finish().unwrap();
     assert!(out.undecodable.is_empty(), "{:?}", out.undecodable);
-    let b = deltalake::arrow::compute::concat_batches(&out.batches[0].schema(), &out.batches).unwrap();
+    let b =
+        deltalake::arrow::compute::concat_batches(&out.batches[0].schema(), &out.batches).unwrap();
     assert_eq!(i64s(&b, "kafka_offset"), [0, 1]);
     let f = column(&b, "f");
     assert_eq!((f.is_valid(0), f.is_valid(1)), (true, false));
