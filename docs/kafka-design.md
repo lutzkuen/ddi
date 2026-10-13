@@ -1466,6 +1466,23 @@ SELECT * REPLACE (
 FROM source
 ```
 
+The production shape (M-1) is the same idea with no nested update: every topic's `-t` list, after the entrypoint's rewrite, is the six lines plus lower-cased aliases and `data: to_string(data)`, and one statement serves all 22 topics. Pinned by `tests/kafka_bronze.rs`, which reads two messages either side of midnight UTC and asserts the twelve columns, the partition value, a NULL (not `"null"`) for a null union, and the exact JSON text of the payload:
+```toml
+kdi_compat    = true
+kdi_null_text = false
+transform_sql = """
+SELECT "messageId" AS messageid,
+       to_timestamp_millis("messageTime") AS messagetime,
+       "correlationId" AS correlationid,
+       producer, "producerVersion" AS producerversion, "producerHost" AS producerhost,
+       data,
+       kafka_topic, kafka_partition, kafka_offset, kafka_timestamp,
+       to_char(to_timestamp_millis("messageTime"), '%Y-%m-%d') AS ingest_date
+FROM source
+"""
+```
+`data` is the Avro record, left alone: `kdi_compat` renders it into the STRING column as kdi's JSON text. The statement lists the Kafka columns itself because a `SELECT` list replaces the source's columns.
+
 ---
 
 ## 7. Metrics and checkpoints
