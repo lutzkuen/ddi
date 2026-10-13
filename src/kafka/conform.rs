@@ -975,7 +975,11 @@ impl Fitter<'_> {
             (precision, scale): (u8, i8),
             mut reject: impl FnMut(usize),
         ) -> Vec<Option<T::Native>> {
-            let parse = |t: &str| parse_decimal::<T>(t, precision, scale).ok();
+            let parse = |t: &str| {
+                (counted_digits(t, scale) <= usize::from(u8::MAX))
+                    .then(|| parse_decimal::<T>(t, precision, scale).ok())
+                    .flatten()
+            };
             (texts.iter().enumerate())
                 .map(|(i, text)| {
                     let value = text.as_ref()?.as_deref().and_then(parse);
@@ -1067,6 +1071,28 @@ fn decimal_shape(t: &DataType) -> (u8, i8) {
         }
         _ => unreachable!("matched as a decimal"),
     }
+}
+
+/// How many digits arrow's `parse_decimal` counts in `t` before its exponent: those of the
+/// integer part from the first one that is not a leading zero, and those of the fraction up to
+/// `scale`. It counts them in a `u8` and multiplies without a check, so a text of more than 255
+/// reads as a wrong value (in a release build) instead of an overflow: it is turned away first.
+fn counted_digits(t: &str, scale: i8) -> usize {
+    let scale = usize::try_from(scale).unwrap_or(0);
+    let (mut digits, mut fraction) = (0usize, None::<usize>);
+    for b in t.bytes() {
+        match (b, fraction.as_mut()) {
+            (b'0'..=b'9', None) if !(digits == 0 && b == b'0') => digits += 1,
+            (b'0'..=b'9', Some(f)) if *f < scale => {
+                *f += 1;
+                digits += 1;
+            }
+            (b'.', None) => fraction = Some(0),
+            (b'e' | b'E', _) => break,
+            _ => {}
+        }
+    }
+    digits
 }
 
 /// The text of `v` that `parse_decimal` reads into a decimal of `precision` and `scale`, or

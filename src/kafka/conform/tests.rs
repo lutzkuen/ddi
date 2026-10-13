@@ -616,6 +616,47 @@ async fn double_to_decimal_via_shortest_text() {
     );
 }
 
+/// A text into a decimal with more digits than arrow's `parse_decimal` counts (a `u8`) is
+/// rejected, not read as a wrapped-around value: with 257 digits the count wraps to 1 and passes
+/// the precision check while the value has overflowed. 255 digits of a fraction past the scale
+/// are only validated, not counted, and still read.
+#[tokio::test]
+async fn text_with_more_digits_than_parse_decimal_counts_is_rejected() {
+    const TEXTS: &str = r#"{"type":"record","name":"Amount","fields":[
+        {"name":"id","type":"long"},
+        {"name":"d","type":"string"}]}"#;
+    let row = |id: i64, d: String| {
+        (
+            1,
+            record(vec![("id", Avro::Long(id)), ("d", Avro::String(d))]),
+        )
+    };
+    let batches = decoded(
+        &[(1, TEXTS)],
+        vec![
+            row(0, format!("1{}", "0".repeat(256))),
+            row(1, format!("1.{}", "5".repeat(300))),
+            row(2, format!("{}1.5", "0".repeat(300))),
+        ],
+    )
+    .await;
+    let t = target(vec![
+        field("id", Delta::LONG, false),
+        field("d", Delta::decimal(10, 2).unwrap(), true),
+    ]);
+    let mut c = conformer(t);
+    let (good, rejects) = through(&mut c, batches);
+    assert_eq!(rejected_offsets(&rejects), [0]);
+    let d = good[0]
+        .column_by_name("d")
+        .unwrap()
+        .as_primitive::<Decimal128Type>();
+    assert_eq!(
+        (d.value_as_string(0), d.value_as_string(1)),
+        ("1.55".to_string(), "1.50".to_string())
+    );
+}
+
 // -------------------------------------------------------------------------------- guards
 
 const CUSTOMER: &str = r#"{"type":"record","name":"Customer","fields":[
