@@ -950,3 +950,12 @@ cargo build
 
 Every step asserts the same thing: no order missing, no order twice, JSON parsed and
 cast.
+
+## 12. Reading Kafka (the `kafka` build)
+
+The published image reads Kafka as well as Delta. Add a `[kafka]` section and a `[[kafka.pipeline]]` per topic to the
+same `ddi.toml` (the example is in the README, "Kafka source"). Nothing about the dbt side changes: the table a
+Kafka pipeline fills is an ordinary append-only Delta table, so a downstream `[[pipeline]]` or a dbt model reads it
+like any other. To take a topic over from `kafka-delta-ingest`, follow [docs/kafka-runbook.md](docs/kafka-runbook.md):
+`ddi kafka plan` first, and keep kdi's `app_id`.
+

@@ -1,0 +1,72 @@
+# Prometheus alert rules for ddi's Kafka pipelines (docs/kafka-runbook.md says what to do for each).
+# The metric names are the ones `ddi --metrics-addr` exports; every series carries `pipeline`.
+# Thresholds are starting points: tune them against a week of your own traffic.
+groups:
+  - name: ddi-kafka
+    rules:
+      - alert: DdiKafkaPipelineBlocked
+        expr: max by (pipeline, reason) (ddi_kafka_pipeline_blocked) == 1
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pipeline }} is held whole: {{ $labels.reason }}"
+          description: The member is up and in its group but writes nothing until an operator acts. See the runbook entry for the reason.
+
+      - alert: DdiKafkaPartitionBlocked
+        expr: ddi_kafka_blocked_partitions > 0
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pipeline }} has {{ $value }} blocked partition(s)"
+          description: A retention gap, a regressed offset, a replaced topic or an undecodable message. `ddi kafka plan` names the partition; `ddi kafka set-offsets` with an acknowledgment moves it.
+
+      - alert: DdiKafkaLagGrowing
+        expr: ddi_kafka_lag_messages_max > 100000 and deriv(ddi_kafka_lag_messages_max[30m]) > 0
+        for: 30m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pipeline }} is falling behind ({{ $value }} messages at most)"
+
+      - alert: DdiKafkaRetentionHeadroomLow
+        expr: ddi_kafka_retention_headroom_messages < 1000000 and ddi_kafka_retention_headroom_messages >= 0
+        for: 15m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pipeline }} is {{ $value }} messages from the topic's retention edge"
+          description: If the topic trims past the stored offset, the partition blocks and the skipped messages are lost for this table.
+
+      - alert: DdiKafkaNoProgress
+        expr: ddi_pipeline_seconds_since_progress > 900 and ddi_kafka_lag_messages > 0
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pipeline }} has lag and has committed nothing for {{ $value }}s"
+
+      - alert: DdiKafkaFenced
+        expr: increase(ddi_kafka_fenced_total[15m]) > 20
+        for: 15m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pipeline }} keeps losing commits to another writer"
+          description: A second deployment of the same app_id, or kafka-delta-ingest still running against this table. Stop one of them.
+
+      - alert: DdiKafkaUndecodable
+        expr: increase(ddi_kafka_undecodable_total[1h]) > 0
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pipeline }} set aside undecodable messages"
+          description: They are in <target>__ddi_dq with the reason. Past the per-batch cap the pipeline blocks (ddi_kafka_undecodable_blocking).
+
+      - alert: DdiKafkaBrokersDown
+        expr: ddi_kafka_brokers_up == 0
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pipeline }} reaches no broker"
+
+      - alert: DdiPipelineConfigInvalid
+        expr: ddi_pipeline_config_valid == 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pipeline }} was held back at load and never started"

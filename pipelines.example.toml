@@ -196,3 +196,27 @@ FROM orders
 # failure_threshold  = 5       # consecutive failures before the breaker opens
 # breaker_cooldown_secs = 30
 # max_message_bytes  = "900KB" # the service's frame limit is 1 MB
+
+# --- Kafka (needs the `kafka` build; see README "Kafka source" and docs/kafka-runbook.md) ----------
+# A Confluent-framed Avro topic into an append-only Delta table. Offsets live in the table: one
+# commit holds the rows and a txn per partition, and nothing is committed to Kafka.
+#
+# [kafka]
+# brokers = "b-1.kafka.internal:9092"
+# allowed_latency_secs = 300          # commit at the latest this long after the first message
+# max_bytes_per_batch  = "128MB"      # or when this much Kafka payload is buffered
+# starting_offsets     = "earliest"   # a fresh app_id only: "earliest" | "latest" | { "0" = 1234, "*" = "latest" }
+# kdi_compat = true                   # a table kafka-delta-ingest wrote: keep its STRING rendering
+# jaas_env = "KAFKA_SASL_JAAS_CONFIG" # a Kafka JAAS line holding username= and password=
+# [kafka.settings]
+# "security.protocol" = "SASL_SSL"
+# "sasl.mechanism"    = "PLAIN"
+# [kafka.schema_registry]
+# url = "https://sr.internal"         # credentials: SCHEMA_REGISTRY_USERNAME / SCHEMA_REGISTRY_PASSWORD
+#
+# [[kafka.pipeline]]
+# name       = "orders_raw"
+# app_id     = "ddi.orders_raw"       # taking over kdi's table: its -a, exactly
+# topic      = "orders.created"
+# target_uri = "abfss://lake@acct.dfs.core.windows.net/raw/orders_created"
+# transform_sql = "SELECT * FROM source"   # row-local, one SELECT; Kafka columns kafka_topic/_partition/_offset/_timestamp

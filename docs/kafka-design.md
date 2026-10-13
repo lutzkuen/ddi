@@ -1414,7 +1414,7 @@ With no SQL, the coercer keeps the columns whose names exist in the target and d
 
 kdi evaluates every expression against the **original** message, keeps all original fields, and does not set a field whose result is null (`set_value`, transforms.rs:343-372). `SELECT *, … FROM source` has the same shape.
 
-To overwrite an existing column with kdi's semantics (a null result keeps the original), use `SELECT * REPLACE (coalesce(<expr>, "f") AS "f")`. GenericDialect parses REPLACE (sqlparser generic.rs:232) and DataFusion plans it (datafusion-sql select.rs:847); acceptance by ddi's validator is **verify (M4)**, with an enumerated column list as the fallback.
+To overwrite an existing column with kdi's semantics (a null result keeps the original), use `SELECT * REPLACE (coalesce(<expr>, "f") AS "f")`. GenericDialect parses REPLACE (sqlparser generic.rs:232) and DataFusion plans it (datafusion-sql select.rs:847); ddi's validator accepts it and the engine evaluates it with kdi's semantics (a null result keeps the original: `tests/kafka_translation.rs`, M4).
 
 | kdi `-t` | ddi `transform_sql` |
 |---|---|
@@ -1422,7 +1422,7 @@ To overwrite an existing column with kdi's semantics (a null result keeps the or
 | `x: kafka.timestamp` | `kafka_timestamp AS x`. A BIGINT target gets µs, as in kdi; TIMESTAMP is correct; STRING with `kdi_compat` gets µs text. |
 | `meta.kafka.offset: kafka.offset` (nested, merging into an existing `meta`) | `SELECT * REPLACE (named_struct('producer', "meta"."producer", 'kafka', named_struct('offset', kafka_offset, 'partition', kafka_partition, 'topic', kafka_topic)) AS "meta")`. Every existing child must be listed. |
 | `x: field` | `"field" AS "x"` |
-| `x: a.b.c` | `"a"."b"."c" AS "x"`. Planning of quoted multi-level access **verify (M4)**; fallback `get_field(get_field("a",'b'),'c')`. |
+| `x: a.b.c` | `"a"."b"."c" AS "x"`. Quoted multi-level access plans (`tests/kafka_translation.rs`, M4); `get_field(get_field("a",'b'),'c')` is the same thing spelled out. |
 | `f: <expr>` where f already exists | `* REPLACE (coalesce(<expr>, "f") AS "f")` |
 | `x: substr(s, \`a\`, \`n\`)` (skip a characters, take n; transforms.rs:216-240) | `substr("s", a + 1, n)` |
 | `x: epoch_seconds_to_iso8601(n)`, TIMESTAMP target | `from_unixtime(n, 'UTC')` or `to_timestamp_seconds(n)` |

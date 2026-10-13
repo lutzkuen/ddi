@@ -146,6 +146,8 @@ enum KafkaCommand {
         #[arg(long)]
         to: String,
     },
+    /// Create the pipeline's data-quality table (`<target>__ddi_dq`) where it does not exist.
+    CreateDq,
     /// Move a pipeline's offsets. Offsets here are the NEXT offset to read.
     SetOffsets {
         /// The partition to move (repeatable with `--next` in the same order is not
@@ -710,6 +712,13 @@ async fn kafka_command(
             }
             if blocked {
                 return Err(Error::Other("a pipeline is blocked (see above)".into()));
+            }
+            Ok(())
+        }
+        KafkaCommand::CreateDq => {
+            for p in &pipelines {
+                let uri = clone::create_dq(p).await?;
+                println!("created {uri}");
             }
             Ok(())
         }

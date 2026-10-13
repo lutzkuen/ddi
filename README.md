@@ -430,6 +430,43 @@ Use this for compact, keyed relations such as daily FX rates. It is not a substi
 joining a many-gigabyte historical RRP/COGS table into every 5,000-row source batch; materialize
 a compact lookup with a documented key first, or enrich downstream.
 
+## Kafka source
+
+A build with the `kafka` feature (the published image has it) also runs `[[kafka.pipeline]]`s: a Confluent-framed
+Avro topic into an append-only Delta table, with the same exactly-once rule as the Delta pipelines. A batch is one
+Delta commit holding the rows and one `txn` per partition, so a row is in the table exactly when its offset is. The
+consumer group only shares partitions; offsets live in the table and nothing is committed to Kafka.
+
+```toml
+[kafka]
+brokers  = "b-1.kafka.internal:9092"
+jaas_env = "KAFKA_SASL_JAAS_CONFIG"                  # a JAAS line; or scram_json_env, or settings_env
+[kafka.settings]
+"security.protocol" = "SASL_SSL"
+"sasl.mechanism"    = "PLAIN"
+[kafka.schema_registry]
+url = "https://sr.internal"                          # SCHEMA_REGISTRY_USERNAME / _PASSWORD
+
+[[kafka.pipeline]]
+name       = "orders_raw"
+app_id     = "ddi.orders_raw"
+topic      = "orders.created"
+target_uri = "abfss://lake@acct.dfs.core.windows.net/raw/orders_created"
+transform_sql = "SELECT * FROM source"               # optional, row-local, Trino spellings
+```
+
+- Every Avro field becomes a column by name, and the Kafka coordinates are appended as `kafka_topic`,
+  `kafka_partition`, `kafka_offset`, `kafka_timestamp` (also `kafka_key`, `kafka_headers`, ...); a column the target
+  does not have is dropped. Messages written with older or newer versions of the schema are conformed to the target
+  by name.
+- A message it cannot decode, or a row the SQL cannot evaluate, goes to `<target>__ddi_dq` with the reason
+  (`ddi kafka create-dq`). Something it cannot decide alone (a retention gap, a recreated topic, a table another
+  engine rewrote) **blocks** the partition or pipeline and says why in `ddi_kafka_pipeline_blocked`.
+- **Taking over a table kafka-delta-ingest wrote**: same `app_id`, kdi stopped, `kdi_compat = true` to keep its STRING
+  rendering. `ddi kafka plan` is the read-only preflight, `ddi kafka set-offsets` the guarded way to move offsets,
+  `ddi kafka clone-table` makes the shadow table. The whole procedure is in [docs/kafka-runbook.md](docs/kafka-runbook.md);
+  alerts in [docs/alerts.yml](docs/alerts.yml); the design and its proofs in [docs/kafka-design.md](docs/kafka-design.md).
+
 ## Running alongside dbt
 
 The two-speed lakehouse: dbt rebuilds a model nightly and owns correctness; `ddi` streams

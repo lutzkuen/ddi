@@ -186,6 +186,28 @@ async fn clone_table_keeps_the_case_and_the_partition_columns() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs Redpanda; set DDI_TEST_KAFKA"]
+async fn create_dq_makes_the_table_once() {
+    let f = Fixture::bare(1).await;
+    create_target(&f.target).await;
+    let toml = f.toml("tools", "", "");
+    let config = f.write("dq.toml", &toml);
+    let (ok, out) = run(&config, &["create-dq"]).await;
+    assert!(ok && out.contains("__ddi_dq"), "{out}");
+    let names: Vec<String> = open(&f.dq)
+        .await
+        .snapshot()
+        .unwrap()
+        .schema()
+        .fields()
+        .map(|c| c.name().to_string())
+        .collect();
+    assert!(names.contains(&"reason".to_string()), "{names:?}");
+    let (ok, _) = run(&config, &["create-dq"]).await;
+    assert!(!ok, "the table exists");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Redpanda; set DDI_TEST_KAFKA"]
 async fn set_offsets_moves_guards_and_reasserts() {
     let f = Fixture::new(2).await;
     let id = register(&f.subject(), EVENT_V1).await;

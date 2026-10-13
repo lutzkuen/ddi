@@ -58,3 +58,21 @@ pub async fn clone_table(cfg: &ResolvedPipeline, to: &str) -> Result<i64> {
         .map_err(Error::Delta)?;
     Ok(table.version().unwrap_or(0) as i64)
 }
+
+/// Create the pipeline's data-quality table, `<target>__ddi_dq` unless `dq_uri` says otherwise,
+/// with the columns every writer of it agrees on ([`crate::dq::columns`]). A pipeline without
+/// one pauses on the first message it cannot decode, rather than discard it (§5.7). Refuses
+/// where the table exists.
+pub async fn create_dq(cfg: &ResolvedPipeline) -> Result<String> {
+    let uri = cfg.dq_uri();
+    let url = ensure_table_uri(&uri).map_err(Error::Delta)?;
+    DeltaTable::try_from_url(url)
+        .await
+        .map_err(Error::Delta)?
+        .create()
+        .with_columns(crate::dq::columns())
+        .with_save_mode(SaveMode::ErrorIfExists)
+        .await
+        .map_err(Error::Delta)?;
+    Ok(uri)
+}
