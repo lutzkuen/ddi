@@ -42,9 +42,10 @@ use delta_delta_ingest::dbt::Manifest;
 use delta_delta_ingest::transform::{SqlTransform, Transform};
 use delta_delta_ingest::trino::{TrinoClient, TrinoConnection};
 use deltalake::arrow::array::{
-    Array, ArrayRef, AsArray, Decimal128Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    StructArray, TimestampMicrosecondArray,
+    Array, ArrayRef, AsArray, Decimal128Array, Float64Array, Int32Array, Int64Array, ListArray,
+    RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
 };
+use deltalake::arrow::buffer::OffsetBuffer;
 use deltalake::arrow::compute::cast;
 use deltalake::arrow::datatypes::{
     DataType, Field, Fields, Float32Type, Float64Type, Schema, TimeUnit,
@@ -641,5 +642,54 @@ const BRANCHES: &[&str] = &[
 #[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
 async fn a_coalesce_over_names_gives_the_value_trino_gives() {
     let differ = differences(&trino(), &epochs(), BRANCHES, false).await;
+    assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
+}
+
+/// Arrays of doubles holding a NaN: among other values, and alone.
+fn doubles_with_nan() -> Source {
+    let from = "(VALUES (ARRAY[DOUBLE '1.0', nan(), DOUBLE '3.0'], ARRAY[nan(), DOUBLE '2.0'], \
+                ARRAY[nan()])) AS source(a, b, c)";
+    let list = |vals: Vec<f64>| -> ArrayRef {
+        let n = vals.len() as i32;
+        Arc::new(ListArray::new(
+            Arc::new(Field::new("element", DataType::Float64, true)),
+            OffsetBuffer::new(vec![0, n].into()),
+            Arc::new(Float64Array::from(vals)),
+            None,
+        ))
+    };
+    let (a, b, c) = (
+        list(vec![1.0, f64::NAN, 3.0]),
+        list(vec![f64::NAN, 2.0]),
+        list(vec![f64::NAN]),
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("a", a.data_type().clone(), false),
+            Field::new("b", b.data_type().clone(), false),
+            Field::new("c", c.data_type().clone(), false),
+        ])),
+        vec![a, b, c],
+    )
+    .unwrap();
+    Source {
+        from: from.into(),
+        batch,
+    }
+}
+
+/// `array_min` / `array_max` pass over a NaN element and give NaN only when every element is one.
+#[tokio::test]
+#[ignore = "needs a Trino coordinator; set DDI_TEST_TRINO"]
+async fn array_min_and_max_treat_nan_as_trino_does() {
+    let exprs = [
+        "array_min(a)",
+        "array_max(a)",
+        "array_min(b)",
+        "array_max(b)",
+        "array_min(c)",
+        "array_max(c)",
+    ];
+    let differ = differences(&trino(), &doubles_with_nan(), &exprs, false).await;
     assert!(differ.is_empty(), "values differ:\n{}", differ.join("\n"));
 }

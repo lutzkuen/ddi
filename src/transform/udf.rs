@@ -226,9 +226,10 @@ impl Reduce {
         }
         Some(match self {
             Reduce::Sum => vals.iter().sum(),
-            // Trino's array_min / array_max return NaN when any element is NaN; f64::min and
-            // f64::max would skip it.
-            Reduce::Min | Reduce::Max if vals.iter().any(|v| v.is_nan()) => f64::NAN,
+            // Trino's array_min / array_max pass over a NaN element and return NaN only when
+            // every element is one (Trino 480, tests/trino_dialect.rs). f64::min and f64::max
+            // skip NaN too; a fold from ±Infinity would turn all-NaN into ±Infinity.
+            Reduce::Min | Reduce::Max if vals.iter().all(|v| v.is_nan()) => f64::NAN,
             Reduce::Min => vals.iter().copied().fold(f64::INFINITY, f64::min),
             Reduce::Max => vals.iter().copied().fold(f64::NEG_INFINITY, f64::max),
             Reduce::Avg => vals.iter().sum::<f64>() / vals.len() as f64,
@@ -567,5 +568,18 @@ mod tests {
         assert_eq!(Reduce::Min.apply(&v), Some(1.0));
         assert_eq!(Reduce::Max.apply(&v), Some(3.0));
         assert_eq!(Reduce::Avg.apply(&v), Some(2.0));
+    }
+
+    #[test]
+    fn min_and_max_pass_over_nan_as_trino_does() {
+        let v = [1.0, f64::NAN, 3.0];
+        assert_eq!(Reduce::Min.apply(&v), Some(1.0));
+        assert_eq!(Reduce::Max.apply(&v), Some(3.0));
+        let v = [f64::NAN, 2.0];
+        assert_eq!(Reduce::Min.apply(&v), Some(2.0));
+        assert_eq!(Reduce::Max.apply(&v), Some(2.0));
+        let all = [f64::NAN, f64::NAN];
+        assert!(Reduce::Min.apply(&all).unwrap().is_nan());
+        assert!(Reduce::Max.apply(&all).unwrap().is_nan());
     }
 }
