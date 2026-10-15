@@ -45,8 +45,8 @@
 //! going through the parser means the result is a thing the parser accepts, by construction.
 
 use deltalake::datafusion::sql::sqlparser::ast::{
-    DataType, Expr, Join, Query, Select, SelectItem, SetExpr, Statement as SqlStatement,
-    TableFactor, TableWithJoins, VisitMut, VisitorMut,
+    DataType, Expr, Join, JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr,
+    Statement as SqlStatement, TableFactor, TableWithJoins, VisitMut, VisitorMut,
 };
 use std::ops::ControlFlow;
 
@@ -185,14 +185,23 @@ fn rewrite_select(select: &mut Select) -> Result<()> {
     // metadata, which is where an element's JSON type lives (see
     // `crate::transform::json::JSON_MARKER`). An element of `CAST(.. AS ARRAY(JSON))` is
     // JSON in Trino, so it is marked again on the way out.
-    let element = if elements_are_json(&found.array) {
+    //
+    // `LEFT JOIN UNNEST(..) ON TRUE` keeps a row whose array is empty, with a NULL element;
+    // so does a NULL one. Unnest drops both, so each is swapped for `[NULL]`, built from the
+    // array's own (out of range, so NULL) first element to get the element type right.
+    let array = if found.outer {
         format!(
-            "{}(unnest({}))",
-            crate::transform::json_build::AS_JSON,
-            found.array
+            "CASE WHEN {a} IS NULL OR cardinality({a}) = 0 \
+             THEN make_array(array_element({a}, 1)) ELSE {a} END",
+            a = found.array
         )
     } else {
-        format!("unnest({})", found.array)
+        found.array.clone()
+    };
+    let element = if elements_are_json(&found.array) {
+        format!("{}(unnest({array}))", crate::transform::json_build::AS_JSON)
+    } else {
+        format!("unnest({array})")
     };
     let inner = format!(
         "SELECT {qualifier}*, {element} AS {column} FROM {base}",
@@ -226,6 +235,9 @@ struct Found {
     array: String,
     /// The name the outer query refers to each element by.
     column: String,
+    /// `LEFT JOIN UNNEST(..) ON TRUE`: a row with an empty or NULL array survives, with a
+    /// NULL element. `CROSS JOIN UNNEST` drops it.
+    outer: bool,
 }
 
 /// Locate the single `UNNEST` in this `FROM`, if there is one.
@@ -234,11 +246,15 @@ struct Found {
 /// older `a, UNNEST(x) AS t(y)`.
 fn find(select: &Select) -> Result<Option<Found>> {
     let mut factors: Vec<&TableFactor> = Vec::new();
+    let mut outer = false;
     for (i, twj) in select.from.iter().enumerate() {
         if i > 0 {
             factors.push(&twj.relation);
         }
         for join in &twj.joins {
+            if matches!(join.relation, TableFactor::UNNEST { .. }) {
+                outer = unnest_join_is_outer(&join.join_operator)?;
+            }
             factors.push(&join.relation);
         }
     }
@@ -329,7 +345,35 @@ fn find(select: &Select) -> Result<Option<Found>> {
         // be re-encoded before it renders. See `crate::transform::lambda::render_expr`.
         array: crate::transform::lambda::render_expr(&array_exprs[0]),
         column,
+        outer,
     }))
+}
+
+/// Is this join to an `UNNEST` a `LEFT` one? `Ok(false)` for the forms that mean a cross
+/// join. Anything else is refused: an `ON` that is not `TRUE` would filter the fan-out, and
+/// a `RIGHT` or `FULL` join would have to invent a source row for an element.
+fn unnest_join_is_outer(op: &JoinOperator) -> Result<bool> {
+    let always = |c: &JoinConstraint| match c {
+        JoinConstraint::None => true,
+        JoinConstraint::On(e) => e.to_string().eq_ignore_ascii_case("true"),
+        _ => false,
+    };
+    match op {
+        JoinOperator::CrossJoin(c) | JoinOperator::Join(c) | JoinOperator::Inner(c)
+            if always(c) =>
+        {
+            Ok(false)
+        }
+        JoinOperator::Left(c) | JoinOperator::LeftOuter(c) if always(c) => Ok(true),
+        _ => Err(unsupported(
+            "this join to UNNEST",
+            "an UNNEST of a column of the same row is a fan-out, not a join: only CROSS JOIN \
+             and INNER or LEFT JOIN ... ON TRUE mean that, and any other condition or join \
+             type would filter or invent rows.",
+            "write `CROSS JOIN UNNEST(<array>) AS t(<name>)`, or `LEFT JOIN UNNEST(<array>) \
+             AS t(<name>) ON TRUE` to keep a row whose array is empty or NULL.",
+        )),
+    }
 }
 
 /// Are the elements of this array expression JSON-typed — is it `CAST(.. AS ARRAY(JSON))`,
@@ -427,6 +471,31 @@ mod tests {
              (SELECT o.*, unnest(o.line_items) AS li FROM source o) AS o",
             "the outer query must survive untouched"
         );
+    }
+
+    #[test]
+    fn a_left_join_unnest_on_true_is_an_outer_fan_out() {
+        let got = rewritten(
+            "SELECT o.order_id, li.sku FROM source o LEFT JOIN UNNEST(o.line_items) AS t(li) ON TRUE",
+        )
+        .unwrap();
+        assert!(got.contains("CASE WHEN o.line_items IS NULL"), "got: {got}");
+        assert!(got.contains("unnest(CASE"), "got: {got}");
+    }
+
+    #[test]
+    fn a_join_to_unnest_with_another_condition_or_type_is_refused() {
+        for join in [
+            "LEFT JOIN UNNEST(o.line_items) AS t(li) ON o.order_id > 1",
+            "RIGHT JOIN UNNEST(o.line_items) AS t(li) ON TRUE",
+            "FULL JOIN UNNEST(o.line_items) AS t(li) ON TRUE",
+            "INNER JOIN UNNEST(o.line_items) AS t(li) ON o.order_id > 1",
+        ] {
+            let e = rewritten(&format!("SELECT o.order_id FROM source o {join}"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("not supported"), "{join}: {e}");
+        }
     }
 
     #[test]

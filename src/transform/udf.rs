@@ -226,6 +226,9 @@ impl Reduce {
         }
         Some(match self {
             Reduce::Sum => vals.iter().sum(),
+            // Trino's array_min / array_max return NaN when any element is NaN; f64::min and
+            // f64::max would skip it.
+            Reduce::Min | Reduce::Max if vals.iter().any(|v| v.is_nan()) => f64::NAN,
             Reduce::Min => vals.iter().copied().fold(f64::INFINITY, f64::min),
             Reduce::Max => vals.iter().copied().fold(f64::NEG_INFINITY, f64::max),
             Reduce::Avg => vals.iter().sum::<f64>() / vals.len() as f64,
@@ -493,12 +496,9 @@ fn struct_expr_values(elems: &ArrayRef, expr: &FieldExpr, fname: &str) -> DFResu
                     '+' => a + b,
                     '-' => a - b,
                     '*' => a * b,
-                    '/' => {
-                        if b == 0.0 {
-                            return None;
-                        }
-                        a / b
-                    }
+                    // IEEE division, as Trino's double: x/0 is ±Infinity and 0/0 is NaN. The
+                    // element is kept, never skipped.
+                    '/' => a / b,
                     _ => return None,
                 })
             }

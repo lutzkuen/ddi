@@ -448,10 +448,12 @@ async fn a_rebuild_that_overtook_the_stream_does_not_duplicate_its_rows() {
     let got = read_ids(&f.target).await;
     assert_eq!(got, vec![1, 2, 3, 4, 5], "no key reprocessed: {got:?}");
     assert!(!has_duplicates(&got));
-    assert_eq!(
-        n, 0,
-        "the rescan is bounded by the source's file statistics, so there was nothing left \
-         to read at all — not merely nothing left to emit"
+    // The rescan is bounded by the source's file statistics, so only the commit tied at the
+    // watermark is read again (a tie proves nothing: rows sharing the watermark may be in it
+    // and not in the target) and the key filter drops its row.
+    assert!(
+        n <= 1,
+        "the rescan reads the one boundary commit and nothing before it, read {n}"
     );
 }
 

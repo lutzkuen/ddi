@@ -421,3 +421,115 @@ async fn array_sum_over_decimals_starts_from_the_nearest_doubles() {
         );
     }
 }
+
+// ---------------------------------------------------------------- LEFT JOIN UNNEST
+
+/// Three rows: #1 has two tags, #2 an empty array, #3 a NULL one.
+fn orders_with_tags() -> RecordBatch {
+    use deltalake::arrow::datatypes::Int64Type;
+    let tags = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+        Some(vec![Some(10), Some(20)]),
+        Some(vec![]),
+        None,
+    ]);
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("tags", tags.data_type().clone(), true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2, 3])) as ArrayRef,
+            Arc::new(tags) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+async fn tags(sql: &str) -> Vec<(i64, Option<i64>)> {
+    let out = SqlTransform::new(sql)
+        .apply(vec![orders_with_tags()])
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for b in out {
+        let ids = b.column_by_name("order_id").unwrap();
+        let ids = ids.as_any().downcast_ref::<Int64Array>().unwrap();
+        let tag = b.column_by_name("tag").unwrap();
+        let tag = tag.as_any().downcast_ref::<Int64Array>().unwrap();
+        for i in 0..b.num_rows() {
+            rows.push((ids.value(i), (!tag.is_null(i)).then(|| tag.value(i))));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+#[tokio::test]
+async fn cross_join_unnest_drops_a_row_whose_array_is_empty_or_null() {
+    let got =
+        tags("SELECT o.order_id, tag FROM source o CROSS JOIN UNNEST(o.tags) AS t(tag)").await;
+    assert_eq!(got, vec![(1, Some(10)), (1, Some(20))]);
+}
+
+#[tokio::test]
+async fn left_join_unnest_keeps_a_row_whose_array_is_empty_or_null() {
+    // Trino: `LEFT JOIN UNNEST(..) ON TRUE` yields one row with a NULL element.
+    let want = vec![(1, Some(10)), (1, Some(20)), (2, None), (3, None)];
+    for join in ["LEFT JOIN", "LEFT OUTER JOIN"] {
+        let got = tags(&format!(
+            "SELECT o.order_id, tag FROM source o {join} UNNEST(o.tags) AS t(tag) ON TRUE"
+        ))
+        .await;
+        assert_eq!(got, want, "{join}");
+    }
+}
+
+#[tokio::test]
+async fn a_join_to_unnest_that_would_filter_or_invent_rows_is_refused() {
+    for join in [
+        "LEFT JOIN UNNEST(o.tags) AS t(tag) ON o.order_id > 1",
+        "RIGHT JOIN UNNEST(o.tags) AS t(tag) ON TRUE",
+        "FULL JOIN UNNEST(o.tags) AS t(tag) ON TRUE",
+    ] {
+        let err = delta_delta_ingest::transform::validate_sql(&format!(
+            "SELECT o.order_id, tag FROM source o {join}"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("not supported"), "{join}: {err}");
+    }
+}
+
+// ---------------------------------------------------------------- array_* over an expression
+
+#[tokio::test]
+async fn array_reduce_over_an_expression_divides_like_a_double() {
+    // Trino's double: x/0 is Infinity, 0/0 is NaN. The element is kept, not skipped.
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "line_items",
+            orders_with_line_items()
+                .schema()
+                .field(1)
+                .data_type()
+                .clone(),
+            false,
+        )])),
+        vec![orders_with_line_items().column(1).clone()],
+    )
+    .unwrap();
+    let out =
+        SqlTransform::new("SELECT array_sum(line_items, 'price / (qty - qty)') AS s FROM source")
+            .apply(vec![batch])
+            .await
+            .unwrap();
+    let s = out[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert!(
+        s.value(0).is_infinite(),
+        "10/0 + 5.5/0 = Infinity, got {}",
+        s.value(0)
+    );
+}

@@ -614,7 +614,12 @@ pub(crate) fn java_bigdecimal_text(text: &str) -> String {
         None => (false, text),
     };
     let (mantissa, exponent) = match rest.split_once(['e', 'E']) {
-        Some((m, e)) => (m, e.parse::<i64>().unwrap_or(0)),
+        // Java's BigDecimal rejects an exponent outside i32; keep the number's own spelling
+        // rather than respell it as if the exponent were 0.
+        Some((m, e)) => match e.parse::<i32>() {
+            Ok(e) => (m, i64::from(e)),
+            Err(_) => return text.to_string(),
+        },
         None => (rest, 0),
     };
     let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));

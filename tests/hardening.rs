@@ -1044,10 +1044,11 @@ async fn a_rescan_does_not_skip_a_commit_whose_timestamp_max_was_truncated_to_th
         .await
         .unwrap();
     assert_eq!(
-        start, 3,
+        start, 2,
         "the commit whose maximum was truncated to a whole millisecond could hold rows up to \
-         999 us past it, so it is read again; the watermark's own, recorded to the \
-         microsecond, is covered"
+         999 us past it, so it is read again; so is the watermark's own, because a tie at \
+         the watermark proves nothing about the rows sharing it, and the key filter drops \
+         the ones the target holds; the commit before it is covered"
     );
 }
 

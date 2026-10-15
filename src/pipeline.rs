@@ -371,6 +371,7 @@ impl Pipeline {
             .open(&cfg.source_uri)
             .await
             .map_err(|e| Error::Config(format!("pipeline {:?}: source: {e}", cfg.name)))?;
+        refuse_a_column_mapped_source(&cfg, &source)?;
         // The one table this tool creates, and only because it is the one table that is
         // ours: a staging table's schema is the target's, so requiring it to be declared
         // would be requiring the target's schema to be written down twice.
@@ -2653,6 +2654,30 @@ fn attach_partition_columns(
 
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| Error::Schema(format!("could not attach partition columns: {e}")))
+}
+
+/// A source whose files hold physical column names (`delta.columnMapping.mode` of `name` or
+/// `id`) is refused at open. The scan reads each file's parquet and attaches partition values
+/// by logical name, so a mapped table would arrive as `col-<uuid>` columns the target lacks and
+/// NULL partition columns, and the coercer would commit rows of NULLs and advance the offset:
+/// the data lost without a word.
+fn refuse_a_column_mapped_source(cfg: &ResolvedPipeline, source: &DeltaTable) -> Result<()> {
+    let snapshot = source.snapshot().map_err(Error::Delta)?;
+    let mode = snapshot
+        .metadata()
+        .configuration()
+        .get(crate::fence::COLUMN_MAPPING_MODE);
+    match mode.filter(|m| !m.eq_ignore_ascii_case("none")) {
+        Some(mode) => Err(Error::Config(format!(
+            "pipeline {:?}: source {} uses column mapping ({} = {mode}), and ddi reads its \
+             files by logical column name, which would come back empty. Read it through a \
+             table without column mapping (a copy, or Trino/Spark writing an unmapped table).",
+            cfg.name,
+            cfg.source_uri,
+            crate::fence::COLUMN_MAPPING_MODE
+        ))),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

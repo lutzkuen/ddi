@@ -56,7 +56,7 @@ use crate::sink::{KafkaOffsets, MessageMark};
 const TXN_RETENTION: &str = "delta.setTransactionRetentionDuration";
 
 /// The table property that turns column mapping on.
-const COLUMN_MAPPING_MODE: &str = "delta.columnMapping.mode";
+pub(crate) const COLUMN_MAPPING_MODE: &str = "delta.columnMapping.mode";
 
 /// How many commit files the backward walk keeps in flight.
 const IN_FLIGHT: usize = 4;

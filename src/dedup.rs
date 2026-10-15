@@ -1180,8 +1180,11 @@ pub async fn bounded_rescan_start(
         if saw_add {
             if let Some(cmax) = commit_max {
                 // Everything this commit added is already in the target, so everything
-                // before it is too.
-                if cmax <= covered_to {
+                // before it is too. A commit tied at the watermark proves nothing: rows
+                // sharing the watermark may be in it and not in the target, and
+                // Dedup::filter settles those ties by key. So it is re-read (the walk
+                // goes on past it), like the partitioned bound's ties_covered=false.
+                if cmax < covered_to {
                     return Ok(v.saturating_add(1));
                 }
             }
