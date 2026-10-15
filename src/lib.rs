@@ -4,6 +4,7 @@
 //! version number read from the target's own transaction log.
 
 pub mod budget;
+pub mod compact;
 pub mod config;
 pub mod dbt;
 pub mod dedup;

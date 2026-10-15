@@ -5,7 +5,7 @@ description: Run ddi's Kafka integration tests - start the pinned Redpanda, set 
 
 # Kafka integration tests
 
-They are `#[ignore]`d without a broker. Read `ddi-build-hygiene` first (target dir on the external drive, one heavy job at a time).
+They are `#[ignore]`d without a broker. Read `ddi-build-hygiene` first (target dir on the external drive, one heavy job at a time). If cargo is blocked by the hook (after a reboot or replug the target image is not mounted): `udisksctl loop-setup -f /media/lutz/ExternalHD/cargo-target.img`, then `udisksctl mount -b /dev/loopN` (N from the first command's output); see `ddi-build-hygiene`.
 
 ## Broker
 ```
@@ -31,3 +31,9 @@ Needs `DDI_TEST_KDI=<path to a kafka-delta-ingest binary>` (build: `ddi-build-hy
 - Test output goes to a file; `grep -E "^test |panicked|FAILED"`, then read the assertion. A "left/right" mismatch on a row prints both rows in full.
 - Fault hooks (`DDI_TEST_FAULT`) exist only with `fault-injection`; a test using one fails to compile without it.
 - If many tests fail at once with connection errors, the broker died (memory): recreate the container.
+
+## `kafka_kill_mid_batch` and its coverage guard (tests/kafka_basics.rs)
+It SIGKILLs `ddi once` until >=30 kills and at least one left an orphan parquet (a kill between upload and commit). The panic `N of 200 runs were still running when killed, and 0 files left` is that coverage guard, **not** an exactly-once failure: the duplicate and exactly-once assertions come after the loop and never ran.
+- Upload and commit are both inside one delta-rs `write.await` (`Sink::write`); there is no seam for a fault hook, and `sleep_before_commit` fires *before* the upload, so it does not widen the window. The deterministic cover of that window is `kill_between_upload_and_commit` (read-only `_delta_log`).
+- The kills used to land 250-1650 ms after launch, which a slow runner outlasted (red twice on the v0.5.0 tag, green on the same SHA on main). They now spread over the measured length of one unkilled run (#18). If the guard fires again, compare the test's duration with green runs (76-215 s when an orphan shows up early; ~440 s when all 200 iterations run) and check the span, before touching the hooks.
+- ddi's stderr is discarded in this test; to see why kills miss, send it to a file for a local run.
