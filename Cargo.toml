@@ -1,6 +1,6 @@
 [package]
 name = "delta-delta-ingest"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.94.1"
 license = "Apache-2.0"
@@ -64,6 +64,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 bytesize = "2"
+# Both already in the tree beneath delta-rs; named here because its `LogStore` trait, which
+# src/compact.rs implements, speaks in them.
+bytes = "1"
+uuid = "1"
 
 # Already in the tree beneath delta-rs's kernel; declared here so the Trino client can
 # speak its HTTP protocol directly rather than taking a client dependency.
@@ -95,10 +99,10 @@ base64 = "0.23"
 #   ships.
 rdkafka = { version = "0.39", default-features = false, features = ["tokio", "libz", "ssl", "zstd", "tracing"], optional = true }
 # The one direct arrow crate, and the exception to the rule above: pinned exactly to the arrow
-# deltalake re-exports (59.3.0), so it resolves to that copy and not a second one. Default
+# deltalake re-exports (59.3.1), so it resolves to that copy and not a second one. Default
 # features off: they are codecs for Avro container files, which Kafka messages are not, and
 # `xz` would bring back the `links = "lzma"` collision.
-arrow-avro = { version = "=59.3.0", default-features = false, optional = true }
+arrow-avro = { version = "=59.3.1", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

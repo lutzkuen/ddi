@@ -134,19 +134,13 @@ impl TrinoClient {
         debug!(trino = %self.conn.describe(), sql, "running statement");
 
         let mut request = self
-            .http
-            .post(self.conn.statement_url())
-            .header("X-Trino-User", &self.conn.user)
-            .header("X-Trino-Source", "ddi")
+            .authenticated(self.http.post(self.conn.statement_url()))
             .body(sql.to_string());
         if let Some(c) = &self.conn.catalog {
             request = request.header("X-Trino-Catalog", c);
         }
         if let Some(s) = &self.conn.schema {
             request = request.header("X-Trino-Schema", s);
-        }
-        if let Some(p) = &self.conn.password {
-            request = request.basic_auth(&self.conn.user, Some(p));
         }
 
         let mut page: Page = self.send(request).await?;
@@ -174,9 +168,21 @@ impl TrinoClient {
             // the query is finished. Following it to the end is what marks the query
             // complete server-side, so it is not optional even once we have our row.
             let Some(next) = page.next_uri else { break };
-            page = self.send(self.http.get(next)).await?;
+            page = self.send(self.authenticated(self.http.get(next))).await?;
         }
         Ok(out)
+    }
+
+    /// Identity and credentials, on every request of a query: the `nextUri` pages are
+    /// authenticated like the statement that opened them.
+    fn authenticated(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut request = request
+            .header("X-Trino-User", &self.conn.user)
+            .header("X-Trino-Source", "ddi");
+        if let Some(p) = &self.conn.password {
+            request = request.basic_auth(&self.conn.user, Some(p));
+        }
+        request
     }
 
     async fn send(&self, request: reqwest::RequestBuilder) -> Result<Page> {

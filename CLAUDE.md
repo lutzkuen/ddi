@@ -7,7 +7,7 @@ default branch. Instructions come from a dbt project; ddi has no functional conf
 
 ## Build and test (this laptop)
 - `cargo` is not on the non-interactive PATH: start commands with `export PATH="$HOME/.cargo/bin:$PATH"`.
-- **Build output**: the target dir is meant to live on the external drive (prepared, blocked until the drive's label loses its space: see `ddi-build-hygiene`). Until then it is `~/ddi/target` on the internal disk (watch `df -h /`; it reached 140 GB once). When the drive is configured and unplugged, a hook blocks cargo: ask the user to plug it in. One heavy cargo job at a time.
+- **Build output**: the target dir is `~/cargo-target` -> `/media/lutz/cargotarget`, an ext4 image on the external drive (active; watch `df -h /media/lutz/cargotarget`). If cargo is blocked by the hook (after a reboot or replug the target image is not mounted): `udisksctl loop-setup -f /media/lutz/ExternalHD/cargo-target.img`, then `udisksctl mount -b /dev/loopN` (N from the first command's output); see `ddi-build-hygiene`. Never build into the internal disk. One heavy cargo job at a time.
 - Always `-j 2`. `~/.cargo/config.toml` runs rustc and test binaries in a capped `build.slice`
   (systemd-oomd otherwise kills the VS Code window). A clean build is ~8 min. Never plain `--release`
   (single huge LTO link); use `--profile release-lean` (~38 min).
@@ -49,7 +49,7 @@ Dependency sources for lookups: `~/.cargo/registry/src/*/deltalake-core-1.1.1` e
 - Behaviour claims about Trino/Starburst are verified against a live Trino (`ddi-trino-check`), not memory.
 - Never print, log or commit credentials (SCRAM, SR, storage keys). Name the env var instead.
 - Git identity for commits made from here: `git -c user.name="Lutz" -c user.email="lutz.kuenneke89@gmail.com"` (no global config is set). Commit messages: `type: sentence` (fix/feat/docs/test/chore), no trailing period needed.
-- Releases and merging: see the `ddi-ship` skill. Do not push, merge or tag without being asked.
+- Releases and merging: read the `ddi-ship` skill first, also when the user dictates git commands. Do not push, merge or tag without being asked.
 - Project skills: `ddi-ship` (PR, CI, merge, release), `ddi-review` (one bounded review round), `ddi-trino-check`, `ddi-kafka-tests`, `ddi-kdi-parity`, `ddi-inventory-intake`, `ddi-milestone`, `ddi-build-hygiene`.
 - Private data (the production inventory, hosts, topics, customer rows) never goes into this repo: it lives in `~/kdi-private/`.
 

@@ -14,13 +14,12 @@ What went wrong before, so it does not again:
 | VS Code / session killed mid-build | systemd-oomd | `~/.cargo/config.toml` runs rustc and test binaries in `build.slice` via `~/.local/bin/in-build-slice`. Do not bypass it. |
 | command "moved to the background" after 120 s | foreground limit | Run anything over ~2 min with `run_in_background`, and wait with a Bash `until`-loop in the background (or Monitor), not `sleep`. Redirect big logs to the scratchpad, filter with `grep`, never `cat` them. |
 
-## The external drive (prepared, not active yet)
-Goal: cargo's target dir on the USB drive (466 GB exFAT, ~90 MB/s, executables run from it, **no hard or symbolic links**: cargo copies instead). Status 2026-10-13: **blocked by the drive's label**. It mounts at `/media/lutz/External HD`, and the space breaks librdkafka's configure script (`MKL_OUTDBG: ambiguous redirect`, "No such file: /media/lutz/External"). A symlink does not help (the build script sees the real path). Everything else is in place:
-- `~/.cargo/config.toml` has the `target-dir = "/home/lutz/cargo-target"` line commented out; `~/cargo-target` is a symlink to `<mount>/cargo-target`.
-- `~/.claude/hooks/cargo-needs-drive.sh` (PreToolUse on Bash, beside the rtk hook) blocks cargo/rustc/rustup with a "plug in the drive" message when that line is active and the symlink's mount is absent.
-- **To activate:** the user renames the drive's label to something without a space (unmount it in Files, rename, replug; or `sudo exfatlabel /dev/sdb1 ExternalHD`). Then: `mkdir -p /media/lutz/ExternalHD/cargo-target && ln -sfn /media/lutz/ExternalHD/cargo-target ~/cargo-target`, uncomment the line in `~/.cargo/config.toml`, and run `cargo check --all-targets --features kafka,fault-injection -j 2` once (the librdkafka build is the real test; ~15 min). Update the old absolute path in memory `cargo-target-on-external-hd` and remove this paragraph's "blocked" status.
-- Until then builds go to `~/ddi/target` on the internal disk: watch `df -h /`, `cargo clean` past ~85%, and expect it to reach 100+ GB if every feature combination is built.
-- When active and the drive is unplugged: **tell the user to plug it in**; never point `CARGO_TARGET_DIR` at the internal disk to get around the hook.
+## The external drive (ACTIVE since 2026-10-13)
+cargo's target dir is `~/cargo-target` -> `/media/lutz/cargotarget`, a **150 GB sparse ext4 image** (`/media/lutz/ExternalHD/cargo-target.img`) loop-mounted through udisks. Why an image: the drive is exFAT (no symlinks), and librdkafka's `make` does `ln -s librdkafka.so`; the label also had a space (now `ExternalHD`). No sudo needed anywhere.
+- `~/.cargo/config.toml` has `target-dir = "/home/lutz/cargo-target"` active. Verified: `cargo check --all-targets --features kafka,fault-injection -j 2` from a cold target dir passed in 5m18s.
+- **After a reboot or replug the image is not mounted.** Re-attach: `udisksctl loop-setup -f /media/lutz/ExternalHD/cargo-target.img` (prints /dev/loopN), then `udisksctl mount -b /dev/loopN`. Mount point is `/media/lutz/cargotarget` (label `cargotarget`).
+- `~/.claude/hooks/cargo-needs-drive.sh` blocks cargo/rustc/rustup unless the symlink target is a mount point, and says how to re-attach. Never point `CARGO_TARGET_DIR` at the internal disk to get around it.
+- Image full (148 GB)? `cargo clean` inside it; it is regenerable.
 
 ## Commands
 Prefix: `export PATH="$HOME/.cargo/bin:$PATH"` (cargo is not on the non-interactive PATH).

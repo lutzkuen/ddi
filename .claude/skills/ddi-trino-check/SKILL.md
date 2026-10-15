@@ -26,3 +26,5 @@ Run: `export PATH="$HOME/.cargo/bin:$PATH"; DDI_TEST_TRINO=http://127.0.0.1:8080
 
 ## Report
 State the Trino version (480), the expressions compared, and that CI's `trino-dialect` job runs the same file with `--ignored`. If docker is unavailable, say the claim is unverified rather than relying on docs.
+
+**Cargo blocked by the hook?** The target-dir image is unmounted (reboot/replug). Re-attach: `udisksctl loop-setup -f /media/lutz/ExternalHD/cargo-target.img`, then `udisksctl mount -b /dev/loopN` (N from the first command's output); see `ddi-build-hygiene`.

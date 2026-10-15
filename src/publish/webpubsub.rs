@@ -220,8 +220,13 @@ impl WebPubSubPublisher {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let mut body = response.text().await.unwrap_or_default();
-        body.truncate(300);
+        let body: String = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect();
         Err(Error::Config(format!(
             "publishing to {} returned {status}{}{}",
             self.describe(),
