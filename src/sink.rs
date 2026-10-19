@@ -104,8 +104,8 @@ impl Sink {
         self.cutoff = cutoff;
     }
 
-    /// The commit properties every write of ours carries, whatever its shape.
-    fn properties(&self, source_version: i64) -> CommitProperties {
+    /// The commit properties every write of ours to `table` carries, whatever its shape.
+    fn properties(&self, table: &DeltaTable, source_version: i64) -> CommitProperties {
         let mut metadata = vec![
             (
                 "ddi.sourceVersion".to_string(),
@@ -155,11 +155,18 @@ impl Sink {
             metadata.extend(cutoff.to_commit_metadata());
         }
 
-        CommitProperties::default()
+        let properties = CommitProperties::default()
             .with_application_transaction(Transaction::new(&self.app_id, source_version))
             // Recorded for operators and for v2's mid-commit cursor work. Purely
             // informational today: the txn action above is the authority.
-            .with_metadata(metadata)
+            .with_metadata(metadata);
+        // Otherwise left as None: delta-rs follows delta.enableExpiredLogCleanup, which a
+        // Delta pipeline's commit keeps (`a_commit_still_checkpoints_and_cleans_up_the_log`).
+        if crate::fence::protects_checkpoints(table) {
+            properties.with_cleanup_expired_logs(Some(false))
+        } else {
+            properties
+        }
     }
 
     /// The commit properties of a Kafka batch: a `txn` per asserted partition, and the
@@ -168,7 +175,7 @@ impl Sink {
     /// No `ddi.sourceVersion`, which nothing reads back and a Kafka batch has no single value
     /// for, and none of the Delta source's provenance: a Kafka pipeline has no source table, no
     /// lookups and no coverage window.
-    fn kafka_properties(&self, offsets: &KafkaOffsets) -> CommitProperties {
+    fn kafka_properties(&self, table: &DeltaTable, offsets: &KafkaOffsets) -> CommitProperties {
         // Every one stamped with a time no engine expires, unlike a Delta pipeline's `txn`,
         // which keeps none (crate::fence::KAFKA_TXN_LAST_UPDATED says why).
         let txn = |app_id: String, version: i64| {
@@ -247,8 +254,11 @@ impl Sink {
             .with_metadata(metadata)
             // Some(false) as well as Some(true): left as None, delta-rs follows
             // delta.enableExpiredLogCleanup, true by default, and lists the whole log after
-            // every commit (docs/kafka-design.md §7.2).
-            .with_cleanup_expired_logs(Some(offsets.cleanup_logs))
+            // every commit (docs/kafka-design.md §7.2). Never on a table that protects its
+            // checkpoints, whatever the caller asked.
+            .with_cleanup_expired_logs(Some(
+                offsets.cleanup_logs && !crate::fence::protects_checkpoints(table),
+            ))
     }
 
     /// Append `batches` and record `source_version` in a `txn` action, atomically.
@@ -265,7 +275,7 @@ impl Sink {
         batches: Vec<RecordBatch>,
         source_version: i64,
     ) -> Result<DeltaTable> {
-        let props = self.properties(source_version);
+        let props = self.properties(&table, source_version);
         let table = self.write(table, batches, props).await?;
         debug!(
             app_id = %self.app_id,
@@ -293,7 +303,7 @@ impl Sink {
         batches: Vec<RecordBatch>,
         offsets: &KafkaOffsets,
     ) -> Result<DeltaTable> {
-        let props = self.kafka_properties(offsets);
+        let props = self.kafka_properties(&table, offsets);
         let table = self.write(table, batches, props).await?;
         debug!(
             app_id = %self.app_id,
@@ -384,6 +394,7 @@ impl Sink {
             .read_batch(batch)
             .map_err(|e| Error::Other(format!("upsert: cannot register the batch: {e}")))?;
 
+        let props = self.properties(&table, source_version);
         let mut merge = table
             .merge(source, plan.predicate.clone())
             .with_source_alias(crate::upsert::SOURCE_ALIAS)
@@ -407,7 +418,7 @@ impl Sink {
             // are DataFusion's to hold. Giving it the pipeline's share is what makes a
             // merge window that turned out wider than expected spill instead of OOM.
             .with_session_state(session)
-            .with_commit_properties(self.properties(source_version));
+            .with_commit_properties(props);
 
         merge = merge
             .when_matched_update(|update| {
@@ -718,6 +729,85 @@ mod tests {
                 ),
             })
         )
+    }
+
+    #[tokio::test]
+    async fn kafka_commit_never_cleans_up_a_log_that_protects_its_checkpoints() {
+        // Four Kafka commits, each asking for the cleanup a checkpointing commit asks for, to
+        // a table that checkpoints every 2 versions and keeps no log history; `protected`
+        // decides whether another engine committed `checkpointProtection` first (version 1).
+        async fn log_after(protected: bool) -> Vec<String> {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().to_str().unwrap();
+            DeltaTable::try_from_url(ensure_table_uri(path).unwrap())
+                .await
+                .unwrap()
+                .create()
+                .with_columns(vec![
+                    StructField::new("id", DataType::Primitive(PrimitiveType::Long), false),
+                    StructField::new("name", DataType::Primitive(PrimitiveType::String), true),
+                ])
+                .with_configuration([
+                    ("delta.checkpointInterval", Some("2")),
+                    ("delta.logRetentionDuration", Some("interval 0 seconds")),
+                ])
+                .with_save_mode(SaveMode::ErrorIfExists)
+                .await
+                .unwrap();
+            let first = if protected {
+                crate::fence::protect_checkpoints_for_tests(dir.path(), 0, 1);
+                2
+            } else {
+                1
+            };
+            let mut table = open(path).await;
+            for offset in first..first + 4 {
+                // Apart in time, so that every commit is older than the cleanup after it.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let offsets = KafkaOffsets {
+                    cleanup_logs: true,
+                    ..read(&[(0, (offset, offset))])
+                };
+                let batch = rows(&table, &[offset]);
+                table = Sink::new("app", 0)
+                    .commit_kafka(table, vec![batch], &offsets)
+                    .await
+                    .unwrap();
+            }
+            let mut log: Vec<String> = std::fs::read_dir(dir.path().join("_delta_log"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
+                .filter(|name| !name.starts_with('.'))
+                .collect();
+            log.sort();
+            log
+        }
+
+        // Unprotected, the commit at version 4 cleans up below the checkpoint at version 3.
+        assert_eq!(
+            log_after(false).await,
+            [
+                "00000000000000000003.checkpoint.parquet",
+                "00000000000000000003.json",
+                "00000000000000000004.json",
+                "_last_checkpoint",
+            ]
+        );
+        // Protected, every commit and checkpoint stays, and checkpoints are still written.
+        assert_eq!(
+            log_after(true).await,
+            [
+                "00000000000000000000.json",
+                "00000000000000000001.json",
+                "00000000000000000002.json",
+                "00000000000000000003.checkpoint.parquet",
+                "00000000000000000003.json",
+                "00000000000000000004.json",
+                "00000000000000000005.checkpoint.parquet",
+                "00000000000000000005.json",
+                "_last_checkpoint",
+            ]
+        );
     }
 
     #[tokio::test]

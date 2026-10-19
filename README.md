@@ -885,6 +885,15 @@ SELECT reason, count(*) FROM silver.orders__ddi_dq
 WHERE _timestamp > now() - interval '1' day GROUP BY reason
 ```
 
+A value with a fraction going into an integer column does not survive the cast either. `1.5` into
+a `BIGINT` would land as `1`, because Arrow's cast truncates without an error and leaves no
+`NULL` to notice, so `ddi` looks for it in the values before they are cast: a float, or a
+`DECIMAL` with a scale, that is not a whole number is set aside like `"n/a"` (and without a
+data-quality table fails the batch). A whole number still goes in. A `TIMESTAMP` column is
+treated the same way, because the cast reaches it through a `BIGINT` count of microseconds. A Kafka pipeline truncates
+a float's fraction, as kafka-delta-ingest did, and refuses a decimal's, which kafka-delta-ingest
+never wrote.
+
 Two things are deliberately *not* quarantined:
 
 - **A structural mismatch** — a target column the transform does not produce at all, a
@@ -895,7 +904,8 @@ Two things are deliberately *not* quarantined:
   the *children* and keeps the parent's null buffer, so an unconvertible element becomes a
   `NULL` inside a row that still looks valid from the outside — undetectable per row, and it
   would reach the target. Nested columns therefore keep the strict cast: one bad value fails
-  the batch.
+  the batch. A fraction going into an integer is the exception: it is found in the values
+  before the cast, at any depth, so only its row is set aside.
 
 Rejects are written **before** the target commits, in their own commit. Two tables cannot
 share one Delta commit, so the ordering is the guarantee: a crash in between replays the
@@ -1787,6 +1797,16 @@ decodes as nanoseconds however the table is declared — is passed through to th
 has always narrowed it. A `string` where the schema says `timestamp` is not a precision
 difference at all, and fails exactly as it always has. The point of the rule is to narrow
 what is refused, not to refuse more.
+
+A table can also carry a protocol feature other engines rely on. `checkpointProtection` is
+part of Delta's newer `DROP FEATURE`: it keeps the checkpoints below
+`delta.requireCheckpointProtectionBeforeVersion` in place until all history before that
+version is removed in one go. delta-rs writes such a table, but its log cleanup after a commit
+reads neither the feature nor that version and would remove them piecemeal, so `ddi` turns
+the cleanup off for every commit to a table that lists the feature, its data-quality table
+included. (A protection another engine adds in the moment between a commit landing and its
+cleanup is not seen; nothing short of never cleaning up would close that.) Its checkpoints are still written, at the version just committed. The log then grows
+until an engine that honours the feature cleans it up.
 
 If you hit the checkpoint failure on a build that predates this, deleting the offending
 `*.checkpoint.parquet` and `_last_checkpoint` forces the same log replay by hand, and is

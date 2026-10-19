@@ -2,7 +2,7 @@
 name = "delta-delta-ingest"
 version = "0.6.0"
 edition = "2021"
-rust-version = "1.94.1"
+rust-version = "1.95.0"
 license = "Apache-2.0"
 authors = ["Lutz Künneke <lutz.kuenneke89@gmail.com>"]
 description = "Exactly-once, append-only, stateless Delta-to-Delta streaming. No checkpoint directory, no changelog reconciliation, no cluster."
@@ -36,7 +36,7 @@ fault-injection = ["kafka"]
 # `azure` pulls in the ADLS Gen2 / Blob object store and registers the abfss:// and az://
 # handlers at load time. Storage backends are additive: adding "s3" or "gcs" here is all
 # another cloud needs, since everything above this line addresses tables by URI.
-deltalake = { version = "=1.1.1", features = ["datafusion", "azure"] }
+deltalake = { version = "=1.1.2", features = ["datafusion", "azure"] }
 
 # arrow / datafusion / parquet are NOT declared directly: deltalake re-exports the
 # exact versions it was built against (deltalake::arrow, ::datafusion, ::parquet).

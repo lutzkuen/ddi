@@ -2898,6 +2898,8 @@ mod kafka_tests {
         let mut p = Pipeline::open(cfg(&source, &target, &dq)).await.unwrap();
         let conformer = Conformer::new(p.coercer.target(), "kafka_", KdiText::default()).unwrap();
         p.source = Source::Kafka(Box::new(KafkaSource::for_tests(conformer)));
+        // The coercer a Kafka pipeline is opened with.
+        p.coercer = crate::schema::SchemaCoercer::truncating_float_fractions(p.coercer.target());
 
         // As the decoder hands rows on: the writer's own field order, then the metadata.
         let address_fields = Fields::from(vec![

@@ -412,7 +412,7 @@ impl Pipeline {
             "pipeline ready"
         );
         let mut pipeline = Pipeline {
-            coercer: SchemaCoercer::new(target_schema),
+            coercer: SchemaCoercer::truncating_float_fractions(target_schema),
             cfg,
             source: Source::Kafka(Box::new(source)),
             target,
@@ -1256,7 +1256,7 @@ impl Pipeline {
                 pipeline = %self.cfg.name,
                 "the target's schema changed under this pipeline; rebuilding its casts"
             );
-            self.coercer = SchemaCoercer::new(schema.clone());
+            self.coercer = SchemaCoercer::truncating_float_fractions(schema.clone());
             let src = self.kafka_mut();
             let mut conformer = Conformer::new(schema, &src.kafka.metadata_prefix, src.kdi_text)?;
             conformer.observe(&src.writer_schemas());
@@ -1880,7 +1880,7 @@ mod tests {
         let context = DdiContext::new("t", "t", source.metrics.clone());
         source.consumer = Some(client::consumer("t", &settings, context).unwrap());
         Pipeline {
-            coercer: SchemaCoercer::new(schema),
+            coercer: SchemaCoercer::truncating_float_fractions(schema),
             cfg,
             source: Source::Kafka(Box::new(source)),
             target: DeltaTable::new_in_memory(),

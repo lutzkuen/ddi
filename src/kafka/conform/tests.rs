@@ -120,7 +120,7 @@ pub(super) fn through(
 ) -> (Vec<RecordBatch>, Vec<Rejected>) {
     let mut rejects = Vec::new();
     let conformed = c.conform_all(batches, &mut rejects, true).unwrap();
-    let coercer = SchemaCoercer::new(c.target.clone());
+    let coercer = SchemaCoercer::truncating_float_fractions(c.target.clone());
     let mut good = Vec::new();
     for b in &conformed {
         let split = coercer.coerce_quarantining(b).unwrap();
@@ -350,7 +350,9 @@ fn list_and_map_renamed_to_target() {
     };
     assert_eq!(entries.name(), "key_value");
 
-    let coerced = SchemaCoercer::new(t).coerce_quarantining(&out).unwrap();
+    let coerced = SchemaCoercer::truncating_float_fractions(t)
+        .coerce_quarantining(&out)
+        .unwrap();
     assert!(coerced.bad.is_none());
     assert_eq!(
         json(&[coerced.good]),
@@ -712,7 +714,7 @@ async fn unmatched_target_column_warns() {
     let mut rejects = Vec::new();
     let out = c.conform_all(batches, &mut rejects, true).unwrap();
     assert!(c.unmatched_target_columns().is_empty());
-    let err = SchemaCoercer::new(strict)
+    let err = SchemaCoercer::truncating_float_fractions(strict)
         .coerce_quarantining(&out[0])
         .unwrap_err()
         .to_string();
@@ -855,9 +857,83 @@ async fn an_unmatched_nested_field_warns() {
     );
 }
 
+/// Into an integer column a double's fraction is truncated, as kafka-delta-ingest's arrow-json
+/// truncated it, and a decimal's is refused: at the top level by the coercer, nested by the
+/// conformer. kdi never wrote a decimal into an integer column; its JSON held one as an array of
+/// bytes, which arrow-json refused there.
+#[tokio::test]
+async fn into_an_integer_a_doubles_fraction_is_truncated_and_a_decimals_refused() {
+    const W: &str = r#"{"type":"record","name":"R","fields":[
+        {"name":"id","type":"long"},
+        {"name":"x","type":"double"},
+        {"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}},
+        {"name":"n","type":{"type":"record","name":"N","fields":[
+            {"name":"x","type":"double"},
+            {"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}}]}}]}"#;
+    // A positive unscaled value in the fewest bytes of two's complement, as Java writes it.
+    let cents = |unscaled: i64| {
+        let bytes = unscaled.to_be_bytes();
+        let mut start = 0;
+        while start < 7 && bytes[start] == 0 && bytes[start + 1] & 0x80 == 0 {
+            start += 1;
+        }
+        Avro::Decimal(apache_avro::Decimal::from(bytes[start..].to_vec()))
+    };
+    let row = |id: i64, x: f64, d: i64, nx: f64, nd: i64| {
+        (
+            1,
+            record(vec![
+                ("id", Avro::Long(id)),
+                ("x", Avro::Double(x)),
+                ("d", cents(d)),
+                ("n", record(vec![("x", Avro::Double(nx)), ("d", cents(nd))])),
+            ]),
+        )
+    };
+    let batches = decoded(
+        &[(1, W)],
+        vec![
+            // The doubles truncated, the decimals whole: written.
+            row(0, 1.5, 200, 2.5, 300),
+            // 1.50 at the top level.
+            row(1, 1.0, 150, 1.0, 100),
+            // 1.25 nested.
+            row(2, 1.0, 100, 1.0, 125),
+        ],
+    )
+    .await;
+    let t = target(vec![
+        field("id", Delta::LONG, false),
+        field("x", Delta::LONG, true),
+        field("d", Delta::LONG, true),
+        field(
+            "n",
+            strct(vec![
+                field("x", Delta::LONG, true),
+                field("d", Delta::LONG, true),
+            ]),
+            true,
+        ),
+    ]);
+    let mut c = conformer(t);
+    let (good, rejects) = through(&mut c, batches);
+    assert_eq!(
+        json(&good),
+        vec![serde_json::json!({"id": 0, "x": 1, "d": 2, "n": {"x": 2, "d": 3}})]
+    );
+    let mut offsets = rejected_offsets(&rejects);
+    offsets.sort();
+    assert_eq!(offsets, [1, 2], "{:?}", reasons(&rejects));
+    assert!(
+        reasons(&rejects).iter().all(|r| r.contains("fraction")),
+        "{:?}",
+        reasons(&rejects)
+    );
+}
+
 /// §5.6 step 2's "verify (M2)": a NOT NULL child inside a struct, or a NOT NULL list element,
 /// that a row has no value for. The design expected the coercer to quarantine the row; it does
-/// not: it casts a nested column strictly (schema.rs:161-173) and refuses the whole batch. So the
+/// not: it casts a nested column strictly (schema.rs:237-249) and refuses the whole batch. So the
 /// conform step sets the row aside itself, with the field named, and the coercer never meets it.
 /// Under a null parent nothing is missing: that row is written, its struct null.
 #[tokio::test]
@@ -943,7 +1019,8 @@ async fn a_missing_not_null_child_rejects_its_row() {
     assert_eq!(good.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
 
     // The coercer alone, given a struct whose NOT NULL child it has to fill: the batch fails.
-    let alone = SchemaCoercer::new(customer_only).coerce_quarantining(&batches[0]);
+    let alone =
+        SchemaCoercer::truncating_float_fractions(customer_only).coerce_quarantining(&batches[0]);
     assert!(alone.is_err(), "the coercer quarantines no nested row");
 }
 

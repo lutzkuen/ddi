@@ -276,7 +276,7 @@ impl DataQuality {
         let batch = self.batch(rejected, source_version, now_micros)?;
 
         let table = std::mem::replace(&mut self.table, DeltaTable::new_in_memory());
-        let props = CommitProperties::default()
+        let mut props = CommitProperties::default()
             .with_application_transaction(Transaction::new(&self.dq_app_id, source_version))
             .with_metadata([
                 (
@@ -288,6 +288,11 @@ impl DataQuality {
                     serde_json::Value::from(self.app_id.clone()),
                 ),
             ]);
+        // As a target's commit (`Sink::properties`): the default cleanup, except on a table
+        // that protects its checkpoints.
+        if crate::fence::protects_checkpoints(&table) {
+            props = props.with_cleanup_expired_logs(Some(false));
+        }
 
         // As in `Sink::commit`: without this delta-rs builds a runtime with an unbounded
         // memory pool and its own private spill budget, outside everything `crate::budget` and
@@ -585,7 +590,8 @@ impl DataQuality {
             .table_config();
         let next = self.table.version().map_or(0, |v| v + 1);
         let cleanup = properties.enable_expired_log_cleanup()
-            && (next + 1).is_multiple_of(properties.checkpoint_interval().get());
+            && (next + 1).is_multiple_of(properties.checkpoint_interval().get())
+            && !crate::fence::protects_checkpoints(&self.table);
         // No `txn`: a plain append, which delta-rs rebases over any other.
         let props = CommitProperties::default()
             .with_cleanup_expired_logs(Some(cleanup))
@@ -1318,6 +1324,84 @@ mod tests {
         assert!(rows
             .iter()
             .all(|r| r.2.as_deref().unwrap().contains("\"order_id\"")));
+    }
+
+    /// Neither data-quality write cleans up the log of a table that protects its checkpoints,
+    /// and both still checkpoint it.
+    #[tokio::test]
+    async fn dq_never_cleans_up_a_log_that_protects_its_checkpoints() {
+        // Four writes to a table that checkpoints every 2 versions and keeps no log history;
+        // `protected` decides whether another engine committed `checkpointProtection` first
+        // (version 1).
+        async fn log_after(protected: bool, kafka: bool) -> Vec<String> {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().to_str().unwrap();
+            DeltaTable::try_from_url(deltalake::ensure_table_uri(path).unwrap())
+                .await
+                .unwrap()
+                .create()
+                .with_columns(columns())
+                .with_configuration([
+                    ("delta.checkpointInterval", Some("2")),
+                    ("delta.logRetentionDuration", Some("interval 0 seconds")),
+                ])
+                .with_save_mode(SaveMode::ErrorIfExists)
+                .await
+                .unwrap();
+            if protected {
+                crate::fence::protect_checkpoints_for_tests(dir.path(), 0, 1);
+            }
+            let mut dq = open_dq(path).await;
+            for version in 1..=4 {
+                // Apart in time, so that every commit is older than the cleanup after it.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let rejects = [uncoordinated(&[version])];
+                let written = match kafka {
+                    true => {
+                        dq.write_kafka(&rejects, &read(&[(0, (version, version))]), NOW)
+                            .await
+                    }
+                    false => dq.write(&rejects, version, NOW).await,
+                };
+                assert_eq!(written.unwrap(), 1);
+            }
+            let mut log: Vec<String> = std::fs::read_dir(dir.path().join("_delta_log"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
+                .filter(|name| !name.starts_with('.'))
+                .collect();
+            log.sort();
+            log
+        }
+
+        for kafka in [false, true] {
+            // Unprotected, the write at version 3 checkpoints and cleans up below it.
+            assert_eq!(
+                log_after(false, kafka).await,
+                [
+                    "00000000000000000003.checkpoint.parquet",
+                    "00000000000000000003.json",
+                    "00000000000000000004.json",
+                    "_last_checkpoint",
+                ],
+                "kafka: {kafka}"
+            );
+            assert_eq!(
+                log_after(true, kafka).await,
+                [
+                    "00000000000000000000.json",
+                    "00000000000000000001.json",
+                    "00000000000000000002.json",
+                    "00000000000000000003.checkpoint.parquet",
+                    "00000000000000000003.json",
+                    "00000000000000000004.json",
+                    "00000000000000000005.checkpoint.parquet",
+                    "00000000000000000005.json",
+                    "_last_checkpoint",
+                ],
+                "kafka: {kafka}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------- commits that go wrong

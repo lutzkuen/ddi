@@ -36,12 +36,15 @@
 //! # What is left to the coercer
 //!
 //! A top-level column of a plain type: the coercer casts it to the target's type, and sets
-//! aside the rows that do not convert, as it does for a Delta source (schema.rs:151-275). And a
+//! aside the rows that do not convert, as it does for a Delta source (schema.rs:227-366), except
+//! that a float's fraction going into an integer column is truncated, as kdi's arrow-json
+//! truncated it, where a Delta source's coercer refuses it; a decimal's is refused on both
+//! (`SchemaCoercer::truncating_float_fractions`), and here at every depth. And a
 //! target column nothing produces: nullable, it is null there (warned about here first);
 //! NOT NULL, the coercer refuses the batch, as it would for any source.
 //!
 //! Inside a nested column it is the other way round. The coercer casts a nested column strictly,
-//! failing the batch on the first bad value rather than setting the row aside (schema.rs:161-173:
+//! failing the batch on the first bad value rather than setting the row aside (schema.rs:237-249:
 //! Arrow pushes a lenient cast into the children and keeps the parent valid). So here a nested
 //! value that does not convert, and a null where the target's nested field is NOT NULL, rejects
 //! its row, and the coercer never sees either.
@@ -339,6 +342,16 @@ impl Fitter<'_> {
             }
         }
         self.unchanged(array, &out, path, &mut bad);
+        // Into the target a float's fraction is truncated, as kdi's arrow-json truncated it, and
+        // a decimal's refused, which kdi never wrote (`schema::Fractions::FloatsTruncated`).
+        if matches!(self.into, Dest::Target) {
+            let dropped = crate::schema::decimal_fractions_dropped(array.as_ref(), to);
+            for (i, _) in dropped.iter().flatten().enumerate().filter(|(_, d)| **d) {
+                bad.set(array.len(), i, || {
+                    format!("{path}: the decimal has a fraction, which {to} would drop")
+                });
+            }
+        }
         Ok(Fitted {
             array: out,
             bad: bad.0,

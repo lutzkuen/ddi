@@ -660,6 +660,12 @@ increment came from.
   has a `__ddi_dq` table next to it, the offending *rows* go there with the reason attached
   and the rest of the batch commits; where it does not, the batch fails. Either way the
   target only holds values that survived the cast. See below.
+- **Nor a silent truncation.** A value with a fraction going into an integer column (`1.5`
+  into a `BIGINT`) is treated the same way, at any depth, though Arrow's cast would write `1`
+  without complaint; a whole number still goes in. So is one going into a `TIMESTAMP`, which
+  the cast reaches through a `BIGINT` count of microseconds. Round it in the model if that is what you
+  mean. A Kafka pipeline truncates a float's fraction, as kafka-delta-ingest did, and refuses
+  a decimal's.
 - **Unnest amplification.** A row with a 10k-element array becomes 10k rows. Batches are
   bounded on input bytes *and* `max_output_rows_per_batch`.
 - **`app_id` is the offset key** and must be stable forever. It is derived from the model
@@ -667,6 +673,10 @@ increment came from.
 - **Two processes with the same `app_id` on one target** is a config error, not a
   supported mode. Delta's optimistic concurrency keeps it correct, but it wastes work.
 - **Deletion vectors in the source** are an explicit error, never a silent wrong result.
+- **A table with the `checkpointProtection` feature** (Delta's newer `DROP FEATURE`) is
+  written, but no `ddi` commit cleans up its log: delta-rs's cleanup does not honour the
+  protected checkpoints. Checkpoints are still written; the log grows until an engine that
+  honours the feature cleans it up.
 - **`delta.deletedFileRetentionDuration` on each source must exceed your worst backlog.**
   `OPTIMIZE` retires a file and `VACUUM` deletes it; a pipeline still behind the commit that
   added it then has a commit it cannot read, and no way to rebuild that batch from the
@@ -919,6 +929,7 @@ column in silver, an upsert will not blank it.
 | `upserts into ... which pipeline ... reads as its source` | A downstream pipeline cannot read an upserted target unless it also upserts on the same key with `ignore_changes` |
 | `write_mode = "upsert" needs upsert_key` | Set `ddi_key` on the model (or `upsert_key` in the TOML) |
 | `adds ... and the object store no longer has that file` | The source vacuumed a file this pipeline had not read yet; restore the file, or rebuild the target and resume past that version |
+| `cannot cast ... without loss: row ... holds a value with a fraction` | A float or decimal that is not a whole number was going into an integer or `TIMESTAMP` column (a `TIMESTAMP` through a `BIGINT` count of microseconds), which would have truncated it. Round or cast it in the model as you mean it, or change the column's type. With a data-quality table only that row is set aside |
 | `transform_sql failed to execute: ...` | The model could not evaluate a value. With a data-quality table that row is set aside; without one, create the table the message names, or fix the model |
 | `More than ... rows of this batch cannot be evaluated` | Too many rows failed the model to be bad data; most likely the model or the upstream schema changed. Fix that, or raise `max_evaluation_rejects_per_batch` to set them aside anyway |
 | `It fails on an empty batch too` | The model fails whatever the rows are (`1/0`, an unknown `date_trunc` unit); fix the model |

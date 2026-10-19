@@ -62,6 +62,51 @@ pub async fn create_table(path: &str) -> DeltaTable {
         .unwrap()
 }
 
+/// Commit, as another engine would, the writer feature `checkpointProtection` to the local
+/// table at `dir`, whose latest version is `version`, with
+/// `delta.requireCheckpointProtectionBeforeVersion` set to `before`. The protocol and metadata
+/// are commit 0's, with the feature and the property added. (The crate's own tests have the
+/// same helper, `fence::protect_checkpoints_for_tests`.)
+pub fn protect_checkpoints(dir: &std::path::Path, version: u64, before: u64) {
+    use serde_json::{json, Value};
+
+    let log = dir.join("_delta_log");
+    let first = std::fs::read_to_string(log.join(format!("{:020}.json", 0))).unwrap();
+    let line = |key: &str| -> Value {
+        first
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find_map(|l| l.get(key).cloned())
+            .unwrap()
+    };
+    let mut protocol = line("protocol");
+    let mut features: Vec<Value> = match protocol["minWriterVersion"].as_i64() {
+        // A legacy writer version 2 implies these two; version 7 lists what it has.
+        Some(2) => vec![json!("appendOnly"), json!("invariants")],
+        Some(7) => protocol["writerFeatures"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+        other => panic!("no test support for writer version {other:?}"),
+    };
+    features.push(json!("checkpointProtection"));
+    protocol["minWriterVersion"] = json!(7);
+    protocol["writerFeatures"] = Value::Array(features);
+    let mut metadata = line("metaData");
+    metadata["configuration"]["delta.requireCheckpointProtectionBeforeVersion"] =
+        json!(before.to_string());
+    std::fs::write(
+        log.join(format!("{:020}.json", version + 1)),
+        format!(
+            "{}\n{}\n{}\n",
+            json!({"commitInfo": {"timestamp": 1_700_000_000_000_i64, "operation": "DROP FEATURE"}}),
+            json!({ "protocol": protocol }),
+            json!({ "metaData": metadata }),
+        ),
+    )
+    .unwrap();
+}
+
 /// Open an existing table fresh from storage.
 pub async fn open(path: &str) -> DeltaTable {
     let url = ensure_table_uri(path).unwrap();
