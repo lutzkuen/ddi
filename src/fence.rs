@@ -1534,13 +1534,15 @@ pub async fn commit_exists(table: &DeltaTable) -> Result<bool> {
 
 /// Whether a commit that landed after `table`'s version changes the protocol.
 ///
-/// delta-rs's conflict check refuses a winning protocol only when it raises the reader
-/// version or lowers the writer version (conflict_checker.rs:409-436), so an append is rebased
-/// over another engine's writer-only upgrade (identity columns, check constraints, appendOnly)
-/// and lands in a table this build may not write. A writer reads the commits after its handle's
+/// delta-rs 0.32's conflict check refused a winning protocol only when it raised the reader
+/// version or lowered the writer version, so an append was rebased over another engine's
+/// writer-only upgrade (identity columns, check constraints, appendOnly) and landed in a table
+/// this build may not write. 1.1 turned the writer comparison round: it refuses a raised reader
+/// or writer version and any newly enabled feature, and no longer a lowered writer version
+/// (conflict_checker.rs:437, 453-471). A writer still reads the commits after its handle's
 /// version before committing, as the conflict check will (one 404 when there are none), and a
-/// protocol among them is a conflict: the reset that follows asks the new protocol
-/// ([`refuse_unwritable_protocol`]) before anything is written (EO-m19).
+/// protocol among them is a conflict, whatever it changes: the reset that follows asks the new
+/// protocol ([`refuse_unwritable_protocol`]) before anything is written (EO-m19).
 pub async fn protocol_changed_since(table: &DeltaTable) -> Result<bool> {
     #[derive(Deserialize)]
     struct Line {
@@ -1722,6 +1724,91 @@ pub fn refuse_unwritable_protocol(table: &DeltaTable) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The writer feature that puts another engine's older checkpoints out of reach of log cleanup.
+const CHECKPOINT_PROTECTION: &str = "checkpointProtection";
+
+/// Whether `table`'s protocol lists the writer feature `checkpointProtection`, so that no commit
+/// of ours may clean up its log.
+///
+/// The feature (delta-io/delta, protocol_rfcs/checkpoint-protection.md) forbids removing a
+/// checkpoint below `delta.requireCheckpointProtectionBeforeVersion` other than by truncating
+/// everything below it in one go. delta-rs writes such tables since 1.1.2, and its post-commit
+/// cleanup (`cleanup_expired_logs_for`) reads neither the feature nor that version: it deletes
+/// every expired commit and checkpoint below the newest checkpoint it keeps. So a commit to such
+/// a table never cleans up. Its checkpoints stay: delta-rs writes one only at the version it has
+/// just committed, which the rules allow.
+///
+/// Asked of the handle the commit is made from. That is exact for a protection that landed at
+/// or before the commit: delta-rs refuses a commit over a winning commit that raised the writer
+/// version or enabled any table feature (`CommitConflictError::ProtocolChanged`), so a commit
+/// that lands has no feature the snapshot it was built on lacks. It cannot see one another
+/// engine commits after ours has landed and before delta-rs's post-commit cleanup lists the
+/// log, which only never letting delta-rs clean up would close. A protocol that cannot be read
+/// counts as protecting, because cleaning up is the side that cannot be undone.
+pub fn protects_checkpoints(table: &DeltaTable) -> bool {
+    let Ok(snapshot) = table.snapshot() else {
+        return true;
+    };
+    // Through serde rather than the kernel's enum, which has no variant of its own for it
+    // (`TableFeature::Unknown`): the name in the log is the contract either way.
+    match serde_json::to_value(snapshot.protocol()) {
+        Ok(protocol) => protocol
+            .get("writerFeatures")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|features| {
+                features
+                    .iter()
+                    .any(|f| f.as_str() == Some(CHECKPOINT_PROTECTION))
+            }),
+        Err(_) => true,
+    }
+}
+
+/// Commit, as another engine would, the writer feature `checkpointProtection` to the local
+/// table at `dir`, whose latest version is `version`, with
+/// `delta.requireCheckpointProtectionBeforeVersion` set to `before`. The protocol and metadata
+/// are commit 0's, with the feature and the property added.
+#[cfg(test)]
+pub(crate) fn protect_checkpoints_for_tests(dir: &std::path::Path, version: u64, before: u64) {
+    use serde_json::{json, Value};
+
+    let log = dir.join("_delta_log");
+    let first = std::fs::read_to_string(log.join(format!("{:020}.json", 0))).unwrap();
+    let line = |key: &str| -> Value {
+        first
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find_map(|l| l.get(key).cloned())
+            .unwrap()
+    };
+    let mut protocol = line("protocol");
+    let mut features: Vec<Value> = match protocol["minWriterVersion"].as_i64() {
+        // A legacy writer version 2 implies these two; version 7 lists what it has.
+        Some(2) => vec![json!("appendOnly"), json!("invariants")],
+        Some(7) => protocol["writerFeatures"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+        other => panic!("no test support for writer version {other:?}"),
+    };
+    features.push(json!(CHECKPOINT_PROTECTION));
+    protocol["minWriterVersion"] = json!(7);
+    protocol["writerFeatures"] = Value::Array(features);
+    let mut metadata = line("metaData");
+    metadata["configuration"]["delta.requireCheckpointProtectionBeforeVersion"] =
+        json!(before.to_string());
+    std::fs::write(
+        log.join(format!("{:020}.json", version + 1)),
+        format!(
+            "{}\n{}\n{}\n",
+            json!({"commitInfo": {"timestamp": 1_700_000_000_000_i64, "operation": "DROP FEATURE"}}),
+            json!({ "protocol": protocol }),
+            json!({ "metaData": metadata }),
+        ),
+    )
+    .unwrap();
 }
 
 #[cfg(test)]
@@ -4245,6 +4332,24 @@ mod tests {
             "got: {e}"
         );
         assert!(e.to_string().contains("writer 7"), "{e}");
+    }
+
+    /// delta-rs 1.1.2 writes a table with `checkpointProtection`, so it is no longer refused,
+    /// and is the one whose log no commit of ours cleans up.
+    #[tokio::test]
+    async fn checkpoint_protection_is_writable_and_protects_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        create(path).await;
+        assert!(!protects_checkpoints(&open(path).await));
+
+        protect_checkpoints_for_tests(dir.path(), 0, 1);
+        let table = open(path).await;
+        assert!(protects_checkpoints(&table));
+        refuse_unwritable_protocol(&table).unwrap();
+
+        // A handle with no snapshot to ask is taken as protecting.
+        assert!(protects_checkpoints(&DeltaTable::new_in_memory()));
     }
 
     /// Trino's checkpoint writes 0 for a txn without `lastUpdated`, which every engine expires

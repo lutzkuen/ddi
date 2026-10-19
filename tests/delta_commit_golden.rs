@@ -25,7 +25,8 @@
 //! the refactor, from golden files the code before it wrote, and pass unchanged after it.
 //!
 //! What delta-rs does after a commit — a checkpoint, a cleanup of the log — leaves nothing
-//! in any commit's JSON, so one more test reads the log's file names instead.
+//! in any commit's JSON, so two more tests read the log's file names instead: one where the
+//! cleanup runs, and one on a table that protects its checkpoints, where it must not.
 //!
 //! # What is compared
 //!
@@ -553,6 +554,69 @@ async fn a_commit_still_checkpoints_and_cleans_up_the_log() {
         [
             "00000000000000000003.checkpoint.parquet",
             "00000000000000000003.json",
+            "_last_checkpoint",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_commit_never_cleans_up_a_log_that_protects_its_checkpoints() {
+    // The same pipeline and target as above, after another engine committed the writer feature
+    // `checkpointProtection` (version 1), which forbids removing a checkpoint below
+    // `delta.requireCheckpointProtectionBeforeVersion` piecemeal. delta-rs's cleanup reads
+    // neither, so the commit turns it off: every commit and checkpoint stays, and checkpoints
+    // are still written at the version just committed.
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let raw = root.join("orders_raw").to_str().unwrap().to_string();
+    let stg = root.join("orders_stg").to_str().unwrap().to_string();
+    create(&raw, columns(raw_schema()), &[]).await;
+    DeltaTable::try_from_url(ensure_table_uri(&stg).unwrap())
+        .await
+        .unwrap()
+        .create()
+        .with_columns(columns(stg_schema()))
+        .with_configuration([
+            ("delta.checkpointInterval", Some("2")),
+            ("delta.logRetentionDuration", Some("interval 0 seconds")),
+        ])
+        .with_save_mode(SaveMode::ErrorIfExists)
+        .await
+        .unwrap();
+    common::protect_checkpoints(Path::new(&stg), 0, 1);
+    let lake = Lake {
+        _dir: dir,
+        root: root.to_str().unwrap().to_string(),
+        raw,
+        stg,
+        dq: None,
+    };
+
+    let mut p = Pipeline::open(lake.cfg()).await.unwrap();
+    for order in 1..=4 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        lake.arrive(&[(order, "eu", "100", order)]).await;
+        let step = p.step().await.unwrap();
+        assert!(matches!(step, StepOutcome::Progressed { .. }), "{step:?}");
+    }
+
+    let mut log: Vec<String> = std::fs::read_dir(Path::new(&lake.stg).join("_delta_log"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    log.sort();
+    assert_eq!(
+        log,
+        [
+            "00000000000000000000.json",
+            "00000000000000000001.json",
+            "00000000000000000002.json",
+            "00000000000000000003.checkpoint.parquet",
+            "00000000000000000003.json",
+            "00000000000000000004.json",
+            "00000000000000000005.checkpoint.parquet",
+            "00000000000000000005.json",
             "_last_checkpoint",
         ]
     );
