@@ -59,8 +59,8 @@
         }
       ],
       "commitInfo": {
-        "clientVersion": "delta-rs.1.1.1",
-        "engineInfo": "delta-rs:1.1.1",
+        "clientVersion": "delta-rs.1.1.2",
+        "engineInfo": "delta-rs:1.1.2",
         "operation": "CREATE TABLE",
         "operationParameters": {
           "location": "file://<lake>/orders_stg/",
@@ -159,8 +159,8 @@
         }
       ],
       "commitInfo": {
-        "clientVersion": "delta-rs.1.1.1",
-        "engineInfo": "delta-rs:1.1.1",
+        "clientVersion": "delta-rs.1.1.2",
+        "engineInfo": "delta-rs:1.1.2",
         "operation": "WRITE",
         "operationMetrics": {
           "execution_time_ms": "<ms>",
@@ -187,14 +187,14 @@
         }
       ],
       "commitInfo": {
-        "clientVersion": "delta-rs.1.1.1",
+        "clientVersion": "delta-rs.1.1.2",
         "ddi.appId": "ddi.test.orders_stg",
         "ddi.cutoff.reason": "bootstrap",
         "ddi.cutoff.sourceThrough": 3,
         "ddi.sourceTableId": "<source table id>",
         "ddi.sourceTableIdVersion": 1,
         "ddi.sourceVersion": 1,
-        "engineInfo": "delta-rs:1.1.1",
+        "engineInfo": "delta-rs:1.1.2",
         "operation": "WRITE",
         "operationMetrics": {
           "execution_time_ms": "<ms>",
@@ -221,14 +221,14 @@
         }
       ],
       "commitInfo": {
-        "clientVersion": "delta-rs.1.1.1",
+        "clientVersion": "delta-rs.1.1.2",
         "ddi.appId": "ddi.test.orders_stg",
         "ddi.cutoff.reason": "bootstrap",
         "ddi.cutoff.sourceThrough": 3,
         "ddi.sourceTableId": "<source table id>",
         "ddi.sourceTableIdVersion": 2,
         "ddi.sourceVersion": 2,
-        "engineInfo": "delta-rs:1.1.1",
+        "engineInfo": "delta-rs:1.1.2",
         "operation": "WRITE",
         "operationMetrics": {
           "execution_time_ms": "<ms>",
@@ -289,12 +289,12 @@
         }
       ],
       "commitInfo": {
-        "clientVersion": "delta-rs.1.1.1",
+        "clientVersion": "delta-rs.1.1.2",
         "ddi.appId": "ddi.test.orders_stg",
         "ddi.sourceTableId": "<source table id>",
         "ddi.sourceTableIdVersion": 3,
         "ddi.sourceVersion": 3,
-        "engineInfo": "delta-rs:1.1.1",
+        "engineInfo": "delta-rs:1.1.2",
         "operation": "WRITE",
         "operationMetrics": {
           "execution_time_ms": "<ms>",
