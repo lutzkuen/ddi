@@ -1,4 +1,4 @@
-//! How delta-rs 1.1.1's OPTIMIZE breaks when two compactors meet, pinned as it happens today.
+//! How delta-rs 1.1.2's OPTIMIZE breaks when two compactors meet, pinned as it happens today.
 //!
 //! These are characterisation tests for the gap `src/compact.rs` has to close: they assert the
 //! behaviour of the library, not of ddi, so a delta-rs bump that fixes a hole fails them on
