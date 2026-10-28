@@ -1030,6 +1030,8 @@ async fn read_request_head(sock: &mut TcpStream) -> bool {
     let mut head = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
+        // Windows that end in earlier reads were scanned already.
+        let from = head.len().saturating_sub(2);
         match sock.read(&mut buf).await {
             Ok(0) => return !head.is_empty(),
             Ok(n) => head.extend_from_slice(&buf[..n]),
@@ -1042,7 +1044,7 @@ async fn read_request_head(sock: &mut TcpStream) -> bool {
         }
         // A bare LF ends a line too (RFC 9112 §2.2), so a blank line is "\n\n" or "\n\r\n".
         let blank_line = |w: &[u8]| w.ends_with(b"\n\n") || w == b"\n\r\n";
-        if head.len() >= MAX_REQUEST_HEAD || head.windows(3).any(blank_line) {
+        if head.len() >= MAX_REQUEST_HEAD || head[from..].windows(3).any(blank_line) {
             return true;
         }
     }
@@ -1488,5 +1490,24 @@ mod tests {
             .expect("no answer within 5 s")
             .unwrap();
         assert_eq!(&first, b"HTTP/1.1 200");
+    }
+
+    /// A head that arrives a byte at a time, its blank line split across reads, is still
+    /// seen to end.
+    #[tokio::test]
+    async fn a_head_sent_a_byte_at_a_time_is_answered() {
+        let (addr, expected) = serve_large_registry().await;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.set_nodelay(true).unwrap();
+        for b in b"GET /metrics HTTP/1.1\r\nHost: ddi\r\n\r\n" {
+            c.write_all(&[*b]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut got))
+            .await
+            .expect("no answer within 5 s")
+            .unwrap();
+        assert!(body_of(&got) == expected, "body differs");
     }
 }
