@@ -1485,18 +1485,14 @@ fn spawn_metrics_server(addr: String, metrics: Metrics, token: CancellationToken
             if token.is_cancelled() {
                 return;
             }
-            let Ok((mut sock, _)) = listener.accept().await else {
+            let Ok((sock, _)) = listener.accept().await else {
                 continue;
             };
-            let body = metrics.render();
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            use tokio::io::AsyncWriteExt;
-            let _ = sock.write_all(resp.as_bytes()).await;
-            let _ = sock.shutdown().await;
+            // A task per scrape: one that reads slowly does not hold up the next.
+            tokio::spawn(delta_delta_ingest::metrics::answer_scrape(
+                sock,
+                metrics.clone(),
+            ));
         }
     });
 }

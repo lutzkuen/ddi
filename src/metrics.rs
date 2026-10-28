@@ -7,6 +7,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 #[derive(Debug, Default)]
 pub struct PipelineMetrics {
@@ -945,6 +949,65 @@ fn render_kafka(s: &mut String, pipelines: &[(&String, &Arc<KafkaMetrics>)]) {
     }
 }
 
+/// How long one `/metrics` connection may take, from accept to close.
+const SCRAPE_DEADLINE: Duration = Duration::from_secs(30);
+/// How long to wait for the scraper to close once the whole answer is sent.
+const SCRAPE_LINGER: Duration = Duration::from_secs(5);
+/// Request head read before answering anyway: every request gets the same answer.
+const MAX_REQUEST_HEAD: usize = 16 * 1024;
+
+/// Answers one `/metrics` connection: reads the request, writes the whole registry, and
+/// waits for the scraper to close before closing.
+///
+/// Both reads matter although the answer never depends on the request. A socket closed
+/// while bytes it received are still unread, or that receives more after the close, is
+/// reset (RFC 1122 §4.2.2.13), and the reset discards whatever of the answer is still in
+/// the send buffer. A body larger than the network takes at once was cut off that way
+/// (#22: reset after 98,304 bytes of a 141,592-byte body).
+pub async fn answer_scrape(mut sock: TcpStream, metrics: Metrics) {
+    let _ = tokio::time::timeout(SCRAPE_DEADLINE, async {
+        if !read_request_head(&mut sock).await {
+            return;
+        }
+        let body = metrics.render();
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        if sock.write_all(resp.as_bytes()).await.is_err() || sock.shutdown().await.is_err() {
+            return;
+        }
+        // Our FIN follows the last byte; the scraper's follows its read of it. Anything it
+        // sends until then is read and dropped, so that closing does not reset.
+        let _ = tokio::time::timeout(SCRAPE_LINGER, async {
+            let mut sink = [0u8; 4096];
+            while matches!(sock.read(&mut sink).await, Ok(n) if n > 0) {}
+        })
+        .await;
+    })
+    .await;
+}
+
+/// Reads up to the end of the request head. False when the peer sent nothing and closed
+/// (a TCP probe), so there is nobody to answer.
+async fn read_request_head(sock: &mut TcpStream) -> bool {
+    let mut head = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match sock.read(&mut buf).await {
+            Ok(0) => return !head.is_empty(),
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+            Err(_) => return false,
+        }
+        // A bare LF ends a line too (RFC 9112 §2.2), so a blank line is "\n\n" or "\n\r\n".
+        let blank_line = |w: &[u8]| w.ends_with(b"\n\n") || w == b"\n\r\n";
+        if head.len() >= MAX_REQUEST_HEAD || head.windows(3).any(blank_line) {
+            return true;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1282,5 +1345,88 @@ mod tests {
             "got:\n{rendered}"
         );
         assert!(rendered.contains("ddi_publish_sent_total{pipeline=\"orders\"} 0"));
+    }
+
+    /// A registry far past what fits in the network at once, served the way the binary
+    /// serves it: a task per accepted connection.
+    async fn serve_large_registry() -> (std::net::SocketAddr, String) {
+        let m = Metrics::new();
+        for i in 0..200 {
+            m.pipeline(&format!("a_pipeline_with_a_long_name_{i:03}"));
+        }
+        let body = m.render();
+        assert!(body.len() > 256 * 1024, "only {} bytes", body.len());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(answer_scrape(sock, m.clone()));
+            }
+        });
+        (addr, body)
+    }
+
+    /// Sends `request`, then `more` once the server has had time to answer, and reads
+    /// until the server closes. A small receive buffer and a late first read keep most of
+    /// the answer in the server's send buffer when it closes, which is where a reset
+    /// discards it.
+    async fn scrape(addr: std::net::SocketAddr, request: &[u8], more: &[u8]) -> Vec<u8> {
+        let s = tokio::net::TcpSocket::new_v4().unwrap();
+        s.set_recv_buffer_size(16 * 1024).unwrap();
+        let mut c = s.connect(addr).await.unwrap();
+        c.write_all(request).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if !more.is_empty() {
+            c.write_all(more).await.unwrap();
+        }
+        let mut got = Vec::new();
+        let read = c.read_to_end(&mut got).await;
+        assert!(read.is_ok(), "{read:?} after {} bytes", got.len());
+        got
+    }
+
+    fn body_of(response: &[u8]) -> &str {
+        let text = std::str::from_utf8(response).unwrap();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        let length: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            body.len(),
+            length,
+            "Content-Length {length}, got {}",
+            body.len()
+        );
+        body
+    }
+
+    /// #22: past ~96KB the answer was cut off by a reset, because the request was never
+    /// read and a socket closed with unread input is reset, dropping its unsent output.
+    #[tokio::test]
+    async fn a_large_registry_is_scraped_whole_every_time() {
+        let (addr, expected) = serve_large_registry().await;
+        for attempt in 0..50 {
+            let got = scrape(addr, b"GET /metrics HTTP/1.1\r\nHost: ddi\r\n\r\n", b"").await;
+            assert!(body_of(&got) == expected, "attempt {attempt}: body differs");
+        }
+    }
+
+    /// Bytes that arrive after the request (a pipelined request; HTTP/1.1 allows it) are
+    /// unread input too, and must not reset the connection either.
+    #[tokio::test]
+    async fn bytes_after_the_request_do_not_cut_the_answer_off() {
+        let (addr, expected) = serve_large_registry().await;
+        for attempt in 0..10 {
+            let got = scrape(
+                addr,
+                b"GET /metrics HTTP/1.1\r\nHost: ddi\r\n\r\n",
+                b"GET /metrics HTTP/1.1\r\nHost: ddi\r\n\r\n",
+            )
+            .await;
+            assert!(body_of(&got) == expected, "attempt {attempt}: body differs");
+        }
     }
 }
