@@ -1035,12 +1035,23 @@ async fn read_request_head(sock: &mut TcpStream) -> bool {
             Ok(n) => head.extend_from_slice(&buf[..n]),
             Err(_) => return false,
         }
+        // Not HTTP, a TLS ClientHello from a scraper set to https, say: answered at once,
+        // so that it fails at once ("server gave HTTP response to HTTPS client").
+        if !can_start_request(head[0]) {
+            return true;
+        }
         // A bare LF ends a line too (RFC 9112 §2.2), so a blank line is "\n\n" or "\n\r\n".
         let blank_line = |w: &[u8]| w.ends_with(b"\n\n") || w == b"\n\r\n";
         if head.len() >= MAX_REQUEST_HEAD || head.windows(3).any(blank_line) {
             return true;
         }
     }
+}
+
+/// Whether `b` can begin an HTTP request: the first character of a method (a `tchar`), or
+/// of an empty line a client may send before the request line (RFC 9112 §2.2).
+fn can_start_request(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~\r\n".contains(&b)
 }
 
 #[cfg(test)]
@@ -1459,5 +1470,23 @@ mod tests {
             .await;
             assert!(body_of(&got) == expected, "attempt {attempt}: body differs");
         }
+    }
+
+    /// A scraper set to https sends a TLS ClientHello, whose head never ends in a blank
+    /// line. It is answered at once, as before #22, so it fails at once with "server gave
+    /// HTTP response to HTTPS client" rather than at its timeout.
+    #[tokio::test]
+    async fn a_tls_hello_is_answered_at_once() {
+        let (addr, _) = serve_large_registry().await;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let mut hello = vec![0x16, 0x03, 0x01, 0x02, 0x00, 0x01];
+        hello.resize(517, 0x42);
+        c.write_all(&hello).await.unwrap();
+        let mut first = [0u8; 12];
+        tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut first))
+            .await
+            .expect("no answer within 5 s")
+            .unwrap();
+        assert_eq!(&first, b"HTTP/1.1 200");
     }
 }
