@@ -1481,18 +1481,7 @@ fn spawn_metrics_server(addr: String, metrics: Metrics, token: CancellationToken
             }
         };
         info!(%addr, "metrics listening on /metrics");
-        loop {
-            if token.is_cancelled() {
-                return;
-            }
-            let Ok((sock, _)) = listener.accept().await else {
-                continue;
-            };
-            // A task per scrape: one that reads slowly does not hold up the next.
-            tokio::spawn(delta_delta_ingest::metrics::answer_scrape(
-                sock,
-                metrics.clone(),
-            ));
-        }
+        delta_delta_ingest::metrics::serve_metrics(listener, metrics, move || token.is_cancelled())
+            .await;
     });
 }

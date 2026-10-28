@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Default)]
 pub struct PipelineMetrics {
@@ -955,6 +956,38 @@ const SCRAPE_DEADLINE: Duration = Duration::from_secs(30);
 const SCRAPE_LINGER: Duration = Duration::from_secs(5);
 /// Request head read before answering anyway: every request gets the same answer.
 const MAX_REQUEST_HEAD: usize = 16 * 1024;
+/// Connections answered at once. Further ones wait in the listen backlog, as every
+/// connection after the first did while scrapes were answered one at a time.
+const MAX_CONCURRENT_SCRAPES: usize = 32;
+
+/// Serves `/metrics` on `listener` until `stopped()`, checked before each accept. Every
+/// connection gets the whole registry, whatever it asks for, in a task of its own, so a
+/// scraper that reads slowly does not hold up the next.
+pub async fn serve_metrics(listener: TcpListener, metrics: Metrics, stopped: impl Fn() -> bool) {
+    let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_SCRAPES));
+    loop {
+        if stopped() {
+            return;
+        }
+        let Ok(slot) = slots.clone().acquire_owned().await else {
+            return;
+        };
+        let sock = match listener.accept().await {
+            Ok((sock, _)) => sock,
+            Err(e) => {
+                // Out of file descriptors, say: retrying at once would only spin.
+                tracing::warn!("metrics: cannot accept a connection: {e}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            answer_scrape(sock, metrics).await;
+            drop(slot);
+        });
+    }
+}
 
 /// Answers one `/metrics` connection: reads the request, writes the whole registry, and
 /// waits for the scraper to close before closing.
@@ -964,17 +997,19 @@ const MAX_REQUEST_HEAD: usize = 16 * 1024;
 /// reset (RFC 1122 §4.2.2.13), and the reset discards whatever of the answer is still in
 /// the send buffer. A body larger than the network takes at once was cut off that way
 /// (#22: reset after 98,304 bytes of a 141,592-byte body).
-pub async fn answer_scrape(mut sock: TcpStream, metrics: Metrics) {
+async fn answer_scrape(mut sock: TcpStream, metrics: Metrics) {
     let _ = tokio::time::timeout(SCRAPE_DEADLINE, async {
         if !read_request_head(&mut sock).await {
             return;
         }
-        let body = metrics.render();
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
+        let resp = {
+            let body = metrics.render();
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
         if sock.write_all(resp.as_bytes()).await.is_err() || sock.shutdown().await.is_err() {
             return;
         }
@@ -1348,7 +1383,7 @@ mod tests {
     }
 
     /// A registry far past what fits in the network at once, served the way the binary
-    /// serves it: a task per accepted connection.
+    /// serves it.
     async fn serve_large_registry() -> (std::net::SocketAddr, String) {
         let m = Metrics::new();
         for i in 0..200 {
@@ -1356,13 +1391,9 @@ mod tests {
         }
         let body = m.render();
         assert!(body.len() > 256 * 1024, "only {} bytes", body.len());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((sock, _)) = listener.accept().await {
-                tokio::spawn(answer_scrape(sock, m.clone()));
-            }
-        });
+        tokio::spawn(serve_metrics(listener, m, || false));
         (addr, body)
     }
 
