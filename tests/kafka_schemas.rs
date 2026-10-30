@@ -261,15 +261,20 @@ async fn undecodable_goes_to_dq_or_blocks() {
 }
 
 /// 16. More undecodable messages in one batch than max_evaluation_rejects_per_batch: a
-/// format or registry misconfiguration, not bad data, so the pipeline holds (once-mode fails).
+/// format or registry misconfiguration, not bad data, so the pipeline holds (once-mode fails),
+/// and says which message was the first, by partition, offset and writer schema id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs Redpanda; set DDI_TEST_KAFKA"]
 async fn undecodable_above_the_cap_blocks() {
     let f = Fixture::new(1).await;
-    register(&f.subject(), EVENT_V1).await;
+    let id = register(&f.subject(), EVENT_V1).await;
     let producer = Producer::new();
-    for _ in 0..5 {
-        producer.send(&f.topic, 0, None, Some(b"not avro")).await;
+    let mut offsets = Vec::new();
+    for n in 0..5 {
+        // Framed with the registered id, and cut inside its name.
+        let mut truncated = framed(EVENT_V1, id, event(n, Some("a name")));
+        truncated.truncate(truncated.len() - 2);
+        offsets.push(producer.send(&f.topic, 0, None, Some(&truncated)).await);
     }
     let toml = f.toml("cap", "", "max_evaluation_rejects_per_batch = 2");
     let mut p = Pipeline::open_with(resolve(&toml, true), None)
@@ -284,14 +289,25 @@ async fn undecodable_above_the_cap_blocks() {
     };
     assert!(
         matches!(
-            e,
+            &e,
             delta_delta_ingest::Error::KafkaTooManyUndecodable {
                 count: 5,
                 cap: 2,
+                partition: 0,
+                offset,
+                schema_id: Some(s),
                 ..
-            }
+            } if *offset == offsets[0] && *s == id
         ),
         "{e:?}"
+    );
+    assert!(
+        e.to_string().contains(&format!(
+            "the first is partition 0 offset {} of topic {:?} (writer schema id {id}): \
+             truncated",
+            offsets[0], f.topic
+        )),
+        "{e}"
     );
     assert!(rejects(&f.dq).await.is_empty());
 }

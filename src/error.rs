@@ -590,15 +590,18 @@ pub enum Error {
     /// A message could not be decoded and there is no data-quality table to put it in
     /// (docs/kafka-design.md §5.7). kafka-delta-ingest dropped such messages silently.
     #[error(
-        "partition {partition} offset {offset} of topic {topic:?} cannot be decoded \
+        "partition {partition} offset {offset} of topic {topic:?} ({}) cannot be decoded \
          ({reason}), and there is no data-quality table at {dq_uri} to set it aside in. The \
          pipeline holds, in its group, until the table exists; create it and it goes on \
-         within blocked_recheck_secs."
+         within blocked_recheck_secs.",
+        writer_schema_id(*schema_id)
     )]
     KafkaUndecodable {
         topic: String,
         partition: i32,
         offset: i64,
+        /// The writer schema id the message's header named, when it had one.
+        schema_id: Option<u32>,
         reason: String,
         dq_uri: String,
     },
@@ -607,13 +610,21 @@ pub enum Error {
     /// allows (docs/kafka-design.md §5.7, "Cap").
     #[error(
         "{count} messages of one batch cannot be decoded, more than \
-         max_evaluation_rejects_per_batch = {cap}; the first: {reason}. This looks like a \
-         format or registry misconfiguration rather than bad data, so nothing is written and \
-         the pipeline holds. Fix the producer or the registry, or raise the cap and restart."
+         max_evaluation_rejects_per_batch = {cap}; the first is partition {partition} offset \
+         {offset} of topic {topic:?} ({}): {reason}. This looks like a format or registry \
+         misconfiguration rather than bad data, so nothing is written and the pipeline holds. \
+         Fix the producer or the registry, or raise the cap and restart.",
+        writer_schema_id(*schema_id)
     )]
     KafkaTooManyUndecodable {
         count: usize,
         cap: usize,
+        /// The first undecodable message of the batch: its coordinates, the writer schema id its
+        /// header named when it had one, and why.
+        topic: String,
+        partition: i32,
+        offset: i64,
+        schema_id: Option<u32>,
         reason: String,
     },
 
@@ -983,6 +994,14 @@ impl Error {
     }
 }
 
+/// An undecodable message's writer schema, as an error names it.
+fn writer_schema_id(id: Option<u32>) -> String {
+    match id {
+        Some(id) => format!("writer schema id {id}"),
+        None => "no writer schema id".to_string(),
+    }
+}
+
 /// The object store failed: worth retrying.
 fn is_store_fault(e: &DeltaTableError) -> bool {
     use deltalake::kernel::transaction::TransactionError;
@@ -1039,6 +1058,47 @@ impl From<deltalake::datafusion::error::DataFusionError> for Error {
 mod tests {
     use super::*;
     use deltalake::datafusion::error::DataFusionError;
+
+    /// An error that holds the pipeline on undecodable messages names the first of them: its
+    /// partition, offset and writer schema id, so it can be looked up.
+    #[test]
+    fn undecodable_errors_name_the_first_message() {
+        let too_many = Error::KafkaTooManyUndecodable {
+            count: 5,
+            cap: 2,
+            topic: "orders".into(),
+            partition: 1,
+            offset: 41,
+            schema_id: Some(7),
+            reason: "cannot turn the decoded record into Arrow".into(),
+        }
+        .to_string();
+        assert!(
+            too_many.starts_with(
+                "5 messages of one batch cannot be decoded, more than \
+                 max_evaluation_rejects_per_batch = 2; the first is partition 1 offset 41 of \
+                 topic \"orders\" (writer schema id 7): cannot turn the decoded record into \
+                 Arrow."
+            ),
+            "{too_many}"
+        );
+        let no_dq = Error::KafkaUndecodable {
+            topic: "orders".into(),
+            partition: 1,
+            offset: 41,
+            schema_id: None,
+            reason: "not Confluent-framed".into(),
+            dq_uri: "/lake/orders__ddi_dq".into(),
+        }
+        .to_string();
+        assert!(
+            no_dq.starts_with(
+                "partition 1 offset 41 of topic \"orders\" (no writer schema id) cannot be \
+                 decoded (not Confluent-framed)"
+            ),
+            "{no_dq}"
+        );
+    }
 
     #[test]
     fn a_capacity_failure_is_not_read_as_a_transform_error() {
@@ -1378,6 +1438,7 @@ mod tests {
                     topic: "orders".into(),
                     partition: 1,
                     offset: 41,
+                    schema_id: None,
                     reason: "not Confluent-framed".into(),
                     dq_uri: "/lake/orders__ddi_dq".into(),
                 },
@@ -1387,6 +1448,10 @@ mod tests {
                 Error::KafkaTooManyUndecodable {
                     count: 101,
                     cap: 100,
+                    topic: "orders".into(),
+                    partition: 1,
+                    offset: 41,
+                    schema_id: None,
                     reason: "not Confluent-framed".into(),
                 },
                 BlockingPipeline,

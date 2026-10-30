@@ -49,7 +49,7 @@ use crate::error::Result;
 use crate::fence::Fence;
 use crate::kafka::client::Consumer;
 use crate::kafka::conform::{Conformer, UnionSchema};
-use crate::kafka::decode::{Decoded, KafkaDecoder, KafkaMessage, NotFed};
+use crate::kafka::decode::{Decoded, KafkaDecoder, KafkaMessage, NotFed, Undecodable};
 use crate::kafka::partitions::{Buffer, Limits, Partitions};
 use crate::kafka::registry::{RegisteredSchema, SubjectSchemas};
 use crate::metrics::KafkaMetrics;
@@ -172,7 +172,8 @@ pub(crate) struct KafkaBatch {
     /// The messages that could not be decoded, as rows for the data-quality table (§5.7).
     pub rejects: Option<Rejected>,
     pub undecodable: usize,
-    pub first_undecodable: Option<(i32, i64, String)>,
+    /// The first of them, which an error that holds the pipeline names.
+    pub first_undecodable: Option<Undecodable>,
     pub tombstones: u64,
     /// Per partition, the first and the last offset read.
     pub ranges: BTreeMap<i32, (i64, i64)>,

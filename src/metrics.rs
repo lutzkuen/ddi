@@ -1126,6 +1126,7 @@ mod tests {
             topic: "events".into(),
             partition: 0,
             offset: 7,
+            schema_id: None,
             reason: "no magic byte".into(),
             dq_uri: "/lake/events__ddi_dq".into(),
         });
