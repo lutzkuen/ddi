@@ -1788,7 +1788,7 @@ async fn a_union_message_isolated_mid_batch_costs_only_itself() {
 /// The shape of the production topic that held: records in arrays in arrays in arrays, maps at
 /// the two lowest levels, unions at the top and the bottom, up to 188 groups and 1,128
 /// attributes in one message (about 0.3 MB), batch after batch. Three batches of 900 messages,
-/// about 9 MB each (the production batch that held had at least 903).
+/// about 9 MB each (the production batch that held had at least 904).
 #[tokio::test]
 async fn deep_nesting_decodes_batch_after_batch() {
     const ITEM: &str = r#"{"type":"record","name":"Item","namespace":"com.example","fields":[

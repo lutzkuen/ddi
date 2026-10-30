@@ -126,7 +126,7 @@ whole mechanism: kdi stores `txn{ "<app_id>-<partition>" = last offset }`) and i
 ## Blocked pipelines (`ddi_kafka_pipeline_blocked{reason}`)
 
 The member stays in its group but writes nothing until the cause is fixed, and `ddi_pipeline_up` reads
-0 meanwhile (since 0.7.2); it re-checks every `blocked_recheck_secs`. `reason` is one of the held errors: `target_replaced` (the table was dropped and
+0 meanwhile (since 0.7.2); it re-checks every `blocked_recheck_secs`. `reason` names the held error; among them: `target_replaced` (the table was dropped and
 recreated under it: restore or point it at the right table), `protocol_unsupported` (another engine
 upgraded the table to a writer feature delta-rs cannot write, column mapping included), `txn_retention`
 (the retention property is set: unset it), `offset_vanished` (an offset it held disappeared from the

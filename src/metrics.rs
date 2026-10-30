@@ -72,7 +72,8 @@ pub struct PipelineMetrics {
     pub up: AtomicI64,
     /// How many times this pipeline has been reopened after a failure. A number that keeps
     /// climbing is a stream stuck in a loop on something a human has to fix. (A Kafka pipeline
-    /// held for one is not reopened: it waits in its group, with `up` at 0.)
+    /// paused whole is not reopened: it waits in its group with `up` at 0; a blocked partition
+    /// leaves `up` at 1.)
     pub restarts: AtomicU64,
     /// Rows the target would not take, written to the data-quality table instead.
     pub rows_rejected: AtomicU64,
@@ -561,7 +562,7 @@ impl Metrics {
                 "ddi_pipeline_up",
                 "gauge",
                 "1 while this pipeline is streaming, 0 while it is backing off after a \
-                 failure or waiting for an operator.",
+                 failure or paused as a whole.",
                 |m| m.up.load(Ordering::Relaxed),
             ),
             (

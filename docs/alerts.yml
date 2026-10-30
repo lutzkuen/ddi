@@ -10,7 +10,7 @@ groups:
         labels: { severity: page }
         annotations:
           summary: "{{ $labels.pipeline }} is held whole: {{ $labels.reason }}"
-          description: The member is in its group but writes nothing until an operator acts; ddi_pipeline_up reads 0 meanwhile. See the runbook entry for the reason.
+          description: The member is in its group but writes nothing until the cause clears (an operator's fix; for transient, capacity or other, a recheck that can read the target); ddi_pipeline_up reads 0 meanwhile. See the runbook entry for the reason.
 
       - alert: DdiKafkaPartitionBlocked
         expr: ddi_kafka_blocked_partitions > 0
