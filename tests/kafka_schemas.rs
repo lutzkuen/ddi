@@ -190,8 +190,9 @@ async fn schema_evolution() {
 }
 
 /// 16. A message that cannot be decoded, with no data-quality table: the pipeline holds
-/// (`ddi_kafka_undecodable_blocking`) and stays in its group; once the table is created the
-/// recheck resumes it, and the message is a row there with its partition, offset and bytes.
+/// (`ddi_kafka_undecodable_blocking`, and `ddi_pipeline_up` 0) and stays in its group; once the
+/// table is created the recheck resumes it, and the message is a row there with its partition,
+/// offset and bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs Redpanda; set DDI_TEST_KAFKA"]
 async fn undecodable_goes_to_dq_or_blocks() {
@@ -226,6 +227,12 @@ async fn undecodable_goes_to_dq_or_blocks() {
         m.metric("ddi_kafka_undecodable_blocking").await == 1.0
     })
     .await;
+    eventually(
+        Duration::from_secs(10),
+        "the pipeline to read down",
+        || async { m.metric("ddi_pipeline_up").await == 0.0 },
+    )
+    .await;
     let rebalances = m.metric("ddi_kafka_rebalances_total").await;
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert!(coordinates(&f.target).await.is_empty());
@@ -257,6 +264,7 @@ async fn undecodable_goes_to_dq_or_blocks() {
         m.metric("ddi_kafka_undecodable_blocking").await == 0.0
     })
     .await;
+    assert_eq!(m.metric("ddi_pipeline_up").await, 1.0);
     m.kill().await;
 }
 

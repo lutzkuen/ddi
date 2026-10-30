@@ -63,14 +63,16 @@ pub struct PipelineMetrics {
     /// Merges started. The denominator for both millisecond counters.
     pub merges: AtomicU64,
 
-    /// 1 while this pipeline is streaming, 0 while it is backing off after a failure.
+    /// 1 while this pipeline is streaming, 0 while it is backing off after a failure, or, for a
+    /// Kafka pipeline, while it is paused whole (`ddi_kafka_pipeline_blocked`).
     ///
     /// With hundreds of streams in one process, "is the process alive" stopped being a
     /// useful question — it is alive whenever *any* stream is. This is the per-stream
     /// answer, and the one to build a health check on.
     pub up: AtomicI64,
     /// How many times this pipeline has been reopened after a failure. A number that keeps
-    /// climbing is a stream stuck in a loop on something a human has to fix.
+    /// climbing is a stream stuck in a loop on something a human has to fix. (A Kafka pipeline
+    /// held for one is not reopened: it waits in its group, with `up` at 0.)
     pub restarts: AtomicU64,
     /// Rows the target would not take, written to the data-quality table instead.
     pub rows_rejected: AtomicU64,
@@ -559,7 +561,7 @@ impl Metrics {
                 "ddi_pipeline_up",
                 "gauge",
                 "1 while this pipeline is streaming, 0 while it is backing off after a \
-                 failure.",
+                 failure or waiting for an operator.",
                 |m| m.up.load(Ordering::Relaxed),
             ),
             (

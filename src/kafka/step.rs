@@ -1581,10 +1581,7 @@ impl Pipeline {
         let retrying = src.stalled.is_some()
             || matches!(src.held_for, Some(HeldFor::Transient)) && src.held.is_some();
         m.retrying.store(i64::from(retrying), Ordering::Relaxed);
-        m.set_pipeline_blocked(
-            src.blocked
-                .or_else(|| src.stalled.as_ref().and_then(|s| s.blocking)),
-        );
+        m.set_pipeline_blocked(src.pipeline_blocked());
         let gauges: BTreeMap<i32, PartitionGauges> = src
             .parts
             .owned()

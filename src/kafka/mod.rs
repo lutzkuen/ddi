@@ -312,6 +312,10 @@ pub struct KafkaProgress {
     pub retrying: bool,
     /// The pipeline, or one of its partitions, waits for an operator.
     pub blocked: bool,
+    /// The whole pipeline is paused (`ddi_kafka_pipeline_blocked`): held for an operator, or
+    /// assigned while its target could not be read. It writes nothing meanwhile, so
+    /// `ddi_pipeline_up` reads 0 though it stays in its group.
+    pub held_whole: bool,
     /// The last step reset the source.
     pub reset: bool,
     /// A batch is held after running out of capacity (`ddi_capacity_exhausted`).
@@ -361,6 +365,12 @@ impl KafkaSource {
         self.decoder().writer_schemas()
     }
 
+    /// Why the whole pipeline is paused, if it is: `ddi_kafka_pipeline_blocked`'s reason.
+    pub(crate) fn pipeline_blocked(&self) -> Option<&'static str> {
+        self.blocked
+            .or_else(|| self.stalled.as_ref().and_then(|s| s.blocking))
+    }
+
     pub(crate) fn progress(&self) -> KafkaProgress {
         KafkaProgress {
             assigned: self.parts.len(),
@@ -370,6 +380,7 @@ impl KafkaSource {
             blocked: self.blocked.is_some()
                 || self.parts.blocked().next().is_some()
                 || self.held.as_ref().is_some_and(|h| !h.retrying),
+            held_whole: self.pipeline_blocked().is_some(),
             reset: self.reset_this_step,
             capacity: self.held.is_some() && self.held_for == Some(step::HeldFor::Capacity),
         }
@@ -553,6 +564,7 @@ mod tests {
             last_commit: None,
             retrying: false,
             blocked: false,
+            held_whole: false,
             reset: false,
             capacity: false,
         };
@@ -591,6 +603,55 @@ mod tests {
         ] {
             assert!(!not.counts(latency), "{not:?}");
         }
+    }
+
+    /// Held whole is exactly what `ddi_kafka_pipeline_blocked` says: a pipeline blocked for an
+    /// operator, one assigned while its target could not be read (reason `transient`), or a
+    /// message whose registry answer needs an operator. A blocked partition, a batch held for a
+    /// retry and a registry outage leave the pipeline streaming.
+    #[test]
+    fn held_whole_is_what_ddi_kafka_pipeline_blocked_says() {
+        use deltalake::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "kafka_value",
+            DataType::Binary,
+            true,
+        )]));
+        let conformer = Conformer::new(schema, "kafka_", conform::KdiText::default()).unwrap();
+        let mut src = KafkaSource::for_tests(conformer);
+        assert!(!src.progress().held_whole);
+
+        for reason in ["undecodable", "transient"] {
+            src.blocked = Some(reason);
+            assert!(src.progress().held_whole, "{reason}");
+            assert_eq!(src.pipeline_blocked(), Some(reason));
+        }
+        src.blocked = None;
+
+        let stalled = |blocking| Stalled {
+            message: KafkaMessage {
+                partition: 0,
+                offset: 0,
+                timestamp: decode::KafkaTimestamp::NotAvailable,
+                key: None,
+                value: Some(vec![0, 0, 0, 0, 1]),
+                headers: Vec::new(),
+            },
+            due: Instant::now(),
+            backoff: Duration::from_secs(1),
+            blocking,
+        };
+        src.stalled = Some(stalled(Some("schema_registry")));
+        assert!(src.progress().held_whole);
+        src.stalled = Some(stalled(None));
+        let p = src.progress();
+        assert!(p.retrying && !p.held_whole, "{p:?}");
+        src.stalled = None;
+
+        src.parts
+            .block(0, partitions::Block::Unresolved, Instant::now());
+        let p = src.progress();
+        assert!(p.blocked && !p.held_whole, "{p:?}");
     }
 
     #[test]

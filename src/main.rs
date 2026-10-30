@@ -1262,7 +1262,11 @@ async fn attempt(
             // Only a Kafka pipeline waits: its step already polled for a second, so this never
             // sleeps. It counts as progress only when the member is idle by design, caught up,
             // or committed recently, and never while it retries, is blocked or has just reset
-            // (§3.9, PO-M5): otherwise a member stuck behind a fence would look healthy.
+            // (§3.9, PO-M5): otherwise a member stuck behind a fence would look healthy. And a
+            // pipeline paused whole (`ddi_kafka_pipeline_blocked`: held for an operator, or
+            // assigned while its target cannot be read) writes nothing: `up` reads 0 for it,
+            // though it stays in its group. Whatever else a Kafka step waits on, the pipeline is
+            // streaming through it.
             Ok(StepOutcome::Waiting) =>
             {
                 #[cfg(feature = "kafka")]
@@ -1274,6 +1278,7 @@ async fn attempt(
                     if p.capacity {
                         m.capacity_exhausted.store(1, Ordering::Relaxed);
                     }
+                    m.up.store(i64::from(!p.held_whole), Ordering::Relaxed);
                 }
             }
             Ok(StepOutcome::Progressed {
