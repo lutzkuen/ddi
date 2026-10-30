@@ -769,10 +769,7 @@ impl Pipeline {
         Ok(KafkaBatch {
             decoded: decoded.batches,
             undecodable: decoded.undecodable.len(),
-            first_undecodable: decoded
-                .undecodable
-                .first()
-                .map(|u| (u.partition, u.offset, u.reason.clone())),
+            first_undecodable: decoded.undecodable.first().cloned(),
             rejects: decoded.rejects,
             tombstones: decoded.tombstones,
             ranges: buf.ranges,
@@ -818,14 +815,15 @@ impl Pipeline {
             return Err(self.moved(p, batch));
         }
         // 2. Messages that cannot be decoded and cannot be set aside.
-        if batch.undecodable > 0 {
-            let (partition, offset, reason) = batch.first_undecodable.clone().unwrap_or_default();
+        if let Some(first) = batch.first_undecodable.clone() {
+            let topic = self.kafka().kafka.topic.clone();
             if self.dq.is_none() {
                 return Err(Error::KafkaUndecodable {
-                    topic: self.kafka().kafka.topic.clone(),
-                    partition,
-                    offset,
-                    reason,
+                    topic,
+                    partition: first.partition,
+                    offset: first.offset,
+                    schema_id: first.schema_id,
+                    reason: first.reason,
                     dq_uri: self.cfg.dq_uri(),
                 });
             }
@@ -833,7 +831,11 @@ impl Pipeline {
                 return Err(Error::KafkaTooManyUndecodable {
                     count: batch.undecodable,
                     cap: self.cfg.max_evaluation_rejects_per_batch,
-                    reason,
+                    topic,
+                    partition: first.partition,
+                    offset: first.offset,
+                    schema_id: first.schema_id,
+                    reason: first.reason,
                 });
             }
         }
@@ -1579,10 +1581,7 @@ impl Pipeline {
         let retrying = src.stalled.is_some()
             || matches!(src.held_for, Some(HeldFor::Transient)) && src.held.is_some();
         m.retrying.store(i64::from(retrying), Ordering::Relaxed);
-        m.set_pipeline_blocked(
-            src.blocked
-                .or_else(|| src.stalled.as_ref().and_then(|s| s.blocking)),
-        );
+        m.set_pipeline_blocked(src.pipeline_blocked());
         let gauges: BTreeMap<i32, PartitionGauges> = src
             .parts
             .owned()

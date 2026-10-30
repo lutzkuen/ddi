@@ -1536,6 +1536,436 @@ async fn a_chunk_that_cannot_be_flushed_builds_a_decoder_only_after_a_failure() 
     assert_eq!(rows_by_offset(&d.finish().unwrap().batches), [(1000, 1000)]);
 }
 
+// --------------------------------------------------------------- unions across flushes
+
+/// Two dense unions (any union but a two-branch one with null, which arrow-avro reads as a
+/// nullable `T`): a three-branch one and a one-branch one. `name` comes last, so a message's
+/// last bytes are its name.
+const UNIONS: &str = r#"{"type":"record","name":"Order","namespace":"com.acme","fields":[
+    {"name":"id","type":"long"},
+    {"name":"amount","type":["null","long","string"]},
+    {"name":"only","type":["string"]},
+    {"name":"name","type":"string"}]}"#;
+
+fn unions(id: i64, name: &str) -> Avro {
+    let amount = match id % 3 {
+        0 => Avro::Union(0, Box::new(Avro::Null)),
+        1 => Avro::Union(1, Box::new(Avro::Long(id))),
+        _ => Avro::Union(2, Box::new(Avro::String(format!("s{id}")))),
+    };
+    Avro::Record(vec![
+        ("id".into(), Avro::Long(id)),
+        ("amount".into(), amount),
+        (
+            "only".into(),
+            Avro::Union(0, Box::new(Avro::String(format!("o{id}")))),
+        ),
+        ("name".into(), Avro::String(name.into())),
+    ])
+}
+
+/// Each row's value of the union column `name`, as `branch:value`.
+fn union_values(batch: &RecordBatch, name: &str) -> Vec<String> {
+    union_strings(column(batch, name))
+}
+
+/// Each value of a union array, as `branch:value`.
+fn union_strings(array: &ArrayRef) -> Vec<String> {
+    let u = array
+        .as_any()
+        .downcast_ref::<UnionArray>()
+        .unwrap_or_else(|| panic!("not a union: {}", array.data_type()));
+    (0..u.len())
+        .map(|i| {
+            let child = u.child(u.type_id(i));
+            let at = u.value_offset(i);
+            match child.data_type() {
+                DataType::Null => "null".to_string(),
+                DataType::Int64 => format!("long:{}", child.as_primitive::<Int64Type>().value(at)),
+                DataType::Utf8 => format!("string:{}", child.as_string::<i32>().value(at)),
+                other => panic!("a branch of {other}"),
+            }
+        })
+        .collect()
+}
+
+/// Every row's unions hold what [`unions`] wrote for its offset.
+fn assert_unions_are_their_messages(batches: &[RecordBatch]) {
+    for b in batches {
+        let expected: Vec<(String, String)> = i64s(b, "kafka_offset")
+            .into_iter()
+            .map(|o| {
+                let amount = match o % 3 {
+                    0 => "null".to_string(),
+                    1 => format!("long:{o}"),
+                    _ => format!("string:s{o}"),
+                };
+                (amount, format!("string:o{o}"))
+            })
+            .collect();
+        let actual: Vec<(String, String)> = union_values(b, "amount")
+            .into_iter()
+            .zip(union_values(b, "only"))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+}
+
+/// arrow-avro 59 keeps a dense union's per-branch counts across a flush (apache/arrow-rs#10876,
+/// fixed in 60.0.0): the second batch's offsets start where the first batch's ended, past the
+/// children just emptied, and the flush fails. A production pipeline set about half of its later
+/// batches aside on it, and held once a batch had more than twice the cap of them. Should the
+/// raw half of this test start to fail, arrow-avro is fixed and [`ArrowAvroDecoder`]'s renewal
+/// can go.
+#[test]
+fn arrow_avro_fails_the_second_flush_of_a_union() {
+    let mut store = SchemaStore::new_with_type(FingerprintAlgorithm::Id);
+    store
+        .set(Fingerprint::Id(1), AvroSchema::new(UNIONS.to_string()))
+        .unwrap();
+    let mut raw = ReaderBuilder::new()
+        .with_writer_schema_store(store)
+        .with_active_fingerprint(Fingerprint::Id(1))
+        .build_decoder()
+        .unwrap();
+    raw.decode(&framed(1, UNIONS, unions(1, "a"))).unwrap();
+    assert_eq!(raw.flush().unwrap().unwrap().num_rows(), 1);
+    raw.decode(&framed(1, UNIONS, unions(2, "b"))).unwrap();
+    let second = raw.flush();
+    assert!(
+        matches!(&second, Err(e) if e.to_string().contains("Offsets must be non-negative")),
+        "arrow-avro flushed a union twice: {second:?}"
+    );
+
+    // ddi's decoder flushes batch after batch, each with its own values.
+    let mut ddi = ArrowAvro.build(1, UNIONS).unwrap();
+    for o in 0..6 {
+        ddi.decode_one(&framed(1, UNIONS, unions(o, "n"))).unwrap();
+        let b = ddi.flush().unwrap().unwrap();
+        assert_eq!(i64s(&b, "id"), [o]);
+        assert_eq!(union_values(&b, "only"), [format!("string:o{o}")]);
+    }
+}
+
+/// A writer schema's decoder outlives the batch: the batches after the first, and the second
+/// chunk of a batch past [`CHUNK_ROWS`], decode too.
+#[tokio::test]
+async fn a_union_decodes_batch_after_batch() {
+    let mut d = decoder(Schemas::with(&[(1, UNIONS)]));
+    let payload = |o: i64| framed(1, UNIONS, unions(o, "n"));
+    let mut next = 0;
+    for rows in [5, 1, 7, CHUNK_ROWS + 5, 3] {
+        let offsets = next..next + rows as i64;
+        next += rows as i64;
+        feed_all(
+            &mut d,
+            offsets
+                .clone()
+                .map(|o| message(o, Some(payload(o))))
+                .collect(),
+        )
+        .await;
+        let out = d.finish().unwrap();
+        assert!(out.undecodable.is_empty(), "{:?}", out.undecodable);
+        assert_eq!(
+            rows_by_offset(&out.batches),
+            offsets.map(|o| (o, o)).collect::<Vec<_>>()
+        );
+        assert_rows_are_their_messages(&out.batches);
+        assert_unions_are_their_messages(&out.batches);
+    }
+}
+
+/// The one-message-at-a-time fallback flushes after every message. With a union in the schema,
+/// that cost every second message of the chunk: in production, 452 messages of one batch, and a
+/// pipeline that held. Only the message whose row cannot be flushed is rejected.
+#[tokio::test]
+async fn a_union_chunk_that_cannot_be_flushed_loses_only_the_bad_message() {
+    /// arrow-avro, except that a flush holding the poisoned message fails as a whole.
+    struct Poisoned;
+    struct PoisonedDecoder {
+        inner: Box<dyn Decode>,
+        poisoned: bool,
+    }
+    impl DecodeFactory for Poisoned {
+        fn build(&self, id: u32, schema: &str) -> std::result::Result<Box<dyn Decode>, String> {
+            Ok(Box::new(PoisonedDecoder {
+                inner: ArrowAvro.build(id, schema)?,
+                poisoned: false,
+            }))
+        }
+    }
+    impl Decode for PoisonedDecoder {
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+        fn decode_one(&mut self, framed: &[u8]) -> std::result::Result<(), String> {
+            self.inner.decode_one(framed)?;
+            self.poisoned |= framed.ends_with(b"poison");
+            Ok(())
+        }
+        fn flush(&mut self) -> std::result::Result<Option<RecordBatch>, String> {
+            let b = self.inner.flush()?;
+            if std::mem::take(&mut self.poisoned) {
+                return Err("cannot build the column".into());
+            }
+            Ok(b)
+        }
+    }
+    let mut d = KafkaDecoder::with_factory(
+        "orders",
+        "kafka_",
+        Schemas::with(&[(1, UNIONS)]),
+        Arc::new(Poisoned),
+    );
+    // A first batch, so that the decoder of the second has been flushed before.
+    feed_all(
+        &mut d,
+        (0..3)
+            .map(|o| message(o, Some(framed(1, UNIONS, unions(o, "fine")))))
+            .collect(),
+    )
+    .await;
+    assert!(d.finish().unwrap().undecodable.is_empty());
+    let batch = 3..907;
+    feed_all(
+        &mut d,
+        batch
+            .clone()
+            .map(|o| {
+                let name = if o == 10 { "poison" } else { "fine" };
+                message(o, Some(framed(1, UNIONS, unions(o, name))))
+            })
+            .collect(),
+    )
+    .await;
+    let out = d.finish().unwrap();
+    let bad: Vec<i64> = out.undecodable.iter().map(|u| u.offset).collect();
+    assert_eq!(bad, [10]);
+    let kept: Vec<i64> = rows_by_offset(&out.batches).iter().map(|r| r.0).collect();
+    assert_eq!(kept, batch.filter(|o| *o != 10).collect::<Vec<_>>());
+    assert_rows_are_their_messages(&out.batches);
+    assert_unions_are_their_messages(&out.batches);
+
+    // And the batch after it.
+    feed_all(
+        &mut d,
+        vec![message(907, Some(framed(1, UNIONS, unions(907, "fine"))))],
+    )
+    .await;
+    let out = d.finish().unwrap();
+    assert!(out.undecodable.is_empty(), "{:?}", out.undecodable);
+    assert_unions_are_their_messages(&out.batches);
+}
+
+/// A message isolated mid-batch: the decoder that decoded the messages before it again was
+/// flushed once already, so with a union the messages after it went through the
+/// one-at-a-time fallback and every second one was rejected with it.
+#[tokio::test]
+async fn a_union_message_isolated_mid_batch_costs_only_itself() {
+    let mut d = decoder(Schemas::with(&[(1, UNIONS)]));
+    let mut truncated = framed(1, UNIONS, unions(4, "a name"));
+    truncated.truncate(truncated.len() - 2);
+    let messages = (3..10)
+        .map(|o| match o {
+            4 => message(o, Some(truncated.clone())),
+            _ => message(o, Some(framed(1, UNIONS, unions(o, "n")))),
+        })
+        .collect();
+    feed_all(&mut d, messages).await;
+    let out = d.finish().unwrap();
+    let bad: Vec<i64> = out.undecodable.iter().map(|u| u.offset).collect();
+    assert_eq!(bad, [4], "{:?}", out.undecodable);
+    assert!(out.undecodable[0].reason.contains("truncated"));
+    assert_eq!(
+        rows_by_offset(&out.batches),
+        [(3, 3), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9)]
+    );
+    assert_rows_are_their_messages(&out.batches);
+    assert_unions_are_their_messages(&out.batches);
+}
+
+/// The shape of the production topic that held: records in arrays in arrays in arrays, maps at
+/// the two lowest levels, unions at the top and the bottom, up to 188 groups and 1,128
+/// attributes in one message (about 0.3 MB), batch after batch. Three batches of 900 messages,
+/// about 9 MB each (the production batch that held had at least 904).
+#[tokio::test]
+async fn deep_nesting_decodes_batch_after_batch() {
+    const ITEM: &str = r#"{"type":"record","name":"Item","namespace":"com.example","fields":[
+        {"name":"id","type":"long"},
+        {"name":"code","type":["string"]},
+        {"name":"tags","type":{"type":"array","items":"string"}},
+        {"name":"groups","type":{"type":"array","items":{
+            "type":"record","name":"Group","fields":[
+            {"name":"groupId","type":["null","string"]},
+            {"name":"attributes","type":{"type":"array","items":{
+                "type":"record","name":"Attribute","fields":[
+                {"name":"id","type":["null","string"]},
+                {"name":"names","type":{"type":"map","values":["null","string"]}},
+                {"name":"values","type":{"type":"array","items":{
+                    "type":"record","name":"Value","fields":[
+                    {"name":"valueId","type":["null","string"]},
+                    {"name":"texts","type":{"type":"map","values":"string"}},
+                    {"name":"spec","type":["null","string","long"]}
+                ]}}}
+            ]}}}
+        ]}}}
+    ]}"#;
+    let localized = |what: &str| {
+        Avro::Map(
+            ["de", "en", "fr", "it"]
+                .iter()
+                .map(|l| (l.to_string(), Avro::String(format!("{what} in {l}"))))
+                .collect(),
+        )
+    };
+    let nullable = |s: String| Avro::Union(1, Box::new(Avro::String(s)));
+    // Value `v` of attribute `a` of group `s`: its `spec`, each branch in turn.
+    let spec = |s: usize, a: usize, v: usize| match (a + v) % 3 {
+        0 => None,
+        1 => Some(Ok(format!("spec {s}.{a}.{v}"))),
+        _ => Some(Err((s * 1000 + a) as i64)),
+    };
+    let spec_text = |s: usize, a: usize, v: usize| match spec(s, a, v) {
+        None => "null".to_string(),
+        Some(Ok(text)) => format!("string:{text}"),
+        Some(Err(n)) => format!("long:{n}"),
+    };
+    // An item with `groups` groups of `attributes` attributes of two values each, without its
+    // `id`: the bytes after it, which every message with this shape shares.
+    let tail = |groups: usize, attributes: usize| {
+        let group = |s: usize| {
+            let attribute = |a: usize| {
+                let value = |v: usize| {
+                    let spec = match spec(s, a, v) {
+                        None => Avro::Union(0, Box::new(Avro::Null)),
+                        Some(Ok(text)) => Avro::Union(1, Box::new(Avro::String(text))),
+                        Some(Err(n)) => Avro::Union(2, Box::new(Avro::Long(n))),
+                    };
+                    Avro::Record(vec![
+                        ("valueId".into(), nullable(format!("v{s}.{a}.{v}"))),
+                        ("texts".into(), localized("a value")),
+                        ("spec".into(), spec),
+                    ])
+                };
+                Avro::Record(vec![
+                    ("id".into(), nullable(format!("a{s}.{a}"))),
+                    (
+                        "names".into(),
+                        Avro::Map(
+                            [("de", 1), ("en", 1), ("xx", 0)]
+                                .iter()
+                                .map(|(l, branch)| {
+                                    let v = match branch {
+                                        0 => Avro::Union(0, Box::new(Avro::Null)),
+                                        _ => nullable(format!("name {s}.{a} in {l}")),
+                                    };
+                                    (l.to_string(), v)
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    ("values".into(), Avro::Array((0..2).map(value).collect())),
+                ])
+            };
+            Avro::Record(vec![
+                ("groupId".into(), nullable(format!("group {s}"))),
+                (
+                    "attributes".into(),
+                    Avro::Array((0..attributes).map(attribute).collect()),
+                ),
+            ])
+        };
+        let item = Avro::Record(vec![
+            ("id".into(), Avro::Long(0)),
+            (
+                "code".into(),
+                Avro::Union(0, Box::new(Avro::String("I-1".into()))),
+            ),
+            (
+                "tags".into(),
+                Avro::Array(vec![Avro::String("a tag".into())]),
+            ),
+            (
+                "groups".into(),
+                Avro::Array((0..groups).map(group).collect()),
+            ),
+        ]);
+        // `id` 0 is the one byte 0x00.
+        framed(1, ITEM, item)[HEADER_LEN + 1..].to_vec()
+    };
+    let typical = tail(8, 5);
+    let largest = tail(188, 6);
+    assert!(typical.len() > 8_000, "{}", typical.len());
+    assert!(largest.len() > 250_000, "{}", largest.len());
+    let payload =
+        |o: i64, tail: &[u8]| [vec![0, 0, 0, 0, 1], zigzag_varint(o), tail.to_vec()].concat();
+
+    let mut d = decoder(Schemas::with(&[(1, ITEM)]));
+    let mut next = 0;
+    for _ in 0..3 {
+        let offsets = next..next + 900;
+        next += 900;
+        let largest_at = offsets.start + 450;
+        feed_all(
+            &mut d,
+            offsets
+                .clone()
+                .map(|o| {
+                    let tail = if o == largest_at { &largest } else { &typical };
+                    message(o, Some(payload(o, tail)))
+                })
+                .collect(),
+        )
+        .await;
+        let out = d.finish().unwrap();
+        assert!(
+            out.undecodable.is_empty(),
+            "{} undecodable, the first: {:?}",
+            out.undecodable.len(),
+            out.undecodable.first()
+        );
+        assert_eq!(
+            rows_by_offset(&out.batches),
+            offsets.map(|o| (o, o)).collect::<Vec<_>>()
+        );
+        assert_rows_are_their_messages(&out.batches);
+        // Every value's union made it, with its own branch: 2 per attribute.
+        let attributes: usize = 899 * 8 * 5 + 188 * 6;
+        let mut specs = Vec::new();
+        for b in &out.batches {
+            let groups = column(b, "groups").as_list::<i32>().values();
+            let attrs = groups
+                .as_struct()
+                .column_by_name("attributes")
+                .unwrap()
+                .as_list::<i32>()
+                .values()
+                .clone();
+            let values = attrs
+                .as_struct()
+                .column_by_name("values")
+                .unwrap()
+                .as_list::<i32>()
+                .values()
+                .clone();
+            let spec = values.as_struct().column_by_name("spec");
+            specs.extend(union_strings(spec.unwrap()));
+        }
+        assert_eq!(specs.len(), attributes * 2);
+        assert_eq!(
+            specs[..4],
+            [
+                spec_text(0, 0, 0),
+                spec_text(0, 0, 1),
+                spec_text(0, 1, 0),
+                spec_text(0, 1, 1)
+            ]
+        );
+        assert_eq!(specs.last(), Some(&spec_text(7, 4, 1)));
+    }
+}
+
 // ------------------------------------------------------------- what holds the pipeline
 
 #[tokio::test]

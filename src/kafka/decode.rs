@@ -192,33 +192,44 @@ impl DecodeFactory for ArrowAvro {
     fn build(&self, id: u32, writer_schema: &str) -> std::result::Result<Box<dyn Decode>, String> {
         let writer_schema = valid_logical_types(writer_schema);
         let writer_schema = writer_schema.as_ref();
-        // A store holding exactly this id, so the decoder never switches schema
-        // (schema.rs:861, 884).
-        let mut store = SchemaStore::new_with_type(FingerprintAlgorithm::Id);
-        store
-            .set(
-                Fingerprint::Id(id),
-                AvroSchema::new(writer_schema.to_string()),
-            )
-            .map_err(|e| e.to_string())?;
-        let build = || {
-            ReaderBuilder::new()
-                .with_writer_schema_store(store)
-                .with_active_fingerprint(Fingerprint::Id(id))
-                .with_batch_size(CHUNK_ROWS)
-                .with_tz(Tz::Utc)
-                .with_utf8_view(false)
-                .build_decoder()
-        };
-        let inner = match catch_unwind(AssertUnwindSafe(build)) {
-            Ok(Ok(d)) => d,
-            Ok(Err(e)) => return Err(e.to_string()),
-            Err(panic) => return Err(format!("arrow-avro panicked: {}", panic_text(&panic))),
-        };
+        let inner = arrow_avro_decoder(id, writer_schema)?;
+        let renew = holds_union(&DataType::Struct(inner.schema().fields().clone()))
+            .then(|| (id, writer_schema.to_string()));
         Ok(Box::new(ArrowAvroDecoder {
             inner,
             wire: Wire::new(writer_schema).ok(),
+            renew,
         }))
+    }
+}
+
+/// arrow-avro's decoder of exactly this writer schema.
+fn arrow_avro_decoder(
+    id: u32,
+    writer_schema: &str,
+) -> std::result::Result<arrow_avro::reader::Decoder, String> {
+    // A store holding exactly this id, so the decoder never switches schema
+    // (schema.rs:861, 884).
+    let mut store = SchemaStore::new_with_type(FingerprintAlgorithm::Id);
+    store
+        .set(
+            Fingerprint::Id(id),
+            AvroSchema::new(writer_schema.to_string()),
+        )
+        .map_err(|e| e.to_string())?;
+    let build = || {
+        ReaderBuilder::new()
+            .with_writer_schema_store(store)
+            .with_active_fingerprint(Fingerprint::Id(id))
+            .with_batch_size(CHUNK_ROWS)
+            .with_tz(Tz::Utc)
+            .with_utf8_view(false)
+            .build_decoder()
+    };
+    match catch_unwind(AssertUnwindSafe(build)) {
+        Ok(Ok(d)) => Ok(d),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(panic) => Err(format!("arrow-avro panicked: {}", panic_text(&panic))),
     }
 }
 
@@ -228,6 +239,12 @@ struct ArrowAvroDecoder {
     /// ([`wire`]). Read as arrow-avro reads the schema, so it is there for every schema arrow-avro
     /// builds a decoder for; were it ever not, the check would be arrow-avro's alone, as before.
     wire: Option<Wire>,
+    /// The writer schema, by id, to build a fresh `inner` from at each flush; only when the
+    /// schema holds a dense union (any union but a two-branch one with null, `["null", T]` or
+    /// `[T, "null"]`, which arrow-avro reads as a nullable `T`). arrow-avro 59 keeps a union's
+    /// per-branch counts across a flush (apache/arrow-rs#10876, fixed in 60.0.0), so every
+    /// batch after a decoder's first would point past its union's children and fail to flush.
+    renew: Option<(u32, String)>,
 }
 
 impl ArrowAvroDecoder {
@@ -296,8 +313,20 @@ impl Decode for ArrowAvroDecoder {
         }
     }
 
+    /// A decoder whose schema holds a dense union is flushed once and replaced (`renew`). The
+    /// new one is built first: should it fail to build, nothing was flushed, and the rows are
+    /// where they were.
     fn flush(&mut self) -> std::result::Result<Option<RecordBatch>, String> {
-        match catch_unwind(AssertUnwindSafe(|| self.inner.flush())) {
+        let mut spent = match &self.renew {
+            Some((id, schema)) => {
+                let fresh = arrow_avro_decoder(*id, schema)
+                    .map_err(|e| format!("cannot renew the decoder: {e}"))?;
+                Some(std::mem::replace(&mut self.inner, fresh))
+            }
+            None => None,
+        };
+        let inner = spent.as_mut().unwrap_or(&mut self.inner);
+        match catch_unwind(AssertUnwindSafe(|| inner.flush())) {
             Ok(r) => r.map_err(|e| e.to_string()),
             Err(panic) => Err(format!("arrow-avro panicked: {}", panic_text(&panic))),
         }
@@ -724,7 +753,9 @@ impl Ctx<'_> {
     /// Each message of `chunk` decoded and flushed alone, into one new decoder: a message whose
     /// row cannot be flushed is rejected, the others keep theirs. The decoder is replaced again
     /// only after a message failed, since it may then hold part of that row; building one per
-    /// message would parse the schema and size fresh builders for every row of the chunk.
+    /// message would parse the schema and size fresh builders for every row of the chunk. (A
+    /// decoder of a schema with a dense union does that anyway, inside its flush: see
+    /// `ArrowAvroDecoder::renew`.)
     fn flush_one_by_one(&self, group: &mut Ready, chunk: Vec<KafkaMessage>, out: &mut Out) {
         let mut rows = Vec::new();
         let mut kept = Vec::new();
@@ -1409,6 +1440,25 @@ fn zero_width(t: &DataType) -> bool {
 /// a byte.
 fn zero_width_field(f: &Field) -> bool {
     zero_width(f.data_type()) && !(f.is_nullable() && *f.data_type() != DataType::Null)
+}
+
+/// Whether a value of this type holds a dense union anywhere (arrow-avro reads `["null", T]` and
+/// `[T, "null"]` as a nullable `T`, and every other union, one-branch ones included, as a
+/// `Union`).
+fn holds_union(t: &DataType) -> bool {
+    match t {
+        DataType::Union(..) => true,
+        DataType::List(item)
+        | DataType::LargeList(item)
+        | DataType::ListView(item)
+        | DataType::LargeListView(item)
+        | DataType::FixedSizeList(item, _)
+        | DataType::Map(item, _) => holds_union(item.data_type()),
+        DataType::Struct(fs) => fs.iter().any(|f| holds_union(f.data_type())),
+        DataType::Dictionary(_, values) => holds_union(values),
+        DataType::RunEndEncoded(_, values) => holds_union(values.data_type()),
+        _ => false,
+    }
 }
 
 /// The first array whose items take no bytes on the wire, by its path.

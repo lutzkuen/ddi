@@ -804,6 +804,33 @@ fn cases() -> Vec<Case> {
             values: vec![A(union(0, Avro::Null)), A(union(1, Avro::Int(5)))],
             targets: vec![("BIGINT", Delta::LONG, Same)],
         },
+        // A one-branch union is a union to arrow-avro, not its one type (codec.rs:1446-1495).
+        Case {
+            avro: "union [string]",
+            schema: r#"["string"]"#,
+            values: vec![A(union(0, s("x")))],
+            targets: vec![("STRING", string(), Same)],
+        },
+        Case {
+            avro: "record of a union [string] and a union [null,long,string]",
+            schema: r#"{"type":"record","name":"Unions","fields":[
+                {"name":"a","type":["string"]},{"name":"b","type":["null","long","string"]}]}"#,
+            values: vec![
+                A(record(vec![
+                    ("a", union(0, s("x"))),
+                    ("b", union(2, s("y"))),
+                ])),
+                A(record(vec![
+                    ("a", union(0, s("z"))),
+                    ("b", union(1, Avro::Long(7))),
+                ])),
+                A(record(vec![
+                    ("a", union(0, s("w"))),
+                    ("b", union(0, Avro::Null)),
+                ])),
+            ],
+            targets: vec![("STRING", string(), Same)],
+        },
         Case {
             avro: "fixed(4)",
             schema: r#"{"type":"fixed","name":"F4","size":4}"#,

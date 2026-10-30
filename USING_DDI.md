@@ -61,7 +61,7 @@ Tagged releases (`vX.Y.Z`) additionally publish `:X.Y.Z` and `:latest` — the n
 release, not the newest commit:
 
 ```bash
-docker pull ghcr.io/lutzkuen/ddi:0.7.1
+docker pull ghcr.io/lutzkuen/ddi:0.7.2
 docker pull ghcr.io/lutzkuen/ddi:latest
 ```
 
@@ -294,7 +294,9 @@ what earlier windows dropped until the process restarts: alert on its `increase(
 its value.
 
 Alert on `ddi_pipeline_up == 0` for a down stream, `ddi_source_lag_versions` for backlog and `increase(ddi_errors_total[5m])` for a
-stopped pipeline. A bad row need not stop one: with a data-quality table beside the target
+stopped pipeline. A Kafka pipeline paused whole (held for an operator, or assigned while its target
+cannot be read) stays in its consumer group and is not reopened, but reads `ddi_pipeline_up` 0
+meanwhile, and `ddi_kafka_pipeline_blocked{reason}` says why (docs/alerts.yml pages on it). A bad row need not stop one: with a data-quality table beside the target
 it is set aside and the rest of the batch commits (§9). Whatever does stop a pipeline is
 retried with backoff, and one that stays down needs a human.
 

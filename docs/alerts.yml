@@ -10,7 +10,7 @@ groups:
         labels: { severity: page }
         annotations:
           summary: "{{ $labels.pipeline }} is held whole: {{ $labels.reason }}"
-          description: The member is up and in its group but writes nothing until an operator acts. See the runbook entry for the reason.
+          description: The member is in its group but writes nothing until the cause clears (an operator's fix; for transient, capacity or other, a recheck that can read the target); ddi_pipeline_up reads 0 meanwhile. See the runbook entry for the reason.
 
       - alert: DdiKafkaPartitionBlocked
         expr: ddi_kafka_blocked_partitions > 0
@@ -18,7 +18,7 @@ groups:
         labels: { severity: page }
         annotations:
           summary: "{{ $labels.pipeline }} has {{ $value }} blocked partition(s)"
-          description: A retention gap, a regressed offset, a replaced topic or an undecodable message. `ddi kafka plan` names the partition; `ddi kafka set-offsets` with an acknowledgment moves it.
+          description: A retention gap, a regressed offset or a replaced topic (`ddi kafka plan` names the partition; `ddi kafka set-offsets` with an acknowledgment moves it), or a partition assigned while the target could not be read, which a recheck clears.
 
       - alert: DdiKafkaLagGrowing
         expr: ddi_kafka_lag_messages_max > 100000 and deriv(ddi_kafka_lag_messages_max[30m]) > 0
@@ -55,7 +55,7 @@ groups:
         labels: { severity: ticket }
         annotations:
           summary: "{{ $labels.pipeline }} set aside undecodable messages"
-          description: They are in <target>__ddi_dq with the reason. Past the per-batch cap the pipeline blocks (ddi_kafka_undecodable_blocking).
+          description: They are in <target>__ddi_dq with the reason. Past the per-batch cap the pipeline blocks (ddi_kafka_undecodable_blocking), and its error names the first message by partition, offset and writer schema id.
 
       - alert: DdiKafkaBrokersDown
         expr: ddi_kafka_brokers_up == 0

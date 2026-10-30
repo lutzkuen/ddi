@@ -986,7 +986,7 @@ Because the process no longer exits when a stream dies, metrics stop being optio
 
 | Signal | Meaning |
 |---|---|
-| `ddi_pipeline_up` | 1 while streaming, 0 while backing off. **The health signal.** |
+| `ddi_pipeline_up` | 1 while streaming, 0 while backing off, or while a Kafka pipeline is paused whole (`ddi_kafka_pipeline_blocked` says why). **The health signal.** |
 | `ddi_pipeline_config_valid` | 0 for a pipeline held back at load. `up = 0` is a stream that stopped; this is one that never started. |
 | `ddi_pipeline_seconds_since_progress` | Staleness. Still moves when a pipeline fails while *opening*, which lag does not. |
 | `ddi_pipeline_restarts_total` | Reopens after a failure. Climbing steadily = stuck on something a human must fix. |
@@ -2005,7 +2005,7 @@ correctness still holds (the `txn` action prevents double-apply) — it just was
 | `ddi_last_source_version` | gauge | Last source version **durably committed** (the `txn` value). |
 | `ddi_source_head_version` | gauge | Source head at the last poll. |
 | `ddi_source_lag_versions` | gauge | Source commits not yet consumed. |
-| `ddi_pipeline_up` | gauge | 1 while streaming, 0 while backing off after a failure. |
+| `ddi_pipeline_up` | gauge | 1 while streaming, 0 while backing off after a failure. A Kafka pipeline paused whole (held for an operator, or assigned while its target cannot be read) stays in its group without reopening, and reads 0 while `ddi_kafka_pipeline_blocked{reason}` is 1. |
 | `ddi_pipeline_config_valid` | gauge | 1 when the configuration was accepted, 0 when the pipeline was held back at load and never started. |
 | `ddi_pipeline_seconds_since_progress` | gauge | Since the last completed step; -1 before the first. |
 | `ddi_source_file_vacuumed` | gauge | 1 while the pipeline is stopped on a source data file the object store no longer has. |
