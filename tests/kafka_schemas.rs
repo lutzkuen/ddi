@@ -268,6 +268,110 @@ async fn undecodable_goes_to_dq_or_blocks() {
     m.kill().await;
 }
 
+/// 16. A batch held for an operator whose retry, once the cause is fixed, loses its commit to
+/// another writer that moved one of its partitions (here an operator's set-offsets, landing while
+/// the retry's commit waits): the batch is dropped, the hold ends with it, and the pipeline reads
+/// on from the moved offset. It used to stay paused and blocked, with no batch to retry and no
+/// recheck due, until a restart.
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Redpanda; set DDI_TEST_KAFKA"]
+async fn a_held_batch_dropped_for_another_writer_ends_the_hold() {
+    use delta_delta_ingest::kafka::setoffsets::{self, Request};
+    let f = Fixture::bare(1).await;
+    create_target(&f.target).await;
+    let id = register(&f.subject(), EVENT_V1).await;
+    let toml = f.toml("dropped", "", "");
+    let config = f.write("run.toml", &toml);
+    // Every target commit waits 8 s: the other writer commits in that time.
+    let mut m = Member::start(
+        &config,
+        &f.dir.path().join("m.log"),
+        &[("DDI_TEST_FAULT", "sleep_before_commit:8")],
+    );
+    eventually(
+        Duration::from_secs(60),
+        "the member to own the partition",
+        || async { m.metric("ddi_kafka_assigned_partitions").await == 1.0 },
+    )
+    .await;
+    let producer = Producer::new();
+    let event_at = |n| framed(EVENT_V1, id, event(n, None));
+
+    // A first commit, so that the partition has an offset to move.
+    let mut expected = BTreeSet::new();
+    for n in 0..3 {
+        expected.insert((
+            0,
+            producer.send(&f.topic, 0, None, Some(&event_at(n))).await,
+        ));
+    }
+    eventually(Duration::from_secs(60), "the first commit", || async {
+        coordinates(&f.target).await.len() == expected.len()
+    })
+    .await;
+
+    // A batch with an undecodable message and no data-quality table: held for an operator.
+    for n in 3..5 {
+        producer.send(&f.topic, 0, None, Some(&event_at(n))).await;
+    }
+    let bad = producer
+        .send(&f.topic, 0, None, Some(b"{\"json\": true}"))
+        .await;
+    eventually(Duration::from_secs(60), "the pipeline to hold", || async {
+        m.metric("ddi_kafka_undecodable_blocking").await == 1.0
+    })
+    .await;
+
+    // The operator creates the table: the recheck retries the batch, which writes its reject
+    // and then waits before its target commit, while the operator also moves the partition
+    // past the batch.
+    create_dq(&f.dq).await;
+    eventually(
+        Duration::from_secs(30),
+        "the retry to write its reject",
+        || async { rejects(&f.dq).await.len() == 1 },
+    )
+    .await;
+    let moves = Request {
+        moves: BTreeMap::from([(0, bad + 1)]),
+        acknowledge_skip: Some("the test moves past the held batch".into()),
+        ..Request::default()
+    };
+    let first_last = expected.iter().map(|(_, o)| *o).max().unwrap();
+    let out = setoffsets::set_offsets(&resolve(&toml, false), &moves)
+        .await
+        .unwrap();
+    // Inside the retry's commit wait, the partition still had the first commit's offset.
+    assert_eq!(
+        out.moved[&0],
+        (Some(first_last), bad),
+        "set-offsets landed after the retry's commit: the 8 s window was missed"
+    );
+
+    // The retry's commit conflicts and the batch is dropped ...
+    eventually(
+        Duration::from_secs(30),
+        "the retry to lose its commit and drop the batch",
+        || async { m.log_text().contains("the batch was dropped") },
+    )
+    .await;
+    // ... and the pipeline goes on from the moved offset.
+    let after = producer.send(&f.topic, 0, None, Some(&event_at(5))).await;
+    expected.insert((0, after));
+    eventually(
+        Duration::from_secs(90),
+        "a message after the moved offset to be committed",
+        || async { coordinates(&f.target).await.contains(&(0, after)) },
+    )
+    .await;
+    assert_exactly(&coordinates(&f.target).await, &expected);
+    assert_eq!(rejects(&f.dq).await.len(), 1);
+    assert_eq!(m.metric("ddi_kafka_pipeline_blocked").await, 0.0);
+    assert_eq!(m.metric("ddi_pipeline_up").await, 1.0);
+    m.kill().await;
+}
+
 /// 16. More undecodable messages in one batch than max_evaluation_rejects_per_batch: a
 /// format or registry misconfiguration, not bad data, so the pipeline holds (once-mode fails),
 /// and says which message was the first, by partition, offset and writer schema id.
