@@ -61,7 +61,7 @@ Tagged releases (`vX.Y.Z`) additionally publish `:X.Y.Z` and `:latest` — the n
 release, not the newest commit:
 
 ```bash
-docker pull ghcr.io/lutzkuen/ddi:0.7.2
+docker pull ghcr.io/lutzkuen/ddi:0.7.3
 docker pull ghcr.io/lutzkuen/ddi:latest
 ```
 
