@@ -240,7 +240,8 @@ struct ArrowAvroDecoder {
     /// builds a decoder for; were it ever not, the check would be arrow-avro's alone, as before.
     wire: Option<Wire>,
     /// The writer schema, by id, to build a fresh `inner` from at each flush; only when the
-    /// schema holds a dense union (any union but `["null", T]`). arrow-avro 59 keeps a union's
+    /// schema holds a dense union (any union but a two-branch one with null, `["null", T]` or
+    /// `[T, "null"]`, which arrow-avro reads as a nullable `T`). arrow-avro 59 keeps a union's
     /// per-branch counts across a flush (apache/arrow-rs#10876, fixed in 60.0.0), so every
     /// batch after a decoder's first would point past its union's children and fail to flush.
     renew: Option<(u32, String)>,
@@ -1441,8 +1442,9 @@ fn zero_width_field(f: &Field) -> bool {
     zero_width(f.data_type()) && !(f.is_nullable() && *f.data_type() != DataType::Null)
 }
 
-/// Whether a value of this type holds a dense union anywhere (arrow-avro reads a `["null", T]`
-/// union as a nullable `T`, and every other union as a `Union`).
+/// Whether a value of this type holds a dense union anywhere (arrow-avro reads `["null", T]` and
+/// `[T, "null"]` as a nullable `T`, and every other union, one-branch ones included, as a
+/// `Union`).
 fn holds_union(t: &DataType) -> bool {
     match t {
         DataType::Union(..) => true,

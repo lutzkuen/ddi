@@ -1538,9 +1538,9 @@ async fn a_chunk_that_cannot_be_flushed_builds_a_decoder_only_after_a_failure() 
 
 // --------------------------------------------------------------- unions across flushes
 
-/// Two dense unions (any union other than `["null", T]`, which arrow-avro reads as a nullable
-/// `T`): a three-branch one and a one-branch one, which Trino reads as its only type. `name`
-/// comes last, so a message's last bytes are its name.
+/// Two dense unions (any union but a two-branch one with null, which arrow-avro reads as a
+/// nullable `T`): a three-branch one and a one-branch one. `name` comes last, so a message's
+/// last bytes are its name.
 const UNIONS: &str = r#"{"type":"record","name":"Order","namespace":"com.acme","fields":[
     {"name":"id","type":"long"},
     {"name":"amount","type":["null","long","string"]},
@@ -1613,9 +1613,10 @@ fn assert_unions_are_their_messages(batches: &[RecordBatch]) {
 
 /// arrow-avro 59 keeps a dense union's per-branch counts across a flush (apache/arrow-rs#10876,
 /// fixed in 60.0.0): the second batch's offsets start where the first batch's ended, past the
-/// children just emptied, and the flush fails. A production pipeline held on it at its second
-/// batch. Should the raw half of this test start to fail, arrow-avro is fixed and
-/// [`ArrowAvroDecoder`]'s renewal can go.
+/// children just emptied, and the flush fails. A production pipeline set about half of its later
+/// batches aside on it, and held once a batch had more than twice the cap of them. Should the
+/// raw half of this test start to fail, arrow-avro is fixed and [`ArrowAvroDecoder`]'s renewal
+/// can go.
 #[test]
 fn arrow_avro_fails_the_second_flush_of_a_union() {
     let mut store = SchemaStore::new_with_type(FingerprintAlgorithm::Id);
@@ -1676,7 +1677,7 @@ async fn a_union_decodes_batch_after_batch() {
 }
 
 /// The one-message-at-a-time fallback flushes after every message. With a union in the schema,
-/// that cost every second message of the chunk: 452 of 904 rejected in production, and a
+/// that cost every second message of the chunk: in production, 452 messages of one batch, and a
 /// pipeline that held. Only the message whose row cannot be flushed is rejected.
 #[tokio::test]
 async fn a_union_chunk_that_cannot_be_flushed_loses_only_the_bad_message() {
@@ -1757,27 +1758,55 @@ async fn a_union_chunk_that_cannot_be_flushed_loses_only_the_bad_message() {
     assert_unions_are_their_messages(&out.batches);
 }
 
-/// The shape of the production topic that held: records in arrays in arrays in arrays, maps at
-/// every level, unions at the bottom, up to 188 styles and 1,128 attributes in one message
-/// (about 0.5 MB), in batches of about 900 messages, batch after batch.
+/// A message isolated mid-batch: the decoder that decoded the messages before it again was
+/// flushed once already, so with a union the messages after it went through the
+/// one-at-a-time fallback and every second one was rejected with it.
 #[tokio::test]
-async fn deep_nesting_decodes_at_production_batch_sizes() {
-    const PRODUCT: &str = r#"{"type":"record","name":"Product","namespace":"com.shop","fields":[
+async fn a_union_message_isolated_mid_batch_costs_only_itself() {
+    let mut d = decoder(Schemas::with(&[(1, UNIONS)]));
+    let mut truncated = framed(1, UNIONS, unions(4, "a name"));
+    truncated.truncate(truncated.len() - 2);
+    let messages = (3..10)
+        .map(|o| match o {
+            4 => message(o, Some(truncated.clone())),
+            _ => message(o, Some(framed(1, UNIONS, unions(o, "n")))),
+        })
+        .collect();
+    feed_all(&mut d, messages).await;
+    let out = d.finish().unwrap();
+    let bad: Vec<i64> = out.undecodable.iter().map(|u| u.offset).collect();
+    assert_eq!(bad, [4], "{:?}", out.undecodable);
+    assert!(out.undecodable[0].reason.contains("truncated"));
+    assert_eq!(
+        rows_by_offset(&out.batches),
+        [(3, 3), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9)]
+    );
+    assert_rows_are_their_messages(&out.batches);
+    assert_unions_are_their_messages(&out.batches);
+}
+
+/// The shape of the production topic that held: records in arrays in arrays in arrays, maps at
+/// the two lowest levels, unions at the top and the bottom, up to 188 groups and 1,128
+/// attributes in one message (about 0.3 MB), batch after batch. Three batches of 900 messages,
+/// about 9 MB each (the production batch that held had at least 903).
+#[tokio::test]
+async fn deep_nesting_decodes_batch_after_batch() {
+    const ITEM: &str = r#"{"type":"record","name":"Item","namespace":"com.example","fields":[
         {"name":"id","type":"long"},
-        {"name":"baseProductId","type":["string"]},
-        {"name":"genders","type":{"type":"array","items":"string"}},
-        {"name":"stylesDescriptions","type":{"type":"array","items":{
-            "type":"record","name":"Style","fields":[
-            {"name":"styleArticleId","type":["null","string"]},
-            {"name":"styleArticleAttributes","type":{"type":"array","items":{
+        {"name":"code","type":["string"]},
+        {"name":"tags","type":{"type":"array","items":"string"}},
+        {"name":"groups","type":{"type":"array","items":{
+            "type":"record","name":"Group","fields":[
+            {"name":"groupId","type":["null","string"]},
+            {"name":"attributes","type":{"type":"array","items":{
                 "type":"record","name":"Attribute","fields":[
                 {"name":"id","type":["null","string"]},
-                {"name":"localizedNames","type":{"type":"map","values":["null","string"]}},
+                {"name":"names","type":{"type":"map","values":["null","string"]}},
                 {"name":"values","type":{"type":"array","items":{
                     "type":"record","name":"Value","fields":[
-                    {"name":"styleArticleAttributeValueId","type":["null","string"]},
-                    {"name":"localizedValues","type":{"type":"map","values":"string"}},
-                    {"name":"valueSpecification","type":["null","string","long"]}
+                    {"name":"valueId","type":["null","string"]},
+                    {"name":"texts","type":{"type":"map","values":"string"}},
+                    {"name":"spec","type":["null","string","long"]}
                 ]}}}
             ]}}}
         ]}}}
@@ -1791,7 +1820,7 @@ async fn deep_nesting_decodes_at_production_batch_sizes() {
         )
     };
     let nullable = |s: String| Avro::Union(1, Box::new(Avro::String(s)));
-    // Value `v` of attribute `a` of style `s`: its `valueSpecification`, each branch in turn.
+    // Value `v` of attribute `a` of group `s`: its `spec`, each branch in turn.
     let spec = |s: usize, a: usize, v: usize| match (a + v) % 3 {
         0 => None,
         1 => Some(Ok(format!("spec {s}.{a}.{v}"))),
@@ -1802,10 +1831,10 @@ async fn deep_nesting_decodes_at_production_batch_sizes() {
         Some(Ok(text)) => format!("string:{text}"),
         Some(Err(n)) => format!("long:{n}"),
     };
-    // A product with `styles` styles of `attributes` attributes of two values each, without its
+    // An item with `groups` groups of `attributes` attributes of two values each, without its
     // `id`: the bytes after it, which every message with this shape shares.
-    let tail = |styles: usize, attributes: usize| {
-        let style = |s: usize| {
+    let tail = |groups: usize, attributes: usize| {
+        let group = |s: usize| {
             let attribute = |a: usize| {
                 let value = |v: usize| {
                     let spec = match spec(s, a, v) {
@@ -1814,18 +1843,15 @@ async fn deep_nesting_decodes_at_production_batch_sizes() {
                         Some(Err(n)) => Avro::Union(2, Box::new(Avro::Long(n))),
                     };
                     Avro::Record(vec![
-                        (
-                            "styleArticleAttributeValueId".into(),
-                            nullable(format!("v{s}.{a}.{v}")),
-                        ),
-                        ("localizedValues".into(), localized("a value")),
-                        ("valueSpecification".into(), spec),
+                        ("valueId".into(), nullable(format!("v{s}.{a}.{v}"))),
+                        ("texts".into(), localized("a value")),
+                        ("spec".into(), spec),
                     ])
                 };
                 Avro::Record(vec![
                     ("id".into(), nullable(format!("a{s}.{a}"))),
                     (
-                        "localizedNames".into(),
+                        "names".into(),
                         Avro::Map(
                             [("de", 1), ("en", 1), ("xx", 0)]
                                 .iter()
@@ -1843,30 +1869,30 @@ async fn deep_nesting_decodes_at_production_batch_sizes() {
                 ])
             };
             Avro::Record(vec![
-                ("styleArticleId".into(), nullable(format!("style {s}"))),
+                ("groupId".into(), nullable(format!("group {s}"))),
                 (
-                    "styleArticleAttributes".into(),
+                    "attributes".into(),
                     Avro::Array((0..attributes).map(attribute).collect()),
                 ),
             ])
         };
-        let product = Avro::Record(vec![
+        let item = Avro::Record(vec![
             ("id".into(), Avro::Long(0)),
             (
-                "baseProductId".into(),
-                Avro::Union(0, Box::new(Avro::String("P-1".into()))),
+                "code".into(),
+                Avro::Union(0, Box::new(Avro::String("I-1".into()))),
             ),
             (
-                "genders".into(),
-                Avro::Array(vec![Avro::String("female".into())]),
+                "tags".into(),
+                Avro::Array(vec![Avro::String("a tag".into())]),
             ),
             (
-                "stylesDescriptions".into(),
-                Avro::Array((0..styles).map(style).collect()),
+                "groups".into(),
+                Avro::Array((0..groups).map(group).collect()),
             ),
         ]);
         // `id` 0 is the one byte 0x00.
-        framed(1, PRODUCT, product)[HEADER_LEN + 1..].to_vec()
+        framed(1, ITEM, item)[HEADER_LEN + 1..].to_vec()
     };
     let typical = tail(8, 5);
     let largest = tail(188, 6);
@@ -1875,7 +1901,7 @@ async fn deep_nesting_decodes_at_production_batch_sizes() {
     let payload =
         |o: i64, tail: &[u8]| [vec![0, 0, 0, 0, 1], zigzag_varint(o), tail.to_vec()].concat();
 
-    let mut d = decoder(Schemas::with(&[(1, PRODUCT)]));
+    let mut d = decoder(Schemas::with(&[(1, ITEM)]));
     let mut next = 0;
     for _ in 0..3 {
         let offsets = next..next + 900;
@@ -1908,10 +1934,10 @@ async fn deep_nesting_decodes_at_production_batch_sizes() {
         let attributes: usize = 899 * 8 * 5 + 188 * 6;
         let mut specs = Vec::new();
         for b in &out.batches {
-            let styles = column(b, "stylesDescriptions").as_list::<i32>().values();
-            let attrs = styles
+            let groups = column(b, "groups").as_list::<i32>().values();
+            let attrs = groups
                 .as_struct()
-                .column_by_name("styleArticleAttributes")
+                .column_by_name("attributes")
                 .unwrap()
                 .as_list::<i32>()
                 .values()
@@ -1923,7 +1949,7 @@ async fn deep_nesting_decodes_at_production_batch_sizes() {
                 .as_list::<i32>()
                 .values()
                 .clone();
-            let spec = values.as_struct().column_by_name("valueSpecification");
+            let spec = values.as_struct().column_by_name("spec");
             specs.extend(union_strings(spec.unwrap()));
         }
         assert_eq!(specs.len(), attributes * 2);
