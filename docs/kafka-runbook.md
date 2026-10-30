@@ -125,14 +125,31 @@ whole mechanism: kdi stores `txn{ "<app_id>-<partition>" = last offset }`) and i
 
 ## Blocked pipelines (`ddi_kafka_pipeline_blocked{reason}`)
 
-The member stays up and in its group but writes nothing until the cause is fixed; it re-checks every
-`blocked_recheck_secs`. `reason` is one of the held errors: `target_replaced` (the table was dropped and
+The member stays in its group but writes nothing until the cause is fixed, and `ddi_pipeline_up` reads
+0 meanwhile (since 0.7.2); it re-checks every `blocked_recheck_secs`. `reason` is one of the held errors: `target_replaced` (the table was dropped and
 recreated under it: restore or point it at the right table), `protocol_unsupported` (another engine
 upgraded the table to a writer feature delta-rs cannot write, column mapping included), `txn_retention`
 (the retention property is set: unset it), `offset_vanished` (an offset it held disappeared from the
 table: `set-offsets --next <last + 1> --acknowledge-skip "<why>"` from the offset the log names),
 `schema`/`transform`/`evaluation` (the writer schema changed in a way the SQL or the target cannot take:
-fix the SQL or the target; the messages are not lost, they wait).
+fix the SQL or the target; the messages are not lost, they wait), `undecodable` (a message cannot be
+decoded and there is no DQ table, or more than `max_evaluation_rejects_per_batch` cannot in one batch:
+the error names the first by partition, offset and writer schema id. Read that message with another
+Avro reader against that schema: if it decodes, the fault is ddi's, so do not raise the cap, which
+would send good messages to the DQ table; report it and roll back to kdi as above), `transient`,
+`capacity`, `other` (the partitions were assigned, or rechecked, while the target could not be read:
+it goes on by itself once a recheck can read it).
+
+**Good messages ddi 0.5.0 to 0.7.1 set aside.** Those versions could not decode a writer schema
+with a union other than a two-branch one with null (`["null", T]`, `[T, "null"]`; a one-branch
+union such as `["string"]` counts) twice in a row: in many batches after the first, about every
+second message of that schema was rejected with a reason containing `Offsets must be non-negative
+and within the length of the Array`; that reason is the exact way to find them. Up to
+`max_evaluation_rejects_per_batch` such rejects went to the DQ table and the batch committed past
+them; more held the pipeline. 0.7.2 fixes it. Those DQ rows are good messages that are missing from
+the target, and the committed offsets (which kdi resumes from too) are past them. ddi has no tool to
+write them back: each row's payload has the message's `<prefix>partition`, `<prefix>offset` and
+bytes (`<prefix>value_b64`), to re-ingest from.
 
 ## Restore or delete
 
