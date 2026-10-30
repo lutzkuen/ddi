@@ -1141,6 +1141,10 @@ impl Pipeline {
             });
             src.held_for = Some(HeldFor::Replan);
         } else {
+            // A hold the batch was under ends with it, as in `recheck_for_batch`. Left set,
+            // `blocked` keeps every partition paused (`release` waits for it) with no batch to
+            // retry and no recheck due, until a rebalance or a restart.
+            self.kafka_mut().blocked = None;
             info!(
                 pipeline = %self.cfg.name,
                 partitions = ?changed,
